@@ -256,6 +256,9 @@ pub enum TrashBackend {
     Gio,
     /// The XDG trash directory, implemented here.
     XdgHome,
+    /// macOS's own `/usr/bin/trash` (macOS 14+): the Finder's Trash, with
+    /// "Put Back" intact.
+    MacOs,
     /// No way to move files to a trash on this machine.
     #[default]
     Unavailable,
@@ -264,7 +267,7 @@ pub enum TrashBackend {
 impl TrashBackend {
     pub const fn is_available(self) -> bool {
         match self {
-            Self::TrashPut | Self::Gio | Self::XdgHome => true,
+            Self::TrashPut | Self::Gio | Self::XdgHome | Self::MacOs => true,
             Self::Unavailable => false,
         }
     }
@@ -274,6 +277,7 @@ impl TrashBackend {
             Self::TrashPut => "trash-put",
             Self::Gio => "gio trash",
             Self::XdgHome => "XDG trash",
+            Self::MacOs => "macOS Trash",
             Self::Unavailable => "no trash tool found",
         }
     }
@@ -287,16 +291,31 @@ impl TrashBackend {
             Self::XdgHome => {
                 "moves into ~/.local/share/Trash on the same volume"
             }
+            Self::MacOs => "moves into the Trash; Put Back works from Finder",
             Self::Unavailable => {
-                "install trash-cli or keep deleting permanently"
+                if cfg!(target_os = "macos") {
+                    "needs macOS 14 or later; keep deleting permanently"
+                } else {
+                    "install trash-cli or keep deleting permanently"
+                }
             }
         }
     }
 }
 
 /// Detect the best available trash backend for this machine.
+///
+/// On macOS only the system tool counts: a Homebrew `trash-put` or `gio`
+/// would move files into an XDG directory the Finder never shows, which
+/// looks like the space was freed while it was not.
 pub fn detect_trash_backend() -> TrashBackend {
-    if which("trash-put") {
+    if cfg!(target_os = "macos") {
+        if Path::new(MACOS_TRASH).is_file() {
+            TrashBackend::MacOs
+        } else {
+            TrashBackend::Unavailable
+        }
+    } else if which("trash-put") {
         TrashBackend::TrashPut
     } else if which("gio") {
         TrashBackend::Gio
@@ -306,6 +325,8 @@ pub fn detect_trash_backend() -> TrashBackend {
         TrashBackend::Unavailable
     }
 }
+
+const MACOS_TRASH: &str = "/usr/bin/trash";
 
 fn which(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
@@ -456,6 +477,7 @@ pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
         TrashBackend::TrashPut => run_tool(Path::new("trash-put"), &[], path),
         TrashBackend::Gio => run_tool(Path::new("gio"), &["trash"], path),
         TrashBackend::XdgHome => trash_via_xdg(path),
+        TrashBackend::MacOs => trash_via_macos(Path::new(MACOS_TRASH), path),
         TrashBackend::Unavailable => Err(io::Error::other(
             "no trash tool is installed; use permanent deletion instead",
         )),
@@ -473,6 +495,26 @@ fn run_tool(program: &Path, arguments: &[&str], path: &Path) -> io::Result<()> {
         .arg("--")
         .arg(path)
         .output()?;
+    tool_result(program, &output)
+}
+
+/// Apple's `trash` has no `--`: it reads one as a file name and fails after
+/// trashing the real path. Only absolute paths are handed to it, so a name
+/// that starts with `-` can never be read as an option.
+fn trash_via_macos(program: &Path, path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::other(
+            "refusing to trash a relative path with the macOS tool",
+        ));
+    }
+    let output = Command::new(program).arg(path).output()?;
+    tool_result(program, &output)
+}
+
+fn tool_result(
+    program: &Path,
+    output: &std::process::Output,
+) -> io::Result<()> {
     if output.status.success() {
         Ok(())
     } else {
@@ -873,9 +915,39 @@ mod tests {
     }
 
     #[test]
+    fn the_macos_tool_refuses_a_relative_path() {
+        let error =
+            trash_via_macos(Path::new("/usr/bin/true"), Path::new("-rf"))
+                .expect_err("relative");
+        assert!(error.to_string().contains("relative"), "{error}");
+    }
+
+    #[test]
+    fn the_macos_tool_gets_the_path_and_nothing_else() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = TempDir::new().expect("tempdir");
+        let log = temp.path().join("argv");
+        let script = temp.path().join("fake-trash");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+        )
+        .expect("write");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+
+        let target = temp.path().join("-rf");
+        trash_via_macos(&script, &target).expect("ran");
+        let argv = fs::read_to_string(&log).expect("log");
+        assert_eq!(argv, format!("{}\n", target.display()));
+    }
+
+    #[test]
     fn detection_prefers_a_tool_this_machine_has() {
         let backend = detect_trash_backend();
-        if which("trash-put") {
+        if cfg!(target_os = "macos") {
+            assert_eq!(backend, TrashBackend::MacOs);
+        } else if which("trash-put") {
             assert_eq!(backend, TrashBackend::TrashPut);
         }
         assert!(backend.is_available());

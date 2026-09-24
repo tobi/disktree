@@ -8,6 +8,7 @@
 mod git;
 mod marks;
 mod palette;
+mod reveal;
 mod state;
 #[cfg(test)]
 mod tests;

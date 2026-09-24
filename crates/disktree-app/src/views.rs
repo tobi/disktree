@@ -37,6 +37,12 @@ use crate::widgets;
 /// removed; the list only stops being exhaustive, which it says out loud.
 const LIST_LIMIT: usize = 1200;
 
+const REVEAL_HELP: &str = if cfg!(target_os = "macos") {
+    "Show the selected tile in Finder"
+} else {
+    "Open the selected tile's folder in the file manager"
+};
+
 /// The whole window.
 pub fn root(
     app: &mut Disktree,
@@ -2738,7 +2744,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 24] = [
+    let rows: [(&str, &str); 25] = [
         ("space / x", "Mark or unmark the tile you point at"),
         ("ctrl-click", "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
@@ -2764,6 +2770,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
         ("p", "Show or hide the selection line"),
+        ("o", REVEAL_HELP),
         ("q", "Quit"),
         ("", ""),
         (
