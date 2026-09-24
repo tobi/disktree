@@ -16,6 +16,8 @@ the removal mode, the confirmation). Marking is never destructive.
 make build                      # release build
 make run                        # build and run, scanning $HOME
 make install                    # ~/.local: binary, desktop entry, icon
+                                # (macOS: ~/Applications/disktree.app)
+make app                        # macOS: build target/disktree.app
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
 make lint                       # rustfmt --check, then clippy --all-targets -D warnings
