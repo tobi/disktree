@@ -376,8 +376,9 @@ tested:
 - nothing is passed through a shell — a file called `-rf` is just a file;
 - reading a checkout never runs a program it names: git is asked with its
   fsmonitor, hooks, pager, signature verifiers, external diffs and text
-  conversions off, with no network, and a checkout that defines its own
-  filter drivers is not read at all.
+  conversions off, with no network. A filter driver runs only when your own
+  git config defines it, as `git lfs install` does; one only the checkout
+  defines is switched off for the read.
 
 ## On Hyprland
 

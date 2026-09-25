@@ -75,7 +75,6 @@ impl Output {
 pub struct Git {
     executable: PathBuf,
     directory: PathBuf,
-    fsmonitor: bool,
 }
 
 impl Git {
@@ -84,7 +83,6 @@ impl Git {
         Some(Self {
             executable: executable()?.clone(),
             directory: directory.to_path_buf(),
-            fsmonitor: false,
         })
     }
 
@@ -92,14 +90,16 @@ impl Git {
         &self.directory
     }
 
-    /// A daemon already watching the checkout makes `status` fast. Only one
-    /// that is running is used: starting one for every checkout pointed at
-    /// would leave processes behind. `core.fsmonitor=true` is git's own
-    /// daemon, never a program the checkout names.
-    #[must_use]
-    pub fn watched(mut self) -> Self {
-        self.fsmonitor = self.run(&["fsmonitor--daemon", "status"]).ok();
-        self
+    /// Global options for `status`, the one read an fsmonitor makes faster:
+    /// git's own daemon, never a program the checkout names, and only one
+    /// already running, since starting one for every checkout pointed at
+    /// would leave processes behind.
+    pub fn watched_status(&self) -> Vec<String> {
+        if self.run(&["fsmonitor--daemon", "status"]).ok() {
+            vec!["-c".into(), "core.fsmonitor=true".into()]
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn run<S: AsRef<OsStr>>(&self, args: &[S]) -> Output {
@@ -211,11 +211,7 @@ impl Git {
             // (From tobi/disktree#10.)
             .args([
                 "-c",
-                if self.fsmonitor {
-                    "core.fsmonitor=true"
-                } else {
-                    "core.fsmonitor=false"
-                },
+                "core.fsmonitor=false",
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
@@ -260,16 +256,17 @@ fn drain(
     })
 }
 
-/// Whether the checkout's own config defines filter drivers.
+/// The filter drivers the checkout's own config defines that the user's own
+/// config does not, by name; `None` when its config cannot be read.
 ///
 /// `git status` runs a file's `clean` filter to compare it with the index,
 /// and a downloaded repository can name any program as one in `.git/config`
-/// and switch it on from its `.gitattributes`. No `-c` can turn off drivers
-/// whose names are not known in advance, so such a checkout is not asked for
-/// its status at all. Filters from the user's own config, such as git-lfs,
-/// are theirs and still run. Reading config runs nothing; if it cannot be
-/// read, the answer is the cautious one.
-pub fn names_its_own_filters(git: &Git) -> bool {
+/// and switch it on from its `.gitattributes`. Filters from the user's own
+/// config, such as git-lfs, are theirs and still run, and so does a
+/// checkout's copy of one, setting for setting, which is what `git lfs
+/// install` writes into a repository. Anything else is switched off with
+/// [`filters_off`]. Reading config runs nothing.
+pub fn foreign_filters(git: &Git) -> Option<Vec<String>> {
     let output = git.run(&[
         "config",
         "--show-scope",
@@ -279,12 +276,64 @@ pub fn names_its_own_filters(git: &Git) -> bool {
     ]);
     match output.code {
         // No filter anywhere.
-        Some(1) => false,
-        Some(0) => output.lines().iter().any(|line| {
-            matches!(line.split('\t').next(), Some("local" | "worktree"))
-        }),
-        _ => true,
+        Some(1) => Some(Vec::new()),
+        Some(0) => Some(foreign_filter_names(&output.text())),
+        _ => None,
     }
+}
+
+/// From `config --show-scope --get-regexp` lines: `scope<TAB>key value`,
+/// where a driver's name may itself hold dots.
+fn foreign_filter_names(listing: &str) -> Vec<String> {
+    let settings: Vec<(&str, &str, &str, &str)> = listing
+        .lines()
+        .filter_map(|line| {
+            let (scope, setting) = line.split_once('\t')?;
+            let (key, value) = setting.split_once(' ').unwrap_or((setting, ""));
+            let (name, variable) =
+                key.strip_prefix("filter.")?.rsplit_once('.')?;
+            Some((scope, name, variable, value))
+        })
+        .collect();
+    let mut foreign: Vec<String> = Vec::new();
+    for &(scope, name, variable, value) in &settings {
+        if !matches!(scope, "local" | "worktree") {
+            continue;
+        }
+        let users_own =
+            settings
+                .iter()
+                .any(|&(own, own_name, own_variable, own_value)| {
+                    matches!(own, "system" | "global")
+                        && (own_name, own_variable, own_value)
+                            == (name, variable, value)
+                });
+        if !users_own && !foreign.iter().any(|known| known == name) {
+            foreign.push(name.to_owned());
+        }
+    }
+    foreign
+}
+
+/// Global options that switch the named filter drivers off for one
+/// command.
+///
+/// With no command left, git compares a file as it is on disk, and a driver
+/// marked required is not missed. At worst a file its filter would have
+/// cleaned reads as changed, which only ever says there is more to lose.
+pub fn filters_off(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .flat_map(|name| {
+            [
+                format!("filter.{name}.clean="),
+                format!("filter.{name}.smudge="),
+                format!("filter.{name}.process="),
+                format!("filter.{name}.required=false"),
+            ]
+        })
+        .flat_map(|setting| ["-c".to_owned(), setting])
+        .collect()
 }
 
 /// The git to run, looked for once.
@@ -358,6 +407,50 @@ mod tests {
         );
         assert!(output.ok(), "{}", output.error);
         assert_eq!(output.text().trim().len(), 40);
+    }
+
+    #[test]
+    fn only_a_filter_the_user_does_not_define_is_foreign() {
+        let lfs = "filter.lfs.clean git-lfs clean -- %f\n\
+                   filter.lfs.process git-lfs filter-process\n\
+                   filter.lfs.required true";
+        let scoped = |scope: &str| {
+            lfs.lines()
+                .map(|line| [scope, "\t", line, "\n"].concat())
+                .collect::<String>()
+        };
+        let copied = format!("{}{}", scoped("global"), scoped("local"));
+        assert!(
+            foreign_filter_names(&copied).is_empty(),
+            "`git lfs install` copies the user's own filter into a repository"
+        );
+        assert_eq!(foreign_filter_names(&scoped("local")), ["lfs"]);
+        let changed = format!(
+            "{}local\tfilter.lfs.process ./fetch.sh\n",
+            scoped("global")
+        );
+        assert_eq!(
+            foreign_filter_names(&changed),
+            ["lfs"],
+            "one setting of its own makes the whole driver the checkout's"
+        );
+        assert_eq!(
+            foreign_filter_names("worktree\tfilter.a.b.clean ./a.sh\n"),
+            ["a.b"]
+        );
+        assert_eq!(
+            filters_off(&["x".into()]),
+            [
+                "-c",
+                "filter.x.clean=",
+                "-c",
+                "filter.x.smudge=",
+                "-c",
+                "filter.x.process=",
+                "-c",
+                "filter.x.required=false"
+            ]
+        );
     }
 
     #[test]

@@ -99,8 +99,9 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 10. **Git is only read.** `git::Git` runs every command with no inherited
     `GIT_*` variable, optional locks off and every program a checkout's
     config could name overridden; nothing fetches, an fsmonitor daemon is
-    used only if one is already running, and a checkout that defines its own
-    filter drivers is not read. Removing a linked worktree's folder leaves
+    used only if one is already running, and a filter driver runs only when
+    the user's own config defines it, setting for setting; one only the
+    checkout defines is switched off for `status`. Removing a linked worktree's folder leaves
     its branches, commits and stashes in its repository, which is why
     `Checkout::loses_nothing` asks only what the folder itself holds.
 11. **Details are found cheaply and read later.** `details::details` decides

@@ -184,14 +184,14 @@ pub fn read_checkout(
         CheckoutKind::Repository
         | CheckoutKind::Worktree { .. }
         | CheckoutKind::Submodule => {
-            if git::names_its_own_filters(&git) {
+            let Some(foreign) = git::foreign_filters(&git) else {
                 return Reading::Failed(
-                    "its config names filter programs, which disktree does \
-                     not run"
-                        .into(),
+                    "its filter settings could not be read".into(),
                 );
-            }
-            read_working_checkout(&git.watched(), item, subtree)
+            };
+            let mut before_status = git::filters_off(&foreign);
+            before_status.extend(git.watched_status());
+            read_working_checkout(&git, item, subtree, &before_status)
         }
     }
 }
@@ -204,14 +204,20 @@ fn read_bare(git: &Git) -> Checkout {
     checkout
 }
 
+/// `before_status` is what `status` alone is run with: the filters the
+/// checkout's own config names switched off, and an fsmonitor already
+/// watching it.
 fn read_working_checkout(
     git: &Git,
     item: &CheckoutItem,
     subtree: Option<&Node>,
+    before_status: &[String],
 ) -> Reading<Checkout> {
+    let mut status: Vec<&str> =
+        before_status.iter().map(String::as_str).collect();
     // Submodules are other checkouts with configs of their own, never
     // vetted; one inside a worktree is a leftover instead.
-    let status = git.run(&[
+    status.extend([
         "status",
         "--porcelain=v2",
         "--branch",
@@ -220,6 +226,7 @@ fn read_working_checkout(
         "--untracked-files=normal",
         "--ignore-submodules=all",
     ]);
+    let status = git.run(&status);
     if !status.ok() {
         return Reading::Failed(if status.error.is_empty() {
             "git status failed".into()
@@ -685,18 +692,20 @@ fn leftovers(
         }
     }
     if !keepsakes.is_empty() {
-        // `check-ignore` refuses the literal pathspecs every other read uses.
+        // Not `check-ignore`, which Apple's git takes seconds to answer on a
+        // monorepo's sparse index, where this takes a blink.
         let mut args = vec![
-            "--no-literal-pathspecs",
-            "-c",
-            "core.quotePath=false",
-            "check-ignore",
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
             "--",
         ];
         args.extend(keepsakes.iter().map(String::as_str));
         found.extend(
             git.run(&args)
-                .lines()
+                .fields()
                 .into_iter()
                 .map(|path| format!("{prefix}{path}")),
         );
@@ -1431,14 +1440,12 @@ mod tests {
             // the filter, to know whether it changed.
             Checkouts::write(&repos.repo(), "a.txt", "one\n");
 
-            let node =
-                scan(&repos.repo(), ScanOptions::default()).expect("scan");
-            let item = Checkouts::item(&repos.repo());
-            assert!(
-                matches!(read_checkout(&item, Some(&node)), Reading::Failed(_)),
-                "not read"
-            );
+            let checkout = Checkouts::read(&repos.repo());
             assert!(!marker.exists(), "the checkout's filter ran");
+            assert_eq!(
+                checkout.change_count, 0,
+                "read with the filter off, the file is as committed"
+            );
         }
     }
 }
