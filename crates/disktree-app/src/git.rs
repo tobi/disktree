@@ -74,6 +74,9 @@ pub fn state(path: &Path) -> Option<GitState> {
 
 fn run(path: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
+        // Inspecting a checkout must not run its fsmonitor hook.
+        .arg("-c")
+        .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(path)
         .args(args)
@@ -133,5 +136,58 @@ mod tests {
         let state = state(dir.path()).expect("a checkout");
         assert_eq!(state.changed, 1, "one untracked file");
         assert_eq!(state.stashes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_state_without_running_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run git")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(path.join("tracked.txt"), "hi").expect("write");
+        // Give status an index to refresh, so the hook would actually run.
+        assert!(git(&["add", "tracked.txt"]).status.success());
+
+        let hook = path.join(".git/fsmonitor-test");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf invoked > .git/fsmonitor-marker\nexit 1\n",
+        )
+        .expect("write hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
+            .expect("make hook executable");
+        assert!(
+            git(&["config", "core.fsmonitor", ".git/fsmonitor-test"])
+                .status
+                .success()
+        );
+
+        let marker = path.join(".git/fsmonitor-marker");
+        assert!(git(&["status", "--porcelain=v1", "-z"]).status.success());
+        assert!(marker.exists(), "plain git status must run the test hook");
+        std::fs::remove_file(&marker).expect("reset marker");
+
+        assert_eq!(
+            state(path),
+            Some(GitState {
+                changed: 1,
+                stashes: 0,
+                unpushed: None,
+            })
+        );
+        assert!(!marker.exists(), "inspection must not run the hook");
     }
 }
