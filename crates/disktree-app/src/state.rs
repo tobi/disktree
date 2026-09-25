@@ -2077,7 +2077,7 @@ impl Disktree {
             "down" | "j" if !control => {
                 self.move_selection(Direction::Down, cx);
             }
-            "backspace" | "u" if !control => self.ascend(cx),
+            "u" if !control => self.ascend(cx),
             // A filter is the first thing Escape takes away.
             "escape" if self.matches.is_some() => self.clear_filter(),
             "escape" => {

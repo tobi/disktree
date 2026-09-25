@@ -201,6 +201,40 @@ fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn backspace_does_not_act_on_tiles_and_u_ascends(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    press(cx, "enter");
+    let before =
+        read(&view, cx, |app| (app.crumbs.clone(), app.selected.clone()));
+    assert!(!before.0.is_empty());
+    for key in ["backspace", "b"] {
+        press(cx, key);
+        assert_eq!(
+            read(&view, cx, |app| {
+                (app.crumbs.clone(), app.selected.clone())
+            }),
+            before
+        );
+        assert!(read(&view, cx, |app| app.marks.is_empty()));
+    }
+    assert!(temp.path().join(".cache/blob.bin").exists());
+
+    press(cx, "u");
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()));
+
+    // Backspace still edits text when the search field owns the keyboard.
+    press(cx, "/");
+    press(cx, "b");
+    assert_eq!(read(&view, cx, |app| app.find.clone()), "b");
+    press(cx, "backspace");
+    assert!(read(&view, cx, |app| app.find.is_empty()));
+}
+
+#[gpui_kit::test]
 fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
     cx: &mut TestAppContext,
 ) {

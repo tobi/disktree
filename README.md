@@ -99,7 +99,7 @@ Scroll to magnify toward the pointer. The wheel magnifies until the directory
 under the pointer fills the view, and the next notch goes into it — one
 continuous motion, with the directory's contents growing into place. Scroll the
 other way to come back out. Enter goes into the selected directory at any
-depth, and Backspace or Escape goes up one level. `+` and `-` magnify without
+depth, and `u` or Escape goes up one level. `+` and `-` magnify without
 going in; `0` resets.
 
 ### Removing
@@ -123,7 +123,7 @@ and shows how much free space was actually gained.
 | `space` / `x` | mark or unmark the tile you point at |
 | `ctrl`-click | mark without moving the selection |
 | `enter` | open that directory, at any depth |
-| `⌫` / `esc` | go up one directory |
+| `u` / `esc` | go up one directory |
 | `←` `↑` `↓` `→` | move between tiles at this level |
 | `tab` | next largest sibling |
 | scroll | zoom toward a directory, then go into it |
