@@ -40,6 +40,16 @@ make install
 `sudo make install PREFIX=/usr/local` installs system-wide; `make uninstall`
 removes exactly what was installed.
 
+On Arch, including Omarchy, disktree is in the AUR:
+[`disktree`](https://aur.archlinux.org/packages/disktree) builds each release
+from source, and
+[`disktree-bin`](https://aur.archlinux.org/packages/disktree-bin) installs
+the release binary:
+
+```sh
+paru -S disktree-bin
+```
+
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan). Distributions often package an older Rust;
 [rustup](https://rustup.rs) installs a current one.
