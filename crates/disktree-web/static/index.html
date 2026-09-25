@@ -1,0 +1,250 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>disktree-web</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #16181d; color: #ddd;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #top { padding: 8px 12px; font-size: 13px; display: flex; gap: 16px;
+    align-items: center; border-bottom: 1px solid #2a2d33; }
+  #crumbs button { background: none; border: none; color: #9ad; cursor: pointer;
+    font-size: 13px; padding: 2px 4px; }
+  #crumbs button:hover { text-decoration: underline; }
+  #canvas-wrap { position: absolute; top: 36px; left: 0; right: 0; bottom: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #status { position: absolute; bottom: 8px; left: 12px; font-size: 12px;
+    color: #888; }
+  #tip { position: absolute; pointer-events: none; background: #000c;
+    color: #eee; padding: 4px 8px; border-radius: 4px; font-size: 12px;
+    display: none; max-width: 360px; white-space: pre-line; }
+</style>
+</head>
+<body>
+<div id="top">
+  <strong>disktree-web</strong>
+  <span id="crumbs"></span>
+  <span id="totals" style="margin-left:auto;color:#888;"></span>
+</div>
+<div id="canvas-wrap">
+  <canvas id="c"></canvas>
+  <div id="tip"></div>
+</div>
+<div id="status">loading…</div>
+<script>
+const CATEGORY_COLOR = {
+  Code: "#4c8bf5", "Agent scratch": "#9b6cf0", Toolchains: "#e0a53a",
+  Synced: "#3ac0a0", Git: "#e0603a", Media: "#d84fa0", Documents: "#5fb0e0",
+  Cache: "#777c85", Other: "#4a4e57",
+};
+
+let path = [];        // node stack (server responses) from root to the viewed directory
+let rects = [];        // last-laid-out tiles: {node, x, y, w, h}
+const nodeCache = new Map(); // crumbs key -> server node, so re-visiting is instant
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const tip = document.getElementById("tip");
+
+function resize() {
+  const wrap = document.getElementById("canvas-wrap");
+  canvas.width = wrap.clientWidth * devicePixelRatio;
+  canvas.height = wrap.clientHeight * devicePixelRatio;
+  canvas.style.width = wrap.clientWidth + "px";
+  canvas.style.height = wrap.clientHeight + "px";
+  draw();
+}
+window.addEventListener("resize", resize);
+
+function fmtBytes(n) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+}
+
+// Squarified treemap layout (Bruls/Huizing/van Wijk), same family the
+// native app's crates/disktree-core/src/treemap.rs uses.
+function squarify(children, x, y, w, h, out) {
+  const total = children.reduce((s, c) => s + Math.max(c.bytes, 1), 0);
+  if (total <= 0 || children.length === 0) return;
+  const scale = (w * h) / total;
+  const sorted = [...children].sort((a, b) => b.bytes - a.bytes);
+  let items = sorted.map(c => ({ node: c, area: Math.max(c.bytes, 1) * scale }));
+
+  let rx = x, ry = y, rw = w, rh = h;
+  while (items.length) {
+    const shortSide = Math.min(rw, rh);
+    let row = [items[0]];
+    let rowArea = items[0].area;
+    let bestRatio = worstRatio(row, shortSide);
+    let i = 1;
+    while (i < items.length) {
+      const testRow = [...row, items[i]];
+      const testArea = rowArea + items[i].area;
+      const ratio = worstRatio(testRow, shortSide);
+      if (ratio > bestRatio) break;
+      row = testRow; rowArea = testArea; bestRatio = ratio;
+      i++;
+    }
+    items = items.slice(row.length);
+
+    const rowLen = rowArea / shortSide;
+    if (rw >= rh) {
+      let cy = ry;
+      for (const it of row) {
+        const ih = it.area / rowLen;
+        out.push({ node: it.node, x: rx, y: cy, w: rowLen, h: ih });
+        cy += ih;
+      }
+      rx += rowLen; rw -= rowLen;
+    } else {
+      let cx = rx;
+      for (const it of row) {
+        const iw = it.area / rowLen;
+        out.push({ node: it.node, x: cx, y: ry, w: iw, h: rowLen });
+        cx += iw;
+      }
+      ry += rowLen; rh -= rowLen;
+    }
+  }
+}
+
+function worstRatio(row, side) {
+  const areas = row.map(i => i.area);
+  const sum = areas.reduce((a, b) => a + b, 0);
+  const max = Math.max(...areas), min = Math.min(...areas);
+  const s2 = side * side;
+  return Math.max((s2 * max) / (sum * sum), (sum * sum) / (s2 * min));
+}
+
+function currentDir() { return path[path.length - 1]; }
+
+function draw() {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const dir = currentDir();
+  if (!dir) return;
+
+  rects = [];
+  squarify(dir.children, 0, 0, w, h, rects);
+
+  for (const r of rects) {
+    const n = r.node;
+    const color = CATEGORY_COLOR[n.category] || CATEGORY_COLOR.Other;
+    ctx.fillStyle = color;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    if (n.reclaim) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(r.x, r.y, r.w, r.h);
+      ctx.clip();
+      ctx.strokeStyle = "#ffbf4780";
+      ctx.lineWidth = 3 * devicePixelRatio;
+      for (let d = -r.h; d < r.w; d += 10 * devicePixelRatio) {
+        ctx.beginPath();
+        ctx.moveTo(r.x + d, r.y);
+        ctx.lineTo(r.x + d + r.h, r.y + r.h);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    ctx.strokeStyle = "#00000060";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+
+    if (r.w > 40 * devicePixelRatio && r.h > 16 * devicePixelRatio) {
+      ctx.fillStyle = "#fff";
+      ctx.font = `${11 * devicePixelRatio}px sans-serif`;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(r.x, r.y, r.w, r.h);
+      ctx.clip();
+      ctx.fillText(n.name, r.x + 4, r.y + 14 * devicePixelRatio);
+      ctx.restore();
+    }
+  }
+  renderCrumbs();
+  document.getElementById("totals").textContent =
+    `${fmtBytes(dir.bytes)} · ${dir.files.toLocaleString()} files`;
+}
+
+function renderCrumbs() {
+  const el = document.getElementById("crumbs");
+  el.innerHTML = "";
+  path.forEach((n, i) => {
+    const btn = document.createElement("button");
+    btn.textContent = i === 0 ? (n.name || "/") : n.name;
+    btn.onclick = () => { path = path.slice(0, i + 1); draw(); };
+    el.appendChild(btn);
+    if (i < path.length - 1) el.appendChild(document.createTextNode(" / "));
+  });
+}
+
+async function fetchNode(crumbs) {
+  const key = crumbs.join(",");
+  if (nodeCache.has(key)) return nodeCache.get(key);
+  const res = await fetch("/api/node?crumbs=" + encodeURIComponent(key));
+  const node = await res.json();
+  nodeCache.set(key, node);
+  return node;
+}
+
+async function goTo(crumbs) {
+  document.getElementById("status").textContent = "loading…";
+  const node = await fetchNode(crumbs);
+  document.getElementById("status").textContent = "";
+  // Rebuild the breadcrumb trail up to this depth from cache/root.
+  const trail = [];
+  for (let d = 0; d <= crumbs.length; d++) {
+    trail.push(await fetchNode(crumbs.slice(0, d)));
+  }
+  path = trail;
+  path[path.length - 1] = node;
+  draw();
+}
+
+canvas.addEventListener("click", async (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * devicePixelRatio;
+  const y = (e.clientY - rect.top) * devicePixelRatio;
+  const hit = rects.find(r => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+  if (hit && hit.node.has_children) {
+    await goTo(hit.node.crumbs);
+  }
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * devicePixelRatio;
+  const y = (e.clientY - rect.top) * devicePixelRatio;
+  const hit = rects.find(r => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h);
+  if (hit) {
+    tip.style.display = "block";
+    tip.style.left = (e.clientX + 12) + "px";
+    tip.style.top = (e.clientY + 12) + "px";
+    tip.textContent = `${hit.node.name}\n${fmtBytes(hit.node.bytes)} · ${hit.node.files} files` +
+      (hit.node.reclaim ? `\nreclaimable: ${hit.node.reclaim}` : "");
+  } else {
+    tip.style.display = "none";
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" || e.key === "Backspace") {
+    if (path.length > 1) { path.pop(); draw(); }
+  }
+});
+
+async function load() {
+  document.getElementById("status").textContent = "scanning…";
+  const rootNode = await fetchNode([]);
+  document.getElementById("status").textContent = "";
+  path = [rootNode];
+  resize();
+}
+
+load();
+</script>
+</body>
+</html>
