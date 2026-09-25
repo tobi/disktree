@@ -47,7 +47,7 @@ from source, and
 the release binary:
 
 ```sh
-paru -S disktree-bin
+yay -S disktree-bin
 ```
 
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
