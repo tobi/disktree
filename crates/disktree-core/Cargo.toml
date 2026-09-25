@@ -15,5 +15,21 @@ rayon = { workspace = true }
 rustix = { version = "1.1", features = ["fs"] }
 rustc-hash = { workspace = true }
 
+# The mount table, the Finder's Trash and purgeable space; see `macos.rs`.
+# All three are already in the graph through GPUI, so this adds no crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSFileManager",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
+
 [dev-dependencies]
 tempfile = "3"

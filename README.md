@@ -105,7 +105,8 @@ going in; `0` resets.
 there, then choose:
 
 - **Move to trash** — the default when a trash is available (`trash-put` from
-  trash-cli, then `gio trash`, then a built-in XDG trash). Recoverable until
+  trash-cli, then `gio trash`, then a built-in XDG trash; on macOS, the
+  Finder's Trash, so Put Back works). Recoverable until
   the trash is emptied, so it commits directly.
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
@@ -192,9 +193,31 @@ tested:
   filesystem;
 - system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are
   refused even where permissions would allow it: packages own them, and
-  pacman, paccache or `journalctl --vacuum` are the tools;
+  pacman, paccache or `journalctl --vacuum` are the tools. On macOS the same
+  goes for `/System`, `/Library`, `/private/etc`, `/private/var/db`,
+  `/private/var/vm` and `/opt/homebrew`, through either face of a firmlink;
 - a symlink is unlinked, never followed;
 - nothing is passed through a shell — a file called `-rf` is just a file.
+
+## On macOS
+
+disktree builds and runs on macOS (Apple silicon or Intel) with `cargo build
+--release`; GPUI draws with Metal, so nothing else is needed. The Omarchy
+theme falls back to its defaults. What differs underneath:
+
+- **The whole disk is `/`.** Your files live on the Data volume, mounted at
+  `/System/Volumes/Data` and shown again at `/Users`, `/Applications` and so
+  on through firmlinks. `g` and `--disk` scan `/` and leave the Data volume's
+  own mount point out, so the sealed system and every user file are each
+  counted once.
+- **The mount table comes from `getfsstat`,** without waiting on any
+  filesystem, so a mounted SMB or NFS share that has gone away cannot stall
+  a scan, and is never entered.
+- **Free space counts purgeable space,** the figure the Finder and System
+  Settings show: caches, local Time Machine snapshots and iCloud files the
+  system drops on demand. It can be well above what `df` reports.
+- **Trash is the Finder's Trash.** A removal to the trash frees nothing until
+  the Trash is emptied; the summary says so.
 
 ## On Hyprland
 

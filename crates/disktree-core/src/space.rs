@@ -59,20 +59,77 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     } else {
         stat.f_frsize
     };
-    Ok(SpaceInfo {
+    let info = SpaceInfo {
         total: stat.f_blocks.saturating_mul(block),
         free: stat.f_bfree.saturating_mul(block),
         available: stat.f_bavail.saturating_mul(block),
-    })
+    };
+    Ok(with_purgeable(info, path))
+}
+
+/// Count purgeable space as free, the way the Finder does.
+///
+/// macOS keeps caches, local Time Machine snapshots and evictable iCloud
+/// files in space `statvfs` calls used, and drops them the moment a write
+/// needs the room. Showing the smaller number would disagree with every
+/// other disk figure on the machine. Both `free` and `available` take it,
+/// so `used()` still adds up with the free figure to the volume size.
+#[cfg(target_os = "macos")]
+fn with_purgeable(info: SpaceInfo, path: &Path) -> SpaceInfo {
+    let Some(important) = crate::macos::available_for_important_use(path)
+    else {
+        return info;
+    };
+    let important = important.min(info.total);
+    SpaceInfo {
+        total: info.total,
+        free: info.free.max(important),
+        available: info.available.max(important),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn with_purgeable(info: SpaceInfo, _path: &Path) -> SpaceInfo {
+    info
+}
+
+/// This machine's mount table, or `None` where it cannot be read, so the
+/// caller can fall back to comparing devices.
+#[cfg(target_os = "macos")]
+pub fn mount_table() -> Option<Vec<Mount>> {
+    crate::macos::mount_table()
+}
+
+/// This machine's mount table, or `None` where it cannot be read, so the
+/// caller can fall back to comparing devices.
+#[cfg(not(target_os = "macos"))]
+pub fn mount_table() -> Option<Vec<Mount>> {
+    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    Some(parse_mounts(&table))
 }
 
 /// The device a path's filesystem is mounted from, such as
 /// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
 /// `/proc/self/mounts`. `None` where that table cannot be read.
+#[cfg(not(target_os = "macos"))]
 pub fn device_for(path: &Path) -> Option<String> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     device_in(&table, &path)
+}
+
+/// The device a path's filesystem is mounted from, such as `/dev/disk3s5`.
+///
+/// The volume comes from the kernel rather than from the longest matching
+/// mount point, which firmlinks make wrong: `/Users` is the Data volume,
+/// not the sealed system volume mounted at `/`.
+#[cfg(target_os = "macos")]
+pub fn device_for(path: &Path) -> Option<String> {
+    let point = crate::macos::mount_point_of(path)?;
+    mount_table()?
+        .into_iter()
+        .find(|mount| mount.point == point)
+        .map(|mount| mount.source)
 }
 
 /// [`device_for`] over a given mount table, for testing.
@@ -186,17 +243,24 @@ pub fn volume_root(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
 }
 
 /// [`volume_root`] for this machine.
+#[cfg(not(target_os = "macos"))]
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    volume_root(&parse_mounts(&table), &path)
+    volume_root(&mount_table()?, &path)
+}
+
+/// The top of the disk `path` lives on: `/` for anything on the Data
+/// volume, see [`crate::macos::volume_root_of`].
+#[cfg(target_os = "macos")]
+pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    crate::macos::volume_root_of(&path)
 }
 
 /// [`foreign_mounts`] for this machine; `None` when the mount table cannot
 /// be read, so the caller can fall back to comparing devices.
 pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    Some(foreign_mounts(&parse_mounts(&table), root))
+    Some(foreign_mounts(&mount_table()?, root))
 }
 
 #[cfg(test)]

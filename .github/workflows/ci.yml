@@ -43,3 +43,25 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+  macos:
+    name: Lint and test (macOS)
+    # Apple silicon. GPUI draws with Metal here, so no system libraries are
+    # needed; the core tests also exercise getfsstat, firmlinks and the
+    # Finder's Trash against the runner's real volumes.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo xtask lint
+
+      - name: Test
+        run: cargo xtask test

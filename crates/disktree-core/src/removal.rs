@@ -9,9 +9,10 @@
 //! * [`RemovalMode::Permanent`] — `rm -rf` semantics, implemented with the
 //!   standard library rather than by shelling out, so no path ever reaches a
 //!   shell and no filename can be misread as an option.
-//! * [`RemovalMode::Trash`] — move to the desktop trash, using `trash-put`,
-//!   then `gio trash`, then a built-in XDG implementation. The backend is
-//!   detected once and named in the UI so the user knows what actually happens.
+//! * [`RemovalMode::Trash`] — move to the desktop trash: the Finder's Trash
+//!   on macOS; elsewhere `trash-put`, then `gio trash`, then a built-in XDG
+//!   implementation. The backend is detected once and named in the UI so the
+//!   user knows what actually happens.
 
 use std::fs;
 use std::io;
@@ -152,14 +153,43 @@ const SYSTEM_TREES: [&str; 14] = [
     "/efi",
 ];
 
+/// The same idea on macOS. `/System` is sealed and would refuse anyway, but
+/// its writable half on the Data volume would not. `/Library` holds launch
+/// daemons, kernel extensions and receipts that apps' own uninstallers
+/// expect to find; `/private/var/db` and `/private/var/vm` are the system's
+/// databases and swap; `/opt/homebrew` belongs to `brew`, as `/usr` belongs
+/// to pacman. None of these paths exists on Linux, so one list serves both.
+const MACOS_SYSTEM_TREES: [&str; 6] = [
+    "/System",
+    "/Library",
+    "/private/etc",
+    "/private/var/db",
+    "/private/var/vm",
+    "/opt/homebrew",
+];
+
+/// Where the macOS Data volume is mounted. Firmlinks show everything on it
+/// again at `/`, so `/System/Volumes/Data/Users/x` *is* `/Users/x`.
+const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// `path` as it appears through the firmlinks: the Data volume's copy of a
+/// path is judged exactly like the path itself, or a scan of the Data volume
+/// would put everything under `/System` and refuse the home directory.
+fn firmlink_face(path: &Path) -> PathBuf {
+    path.strip_prefix(DATA_VOLUME)
+        .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/").join(rest))
+}
+
 /// The system tree `path` is in, if any. The home directory is never
 /// system, wherever it lives.
 fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
+    let path = firmlink_face(path);
     if home.is_some_and(|home| path.starts_with(normalize(home))) {
         return None;
     }
     SYSTEM_TREES
         .iter()
+        .chain(&MACOS_SYSTEM_TREES)
         .find(|tree| path.starts_with(tree))
         .copied()
 }
@@ -171,7 +201,7 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if path == root {
         return Some("the scanned root cannot be removed".into());
     }
-    if home.is_some_and(|home| path == normalize(home)) {
+    if home.is_some_and(|home| firmlink_face(path) == normalize(home)) {
         return Some("the home directory cannot be removed".into());
     }
     if !path.starts_with(root) {
@@ -250,6 +280,8 @@ pub fn normalize(path: &Path) -> PathBuf {
 /// Which tool, if any, moves files to the desktop trash.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TrashBackend {
+    /// The Finder's Trash, through `NSFileManager`, so Put Back works.
+    Finder,
     /// `trash-put` from trash-cli.
     TrashPut,
     /// `gio trash`, present anywhere `GLib` is installed.
@@ -264,13 +296,15 @@ pub enum TrashBackend {
 impl TrashBackend {
     pub const fn is_available(self) -> bool {
         match self {
-            Self::TrashPut | Self::Gio | Self::XdgHome => true,
+            Self::Finder | Self::TrashPut | Self::Gio | Self::XdgHome => true,
             Self::Unavailable => false,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
+            // Read in a sentence: "Uses the Finder's Trash."
+            Self::Finder => "the Finder's Trash",
             Self::TrashPut => "trash-put",
             Self::Gio => "gio trash",
             Self::XdgHome => "XDG trash",
@@ -280,6 +314,7 @@ impl TrashBackend {
 
     pub const fn detail(self) -> &'static str {
         match self {
+            Self::Finder => "restorable from the Finder with Put Back",
             Self::TrashPut => {
                 "uses trash-cli, the same trash as your file manager"
             }
@@ -295,6 +330,17 @@ impl TrashBackend {
 }
 
 /// Detect the best available trash backend for this machine.
+///
+/// On macOS that is always the Finder's Trash: a Homebrew `trash-put` or the
+/// XDG fallback would file things under `~/.local/share/Trash`, where the
+/// Finder never looks.
+#[cfg(target_os = "macos")]
+pub const fn detect_trash_backend() -> TrashBackend {
+    TrashBackend::Finder
+}
+
+/// Detect the best available trash backend for this machine.
+#[cfg(not(target_os = "macos"))]
 pub fn detect_trash_backend() -> TrashBackend {
     if which("trash-put") {
         TrashBackend::TrashPut
@@ -307,6 +353,8 @@ pub fn detect_trash_backend() -> TrashBackend {
     }
 }
 
+// macOS never looks for a trash tool, but the detection test still asks.
+#[cfg(any(not(target_os = "macos"), test))]
 fn which(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -453,6 +501,7 @@ pub fn remove_permanently(path: &Path) -> io::Result<()> {
 /// Move one path to the desktop trash.
 pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
     match backend {
+        TrashBackend::Finder => trash_via_finder(path),
         TrashBackend::TrashPut => run_tool(Path::new("trash-put"), &[], path),
         TrashBackend::Gio => run_tool(Path::new("gio"), &["trash"], path),
         TrashBackend::XdgHome => trash_via_xdg(path),
@@ -460,6 +509,16 @@ pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
             "no trash tool is installed; use permanent deletion instead",
         )),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn trash_via_finder(path: &Path) -> io::Result<()> {
+    crate::macos::move_to_trash(path).map(drop)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_via_finder(_path: &Path) -> io::Result<()> {
+    Err(io::Error::other("the Finder's Trash exists only on macOS"))
 }
 
 /// Run one trash tool on one path.
@@ -875,7 +934,9 @@ mod tests {
     #[test]
     fn detection_prefers_a_tool_this_machine_has() {
         let backend = detect_trash_backend();
-        if which("trash-put") {
+        if cfg!(target_os = "macos") {
+            assert_eq!(backend, TrashBackend::Finder);
+        } else if which("trash-put") {
             assert_eq!(backend, TrashBackend::TrashPut);
         }
         assert!(backend.is_available());
@@ -910,5 +971,48 @@ mod tests {
         let reason =
             refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home));
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));
+    }
+
+    #[test]
+    fn macos_system_trees_are_refused_through_either_face() {
+        let home = Path::new("/Users/tobi");
+        for (path, tree) in [
+            ("/System/Library/CoreServices", "/System"),
+            ("/Library/LaunchDaemons/x.plist", "/Library"),
+            ("/private/var/db/receipts", "/private/var/db"),
+            ("/opt/homebrew/Cellar/node", "/opt/homebrew"),
+            ("/System/Volumes/Data/Library/Caches", "/Library"),
+            (
+                "/System/Volumes/Data/private/var/vm/swapfile0",
+                "/private/var/vm",
+            ),
+        ] {
+            assert_eq!(system_tree(Path::new(path), Some(home)), Some(tree));
+        }
+        for path in [
+            "/Users/tobi/Library/Caches/Arc",
+            "/System/Volumes/Data/Users/tobi/Library/Caches",
+            "/Applications/CapCut.app",
+            "/private/var/folders/xy/T/scratch",
+        ] {
+            assert_eq!(
+                system_tree(Path::new(path), Some(home)),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_home_directory_is_refused_through_the_data_volume() {
+        let reason = refuse(
+            Path::new("/System/Volumes/Data/Users/tobi"),
+            Path::new("/System/Volumes/Data"),
+            Some(Path::new("/Users/tobi")),
+        );
+        assert!(
+            reason.is_some_and(|reason| reason.contains("home directory")),
+            "the home directory seen through its firmlink"
+        );
     }
 }
