@@ -25,6 +25,12 @@ mod views;
 mod widgets;
 
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::{
+    io::IsTerminal as _,
+    os::unix::process::CommandExt as _,
+    process::{Command, Stdio},
+};
 
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
@@ -74,6 +80,30 @@ fn main() -> Result<()> {
 
 fn run() -> Result<()> {
     let args = parse_args()?;
+
+    // When the app executable is reached through the command-line symlink,
+    // cmux sends SIGTERM to its foreground process group as AppKit takes
+    // focus. Spawn once into a separate group before AppKit starts. Restrict
+    // this to interactive cmux sessions so scripts retain normal foreground
+    // lifetime; the marker prevents the child from spawning recursively.
+    #[cfg(target_os = "macos")]
+    if std::io::stdin().is_terminal()
+        && std::env::var_os("CMUX_SURFACE_ID").is_some()
+        && std::env::var_os("DISKTREE_CMUX_DETACHED").is_none()
+    {
+        Command::new(std::env::current_exe().context("find disktree")?)
+            .args(std::env::args_os().skip(1))
+            .env("DISKTREE_CMUX_DETACHED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // Zero makes the child the leader of a new process group.
+            .process_group(0)
+            .spawn()
+            .context("start disktree")?;
+        return Ok(());
+    }
+
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
