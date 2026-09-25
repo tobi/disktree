@@ -54,7 +54,43 @@ pub fn mount_table() -> Option<Vec<Mount>> {
     let filled = usize::try_from(filled).ok()?.min(capacity);
     // SAFETY: the kernel initialised the first `filled` entries.
     unsafe { entries.set_len(filled) };
-    Some(entries.iter().map(mount_from).collect())
+    let mut mounts: Vec<Mount> = entries.iter().map(mount_from).collect();
+    let firmlinks =
+        std::fs::read_to_string("/usr/share/firmlinks").unwrap_or_default();
+    add_firmlink_aliases(&mut mounts, &firmlinks);
+    Some(mounts)
+}
+
+/// Give every mount its second spelling through a firmlink.
+///
+/// A share mounted at `/Volumes/NAS` is just as reachable at
+/// `/System/Volumes/Data/Volumes/NAS`, and the table names only one of
+/// them. A scan that starts on the Data volume walks the other and would
+/// enter the share. `/usr/share/firmlinks` lists each firmlinked directory
+/// as its visible path, a tab, and its path relative to the Data volume.
+fn add_firmlink_aliases(mounts: &mut Vec<Mount>, firmlinks: &str) {
+    let mut aliases = Vec::new();
+    for line in firmlinks.lines() {
+        let Some((visible, relative)) = line.split_once('\t') else {
+            continue;
+        };
+        let visible = Path::new(visible);
+        let physical = Path::new(DATA_VOLUME).join(relative);
+        for mount in mounts.iter() {
+            let alias = if let Ok(rest) = mount.point.strip_prefix(&physical) {
+                visible.join(rest)
+            } else if let Ok(rest) = mount.point.strip_prefix(visible) {
+                physical.join(rest)
+            } else {
+                continue;
+            };
+            aliases.push(Mount {
+                point: alias,
+                ..mount.clone()
+            });
+        }
+    }
+    mounts.extend(aliases);
 }
 
 fn mount_from(entry: &libc::statfs) -> Mount {
@@ -187,6 +223,46 @@ mod tests {
         let foreign = crate::space::foreign_mounts(&mounts, Path::new("/"));
         assert!(foreign.contains(&PathBuf::from(DATA_VOLUME)), "{foreign:?}");
         assert!(foreign.contains(&PathBuf::from("/dev")), "{foreign:?}");
+    }
+
+    #[test]
+    fn mounts_get_their_other_spelling_through_firmlinks() {
+        let mount = |source: &str, point: &str| Mount {
+            source: source.into(),
+            point: point.into(),
+            fstype: "smbfs".into(),
+            options: String::new(),
+        };
+        let mut mounts = vec![
+            mount("//nas/share", "/Volumes/NAS"),
+            mount("nfs:/home", "/System/Volumes/Data/Users/tobi/nfs"),
+            mount("/dev/disk3s1s1", "/"),
+        ];
+        add_firmlink_aliases(&mut mounts, "/Volumes\tVolumes\n/Users\tUsers\n");
+        let points: Vec<&Path> =
+            mounts.iter().map(|mount| mount.point.as_path()).collect();
+        assert!(
+            points.contains(&Path::new("/System/Volumes/Data/Volumes/NAS"))
+        );
+        assert!(points.contains(&Path::new("/Users/tobi/nfs")));
+        assert_eq!(mounts.len(), 5, "`/` is under no firmlink: {points:?}");
+    }
+
+    #[test]
+    fn a_data_volume_scan_leaves_out_shares_under_volumes() {
+        // Whatever this machine has under `/Volumes` must also be left out
+        // when the walk reaches it through the Data volume.
+        let mounts = mount_table().expect("getfsstat works");
+        let foreign =
+            crate::space::foreign_mounts(&mounts, Path::new(DATA_VOLUME));
+        for mount in &mounts {
+            if let Ok(rest) = mount.point.strip_prefix("/Volumes")
+                && !rest.as_os_str().is_empty()
+            {
+                let alias = Path::new(DATA_VOLUME).join("Volumes").join(rest);
+                assert!(foreign.contains(&alias), "{alias:?} in {foreign:?}");
+            }
+        }
     }
 
     #[test]

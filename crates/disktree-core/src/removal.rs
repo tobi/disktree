@@ -158,7 +158,9 @@ const SYSTEM_TREES: [&str; 14] = [
 /// daemons, kernel extensions and receipts that apps' own uninstallers
 /// expect to find; `/private/var/db` and `/private/var/vm` are the system's
 /// databases and swap; `/opt/homebrew` belongs to `brew`, as `/usr` belongs
-/// to pacman. None of these paths exists on Linux, so one list serves both.
+/// to pacman. Only on macOS: `/opt` is an ordinary directory on Linux, and
+/// refusing its parents there would be wrong.
+#[cfg(target_os = "macos")]
 const MACOS_SYSTEM_TREES: [&str; 6] = [
     "/System",
     "/Library",
@@ -180,18 +182,46 @@ fn firmlink_face(path: &Path) -> PathBuf {
         .map_or_else(|_| path.to_path_buf(), |rest| Path::new("/").join(rest))
 }
 
+#[cfg(target_os = "macos")]
+fn system_trees() -> impl Iterator<Item = &'static str> {
+    SYSTEM_TREES.into_iter().chain(MACOS_SYSTEM_TREES)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_trees() -> impl Iterator<Item = &'static str> {
+    SYSTEM_TREES.into_iter()
+}
+
+/// How a guard compares a path: through the firmlinks, and on macOS without
+/// case, because the default APFS volume is case-insensitive and
+/// `/library/launchdaemons` there *is* `/Library/LaunchDaemons`. On a
+/// case-sensitive volume that refuses a little more than it must, which is
+/// the right way to be wrong.
+fn guard_key(path: &Path) -> PathBuf {
+    let path = firmlink_face(&normalize(path));
+    if cfg!(target_os = "macos") {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path
+    }
+}
+
 /// The system tree `path` is in, if any. The home directory is never
 /// system, wherever it lives.
 fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
-    let path = firmlink_face(path);
-    if home.is_some_and(|home| path.starts_with(normalize(home))) {
+    let path = guard_key(path);
+    if home.is_some_and(|home| path.starts_with(guard_key(home))) {
         return None;
     }
-    SYSTEM_TREES
-        .iter()
-        .chain(&MACOS_SYSTEM_TREES)
-        .find(|tree| path.starts_with(tree))
-        .copied()
+    system_trees().find(|tree| path.starts_with(guard_key(Path::new(tree))))
+}
+
+/// The system tree `path` would take with it, if any: removing `/var`
+/// removes `/var/lib`, and `remove_dir_all` deletes everything it is allowed
+/// to on the way down before the first refusal stops it.
+fn system_tree_below(path: &Path) -> Option<&'static str> {
+    let path = guard_key(path);
+    system_trees().find(|tree| guard_key(Path::new(tree)).starts_with(&path))
 }
 
 fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
@@ -201,8 +231,17 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if path == root {
         return Some("the scanned root cannot be removed".into());
     }
-    if home.is_some_and(|home| firmlink_face(path) == normalize(home)) {
+    if home.is_some_and(|home| guard_key(path) == guard_key(home)) {
         return Some("the home directory cannot be removed".into());
+    }
+    // `/Users` is not a mount point on macOS, and `/home` need not be one on
+    // Linux, so the mount guard below does not catch them. A recursive
+    // delete would empty the home directory before failing on the
+    // root-owned parent.
+    if home.is_some_and(|home| guard_key(home).starts_with(guard_key(path))) {
+        return Some(
+            "it contains the home directory, which cannot be removed".into(),
+        );
     }
     if !path.starts_with(root) {
         return Some("outside the scanned root".into());
@@ -210,6 +249,11 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if let Some(system) = system_tree(path, home) {
         return Some(format!(
             "part of the system under {system}: use the package manager"
+        ));
+    }
+    if let Some(system) = system_tree_below(path) {
+        return Some(format!(
+            "it contains the system tree {system}, which cannot be removed"
         ));
     }
     if is_mount_point(path) {
@@ -464,9 +508,15 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let outcome = match mode {
-            RemovalMode::Permanent => remove_permanently(&target.path),
-            RemovalMode::Trash => move_to_trash(&target.path, backend),
+        let outcome = match mount_below(&target.path) {
+            Some(mount) => Err(io::Error::other(format!(
+                "{} is mounted inside it; unmount it first",
+                mount.display()
+            ))),
+            None => match mode {
+                RemovalMode::Permanent => remove_permanently(&target.path),
+                RemovalMode::Trash => move_to_trash(&target.path, backend),
+            },
         };
         if outcome.is_ok() {
             removed += 1;
@@ -486,6 +536,39 @@ fn run(
         bytes,
         failed,
     });
+}
+
+/// A filesystem mounted somewhere inside the directory `path`.
+///
+/// The target itself is checked when the plan is made, but a share mounted
+/// deeper down would be emptied by the recursive walk: `remove_dir_all`
+/// does not stop at mount points. Read from the mount table rather than
+/// device numbers, so an automount is never triggered to find out. Checked
+/// on the removal worker, just before each target, because it reads the
+/// mount table and the table can change while the review screen is open.
+fn mount_below(path: &Path) -> Option<PathBuf> {
+    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return None;
+    }
+    // Where the table cannot be read, only the target's own mount check
+    // remains; that is the behaviour before this guard existed.
+    let mounts = crate::space::mount_table()?;
+    let points: Vec<PathBuf> =
+        mounts.into_iter().map(|mount| mount.point).collect();
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    mount_below_in(&points, &path)
+}
+
+/// [`mount_below`] over a given list of mount points, for testing.
+fn mount_below_in(points: &[PathBuf], path: &Path) -> Option<PathBuf> {
+    let key = guard_key(path);
+    points
+        .iter()
+        .find(|point| {
+            let point_key = guard_key(point);
+            point_key != key && point_key.starts_with(&key)
+        })
+        .cloned()
 }
 
 /// `rm -rf` semantics: a symlink is unlinked, never followed.
@@ -973,6 +1056,7 @@ mod tests {
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_system_trees_are_refused_through_either_face() {
         let home = Path::new("/Users/tobi");
@@ -1003,6 +1087,96 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_guards_ignore_case() {
+        let home = Path::new("/Users/tobi");
+        assert_eq!(
+            system_tree(Path::new("/library/LaunchDaemons"), Some(home)),
+            Some("/Library")
+        );
+        let reason = refuse(
+            Path::new("/USERS/Tobi"),
+            Path::new("/"),
+            Some(Path::new("/Users/tobi")),
+        );
+        assert!(
+            reason.is_some_and(|reason| reason.contains("home directory")),
+            "the home directory in another case"
+        );
+    }
+
+    #[test]
+    fn a_parent_of_the_home_directory_is_refused() {
+        for (parent, home) in
+            [("/Users", "/Users/tobi"), ("/home", "/home/tobi")]
+        {
+            let reason = refuse(
+                Path::new(parent),
+                Path::new("/"),
+                Some(Path::new(home)),
+            );
+            assert!(
+                reason.is_some_and(|reason| reason.contains("home directory")),
+                "{parent} holds {home}"
+            );
+        }
+        assert!(
+            refuse(
+                Path::new("/home/other"),
+                Path::new("/"),
+                Some(Path::new("/home/tobi"))
+            )
+            .is_none_or(|reason| !reason.contains("home directory")),
+            "a sibling is not a parent"
+        );
+    }
+
+    #[test]
+    fn a_parent_of_a_system_tree_is_refused() {
+        let home = Some(Path::new("/home/tobi"));
+        let reason = refuse(Path::new("/var"), Path::new("/"), home);
+        assert!(
+            reason.is_some_and(|reason| reason.contains("/var/lib")),
+            "/var holds /var/lib"
+        );
+        assert_eq!(system_tree_below(Path::new("/var/cache")), None);
+        assert_eq!(system_tree_below(Path::new("/varnish")), None);
+    }
+
+    #[test]
+    fn a_mount_inside_a_target_is_found() {
+        let points: Vec<PathBuf> = ["/", "/home/tobi/nas", "/mnt/usb"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert_eq!(
+            mount_below_in(&points, Path::new("/home/tobi")),
+            Some(PathBuf::from("/home/tobi/nas"))
+        );
+        assert_eq!(
+            mount_below_in(&points, Path::new("/home/tobi/nas")),
+            None,
+            "the target's own mount is the plan's job"
+        );
+        assert_eq!(mount_below_in(&points, Path::new("/home/tobi/src")), None);
+        assert_eq!(
+            mount_below_in(&points, Path::new("/mn")),
+            None,
+            "components, not prefixes"
+        );
+    }
+
+    #[test]
+    fn a_removal_stops_at_a_mount_inside_the_target() {
+        // Whatever this machine has mounted below `/`, the real table must
+        // report at least one mount strictly inside it.
+        assert!(mount_below(Path::new("/")).is_some());
+        let temp = TempDir::new().expect("tempdir");
+        assert_eq!(mount_below(temp.path()), None);
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_home_directory_is_refused_through_the_data_volume() {
         let reason = refuse(
