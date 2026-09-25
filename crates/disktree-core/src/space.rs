@@ -7,6 +7,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// A volume's capacity in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpaceInfo {
@@ -70,9 +73,16 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
 /// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
 /// `/proc/self/mounts`. `None` where that table cannot be read.
 pub fn device_for(path: &Path) -> Option<String> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    device_in(&table, &path)
+    #[cfg(target_os = "macos")]
+    {
+        macos::device(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        device_in(&table, &path)
+    }
 }
 
 /// [`device_for`] over a given mount table, for testing.
@@ -187,16 +197,30 @@ pub fn volume_root(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
 
 /// [`volume_root`] for this machine.
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    volume_root(&parse_mounts(&table), &path)
+    #[cfg(target_os = "macos")]
+    {
+        macos::volume_root(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        volume_root(&parse_mounts(&table), &path)
+    }
 }
 
 /// [`foreign_mounts`] for this machine; `None` when the mount table cannot
 /// be read, so the caller can fall back to comparing devices.
 pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    Some(foreign_mounts(&parse_mounts(&table), root))
+    #[cfg(target_os = "macos")]
+    {
+        macos::foreign_mounts(root)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+        Some(foreign_mounts(&parse_mounts(&table), root))
+    }
 }
 
 #[cfg(test)]
@@ -310,5 +334,13 @@ tmpfs /tmp tmpfs rw 0 0
     fn used_fraction_handles_an_empty_volume_report() {
         let space = SpaceInfo::default();
         assert!((space.used_fraction() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_volume_root_matches_home_filesystem_device() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        let root = volume_root_for(&home).expect("home has a mounted volume");
+        assert_eq!(device_for(&home), device_for(&root));
     }
 }

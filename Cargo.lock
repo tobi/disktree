@@ -1435,6 +1435,7 @@ name = "disktree-core"
 version = "0.9.1"
 dependencies = [
  "chrono",
+ "libc",
  "rayon",
  "rustc-hash 2.1.3",
  "rustix",

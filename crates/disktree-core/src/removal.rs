@@ -164,6 +164,60 @@ fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
         .copied()
 }
 
+#[cfg(target_os = "macos")]
+fn macos_refuse(path: &Path, home: Option<&Path>) -> Option<String> {
+    let raw_key = path.to_string_lossy().to_ascii_lowercase();
+    let key = macos_path_key(path);
+    let home_key = home.map(macos_path_key);
+    let home_identity =
+        home.and_then(|home| fs::metadata(home).ok()).map(|meta| {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.dev(), meta.ino())
+        });
+    let exact_home = home_key.as_deref().is_some_and(|home| key == *home)
+        || fs::metadata(path).ok().is_some_and(|meta| {
+            use std::os::unix::fs::MetadataExt as _;
+            home_identity
+                .is_some_and(|identity| (meta.dev(), meta.ino()) == identity)
+        });
+    if exact_home {
+        return Some("the home directory cannot be removed".into());
+    }
+    if home_key
+        .as_deref()
+        .is_some_and(|home| key.starts_with(&format!("{home}/")))
+    {
+        return None;
+    }
+    if raw_key == "/system/volumes/data" {
+        return Some("the macOS Data volume cannot be removed".into());
+    }
+    for tree in ["/system", "/library", "/private/etc", "/private/var"] {
+        if key == tree || key.starts_with(&format!("{tree}/")) {
+            return Some(format!("part of the macOS system under {tree}"));
+        }
+    }
+    for tree in SYSTEM_TREES {
+        let tree = tree.to_ascii_lowercase();
+        if key == tree || key.starts_with(&format!("{tree}/")) {
+            return Some(format!("part of the macOS system under {tree}"));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_key(path: &Path) -> String {
+    let mut key = path.to_string_lossy().to_ascii_lowercase();
+    if key == "/system/volumes/data" {
+        key = "/".into();
+    } else if let Some(rest) = key.strip_prefix("/system/volumes/data/") {
+        key = rest.to_string();
+        key.insert(0, '/');
+    }
+    key
+}
+
 fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if path.parent().is_none() {
         return Some("the filesystem root cannot be removed".into());
@@ -176,6 +230,10 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     }
     if !path.starts_with(root) {
         return Some("outside the scanned root".into());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(reason) = macos_refuse(path, home) {
+        return Some(reason);
     }
     if let Some(system) = system_tree(path, home) {
         return Some(format!(
@@ -256,7 +314,7 @@ pub enum TrashBackend {
     Gio,
     /// The XDG trash directory, implemented here.
     XdgHome,
-    /// macOS's own `/usr/bin/trash` (macOS 14+): the Finder's Trash, with
+    /// macOS's own `/usr/bin/trash` (macOS 15+): the Finder's Trash, with
     /// "Put Back" intact.
     MacOs,
     /// No way to move files to a trash on this machine.
@@ -294,7 +352,7 @@ impl TrashBackend {
             Self::MacOs => "moves into the Trash; Put Back works from Finder",
             Self::Unavailable => {
                 if cfg!(target_os = "macos") {
-                    "needs macOS 14 or later; keep deleting permanently"
+                    "needs macOS 15 or later; keep deleting permanently"
                 } else {
                     "install trash-cli or keep deleting permanently"
                 }
@@ -507,7 +565,7 @@ fn trash_via_macos(program: &Path, path: &Path) -> io::Result<()> {
             "refusing to trash a relative path with the macOS tool",
         ));
     }
-    let output = Command::new(program).arg(path).output()?;
+    let output = Command::new(program).arg("-s").arg(path).output()?;
     tool_result(program, &output)
 }
 
@@ -939,7 +997,18 @@ mod tests {
         let target = temp.path().join("-rf");
         trash_via_macos(&script, &target).expect("ran");
         let argv = fs::read_to_string(&log).expect("log");
-        assert_eq!(argv, format!("{}\n", target.display()));
+        assert_eq!(argv, format!("-s\n{}\n", target.display()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_tool_reports_a_missing_path_without_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("missing");
+        let error = move_to_trash(&missing, TrashBackend::MacOs)
+            .expect_err("missing path");
+        assert!(!missing.exists());
+        assert!(error.to_string().contains("trash"));
     }
 
     #[test]
@@ -982,5 +1051,69 @@ mod tests {
         let reason =
             refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home));
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_guards_cover_data_aliases_and_prefixes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        let root = Path::new("/");
+        let blocked = |path: PathBuf| {
+            let result = plan(&[target(&path, 0)], root);
+            assert!(result.targets.is_empty(), "{path:?} was accepted");
+            result.blocked[0].reason.clone()
+        };
+        assert!(blocked(home.clone()).contains("home directory"));
+
+        let data_root =
+            crate::space::volume_root_for(&home).expect("home volume root");
+        if data_root == Path::new("/System/Volumes/Data")
+            && !home.starts_with(&data_root)
+        {
+            let data_home =
+                data_root.join(home.strip_prefix("/").expect("absolute HOME"));
+            assert_eq!(
+                fs::metadata(&data_home).expect("Data alias").ino(),
+                fs::metadata(&home).expect("HOME").ino()
+            );
+            assert!(blocked(data_home).contains("home directory"));
+        }
+
+        let mut case_alias = home.clone();
+        let alias = case_alias
+            .to_string_lossy()
+            .char_indices()
+            .find(|(_, ch)| ch.is_ascii_alphabetic())
+            .map(|(index, ch)| {
+                let replacement = if ch.is_ascii_uppercase() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch.to_ascii_uppercase()
+                };
+                (index, replacement)
+            });
+        if let Some((index, replacement)) = alias {
+            let mut text = case_alias.to_string_lossy().into_owned();
+            text.replace_range(index..=index, &replacement.to_string());
+            case_alias = PathBuf::from(text);
+            assert_ne!(case_alias, home);
+            if fs::metadata(&case_alias).is_ok_and(|meta| {
+                use std::os::unix::fs::MetadataExt as _;
+                let home_meta = fs::metadata(&home).expect("HOME");
+                meta.dev() == home_meta.dev() && meta.ino() == home_meta.ino()
+            }) {
+                assert!(blocked(case_alias).contains("home directory"));
+            }
+        }
+
+        for path in [
+            "/System/Volumes/Data/usr/bin",
+            "/system/volumes/data/usr/bin",
+            "/System/Volumes/Database",
+        ] {
+            assert!(blocked(PathBuf::from(path)).contains("system"));
+        }
     }
 }

@@ -5,7 +5,7 @@
 Find what is filling a disk, mark what should go, and remove it — with the
 volume's free space in view the whole time.
 
-disktree is a treemap for Omarchy. It scans your home directory by default,
+disktree is a treemap for Omarchy and macOS. It scans your home directory by default,
 draws every directory as a nested mosaic sized by what it really costs on disk,
 and lets you walk into it with the keyboard or the mouse. Mark as much as you
 like; nothing happens until you review the list and commit, and the permanent
@@ -13,9 +13,11 @@ path always asks first.
 
 Built with [GPUI](https://gpui-kit.com/) through
 [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
-Omarchy theme and behaves like the rest of the desktop.
+Omarchy theme. On macOS it uses the bundled Tokyo Night theme.
 
 ## Install
+
+### Linux
 
 Download `disktree-*-x86_64-linux.tar.gz` from the
 [latest release](https://github.com/tobi/disktree/releases/latest), unpack
@@ -42,6 +44,27 @@ removes exactly what was installed.
 
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan).
+
+### macOS
+
+On macOS 15 or newer, install Rust 1.97 or newer and Xcode, with its developer
+tools selected by `xcode-select`, then build from source:
+
+```sh
+git clone https://github.com/tobi/disktree
+cd disktree
+make install
+~/.local/bin/disktree
+```
+
+On macOS, `make install` installs `~/Applications/disktree.app` and a command
+symlink at `~/.local/bin/disktree`. Launch the app from Finder or a terminal.
+Use `APPLICATIONS=/Applications` for a shared installation. `make uninstall`
+removes the app and symlink. Linux release archives do not run on macOS.
+
+macOS privacy settings can prevent a scan from reading protected folders.
+Grant disktree (or your launching terminal) Full Disk Access in **System Settings
+> Privacy & Security** if you want to include them, then restart it.
 
 ## Use
 
@@ -107,11 +130,13 @@ going in; `0` resets.
 `c` (or **Review…**) opens the list of everything marked. Unmark anything
 there, then choose:
 
-- **Move to trash** — the default when a trash is available (`trash-put` from
-  trash-cli, then `gio trash`, then a built-in XDG trash). Recoverable until
+- **Move to trash** — the default when a trash is available (native macOS Trash;
+  on Linux, `trash-put` from trash-cli, then `gio trash`, then a built-in XDG trash). Recoverable until
   the trash is emptied, so it commits directly.
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
+
+On macOS, the backend uses `/usr/bin/trash`. Recover items from Finder's Trash.
 
 When it finishes, disktree scans again so the numbers on screen match the disk,
 and shows how much free space was actually gained.
@@ -154,6 +179,10 @@ commits, `esc` goes back.
 - **Hidden entries included**, because `~/.cache` is often the biggest thing in
   a home directory. Symlinks are not followed.
 
+On APFS, clones and snapshots can share blocks. Allocated size is not a promise
+of reclaimable space; only the measured free-space change after removal is
+reported as recovered. Moving to Trash does not free those blocks.
+
 The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
@@ -165,6 +194,10 @@ Click `/` (or any directory above the scanned root) in the trail, press
 `g`, run `disktree --disk`, or use the launcher's *Scan the whole disk*
 action. `g` and `--disk` scan the disk your home directory lives on — `/`
 on Omarchy.
+
+On macOS, `g` and `--disk` scan the containing volume, normally
+`/System/Volumes/Data` for a home directory. The sealed system volume is
+separate. Other mounted volumes and automount points are excluded by default.
 
 Widening is memoized: the tree already measured is handed to the wider walk
 and reused where it is reached, so going from `~` to `/` reads only what is

@@ -105,11 +105,11 @@ install: install-$(PLATFORM)
 uninstall: uninstall-$(PLATFORM)
 
 install-macos: app
-	install -d $(APPLICATIONS) $(BINDIR)
-	rm -rf $(APPLICATIONS)/disktree.app
-	cp -R $(APP) $(APPLICATIONS)/disktree.app
-	ln -sf $(APPLICATIONS)/disktree.app/Contents/MacOS/disktree \
-	    $(BINDIR)/disktree
+	install -d "$(APPLICATIONS)" "$(BINDIR)"
+	rm -rf "$(APPLICATIONS)/disktree.app"
+	cp -R "$(APP)" "$(APPLICATIONS)/disktree.app"
+	ln -sf "$(APPLICATIONS)/disktree.app/Contents/MacOS/disktree" \
+	    "$(BINDIR)/disktree"
 	@echo
 	@echo "installed:"
 	@echo "  $(APPLICATIONS)/disktree.app"
@@ -118,8 +118,8 @@ install-macos: app
 	    echo; echo "note: $(BINDIR) is not on PATH in this shell";; esac
 
 uninstall-macos:
-	rm -rf $(APPLICATIONS)/disktree.app
-	rm -f $(BINDIR)/disktree
+	rm -rf "$(APPLICATIONS)/disktree.app"
+	rm -f "$(BINDIR)/disktree"
 	@echo "removed"
 
 # macOS: a self-contained bundle. Quick Look renders an SVG at its intrinsic

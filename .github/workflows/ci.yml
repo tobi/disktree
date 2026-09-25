@@ -14,14 +14,19 @@ env:
 
 jobs:
   check:
-    name: Lint and test
-    runs-on: ubuntu-24.04
+    name: Lint and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
       # What GPUI links against: windowing (Wayland, X11), input, fonts,
       # and the Vulkan loader.
       - name: System libraries
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -43,3 +48,6 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+      - name: Build release
+        run: cargo build --release --locked -p disktree-app
