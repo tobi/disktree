@@ -1640,3 +1640,179 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         );
     }
 }
+
+/// A repository with worktrees of it under `trees/<name>/src`, made by git
+/// the way a person makes them, ignoring the developer's own git config.
+/// Unix only: git writes Windows paths as `C:/…`, sometimes in their short
+/// form, which never compare equal to a canonical temporary path.
+#[cfg(unix)]
+struct Worktrees {
+    temp: tempfile::TempDir,
+    git: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Worktrees {
+    fn new() -> Option<Self> {
+        let git = disktree_core::git::executable()?.clone();
+        let repos = Self {
+            temp: tempfile::TempDir::new().ok()?,
+            git,
+        };
+        repos.run(".", &["init", "-q", "--bare", "-b", "main", "origin.git"]);
+        repos.run(".", &["clone", "-q", "origin.git", "repo"]);
+        repos.commit("repo", "a.txt", "one\n", "Start");
+        repos.run("repo", &["push", "-q", "-u", "origin", "main"]);
+        Some(repos)
+    }
+
+    fn root(&self) -> std::path::PathBuf {
+        dunce::canonicalize(self.temp.path()).expect("canonical")
+    }
+
+    fn run(&self, directory: &str, args: &[&str]) {
+        let mut command = std::process::Command::new(&self.git);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        for role in ["AUTHOR", "COMMITTER"] {
+            command
+                .env(format!("GIT_{role}_NAME"), "Test")
+                .env(format!("GIT_{role}_EMAIL"), "test@example.com");
+        }
+        let _ = command
+            .arg("-C")
+            .arg(self.root().join(directory))
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn write(&self, relative: &str, text: &str) {
+        let path = self.root().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
+
+    fn commit(&self, checkout: &str, file: &str, text: &str, message: &str) {
+        self.write(&format!("{checkout}/{file}"), text);
+        self.run(checkout, &["add", "-A"]);
+        self.run(checkout, &["commit", "-q", "-m", message]);
+    }
+
+    fn worktree(&self, name: &str) {
+        let path = self.root().join(format!("trees/{name}/src"));
+        let path = path.to_string_lossy().into_owned();
+        self.run("repo", &["worktree", "add", "-q", "-b", name, &path]);
+    }
+}
+
+/// Pointing at a folder of worktrees lists them, reads each once the
+/// pointer has settled, and offers to mark only the one that is merged and
+/// holds nothing git lacks.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_folder_of_worktrees_marks_only_the_merged_clean_ones(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::details::Detail;
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let Some(repos) = Worktrees::new() else {
+        return; // no git on this machine
+    };
+    repos.worktree("done");
+    repos.commit("trees/done/src", "b.txt", "two\n", "Add b");
+    repos.run(
+        "repo",
+        &["merge", "-q", "--no-ff", "done", "-m", "Merge done"],
+    );
+    repos.run("repo", &["push", "-q", "origin", "main"]);
+    repos.worktree("dirty");
+    repos.write("trees/dirty/src/scratch.txt", "unsaved\n");
+    repos.worktree("open");
+    repos.commit("trees/open/src", "c.txt", "three\n", "Add c");
+
+    let root = repos.root();
+    let (view, cx) = view_over(&root, cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    let items = update(&view, cx, |app, cx| {
+        let trees = child_crumbs(app, &[], "trees");
+        app.select(Some(trees.clone()), cx);
+        match app.details_at(&trees).into_iter().next() {
+            Some(Detail::Worktrees { repository, items }) => {
+                assert_eq!(repository, root.join("repo"));
+                items
+            }
+            other => panic!("trees holds three worktrees: {other:?}"),
+        }
+    });
+    assert_eq!(items.len(), 3);
+
+    // The first frames only note what is wanted; once it has been for a
+    // moment, the next frame starts the reads.
+    draw(cx);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    for _ in 0..50 {
+        draw(cx);
+        cx.run_until_parked();
+        let done = read(&view, cx, |app| {
+            items
+                .iter()
+                .all(|item| app.checkouts.get(&item.item).is_some())
+        });
+        if done {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let safe = read(&view, cx, |app| {
+        app.merged_and_clean(&items)
+            .into_iter()
+            .map(|item| item.item.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(safe, [root.join("trees/done")]);
+
+    draw(cx);
+    let button = cx
+        .debug_bounds("mark-merged-worktrees")
+        .expect("the list offers to mark them");
+    cx.simulate_click(button.center(), Modifiers::none());
+    let marked = read(&view, cx, |app| {
+        app.marks
+            .items()
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(marked, [root.join("trees/done")]);
+    update(&view, cx, |app, cx| {
+        app.mark_worktrees(&[root.join("trees/done")], cx);
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.marks.len()),
+        1,
+        "marking again adds nothing"
+    );
+
+    // The one checkout on its own gets a card, which draws what it read.
+    update(&view, cx, |app, cx| {
+        let trees = child_crumbs(app, &[], "trees");
+        let done = child_crumbs(app, &trees, "done");
+        app.select(Some(done), cx);
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("checkout-reread").is_some(),
+        "the card is drawn"
+    );
+}

@@ -96,6 +96,18 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    base-space pixels and is cached; `screen = (base - origin) * scale`.
 9. **The status bar never claims a saving it cannot measure.** Projections come
    from marked bytes; the final number comes from `statvfs` before and after.
+10. **Git is only read.** `git::Git` runs every command with no inherited
+    `GIT_*` variable, optional locks off and every program a checkout's
+    config could name overridden; nothing fetches, an fsmonitor daemon is
+    used only if one is already running, and a checkout that defines its own
+    filter drivers is not read. Removing a linked worktree's folder leaves
+    its branches, commits and stashes in its repository, which is why
+    `Checkout::loses_nothing` asks only what the folder itself holds.
+11. **Details are found cheaply and read later.** `details::details` decides
+    from the tree and a few `lstat`s what else an item is, since the panel
+    asks on every pointer move; anything slower is a reading, which the
+    window starts once it has been wanted for a moment, two at a time, and
+    keeps until the next scan.
 
 ## Where changes belong
 
@@ -105,6 +117,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
+| what an item is beyond its size (a new kind is a `Detail` case, its reading, its card) | `crates/disktree-core/src/details.rs`, `crates/disktree-app/src/detail_cards.rs` |
+| reading a git checkout, what removing it would lose | `crates/disktree-core/src/checkout.rs`, and `git.rs` for how git is run |
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
@@ -119,6 +133,14 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 * Size accounting, hardlinks, symlinks, hidden entries, depth limits, the
   removal guards and squarified layout are covered by `disktree-core` tests
   against real temporary trees.
+* Git checkouts are covered by `checkout.rs` tests that build a bare origin,
+  a clone and worktrees with git itself and read them: merges, squashes found
+  by content and by patch, detached heads, locks, nested checkouts, ignored
+  `.env` files, submodules kept out of the worktree list, and a checkout's
+  own fsmonitor, signature program and filter drivers never running. The
+  merge base comes from `rev-list --boundary` and the squash search has a
+  time budget because a monorepo with a hundred thousand remote refs makes
+  the obvious commands take seconds.
 * The screens are covered by window-harness tests that draw frames and press
   keys, including one that marks a directory, confirms the removal and checks
   the files are gone while unmarked neighbours are untouched.

@@ -13,9 +13,10 @@
 
 mod app_menu;
 mod appearance;
-mod git;
+mod detail_cards;
 mod marks;
 mod palette;
+mod readings;
 mod state;
 #[cfg(test)]
 mod tests;
