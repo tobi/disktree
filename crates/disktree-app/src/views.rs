@@ -1066,14 +1066,53 @@ fn selection_section(
         )
         .child(
             div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(path.as_deref().map_or_else(String::new, |path| {
-                    crate::marks::display_path(path, app.home.as_deref())
-                })),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::XS)
+                .min_w_0()
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(path.as_deref().map_or_else(
+                            String::new,
+                            |path| {
+                                crate::marks::display_path(
+                                    path,
+                                    app.home.as_deref(),
+                                )
+                            },
+                        )),
+                )
+                .when(node.is_dir(), |row| {
+                    row.children(path.clone().map(|path| {
+                        with_tooltip(
+                            gpui_omarchy::icon_button(
+                                "search-folder",
+                                gpui_omarchy::IconName::Search,
+                                "Look up this folder on Google",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .debug_selector(|| "search-folder".into())
+                            .tab_stop(false)
+                            .flex_shrink_0()
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.search_folder(&path, cx);
+                                    window.focus(&this.focus, cx);
+                                },
+                            )),
+                            "Search Google for this folder's purpose, \
+                             application, and deletion risks",
+                        )
+                    }))
+                }),
         );
 
     let (number, unit) = match app.options.metric {

@@ -1429,6 +1429,7 @@ dependencies = [
  "gpui-omarchy",
  "rustc-hash 2.1.3",
  "tempfile",
+ "url",
  "windows-sys 0.61.2",
 ]
 

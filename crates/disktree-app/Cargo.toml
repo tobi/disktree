@@ -20,6 +20,7 @@ disktree-core = { workspace = true }
 anyhow = { workspace = true }
 dunce = "1.0.5"
 rustc-hash = { workspace = true }
+url = "2.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

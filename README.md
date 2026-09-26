@@ -143,6 +143,9 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   what is marked; and the disk, free now and after the marks, with the way
   to the review screen. Drag its left edge to resize it; double-click the
   edge to reset.
+  The search icon beside a selected folder's path opens Google in your
+  browser with the platform and displayed path, asking what the folder is,
+  what application it belongs to, and the risks of deleting it.
 
 One colour is kept apart: amber marks the selection, the main action, and
 what can be had back.
