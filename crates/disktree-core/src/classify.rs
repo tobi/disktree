@@ -140,6 +140,7 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | "iclouddrive" => Category::Synced,
         ".git" => Category::Git,
         "pictures" | "photos" | "music" | "videos" | "movies" | "steam"
+        | "steamlibrary" | "steamapps" | "emulation"
         | "models" | ".ollama" | ".lmstudio" | "games" | "wineprefix" => {
             Category::Media
         }
@@ -373,6 +374,41 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {part}"));
         }
         node
+    }
+
+    /// Regression: a Steam library on a second drive was named by the
+    /// `temp` folder Steam keeps in `steamapps`, so a disk of games showed
+    /// as cache.
+    #[test]
+    fn a_steam_library_on_another_drive_is_media_not_its_temp_folder() {
+        let mut root = dir(
+            "data",
+            vec![dir(
+                "SteamLibrary",
+                vec![dir(
+                    "steamapps",
+                    vec![
+                        dir("temp", vec![file("partial", 1)]),
+                        dir("common", vec![file("game.pak", 1_000)]),
+                    ],
+                )],
+            )],
+        );
+        aggregate(&mut root, Metric::Bytes);
+        classify(&mut root);
+        let library = &root.children[0];
+        assert_eq!(library.category, Category::Media);
+        let common = library.children[0].child_named("common").expect("common");
+        assert_eq!(common.category, Category::Media);
+        assert_eq!(common.reclaim, None, "installed games are not hatched");
+    }
+
+    #[test]
+    fn steam_libraries_and_emulation_are_media_not_disposable_caches() {
+        for name in ["SteamLibrary", "steamapps", "Emulation"] {
+            assert_eq!(category_of_name(name), Some(Category::Media));
+            assert_eq!(reclaim_of(name, Category::Other, |_| false), None);
+        }
     }
 
     #[test]
