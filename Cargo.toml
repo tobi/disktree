@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/disktree-app", "crates/disktree-core", "xtask"]
+members = [
+    "crates/disktree-app",
+    "crates/disktree-cli",
+    "crates/disktree-core",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.10.1"

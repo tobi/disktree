@@ -1433,6 +1433,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "disktree-cli"
+version = "0.10.1"
+dependencies = [
+ "anyhow",
+ "disktree-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "disktree-core"
 version = "0.10.1"
 dependencies = [
