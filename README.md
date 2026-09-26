@@ -211,6 +211,7 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `esc` while scanning | stop the scan |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |

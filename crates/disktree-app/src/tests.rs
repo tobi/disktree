@@ -1322,3 +1322,67 @@ fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
         Vec::<usize>::new()
     );
 }
+
+/// Escape stops a first scan. What the walk found so far is not shown as a
+/// tree, a late result is ignored, and `r` starts over.
+#[gpui_kit::test]
+fn escape_cancels_the_first_scan_and_r_starts_it_again(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = temp.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(move |_, cx| Disktree::new(root, options(), 3, cx));
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+
+    press(cx, "escape");
+    let (scanning, cancelled) = read(&view, cx, |app| {
+        (app.scan.is_some(), app.progress.cancelled)
+    });
+    assert!(!scanning, "the walk was dropped");
+    assert!(cancelled, "the panel can say it stopped");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let polling = update(&view, cx, |app, cx| app.poll_scan_once(epoch, cx));
+    assert!(!polling, "the old poller stops");
+    assert!(read(&view, cx, |app| app.tree().is_none()));
+    draw(cx);
+
+    press(cx, "r");
+    finish_scan(&view, cx);
+    assert!(read(&view, cx, |app| app.tree().is_some()));
+}
+
+/// Escape stops a widening scan and keeps the tree it started from.
+#[gpui_kit::test]
+fn escape_cancels_widening_and_keeps_the_tree_on_screen(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let inner = temp.path().join("junk");
+    let (view, cx) = view_over(&inner, cx);
+    update(&view, cx, |app, _| {
+        app.disk_root = Some(temp.path().to_path_buf());
+    });
+    let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
+
+    press(cx, "g");
+    assert!(read(&view, cx, |app| app.scan.is_some()));
+    press(cx, "escape");
+    let (scanning, root, scan_root, files) = read(&view, cx, |app| {
+        (
+            app.scan.is_some(),
+            app.root_path.clone(),
+            app.scan_root.clone(),
+            app.tree().map(|tree| tree.files),
+        )
+    });
+    assert!(!scanning);
+    assert_eq!(root, inner);
+    assert_eq!(scan_root, inner, "the trail stops showing a widening");
+    assert_eq!(files, before, "the tree on screen is unchanged");
+}

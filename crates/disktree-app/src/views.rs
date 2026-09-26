@@ -1800,6 +1800,11 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
             widgets::human_count(app.progress.files),
             human_bytes(app.progress.bytes)
         )
+    } else if app.progress.cancelled {
+        format!(
+            "scan cancelled \u{00b7} {} entries \u{00b7} r scans again",
+            widgets::human_count(app.progress.files)
+        )
     } else {
         let elapsed = app.scan_elapsed.map_or_else(String::new, |time| {
             format!(" \u{00b7} {:.1} s", time.as_secs_f32())
@@ -1820,8 +1825,13 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
 }
 
 /// What the viewport shows while the first scan is running.
-fn scanning_panel(app: &Disktree, theme: &Theme, cx: &gpui_kit::App) -> Div {
+fn scanning_panel(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
     let progress = &app.progress;
+    let cancelled = app.scan.is_none() && progress.cancelled;
     let mut panel = div()
         .flex()
         .flex_col()
@@ -1831,17 +1841,23 @@ fn scanning_panel(app: &Disktree, theme: &Theme, cx: &gpui_kit::App) -> Div {
         .justify_center()
         .gap(space::LG)
         .bg(theme.inset)
-        .child(
-            gpui_omarchy::icon(gpui_omarchy::IconName::Loader)
-                .size(icon::LG)
-                .text_color(theme.accent),
-        )
+        .when(!cancelled, |panel| {
+            panel.child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::Loader)
+                    .size(icon::LG)
+                    .text_color(theme.accent),
+            )
+        })
         .child(
             div()
                 .text_size(text::TITLE)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.bright)
-                .child(format!("Reading {}", widgets::display_root(app))),
+                .child(if cancelled {
+                    format!("Stopped reading {}", widgets::display_root(app))
+                } else {
+                    format!("Reading {}", widgets::display_root(app))
+                }),
         )
         .child(
             div()
@@ -1866,23 +1882,43 @@ fn scanning_panel(app: &Disktree, theme: &Theme, cx: &gpui_kit::App) -> Div {
                     cx,
                 )),
         )
-        .child(
-            div()
-                .w(size::SCANNING_METER)
-                .child(widgets::meter_row(
-                    "",
-                    "",
-                    progress_estimate(progress.files),
-                    theme.accent,
-                    cx,
-                )),
-        )
+        .when(!cancelled, |panel| {
+            panel.child(
+                div()
+                    .w(size::SCANNING_METER)
+                    .child(widgets::meter_row(
+                        "",
+                        "",
+                        progress_estimate(progress.files),
+                        theme.accent,
+                        cx,
+                    )),
+            )
+        })
         .child(
             div()
                 .text_size(text::BODY)
                 .text_color(theme.secondary)
-                .child("Marking, zooming and the free-space meter all work as soon as it lands."),
-        );
+                .child(if cancelled {
+                    "Nothing is shown from a scan that did not finish."
+                } else {
+                    "Marking, zooming and the free-space meter all work as soon as it lands."
+                }),
+        )
+        // A failed scan has nothing left to cancel either.
+        .child(if app.scan.is_none() {
+            button("scan-again", "Scan again", ButtonVariant::Outline, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_scan(cx);
+                    window.focus(&this.focus, cx);
+                }))
+        } else {
+            button("cancel-scan", "Cancel", ButtonVariant::Outline, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.cancel_scan(cx);
+                    window.focus(&this.focus, cx);
+                }))
+        });
 
     if let Some(error) = &app.scan_error {
         panel = panel.child(
@@ -2995,7 +3031,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 27] = [
+    let rows: [(&str, &str); 28] = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
@@ -3021,6 +3057,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
         ("r", "Scan again from the same root"),
+        ("esc", "Stop a scan in progress"),
         (MODIFIER_OPEN, "Choose another directory to scan"),
         ("g", "The whole disk; click any directory above to widen"),
         ("d", "Disk usage or apparent size"),
