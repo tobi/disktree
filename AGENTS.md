@@ -97,6 +97,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
+| what git says about a checkout | `crates/disktree-core/src/git.rs` |
+| the JSON the headless command prints | `crates/disktree-cli/src/main.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |

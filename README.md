@@ -121,6 +121,27 @@ disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
+### Without a window
+
+`disktree-cli` is the same scan, classifier and removal guards with no
+window, for scripts and coding agents. Every command prints JSON.
+
+```sh
+cargo install --path crates/disktree-cli   # or: make build, then target/release/disktree-cli
+disktree-cli scan ~/src                    # totals, free space, "Worth a look"
+disktree-cli scan ~ --store ~/Models       # a store's contents are kept on purpose
+disktree-cli check --root ~/src PATH...    # what the guards would accept
+disktree-cli trash --root ~/src PATH...    # move the accepted paths to the trash
+```
+
+Each finding has a `tier`. `regenerable` is space a tool or a build writes
+again. `judge` is space that may be the only copy: worktrees (with each
+checkout's changes, stashes and unpushed commits), stale experiments, model
+weights and old archives. A weight file with the same name and size as one
+in a `--store` is listed with that copy. The CLI never deletes outright:
+`trash` is the only way it removes anything, and `--root` is required, as
+the scanned root is the consent boundary in the window.
+
 ### The screen
 
 - **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
@@ -352,6 +373,7 @@ gone while their neighbours are not.
 | path | what lives there |
 | --- | --- |
 | `crates/disktree-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
+| `crates/disktree-cli` | the same without a window: scan to JSON, check and trash paths |
 | `crates/disktree-app/src/state.rs` | every action the interface can take, and the key map |
 | `crates/disktree-app/src/views.rs` | the screens |
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |

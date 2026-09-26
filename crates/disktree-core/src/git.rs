@@ -1,4 +1,5 @@
-//! What git knows about a checkout, for the selection panel.
+//! What git knows about a checkout, for the selection panel and for
+//! anything else deciding whether a checkout can go.
 //!
 //! Before deleting an agent worktree the question is "would anything be
 //! lost": uncommitted changes, stashes, commits nobody pushed. That is three
