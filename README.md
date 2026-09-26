@@ -42,7 +42,9 @@ removes exactly what was installed.
 
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan). Distributions often package an older Rust;
-[rustup](https://rustup.rs) installs a current one.
+[rustup](https://rustup.rs) installs a current one. The repo pins 1.97 in
+`rust-toolchain.toml`, so with rustup the right toolchain is fetched on the
+first build even if `rustup default` points at something older.
 
 ### macOS
 
