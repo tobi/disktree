@@ -99,6 +99,24 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+      - name: Check embedded executable icon
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p disktree-app
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class ExecutableIcons {
+              [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+              public static extern uint ExtractIconEx(
+                  string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+          }
+          '@
+          $exe = (Resolve-Path target/release/disktree.exe).Path
+          if ([ExecutableIcons]::ExtractIconEx($exe, -1, $null, $null, 0) -lt 1) {
+            throw "disktree.exe has no embedded icon"
+          }
+
   # The other half of each release: the same tests on the architectures
   # the release builds for but the jobs above do not run on.
   other-architectures:
