@@ -1382,6 +1382,16 @@ fn insight_text(app: &Disktree, candidate: &Candidate) -> (String, String) {
                 if *count == 1 { "" } else { "s" }
             ),
         ),
+        Finding::Weights { files } => (
+            tail,
+            format!(
+                "{files} weight file{} \u{00b7} check for a copy",
+                if *files == 1 { "" } else { "s" }
+            ),
+        ),
+        Finding::StaleArchive { days } => {
+            (tail, format!("archive \u{00b7} untouched {days} d"))
+        }
     }
 }
 

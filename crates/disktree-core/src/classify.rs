@@ -119,7 +119,8 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | "sites" | "development" => Category::Code,
         ".codex" | ".claude" | ".herdr" | ".pi" | ".cursor" | ".aider"
         | ".gemini" | ".continue" | ".windsurf" | ".microsandbox" | ".omp"
-        | ".agents" | ".openai" | "tries" | "worktrees" | "experiments"
+        | ".agents" | ".openai" | "tries" | "worktrees" | ".worktrees"
+        | "experiments"
         | "scratch" | "playground" => Category::AgentScratch,
         ".cargo" | ".rustup" | ".local" | ".npm" | ".pnpm-store" | "pnpm"
         | ".bun" | ".deno" | "go" | ".gradle" | ".m2" | ".platformio"
