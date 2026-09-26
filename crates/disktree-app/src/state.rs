@@ -2219,6 +2219,26 @@ impl Disktree {
         cx.notify();
     }
 
+    /// Research the path shown beside the clicked button in the browser.
+    pub fn search_folder(&self, path: &Path, cx: &Context<'_, Self>) {
+        let platform = match std::env::consts::OS {
+            "macos" => "macOS",
+            "windows" => "Windows",
+            "linux" => "Linux",
+            other => other,
+        };
+        let path = crate::marks::display_path(path, self.home.as_deref());
+        let query = format!(
+            "{platform} \"{path}\" what is this folder, what application \
+             does it belong to, and what are the risks of deleting it?"
+        );
+        let mut url = url::Url::parse("https://www.google.com/search")
+            .expect("the Google search URL is valid");
+        // Encode the whole query so punctuation in a path stays search text.
+        url.query_pairs_mut().append_pair("q", &query);
+        cx.open_url(url.as_str());
+    }
+
     /// Show the tile a key acts on in Finder (or the file manager), selected.
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
         let crumbs =

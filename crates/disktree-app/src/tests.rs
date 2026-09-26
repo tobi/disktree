@@ -162,6 +162,48 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
     assert!(hidden_present, "hidden directories are part of the tree");
 }
 
+/// Clicking the panel researches its displayed folder, even when punctuation
+/// in the name would otherwise split the URL into parameters or a fragment.
+#[gpui_kit::test]
+fn folder_search_opens_google_with_the_displayed_path(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let name = "cache & data+#日本";
+    std::fs::create_dir(temp.path().join(name)).expect("mkdir");
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    update(&view, cx, |app, cx| {
+        app.home = Some(temp.path().to_path_buf());
+        let folder = child_crumbs(app, &[], name);
+        app.select(Some(folder), cx);
+    });
+    draw(cx);
+    assert!(cx.cx.opened_url().is_none());
+    let button = cx.debug_bounds("search-folder").expect("search icon");
+    cx.simulate_click(button.center(), gpui_kit::Modifiers::none());
+    let opened = cx.cx.opened_url().expect("opened browser URL");
+    let url = url::Url::parse(&opened).expect("valid URL");
+    assert_eq!(url.host_str(), Some("www.google.com"));
+    assert_eq!(url.path(), "/search");
+    assert!(url.fragment().is_none());
+    let pairs: Vec<_> = url.query_pairs().collect();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].0, "q");
+    let query = &pairs[0].1;
+    let separator = std::path::MAIN_SEPARATOR;
+    assert!(query.contains(&format!("~{separator}{name}")));
+    assert!(query.contains("what is this folder"));
+    assert!(query.contains("what application does it belong to"));
+    assert!(query.contains("risks of deleting it"));
+    let platform = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    assert!(query.starts_with(platform));
+}
+
 #[gpui_kit::test]
 fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
