@@ -540,6 +540,11 @@ impl Disktree {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let mut app = Self::new(root_path, options, depth, cx);
+        // `new` started a walk; this tree stands in for its result.
+        if let Some(scan) = app.scan.take() {
+            scan.cancel();
+        }
+        app.scan_epoch += 1;
         app.marks.refresh(&app.root_path, &tree, app.options.metric);
         app.tree = Some(Arc::new(tree));
         app.cache = None;
@@ -657,6 +662,22 @@ impl Disktree {
     }
 
     // ── scanning ────────────────────────────────────────────────────────
+
+    /// Stop the walk in progress. A partial tree is never shown as if it
+    /// were the whole one: a first scan leaves the panel saying it stopped,
+    /// and a widening scan leaves the tree it started from on screen.
+    pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(scan) = self.scan.take() else {
+            return;
+        };
+        scan.cancel();
+        // The poller stops at its next tick instead of taking the result.
+        self.scan_epoch += 1;
+        self.progress = scan.progress.snapshot();
+        self.scan_elapsed = self.scan_started.map(|started| started.elapsed());
+        self.scan_root.clone_from(&self.root_path);
+        cx.notify();
+    }
 
     /// Start a fresh scan, abandoning any walk still in progress.
     pub fn start_scan(&mut self, cx: &mut Context<'_, Self>) {
@@ -2381,6 +2402,7 @@ impl Disktree {
             "backspace" | "u" if !control => self.ascend(cx),
             // A filter is the first thing Escape takes away.
             "escape" if self.matches.is_some() => self.clear_filter(),
+            "escape" if self.scan.is_some() => self.cancel_scan(cx),
             "escape" => {
                 if self.selected.is_some() {
                     self.selected = None;
