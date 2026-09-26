@@ -271,7 +271,7 @@ fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
         return None;
     }
     let path = app.path_at(&target)?;
-    crate::git::is_checkout(&path).then_some(path)
+    disktree_core::git::is_checkout(&path).then_some(path)
 }
 
 /// Width, in rem, below which the side panel gives the mosaic its room.
@@ -1096,7 +1096,7 @@ fn selection_section(
 
     let fourth = if node.is_dir()
         && let Some(path) = &path
-        && crate::git::is_checkout(path)
+        && disktree_core::git::is_checkout(path)
     {
         let value = match app.git.get(path) {
             Some(Some(state)) => state.summary(),

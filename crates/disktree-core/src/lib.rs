@@ -9,6 +9,7 @@ pub mod access;
 pub mod classify;
 pub mod export;
 pub mod filter;
+pub mod git;
 pub mod insights;
 pub mod removal;
 pub mod scan;

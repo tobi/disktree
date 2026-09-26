@@ -13,7 +13,6 @@
 
 mod app_menu;
 mod appearance;
-mod git;
 mod marks;
 mod palette;
 mod state;
