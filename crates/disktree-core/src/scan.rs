@@ -683,7 +683,8 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         ));
     }
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let never = crate::space::never_scanned(root, &canonical);
+    let mut never = crate::space::never_scanned(root, &canonical);
+    never.extend(crate::space::repeated_mounts_for(root, &canonical));
     let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));

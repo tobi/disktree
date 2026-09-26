@@ -222,6 +222,136 @@ pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
     Some(foreign_mounts(&parse_mounts(&table), root))
 }
 
+/// One line of `/proc/self/mountinfo`.
+///
+/// What [`Mount`] says, plus which directory of the filesystem the mount
+/// shows. `/proc/self/mounts` leaves that out, and it is what tells a bind
+/// mount from the filesystem itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountView {
+    pub source: String,
+    pub fstype: String,
+    pub point: PathBuf,
+    /// The directory inside the filesystem that appears at `point`: `/` for
+    /// a whole filesystem, `/@home` for a Btrfs subvolume, the bound
+    /// directory for a bind mount.
+    pub fs_root: PathBuf,
+}
+
+/// Parse `/proc/self/mountinfo`. Lines it cannot read are skipped.
+pub fn parse_mountinfo(table: &str) -> Vec<MountView> {
+    table
+        .lines()
+        .filter_map(|line| {
+            // Optional fields run up to a lone `-`; after it come the type
+            // and the source.
+            let (left, right) = line.split_once(" - ")?;
+            let mut left = left.split_whitespace().skip(3);
+            let fs_root = PathBuf::from(unescape_octal(left.next()?));
+            let point = PathBuf::from(unescape_octal(left.next()?));
+            let mut right = right.split_whitespace();
+            let fstype = right.next()?.to_string();
+            let source = unescape_octal(right.next()?);
+            Some(MountView {
+                source,
+                fstype,
+                point,
+                fs_root,
+            })
+        })
+        .collect()
+}
+
+/// The kernel writes space, tab, newline and backslash in mount fields as
+/// three octal digits after a backslash. Decoded in one pass, so a name that
+/// really contains `\040` is not decoded twice.
+fn unescape_octal(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let digits = bytes.get(index + 1..index + 4);
+        let value = digits
+            .filter(|_| bytes[index] == b'\\')
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        if let Some(value) = value {
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Paths under `root` that show a directory the scan already reaches
+/// another way, so walking them would count the same files twice.
+///
+/// A bind mount, a second mount of the same disk, or the top of a Btrfs
+/// filesystem mounted beside its subvolumes all show one directory at two
+/// paths. Device numbers cannot tell: a bind mount has its original's. The
+/// mount table can, since each line names the filesystem and the directory
+/// of it that is shown. When one directory is visible twice, the view
+/// showing the widest part of the filesystem is kept, and the narrower one
+/// is left out. The scanned root itself is never left out; if it is the
+/// narrower view, its copy inside the wider one is.
+pub fn repeated_mounts(mounts: &[MountView], root: &Path) -> Vec<PathBuf> {
+    let mut visible: Vec<&MountView> = mounts
+        .iter()
+        .filter(|mount| {
+            mount.point.starts_with(root) || root.starts_with(&mount.point)
+        })
+        .collect();
+    visible.sort_by_key(|mount| {
+        (
+            mount.fs_root.components().count(),
+            mount.point.components().count(),
+            &mount.point,
+        )
+    });
+    let mut kept: Vec<&MountView> = Vec::new();
+    let mut repeated = Vec::new();
+    for mount in visible {
+        // Where this view's directory already appears through a kept one.
+        let elsewhere = kept.iter().find_map(|wider| {
+            if wider.source != mount.source || wider.fstype != mount.fstype {
+                return None;
+            }
+            let inside = mount.fs_root.strip_prefix(&wider.fs_root).ok()?;
+            let path = wider.point.join(inside);
+            (path.starts_with(root) && path != mount.point).then_some(path)
+        });
+        match elsewhere {
+            Some(_) if mount.point != root && mount.point.starts_with(root) => {
+                repeated.push(mount.point.clone());
+            }
+            Some(copy) => {
+                if copy != root {
+                    repeated.push(copy);
+                }
+                kept.push(mount);
+            }
+            None => kept.push(mount),
+        }
+    }
+    repeated
+}
+
+/// [`repeated_mounts`] for this machine, in `root`'s own spelling. Empty
+/// where there is no `/proc/self/mountinfo`.
+pub fn repeated_mounts_for(root: &Path, canonical: &Path) -> Vec<PathBuf> {
+    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+    repeated_mounts(&parse_mountinfo(&table), canonical)
+        .iter()
+        .filter_map(|path| path.strip_prefix(canonical).ok())
+        .map(|below| root.join(below))
+        .collect()
+}
+
 /// The mount points in what macOS's `mount` prints.
 ///
 /// One per line: `/dev/disk3s5 on /System/Volumes/Data (apfs, local, …)`.
@@ -345,6 +475,81 @@ systemd-1 /mnt/nas-home autofs rw,direct 0 0
 tmpfs /tmp tmpfs rw 0 0
 portal /run/user/1000/doc fuse.portal rw 0 0
 ";
+
+    const MOUNTINFO: &str = "\
+22 1 0:21 /@ / rw,relatime - btrfs /dev/mapper/root rw,subvol=/@
+23 22 0:21 /@home /home rw,relatime - btrfs /dev/mapper/root rw,subvol=/@home
+24 22 0:21 /@log /var/log rw,relatime - btrfs /dev/mapper/root rw,subvol=/@log
+25 22 0:21 /@snapshots /.snapshots rw - btrfs /dev/mapper/root rw
+26 22 0:30 / /data rw,relatime shared:5 - btrfs /dev/mapper/data rw
+27 22 0:30 / /mnt/data rw,relatime shared:5 - btrfs /dev/mapper/data rw
+28 22 0:31 / /tmp rw - tmpfs tmpfs rw
+29 22 259:3 / /boot rw - vfat /dev/nvme0n1p1 rw
+";
+
+    fn repeated(table: &str, root: &str) -> Vec<PathBuf> {
+        let mut paths =
+            repeated_mounts(&parse_mountinfo(table), Path::new(root));
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn subvolumes_are_not_repeats_but_a_second_mount_of_a_disk_is() {
+        assert_eq!(repeated(MOUNTINFO, "/"), [PathBuf::from("/mnt/data")]);
+        assert!(repeated(MOUNTINFO, "/home/tobi").is_empty());
+        assert!(repeated(MOUNTINFO, "/data").is_empty());
+        assert!(
+            repeated(MOUNTINFO, "/mnt/data").is_empty(),
+            "the view that was asked for is scanned"
+        );
+    }
+
+    #[test]
+    fn a_bind_mount_inside_the_scan_is_left_out() {
+        let table = format!(
+            "{MOUNTINFO}30 23 0:21 /@home/tobi/src /srv/src rw - btrfs /dev/mapper/root rw\n"
+        );
+        assert_eq!(
+            repeated(&table, "/"),
+            [PathBuf::from("/mnt/data"), PathBuf::from("/srv/src")]
+        );
+        // From home, the original is outside the scan: nothing repeats.
+        assert!(repeated(&table, "/home/tobi").is_empty());
+        assert!(repeated(&table, "/srv").is_empty());
+    }
+
+    #[test]
+    fn the_top_of_a_btrfs_disk_beside_its_subvolumes_is_counted_once() {
+        let table = format!(
+            "{MOUNTINFO}31 22 0:21 / /mnt/top rw - btrfs /dev/mapper/root rw\n"
+        );
+        // The root cannot be left out, so its copy under /mnt/top is; the
+        // other subvolumes are seen under /mnt/top instead of twice.
+        assert_eq!(
+            repeated(&table, "/"),
+            [
+                PathBuf::from("/.snapshots"),
+                PathBuf::from("/home"),
+                PathBuf::from("/mnt/data"),
+                PathBuf::from("/mnt/top/@"),
+                PathBuf::from("/var/log"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mountinfo_escapes_are_decoded_once() {
+        let mounts = parse_mountinfo(
+            "not a mount line\n\
+             40 22 8:1 /a\\040b /media/My\\040Disk\\134040 rw - ext4 /dev/sda1 rw\n",
+        );
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].fs_root, Path::new("/a b"));
+        assert_eq!(mounts[0].point, Path::new("/media/My Disk\\040"));
+        assert_eq!(mounts[0].source, "/dev/sda1");
+        assert_eq!(mounts[0].fstype, "ext4");
+    }
 
     #[test]
     fn a_volume_includes_its_subvolumes_and_nothing_else() {
