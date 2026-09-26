@@ -1322,3 +1322,54 @@ fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
         Vec::<usize>::new()
     );
 }
+
+/// Regression: children are ordered by the metric, so switching between
+/// Size and Files reorders them. The directory on screen and the selection
+/// are found again by path, rather than following their old positions into
+/// a sibling.
+#[gpui_kit::test]
+fn switching_the_metric_keeps_the_directory_and_the_selection(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path();
+    // Largest by size, but fewest files: the two swap places.
+    std::fs::create_dir_all(root.join("big")).expect("mkdir");
+    std::fs::write(root.join("big/one.bin"), vec![b'x'; 500_000])
+        .expect("write");
+    std::fs::write(root.join("big/two.bin"), vec![b'x'; 1_000]).expect("write");
+    for index in 0..5 {
+        let file = root.join(format!("many/{index}.txt"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, b"x").expect("write");
+    }
+    let (view, cx) = view_over(root, cx);
+    draw(cx);
+
+    update(&view, cx, |app, cx| {
+        let big = child_crumbs(app, &[], "big");
+        assert_eq!(big, vec![0], "largest first by size");
+        app.go_to(big.clone(), cx);
+        let one = child_crumbs(app, &big, "one.bin");
+        app.select(Some(one), cx);
+    });
+    draw(cx);
+
+    update(&view, cx, |app, cx| app.set_mode(1, cx));
+    draw(cx);
+    let (here, selected) = read(&view, cx, |app| {
+        (
+            app.current_path(),
+            app.selected
+                .as_deref()
+                .and_then(|crumbs| app.path_at(crumbs)),
+        )
+    });
+    assert_eq!(here, root.join("big"));
+    assert_eq!(selected, Some(root.join("big/one.bin")));
+
+    update(&view, cx, |app, cx| app.set_mode(0, cx));
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::current_path), root.join("big"));
+}

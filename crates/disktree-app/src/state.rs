@@ -1797,6 +1797,10 @@ impl Disktree {
     }
 
     pub fn toggle_metric(&mut self, cx: &mut Context<'_, Self>) {
+        // Children are ordered by the metric, so every crumb moves. Keep the
+        // paths and find them again in the reordered tree.
+        let directory = self.current_path();
+        let selected = self.selected.as_deref().and_then(|c| self.path_at(c));
         self.options.metric = self.options.metric.toggled();
         if let Some(tree) = &self.tree {
             let mut tree = (**tree).clone();
@@ -1809,7 +1813,11 @@ impl Disktree {
                 metric,
             );
         }
-        // Children are ordered by the metric, so every crumb moved.
+        self.crumbs = self.crumbs_for_path(&directory).unwrap_or_default();
+        self.selected = selected.and_then(|path| self.crumbs_for_path(&path));
+        self.forget_hover();
+        self.crumb_menu = None;
+        self.transition = None;
         self.refresh_insights();
         self.clear_filter();
         self.cache = None;
