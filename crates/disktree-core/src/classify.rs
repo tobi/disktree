@@ -11,6 +11,10 @@
 //! space is the same idea, plus a sibling check where a name alone is too
 //! common to trust: `target` is only a build directory beside a `Cargo.toml`.
 
+use std::borrow::Cow;
+
+use rayon::prelude::*;
+
 use crate::tree::Node;
 
 /// A kind of data, for colour.
@@ -105,10 +109,33 @@ impl Reclaim {
     }
 }
 
+/// Bytes of a name lowercased on the stack.
+const LOWERED: usize = 32;
+
+/// `name` lowercased, on the stack when it fits in [`LOWERED`] bytes: a
+/// directory on a whole disk is looked up twice for each of hundreds of
+/// thousands, and a string allocated each time was most of what
+/// classifying cost. A longer name is rare enough to allocate.
+fn lowered<'a>(name: &str, buffer: &'a mut [u8; LOWERED]) -> Cow<'a, str> {
+    let Some(bytes) = buffer.get_mut(..name.len()) else {
+        return Cow::Owned(name.to_ascii_lowercase());
+    };
+    bytes.copy_from_slice(name.as_bytes());
+    bytes.make_ascii_lowercase();
+    // ASCII lowercasing keeps UTF-8.
+    Cow::Borrowed(std::str::from_utf8(bytes).unwrap_or_default())
+}
+
 /// The kind a directory name announces on its own, if any.
 pub fn category_of_name(name: &str) -> Option<Category> {
-    let lower = name.to_ascii_lowercase();
-    let category = match lower.as_str() {
+    let mut buffer = [0; LOWERED];
+    let lower = lowered(name, &mut buffer);
+    // Windows: a work or school account's folder carries the organisation,
+    // `OneDrive - Contoso`, and Dropbox's does the same, `Dropbox (Contoso)`.
+    if lower.starts_with("onedrive - ") || lower.starts_with("dropbox (") {
+        return Some(Category::Synced);
+    }
+    let category = match &*lower {
         "src" | "code" | "projects" | "repos" | "dev" | "work"
         | "workspace" | "workspaces" | "github.com" | "gitlab.com"
         | "sites" | "development" => Category::Code,
@@ -122,11 +149,20 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | ".espressif" | ".arduino15" | ".config" | ".vscode" | ".zig"
         | ".rye" | ".conda" | "anaconda3" | "miniconda3" | ".opam"
         | ".ghcup" | ".stack" | ".julia" | ".dotnet" | ".android"
-        | ".sdkman" | ".volta" | ".yarn" | ".java" => Category::Toolchain,
+        | ".sdkman" | ".volta" | ".yarn" | ".java" | ".nuget"
+        // macOS: Xcode's and the simulators' state in ~/Library/Developer.
+        // Not `Developer` itself: ~/Developer is where Apple puts projects.
+        | "xcode" | "coresimulator" => Category::Toolchain,
         "sync" | "dropbox" | "nextcloud" | "google drive" | "onedrive"
-        | "pclouddrive" | "mega" | ".stversions" => Category::Synced,
+        | "pclouddrive" | "mega" | ".stversions"
+        // macOS: iCloud Drive, and the File Provider clients (Dropbox,
+        // Google Drive, OneDrive) since macOS 12.
+        | "mobile documents" | "cloudstorage"
+        // Windows: iCloud for Windows.
+        | "iclouddrive" => Category::Synced,
         ".git" => Category::Git,
         "pictures" | "photos" | "music" | "videos" | "movies" | "steam"
+        | "steamlibrary" | "steamapps" | "emulation"
         | "models" | ".ollama" | ".lmstudio" | "games" | "wineprefix" => {
             Category::Media
         }
@@ -134,7 +170,11 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | "obsidian" | "public" | "templates" => Category::Documents,
         ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
         | "__pycache__" | "node_modules" | "trash" | ".trash" | "tmp"
-        | ".tmp" => Category::Cache,
+        | ".tmp" | "deriveddata" | "ios devicesupport"
+        | "watchos devicesupport"
+        // Windows: see `reclaim_of`.
+        | "temp" | "$recycle.bin" | "npm-cache" | "v3-cache" | "inetcache"
+        | "d3dscache" | "dxcache" | "glcache" | "crashdumps" => Category::Cache,
         _ => return None,
     };
     Some(category)
@@ -147,23 +187,36 @@ pub fn reclaim_of(
     parent: Category,
     has_sibling: impl Fn(&str) -> bool,
 ) -> Option<Reclaim> {
-    let lower = name.to_ascii_lowercase();
-    let reclaim = match lower.as_str() {
-        ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache" => {
-            Reclaim::Regenerable
-        }
+    let mut buffer = [0; LOWERED];
+    let lower = lowered(name, &mut buffer);
+    let reclaim = match &*lower {
+        ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
+        // Windows' own caches in AppData\Local: npm's, NuGet's downloads,
+        // the browser engine's, and compiled shaders, Direct3D's and the
+        // graphics driver's, all rebuilt as they are needed.
+        | "npm-cache" | "v3-cache" | "inetcache" | "d3dscache" | "dxcache"
+        | "glcache"
+        // Symbols Xcode copies off a device it meets, and copies again the
+        // next time that device is plugged in.
+        | "ios devicesupport" | "watchos devicesupport" => Reclaim::Regenerable,
         ".stversions" => Reclaim::SyncHistory,
         ".pnpm-store" | "pnpm" => Reclaim::PackageStore,
         "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
-        | ".next" | ".turbo" | ".parcel-cache" => Reclaim::BuildOutput,
+        | ".next" | ".turbo" | ".parcel-cache"
+        // Xcode's build products and indexes, rebuilt on the next build.
+        | "deriveddata" => Reclaim::BuildOutput,
+        // ~/Library/Logs, told apart from a project's logs by its neighbour.
+        "logs" if has_sibling("Application Support") => Reclaim::Temporary,
         // Too common to trust alone: only a build directory beside a manifest.
         "target" if has_sibling("Cargo.toml") => Reclaim::BuildOutput,
         "node_modules" if has_sibling("package.json") => Reclaim::Reinstallable,
         // Layers and snapshots are only disposable inside sandbox state.
         "layers" if parent == Category::AgentScratch => Reclaim::SandboxLayers,
         "snapshots" if parent == Category::AgentScratch => Reclaim::Snapshots,
-        "trash" | ".trash" => Reclaim::Trash,
-        "tmp" | ".tmp" => Reclaim::Temporary,
+        "trash" | ".trash" | "$recycle.bin" => Reclaim::Trash,
+        // `Temp` is where Windows puts temporary files, in AppData\Local;
+        // `CrashDumps` beside it holds dumps of programs that crashed.
+        "tmp" | ".tmp" | "temp" | "crashdumps" => Reclaim::Temporary,
         _ => return None,
     };
     Some(reclaim)
@@ -176,14 +229,11 @@ pub fn reclaim_of(
 pub fn classify(root: &mut Node) {
     root.category = Category::Other;
     root.reclaim = None;
-    let children = std::mem::take(&mut root.children);
-    let names: Vec<Box<str>> =
-        children.iter().map(|child| child.name.clone()).collect();
-    root.children = children;
     for index in 0..root.children.len() {
+        let siblings = &root.children;
         let has_sibling =
-            |wanted: &str| names.iter().any(|name| &**name == wanted);
-        let child = &mut root.children[index];
+            |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
+        let child = &siblings[index];
         // A top-level directory with an unknown name takes the kind of its
         // largest recognisable child: `~/world` is mostly `.git`.
         let category = category_of_name(&child.name)
@@ -194,7 +244,7 @@ pub fn classify(root: &mut Node) {
             .is_dir()
             .then(|| reclaim_of(&child.name, Category::Other, has_sibling))
             .flatten();
-        classify_below(child, category, reclaim);
+        classify_below(&mut root.children[index], category, reclaim, 1);
     }
 }
 
@@ -202,35 +252,65 @@ fn classify_below(
     node: &mut Node,
     category: Category,
     reclaim: Option<Reclaim>,
+    depth: usize,
 ) {
     node.category = category;
     node.reclaim = reclaim;
-    if node.children.is_empty() {
+    // Most directories hold only files, which take this one's kind as
+    // they are: no list of kinds to build, no call per file.
+    if !node.children.iter().any(Node::is_dir) {
+        for child in &mut node.children {
+            child.category = category;
+            child.reclaim = reclaim;
+        }
         return;
     }
-    let names: Vec<Box<str>> = node
-        .children
-        .iter()
-        .map(|child| child.name.clone())
-        .collect();
-    for child in &mut node.children {
-        let has_sibling =
-            |wanted: &str| names.iter().any(|name| &**name == wanted);
-        let child_category = if child.is_dir() {
-            category_of_name(&child.name)
-                .or_else(|| is_git_store(child).then_some(Category::Git))
-                .unwrap_or(category)
-        } else {
-            category
-        };
-        let child_reclaim = reclaim.or_else(|| {
-            child
-                .is_dir()
-                .then(|| reclaim_of(&child.name, category, has_sibling))
-                .flatten()
-        });
-        classify_below(child, child_category, child_reclaim);
+    // See `tree::PARALLEL_LEVELS`: parallel only near the top. Deeper, the
+    // children are decided and descended one at a time, with no list of
+    // decisions: there are half a million directories to get through.
+    if depth < crate::tree::PARALLEL_LEVELS {
+        let kinds: Vec<(Category, Option<Reclaim>)> = (0..node.children.len())
+            .map(|index| kind_of(&node.children, index, category, reclaim))
+            .collect();
+        node.children.par_iter_mut().zip(kinds).for_each(
+            |(child, (category, reclaim))| {
+                classify_below(child, category, reclaim, depth + 1);
+            },
+        );
+    } else {
+        for index in 0..node.children.len() {
+            let (category, reclaim) =
+                kind_of(&node.children, index, category, reclaim);
+            classify_below(
+                &mut node.children[index],
+                category,
+                reclaim,
+                depth + 1,
+            );
+        }
     }
+}
+
+/// What the child at `index` is, given what its parent is: its own name
+/// wins, otherwise it inherits. A file always inherits.
+fn kind_of(
+    siblings: &[Node],
+    index: usize,
+    category: Category,
+    reclaim: Option<Reclaim>,
+) -> (Category, Option<Reclaim>) {
+    let child = &siblings[index];
+    if !child.is_dir() {
+        return (category, reclaim);
+    }
+    let has_sibling =
+        |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
+    let child_category = category_of_name(&child.name)
+        .or_else(|| is_git_store(child).then_some(Category::Git))
+        .unwrap_or(category);
+    let child_reclaim =
+        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling));
+    (child_category, child_reclaim)
 }
 
 /// The kind of an unknown directory, from what fills it: the first
@@ -346,6 +426,41 @@ mod tests {
         node
     }
 
+    /// Regression: a Steam library on a second drive was named by the
+    /// `temp` folder Steam keeps in `steamapps`, so a disk of games showed
+    /// as cache.
+    #[test]
+    fn a_steam_library_on_another_drive_is_media_not_its_temp_folder() {
+        let mut root = dir(
+            "data",
+            vec![dir(
+                "SteamLibrary",
+                vec![dir(
+                    "steamapps",
+                    vec![
+                        dir("temp", vec![file("partial", 1)]),
+                        dir("common", vec![file("game.pak", 1_000)]),
+                    ],
+                )],
+            )],
+        );
+        aggregate(&mut root, Metric::Bytes);
+        classify(&mut root);
+        let library = &root.children[0];
+        assert_eq!(library.category, Category::Media);
+        let common = library.children[0].child_named("common").expect("common");
+        assert_eq!(common.category, Category::Media);
+        assert_eq!(common.reclaim, None, "installed games are not hatched");
+    }
+
+    #[test]
+    fn steam_libraries_and_emulation_are_media_not_disposable_caches() {
+        for name in ["SteamLibrary", "steamapps", "Emulation"] {
+            assert_eq!(category_of_name(name), Some(Category::Media));
+            assert_eq!(reclaim_of(name, Category::Other, |_| false), None);
+        }
+    }
+
     #[test]
     fn names_announce_their_kind_and_children_inherit_it() {
         let home = home();
@@ -423,6 +538,73 @@ mod tests {
             reclaim_of("snapshots", Category::Documents, |_| false),
             None
         );
+    }
+
+    #[test]
+    fn macos_developer_leftovers_are_reclaimable_and_its_risks_are_not() {
+        let none = |_: &str| false;
+        assert_eq!(
+            reclaim_of("DerivedData", Category::Toolchain, none),
+            Some(Reclaim::BuildOutput)
+        );
+        assert_eq!(
+            reclaim_of("iOS DeviceSupport", Category::Toolchain, none),
+            Some(Reclaim::Regenerable)
+        );
+        let library = |name: &str| name == "Application Support";
+        assert_eq!(
+            reclaim_of("Logs", Category::Other, library),
+            Some(Reclaim::Temporary)
+        );
+        assert_eq!(reclaim_of("logs", Category::Code, none), None);
+        // Big, but not safe to offer: Archives hold the symbols crash
+        // reports need, and Backup is an iPhone's only backup.
+        assert_eq!(reclaim_of("Archives", Category::Toolchain, none), None);
+        assert_eq!(reclaim_of("Backup", Category::Other, none), None);
+        assert_eq!(
+            category_of_name("Mobile Documents"),
+            Some(Category::Synced)
+        );
+        // ~/Developer holds a user's projects, not a toolchain.
+        assert_eq!(category_of_name("Developer"), None);
+        assert_eq!(category_of_name("Xcode"), Some(Category::Toolchain));
+    }
+
+    #[test]
+    fn windows_caches_and_sync_folders_are_recognized() {
+        let none = |_: &str| false;
+        for (name, reclaim) in [
+            ("Temp", Reclaim::Temporary),
+            ("CrashDumps", Reclaim::Temporary),
+            ("npm-cache", Reclaim::Regenerable),
+            ("v3-cache", Reclaim::Regenerable),
+            ("INetCache", Reclaim::Regenerable),
+            ("D3DSCache", Reclaim::Regenerable),
+            ("DXCache", Reclaim::Regenerable),
+            ("$Recycle.Bin", Reclaim::Trash),
+        ] {
+            assert_eq!(
+                reclaim_of(name, Category::Other, none),
+                Some(reclaim),
+                "{name}"
+            );
+            assert_eq!(category_of_name(name), Some(Category::Cache), "{name}");
+        }
+        for name in [
+            "OneDrive - Contoso",
+            // Past the stack buffer for lowercasing.
+            "OneDrive - Contoso Pharmaceuticals International",
+            "Dropbox (Contoso)",
+            "iCloudDrive",
+        ] {
+            assert_eq!(
+                category_of_name(name),
+                Some(Category::Synced),
+                "{name}"
+            );
+        }
+        assert_eq!(category_of_name(".nuget"), Some(Category::Toolchain));
+        assert_eq!(category_of_name("OneDriveSetup"), None);
     }
 
     #[test]

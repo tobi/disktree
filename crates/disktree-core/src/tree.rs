@@ -1,6 +1,11 @@
 //! The scanned tree.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
+
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 
 use crate::classify::{Category, Reclaim};
 
@@ -235,7 +240,104 @@ impl Node {
 /// de-duplication rewrites a leaf's weight, and every total above it —
 /// including its parent's "direct" figure — follows without a second pass.
 pub fn aggregate(node: &mut Node, metric: Metric) {
+    aggregate_at(node, metric, 0, None);
+}
+
+/// [`aggregate`], charging a hardlinked file once: a leaf whose identity
+/// `seen` already holds weighs nothing. Which of a file's names is charged
+/// is whichever a worker reaches first, so two scans of an unchanged tree
+/// can split it differently between folders; the totals are the same.
+pub(crate) fn aggregate_deduped(node: &mut Node, metric: Metric, seen: &Seen) {
+    aggregate_at(node, metric, 0, Some(seen));
+}
+
+/// Identities a finish pass has met.
+///
+/// A hash set of every file on a disk is millions of random writes into a
+/// table too big for any cache. Inode and file record numbers are small
+/// integers, though, so a key on the first volume met whose whole number
+/// is below the bitmap's size gets one bit instead: an 8 MiB bitmap the
+/// workers set without locking. The file table reader's record numbers
+/// fit, as do most inodes. Anything else goes into the hash set, whole:
+/// a Windows file id keeps the record's reuse count in its top 16 bits,
+/// and that is what tells a file from an older one on the same record,
+/// which a subtree kept from an earlier scan can still hold. The set is
+/// sharded for the walk's millions of those: 4.1 million ids took 150 ms
+/// across 64 locks and 1.2 s behind one, in a synthetic run.
+pub(crate) struct Seen {
+    /// The first volume met, which is the scanned root's in all but a scan
+    /// that leaves its volume.
+    volume: OnceLock<u64>,
+    /// Made on the first key that fits: most Unix trees, where only files
+    /// with more than one name carry an identity, never need it.
+    bits: LazyLock<Box<[AtomicU64]>>,
+    rest: Box<[Shard]>,
+}
+
+/// One lock's part of the hash set.
+type Shard = Mutex<FxHashSet<(u64, u64)>>;
+
+impl Seen {
+    /// Numbers the bitmap covers: sixty-four million, more files than a
+    /// desktop volume holds, for 8 MiB written once.
+    const BITS: u64 = 1 << 26;
+
+    /// Hash set shards, as a power of two.
+    const SHARD_BITS: u32 = 6;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            volume: OnceLock::new(),
+            bits: LazyLock::new(|| {
+                std::iter::repeat_with(|| AtomicU64::new(0))
+                    .take((Self::BITS / 64) as usize)
+                    .collect()
+            }),
+            rest: std::iter::repeat_with(Mutex::default)
+                .take(1 << Self::SHARD_BITS)
+                .collect(),
+        }
+    }
+
+    /// Whether `key` is new.
+    fn insert(&self, key: (u64, u64)) -> bool {
+        let (volume, number) = key;
+        if *self.volume.get_or_init(|| volume) == volume && number < Self::BITS
+        {
+            let bit = 1 << (number % 64);
+            let word = &self.bits[(number / 64) as usize];
+            return word.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+        }
+        // The top bits of a multiplicative hash, with another constant
+        // than the set's own hasher, so a shard's keys still spread over
+        // its table.
+        let shard = (number.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            >> (u64::BITS - Self::SHARD_BITS)) as usize;
+        crate::scan::lock(&self.rest[shard]).insert(key)
+    }
+}
+
+/// Levels whose subtrees are aggregated in parallel. A top level already
+/// splits a disk into enough work for every thread; below it a parallel
+/// frame per level would only cut the depth that fits in a worker's stack.
+pub(crate) const PARALLEL_LEVELS: usize = 4;
+
+fn aggregate_at(
+    node: &mut Node,
+    metric: Metric,
+    depth: usize,
+    seen: Option<&Seen>,
+) {
     if !node.is_dir() {
+        // Every name of a file has the file's size, so one that weighs
+        // nothing need not be remembered to be charged once.
+        if node.own_bytes > 0
+            && let Some(seen) = seen
+            && let Some(key) = node.inode
+            && !seen.insert(key)
+        {
+            node.own_bytes = 0;
+        }
         node.bytes = node.own_bytes;
         node.files = node.own_files;
         node.dirs = 0;
@@ -248,14 +350,23 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     let mut own_files = 0;
     let mut dirs: u64 = 1;
     let mut modified = 0;
-    for child in &mut node.children {
-        aggregate(child, metric);
+    if depth < PARALLEL_LEVELS {
+        node.children
+            .par_iter_mut()
+            .for_each(|child| aggregate_at(child, metric, depth + 1, seen));
+    } else {
+        for child in &mut node.children {
+            aggregate_at(child, metric, depth + 1, seen);
+        }
+    }
+    for child in &node.children {
         modified = modified.max(child.modified);
-        bytes += child.bytes;
+        // Saturating: a corrupt volume's file table can claim any size.
+        bytes = child.bytes.saturating_add(bytes);
         files += child.files;
         dirs += child.dirs;
         if !child.is_dir() {
-            own_bytes += child.bytes;
+            own_bytes = child.bytes.saturating_add(own_bytes);
             own_files += child.files;
         }
     }
@@ -267,8 +378,11 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     node.modified = modified;
 
     // Largest first: a treemap lays out big tiles best, and the order is what
-    // makes "descend into the largest child" meaningful.
-    node.children.sort_by(|left, right| {
+    // makes "descend into the largest child" meaningful. Unstable: names in
+    // one directory are distinct, and the only ties are names that decoded
+    // to the same lossy text, whose order does not matter, so the stable
+    // sort's scratch allocation buys nothing.
+    node.children.sort_unstable_by(|left, right| {
         right
             .value(metric)
             .cmp(&left.value(metric))
@@ -298,6 +412,42 @@ mod tests {
 
     fn leaf(name: &str, bytes: u64) -> Node {
         Node::entry(name, NodeKind::File, bytes)
+    }
+
+    #[test]
+    fn seen_charges_an_identity_once_in_either_store() {
+        let seen = Seen::new();
+        // The first volume: the bitmap.
+        assert!(seen.insert((7, 42)));
+        assert!(!seen.insert((7, 42)));
+        assert!(seen.insert((7, 43)));
+        // A number past the bitmap, and another volume: the hash set.
+        let far = Seen::BITS + 42;
+        assert!(seen.insert((7, far)));
+        assert!(!seen.insert((7, far)));
+        assert!(seen.insert((8, 42)), "another volume's 42 is another file");
+        assert!(!seen.insert((8, 42)));
+    }
+
+    #[test]
+    fn identities_that_differ_only_in_their_top_bits_are_two_files() {
+        // Record 0x2A of one volume under two reuse counts, as a subtree kept
+        // from an earlier scan and a later file can hold, and a real second
+        // name of the newer one.
+        let older = (7, (1 << 48) | 0x2A);
+        let newer = (7, (2 << 48) | 0x2A);
+        let mut root = Node::directory("root");
+        for (name, bytes, key) in [
+            ("older", 4096, older),
+            ("newer", 8192, newer),
+            ("newer again", 8192, newer),
+        ] {
+            let mut file = leaf(name, bytes);
+            file.inode = Some(key);
+            root.children.push(file);
+        }
+        aggregate_deduped(&mut root, Metric::Bytes, &Seen::new());
+        assert_eq!(root.bytes, 4096 + 8192);
     }
 
     #[test]

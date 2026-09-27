@@ -14,15 +14,19 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-gpui-kit = { version = "=0.6.1", default-features = false, features = ["assets"] }
-gpui-omarchy = "0.1.2"
+gpui-kit = { version = "=0.6.6", default-features = false, features = ["assets"] }
+gpui-omarchy = "0.1.3"
 disktree-core = { workspace = true }
 anyhow = { workspace = true }
+dunce = "1.0.5"
 rustc-hash = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # The window harness: it lets the tests draw a real frame and press real keys.
-gpui-kit = { version = "=0.6.1", default-features = false, features = [
+gpui-kit = { version = "=0.6.6", default-features = false, features = [
     "assets",
     "test-support",
 ] }

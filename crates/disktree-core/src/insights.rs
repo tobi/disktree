@@ -60,7 +60,9 @@ fn visit(
     now: i64,
     found: &mut Vec<Candidate>,
 ) {
-    if !node.is_dir() {
+    // Nothing beneath a small directory can reach `MIN_BYTES` either, so a
+    // scan of millions of files looks at a few thousand directories.
+    if !node.is_dir() || node.bytes < MIN_BYTES {
         return;
     }
     // Topmost only: everything beneath a reclaimable directory goes with it.
@@ -72,9 +74,9 @@ fn visit(
         });
         return;
     }
-    let name = node.name.to_ascii_lowercase();
+    let name = &*node.name;
     let scratch = node.category == Category::AgentScratch;
-    if scratch && name == "worktrees" {
+    if scratch && name.eq_ignore_ascii_case("worktrees") {
         let trees: Vec<&Node> = node
             .children
             .iter()
@@ -98,8 +100,9 @@ fn visit(
             return;
         }
     }
-    let experiments =
-        scratch && matches!(name.as_str(), "tries" | "experiments");
+    let experiments = scratch
+        && (name.eq_ignore_ascii_case("tries")
+            || name.eq_ignore_ascii_case("experiments"));
     let mut stale = (0_usize, 0_u64);
     for (index, child) in node.children.iter().enumerate() {
         let is_stale = experiments

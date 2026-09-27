@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Pull requests run here, so the token can read and nothing more.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -40,6 +44,111 @@ jobs:
 
       - name: Lint
         run: cargo xtask lint
+
+      - name: Test
+        run: cargo xtask test
+
+  check-macos:
+    name: Lint and test (macOS)
+    # Apple silicon. No system libraries to install, and no Metal toolchain
+    # either: gpui-kit builds GPUI with runtime shader compilation, so the
+    # shaders compile when the app starts, not here.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo xtask lint
+
+      - name: Test
+        run: cargo xtask test
+
+      # The app bundle, signed ad hoc: catches a broken Info.plist, icon or
+      # signature before a release does.
+      - name: Bundle
+        run: cargo xtask bundle
+
+  windows:
+    name: Lint and test (Windows)
+    runs-on: windows-2025
+    steps:
+      # Check out with the repository's own line endings, as on Linux.
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+
+      # Pinned with the Linux job, for the same reason. GPUI needs nothing
+      # beyond the Windows SDK the runner already has.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo xtask lint
+
+      - name: Test
+        run: cargo xtask test
+
+      - name: Check embedded executable icon
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p disktree-app
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class ExecutableIcons {
+              [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+              public static extern uint ExtractIconEx(
+                  string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+          }
+          '@
+          $exe = (Resolve-Path target/release/disktree.exe).Path
+          if ([ExecutableIcons]::ExtractIconEx($exe, -1, $null, $null, 0) -lt 1) {
+            throw "disktree.exe has no embedded icon"
+          }
+
+  # The other half of each release: the same tests on the architectures
+  # the release builds for but the jobs above do not run on.
+  other-architectures:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux aarch64, runner: ubuntu-24.04-arm }
+          - { name: macOS x86_64, runner: macos-15-intel }
+          - { name: Windows aarch64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Test
         run: cargo xtask test

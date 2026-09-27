@@ -8,25 +8,27 @@
 //!   `+1` sentinel, so a directory is only built once its own scan *and* all of
 //!   its subdirectory tasks have finished,
 //! * children are handed to the parent as finished `Node`s and sizes are
-//!   aggregated bottom-up in one serial pass, which is also where hardlinks are
-//!   de-duplicated.
+//!   aggregated bottom-up in one pass over the finished tree, which is also
+//!   where hardlinks are de-duplicated.
 //!
 //! What is added on top of dust's approach: live progress counters the UI can
 //! poll without locking, and cooperative cancellation so a re-scan can abandon
 //! a walk of a large home directory instead of queueing behind it.
 
-use std::fs::{self, DirEntry, Metadata};
+#[cfg(not(windows))]
+use std::fs::DirEntry;
+use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 
 use rayon::Scope;
 use rustc_hash::FxHashSet;
 
-use crate::tree::{Metric, Node, NodeKind, aggregate};
+use crate::tree::{Metric, Node, NodeKind, Seen, aggregate, aggregate_deduped};
 
 /// Errors kept verbatim before the list is truncated; the count keeps rising.
 const MAX_ERROR_DETAIL: usize = 50;
@@ -103,21 +105,30 @@ pub struct ScanSnapshot {
 }
 
 impl ScanProgress {
-    fn count_file(&self, bytes: u64) {
-        self.files.fetch_add(1, Ordering::Relaxed);
+    /// What a directory's listing found (see `Tally`), or what a reader
+    /// that measures in bulk has come across so far.
+    pub(crate) fn add(&self, files: u64, dirs: u64, bytes: u64) {
+        self.files.fetch_add(files, Ordering::Relaxed);
+        self.dirs.fetch_add(dirs, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn count_dir(&self) {
-        self.dirs.fetch_add(1, Ordering::Relaxed);
+    /// The totals of the finished tree, replacing a bulk reader's running
+    /// count: it met the whole volume, and the tree may be less of it.
+    #[cfg(windows)]
+    pub(crate) fn settle(&self, files: u64, dirs: u64, bytes: u64) {
+        self.files.store(files, Ordering::Relaxed);
+        self.dirs.store(dirs, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
     }
 
     fn record_error(&self, path: &Path, error: &io::Error) {
         self.errors.fetch_add(1, Ordering::Relaxed);
-        let message = format!("{}: {error}", path.display());
+        // A scan without Full Disk Access can refuse thousands of paths;
+        // only the ones that will be kept are worth formatting.
         let mut messages = lock(&self.messages);
         if messages.len() < MAX_ERROR_DETAIL {
-            messages.push(message);
+            messages.push(format!("{}: {error}", path.display()));
         }
         drop(messages);
     }
@@ -185,8 +196,10 @@ impl ScanHandle {
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
+            volume: OnceLock::new(),
         });
         let (sender, result) = mpsc::channel();
 
@@ -233,8 +246,10 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
         progress: Arc::clone(&progress),
         root_device: Mutex::new(None),
         foreign_mounts: OnceLock::new(),
+        never_scanned: OnceLock::new(),
         visited_dirs: Mutex::new(FxHashSet::default()),
         root: Mutex::new(None),
+        volume: OnceLock::new(),
     });
     let node = scan_blocking(root, &context)?;
     progress.finish();
@@ -252,10 +267,17 @@ struct WalkContext {
     /// Mount points `one_filesystem` keeps out, from the mount table. Unset
     /// when the table cannot be read, and devices are compared instead.
     foreign_mounts: OnceLock<FxHashSet<PathBuf>>,
+    /// Directories no scan enters, on any volume setting: see
+    /// [`crate::space::never_scanned`].
+    never_scanned: OnceLock<FxHashSet<PathBuf>>,
     /// Directories already entered, so followed symlinks cannot loop.
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     /// Set by the root's `complete`, read after the scope joins.
     root: Mutex<Option<Node>>,
+    /// Serial number of the root's volume, on Windows, for a walk that
+    /// cannot leave it: every listing takes it instead of asking. See
+    /// [`crate::windows::walk_volume`].
+    volume: OnceLock<u64>,
 }
 
 impl WalkContext {
@@ -273,77 +295,105 @@ impl WalkContext {
         self.progress.is_cancelled()
     }
 
-    /// Decide what to do with an entry, and account for the work it implies.
-    fn classify(&self, entry: &DirEntry) -> Classified {
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
+    /// Decide what to do with an entry listed in `dir`.
+    ///
+    /// The entry's path is built only where it is used: most entries are
+    /// files, and a disk has millions of them. The name is moved out of
+    /// the entry last, so nothing copies it.
+    fn classify(&self, dir: &Path, entry: &mut impl Listed) -> Classified {
+        let listing = match entry.listing() {
+            Ok(listing) => listing,
             Err(error) => {
-                self.progress.record_error(&path, &error);
+                self.progress.record_error(&entry.entry_path(dir), &error);
                 return Classified::Skipped;
             }
         };
-        // Non-UTF-8 names are lossy for display. The scan still measures them
-        // correctly; only the reported name is approximate.
-        let name: Box<str> =
-            entry.file_name().to_string_lossy().into_owned().into();
 
-        if !self.options.include_hidden && name.starts_with('.') {
+        if !self.options.include_hidden
+            && (entry.name().starts_with('.') || entry.hidden())
+        {
             return Classified::Skipped;
         }
 
-        if file_type.is_symlink() {
-            return self.classify_symlink(&path, name);
-        }
-
-        if file_type.is_dir() {
-            // Memoized: the subtree a narrower scan already measured is
-            // taken whole, before any volume rule, since it was measured
-            // under the same rules.
-            if let Some(known) = &self.known
-                && known.path == path
-            {
-                let tree = (*known.tree).clone();
-                self.progress.files.fetch_add(tree.files, Ordering::Relaxed);
-                self.progress.bytes.fetch_add(tree.bytes, Ordering::Relaxed);
-                self.progress.dirs.fetch_add(tree.dirs, Ordering::Relaxed);
-                let mut tree = tree;
-                tree.name = name;
-                return Classified::Entry(tree);
+        let kind = match listing {
+            Listing::Symlink => {
+                let path = entry.entry_path(dir);
+                return self.classify_symlink(&path, entry.take_name());
             }
-            if self.options.one_filesystem
-                && let Some(foreign) = self.foreign_mounts.get()
-            {
-                // Checked by path before anything reads the directory, so an
-                // automount point is never triggered.
-                if foreign.contains(&path) {
-                    return Classified::Skipped;
-                }
-            } else if self.options.one_filesystem {
-                let device = entry.metadata().map(|meta| device_of(&meta));
-                match (device, self.root_device(&path)) {
-                    (Ok(device), Some(root_device))
-                        if device != root_device =>
-                    {
-                        return Classified::Skipped;
-                    }
-                    (Err(error), _) => {
-                        self.progress.record_error(&path, &error);
-                        return Classified::Skipped;
-                    }
-                    _ => {}
-                }
+            Listing::Directory => {
+                let path = entry.entry_path(dir);
+                return self.classify_dir(entry, path);
             }
-            self.progress.count_dir();
-            return Classified::Subdirectory(path);
-        }
-
-        match entry.metadata() {
-            Ok(meta) => self.leaf(name, kind_of(&meta, file_type), &meta),
+            Listing::Leaf(kind) => kind,
+        };
+        match entry.facts(self.options.apparent_size) {
+            Ok(facts) => self.leaf(entry.take_name(), kind, &facts),
             Err(error) => {
-                self.progress.record_error(&path, &error);
+                self.progress.record_error(&entry.entry_path(dir), &error);
                 Classified::Skipped
             }
+        }
+    }
+
+    fn classify_dir(
+        &self,
+        entry: &mut impl Listed,
+        path: PathBuf,
+    ) -> Classified {
+        if self
+            .never_scanned
+            .get()
+            .is_some_and(|never| never.contains(&path))
+        {
+            return Classified::Skipped;
+        }
+        // Read at most once per directory: macOS needs it for the dataless
+        // flag, and the device check below wherever the mount table cannot
+        // be read, which on macOS is everywhere.
+        let directory_cell = std::cell::OnceCell::new();
+        let directory = || directory_cell.get_or_init(|| entry.directory());
+        if EVICTED_IS_KNOWN
+            && directory()
+                .as_ref()
+                .is_ok_and(|directory| directory.evicted)
+        {
+            return Classified::Skipped;
+        }
+        // Memoized: the subtree a narrower scan already measured is taken
+        // whole, before any volume rule, since it was measured under the same
+        // rules.
+        if let Some(known) = &self.known
+            && known.path == path
+        {
+            let mut tree = (*known.tree).clone();
+            tree.name = entry.take_name();
+            return Classified::Entry(tree);
+        }
+        if self.options.one_filesystem
+            && let Some(foreign) = self.foreign_mounts.get()
+        {
+            // Checked by path before anything reads the directory, so an
+            // automount point is never triggered.
+            if foreign.contains(&path) {
+                return Classified::Skipped;
+            }
+        } else if self.options.one_filesystem {
+            match (directory(), self.root_device(&path)) {
+                (Ok(directory), Some(root_device))
+                    if directory.device != root_device =>
+                {
+                    return Classified::Skipped;
+                }
+                (Err(error), _) => {
+                    self.progress.record_error(&path, error);
+                    return Classified::Skipped;
+                }
+                _ => {}
+            }
+        }
+        Classified::Subdirectory {
+            path,
+            name: entry.take_name(),
         }
     }
 
@@ -353,13 +403,12 @@ impl WalkContext {
             // `du` reports as a handful of bytes or nothing at all.
             return match fs::symlink_metadata(path) {
                 Ok(meta) => {
-                    let size = measure(&meta, self.options.apparent_size);
-                    self.progress.count_file(size);
+                    let facts = Facts::of(&meta, self.options.apparent_size);
                     Classified::Entry(leaf_node(
                         name,
                         NodeKind::Symlink,
-                        size,
-                        &meta,
+                        &facts,
+                        facts.shared,
                     ))
                 }
                 Err(error) => {
@@ -381,34 +430,243 @@ impl WalkContext {
         };
 
         if meta.is_dir() {
-            if let Some(key) = file_identity(&meta)
+            // A link into an evicted cloud folder is left alone for the
+            // same reason the folder itself is.
+            if is_dataless(&meta) {
+                return Classified::Skipped;
+            }
+            if let Some(key) = identity_of(path, &meta)
                 && !lock(&self.visited_dirs).insert(key)
             {
                 return Classified::Skipped;
             }
-            self.progress.count_dir();
-            return Classified::Subdirectory(path.to_path_buf());
+            return Classified::Subdirectory {
+                path: path.to_path_buf(),
+                name,
+            };
         }
 
-        self.leaf(name, kind_of(&meta, meta.file_type()), &meta)
+        let mut facts = Facts::of(&meta, self.options.apparent_size);
+        // What the link leads to, so a file that is also reached directly is
+        // charged once.
+        facts.identity = identity_of(path, &meta);
+        self.leaf(name, kind_of(&meta, meta.file_type()), &facts)
     }
 
     fn leaf(
         &self,
         name: Box<str>,
         kind: NodeKind,
-        meta: &Metadata,
+        facts: &Facts,
     ) -> Classified {
-        let size = measure(meta, self.options.apparent_size);
-        self.progress.count_file(size);
-        Classified::Entry(leaf_node(name, kind, size, meta))
+        // A followed link reaches a file a second way, whatever its link
+        // count says.
+        let track = self.options.follow_links || facts.shared;
+        Classified::Entry(leaf_node(name, kind, facts, track))
     }
+}
+
+/// What the walk reads about one directory entry.
+///
+/// `std::fs::DirEntry` everywhere but Windows. There the standard listing
+/// has neither the allocated size nor a file id, so measuring like `du`
+/// would cost an open per file; [`crate::windows`] lists a directory with
+/// both instead.
+trait Listed {
+    /// The entry's path inside `dir`, the directory it was listed from.
+    fn entry_path(&self, dir: &Path) -> PathBuf;
+    /// Non-UTF-8 names are lossy for display. The scan still measures them
+    /// correctly; only the reported name is approximate.
+    fn name(&self) -> &str;
+    /// The name, moved out for the tree: after this `name` is empty, and
+    /// `entry_path`, which must open the real file, is off limits.
+    fn take_name(&mut self) -> Box<str>;
+    fn listing(&self) -> io::Result<Listing>;
+    /// Size, identity and age of a leaf.
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts>;
+    /// What a directory is, read before the walk enters it.
+    fn directory(&self) -> io::Result<Directory>;
+    /// Hidden by an attribute rather than by a leading dot: on Windows,
+    /// where the listing carries it, so `AppData` is hidden as Explorer
+    /// hides it. macOS's `UF_HIDDEN` would cost a stat per entry.
+    fn hidden(&self) -> bool {
+        false
+    }
+}
+
+/// Whether [`Directory::evicted`] can ever be true here, so a platform that
+/// cannot say never pays for asking.
+const EVICTED_IS_KNOWN: bool = cfg!(any(target_os = "macos", windows));
+
+/// What the walk needs to know about a directory before entering it.
+struct Directory {
+    /// The device it is on, for staying on one volume when the mount table
+    /// cannot be read.
+    device: u64,
+    /// Its contents live only in the cloud (iCloud Drive or a File Provider
+    /// on macOS, `OneDrive` or another cloud files provider on Windows).
+    /// Listing it would make the provider fetch them, so a disk scan must
+    /// not; it holds no local blocks, so skipping it loses nothing.
+    evicted: bool,
+}
+
+/// What an entry is, as far as the walk is concerned.
+enum Listing {
+    Directory,
+    Symlink,
+    Leaf(NodeKind),
+}
+
+/// What a leaf contributes.
+struct Facts {
+    size: u64,
+    identity: Option<(u64, u64)>,
+    modified: i64,
+    /// The file may have another name the walk could meet: its identity is
+    /// worth keeping for hardlink de-duplication.
+    shared: bool,
+}
+
+impl Facts {
+    fn of(meta: &Metadata, apparent_size: bool) -> Self {
+        Self {
+            size: measure(meta, apparent_size),
+            identity: file_identity(meta),
+            modified: modified_seconds(meta),
+            shared: shares_inode(meta),
+        }
+    }
+}
+
+/// A standard directory entry with its name decoded once, up front.
+#[cfg(not(windows))]
+struct Named {
+    entry: DirEntry,
+    name: Box<str>,
+}
+
+#[cfg(not(windows))]
+impl Listed for Named {
+    fn entry_path(&self, _dir: &Path) -> PathBuf {
+        self.entry.path()
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        std::mem::take(&mut self.name)
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        let file_type = self.entry.file_type()?;
+        Ok(if file_type.is_symlink() {
+            Listing::Symlink
+        } else if file_type.is_dir() {
+            Listing::Directory
+        } else if file_type.is_file() {
+            Listing::Leaf(NodeKind::File)
+        } else {
+            Listing::Leaf(NodeKind::Other)
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        self.entry
+            .metadata()
+            .map(|meta| Facts::of(&meta, apparent_size))
+    }
+
+    fn directory(&self) -> io::Result<Directory> {
+        self.entry.metadata().map(|meta| Directory {
+            device: device_of(&meta),
+            evicted: is_dataless(&meta),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Listed for crate::windows::Entry {
+    fn entry_path(&self, dir: &Path) -> PathBuf {
+        self.path(dir)
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        self.take_name()
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        Ok(match self.kind() {
+            crate::windows::Kind::Link => Listing::Symlink,
+            crate::windows::Kind::Directory => Listing::Directory,
+            crate::windows::Kind::File => Listing::Leaf(NodeKind::File),
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        Ok(Facts {
+            size: if apparent_size {
+                self.apparent()
+            } else {
+                self.allocated()
+            },
+            identity: self.identity(),
+            modified: self.modified(),
+            // The listing has no link count; a file id is free here, so
+            // every file keeps one.
+            shared: true,
+        })
+    }
+
+    /// The device is never consulted: see
+    /// [`crate::space::foreign_mounts_for`]. The same answer as
+    /// [`device_of`], so the two could only ever agree.
+    fn directory(&self) -> io::Result<Directory> {
+        Ok(Directory {
+            device: 0,
+            evicted: self.evicted(),
+        })
+    }
+
+    fn hidden(&self) -> bool {
+        self.hidden()
+    }
+}
+
+/// List a directory the way [`Listed`] describes.
+#[cfg(not(windows))]
+fn list(
+    path: &Path,
+    _volume: Option<u64>,
+) -> io::Result<impl Iterator<Item = io::Result<Named>>> {
+    Ok(fs::read_dir(path)?.map(|entry| {
+        entry.map(|entry| Named {
+            name: entry.file_name().into_string().map_or_else(
+                |raw| raw.to_string_lossy().into(),
+                String::into_boxed_str,
+            ),
+            entry,
+        })
+    }))
+}
+
+#[cfg(windows)]
+fn list(
+    path: &Path,
+    volume: Option<u64>,
+) -> io::Result<crate::windows::ReadDir> {
+    crate::windows::read_dir(path, volume)
 }
 
 /// What a directory entry turned out to be.
 enum Classified {
     /// Descend into this directory on a new task.
-    Subdirectory(PathBuf),
+    Subdirectory { path: PathBuf, name: Box<str> },
     /// A leaf that contributes size.
     Entry(Node),
     /// Filtered out, unreadable, or a symlink we chose not to follow.
@@ -423,15 +681,25 @@ struct PendingDir {
     /// Starts at 1 for the directory itself; one more per subdirectory task.
     /// When it reaches zero the directory is complete.
     pending: AtomicUsize,
-    /// Files found directly here, and finished subdirectories handed back up.
-    children: Mutex<Vec<Node>>,
+    /// The node so far, moved out whole once the directory is complete.
+    partial: Mutex<Partial>,
     read_error: AtomicBool,
     depth: usize,
+}
+
+/// What a directory's node is made of before it is built: the name the
+/// listing gave it, and the files found directly in it plus the finished
+/// subdirectories handed back up.
+#[derive(Debug, Default)]
+struct Partial {
+    name: Box<str>,
+    children: Vec<Node>,
 }
 
 impl PendingDir {
     const fn new(
         path: PathBuf,
+        name: Box<str>,
         parent: Option<Arc<Self>>,
         depth: usize,
     ) -> Self {
@@ -439,21 +707,25 @@ impl PendingDir {
             path,
             parent,
             pending: AtomicUsize::new(1),
-            children: Mutex::new(Vec::new()),
+            partial: Mutex::new(Partial {
+                name,
+                children: Vec::new(),
+            }),
             read_error: AtomicBool::new(false),
             depth,
         }
     }
 
     /// Turn a completed directory into a node. Only called when `pending` has
-    /// reached zero, so every child is already in `self.children`.
+    /// reached zero, so every child is already in `self.partial`.
     ///
     /// `bytes` and `own_bytes` are left at zero on purpose: the walk cannot
     /// know the aggregate, and [`crate::tree::aggregate`] derives both from the
     /// children once every child is present.
     fn build(&self) -> Node {
+        let partial = std::mem::take(&mut *lock(&self.partial));
         Node {
-            name: file_name(&self.path),
+            name: partial.name,
             kind: NodeKind::Directory,
             bytes: 0,
             own_bytes: 0,
@@ -465,7 +737,7 @@ impl PendingDir {
             modified: 0,
             category: crate::classify::Category::Other,
             reclaim: None,
-            children: std::mem::take(&mut *lock(&self.children)),
+            children: partial.children,
         }
     }
 }
@@ -478,21 +750,73 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             format!("{} is not a directory", root.display()),
         ));
     }
+    let resolved = root.canonicalize().ok();
+    let canonical = resolved.as_deref().unwrap_or(root);
+    let mut never = crate::space::never_scanned(root, canonical);
+    // Hidden-entry and depth filters can leave an alias as the only route
+    // to files. Keep every mount view when either filter is active.
+    if context.options.include_hidden && context.options.max_depth.is_none() {
+        never.extend(crate::space::repeated_mounts_for(
+            root,
+            canonical,
+            context.options.one_filesystem,
+        ));
+    }
+    let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
-        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        if let Some(foreign) = crate::space::foreign_mounts_for(&root) {
+        if let Some(foreign) = crate::space::foreign_mounts_for(canonical) {
             let _ = context.foreign_mounts.set(foreign.into_iter().collect());
         }
     }
+    // Reading the file table is far faster than any walk, where the
+    // volume allows it. On the walk's pool too: see `WALK_POOL`.
+    #[cfg(windows)]
+    {
+        let progress = &context.progress;
+        let read = WALK_POOL.install(|| {
+            crate::mft::scan(root, canonical, &context.options, progress)
+        });
+        if let Some(node) = read {
+            let node = node?;
+            // Cancelled after the reader's last check: the rescan that
+            // asked is waiting, and this tree is not wanted.
+            if progress.is_cancelled() {
+                return Err(crate::mft::cancelled());
+            }
+            let node = finish_tree(node, &context.options);
+            // The reader counted every file on the volume; the tree may
+            // hold fewer.
+            progress.settle(node.files, node.dirs, node.bytes);
+            return Ok(node);
+        }
+        // The reader gave up, or never started: the walk counts from nothing.
+        progress.settle(0, 0, 0);
+        // Asking once instead of per directory; see `walk_volume` for
+        // when a walk that does not follow links cannot leave the volume.
+        // Only on a resolved root: a mapped share's letter kept as typed
+        // looks like a local drive.
+        if !context.options.follow_links
+            && let Some(resolved) = &resolved
+            && let Some(serial) = crate::windows::walk_volume(resolved)
+        {
+            let _ = context.volume.set(serial);
+        }
+    }
     if context.options.follow_links
-        && let Some(key) = file_identity(&root_meta)
+        && let Some(key) = identity_of(root, &root_meta)
     {
         lock(&context.visited_dirs).insert(key);
     }
 
-    let root_dir = Arc::new(PendingDir::new(root.to_path_buf(), None, 0));
-    rayon::scope(|scope| walk(scope, &root_dir, context));
+    let root_dir = Arc::new(PendingDir::new(
+        root.to_path_buf(),
+        file_name(root),
+        None,
+        0,
+    ));
+    let context: &WalkContext = context;
+    WALK_POOL.install(|| rayon::scope(|scope| walk(scope, &root_dir, context)));
 
     let node = lock(&context.root).take();
     let node = node.ok_or_else(|| {
@@ -501,32 +825,101 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     Ok(finish_tree(node, &context.options))
 }
 
+/// The walk's workers, and the file table reader's. Listing directories
+/// contends in the file system, and past some number of threads more of
+/// them only queue: on Windows a home directory of 3.4 million files
+/// walked in 6.5 s on 16 threads and 8.1 s on all 24. That cap was
+/// measured on one 24-thread NTFS laptop; another disk or CPU may want
+/// another. Elsewhere the default count. A pool of its own on every
+/// platform all the same: work the UI hands the global pool, such as
+/// re-ranking a tree, must not queue behind a scan's blocking reads.
+static WALK_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let threads = if cfg!(windows) {
+        rayon::current_num_threads().min(16)
+    } else {
+        rayon::current_num_threads()
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("disktree-walk-{index}"))
+        .build()
+        .expect("a thread pool")
+});
+
+/// Entries counted before the shared progress counters are touched. Every
+/// worker adding to the same counters per entry keeps one cache line
+/// bouncing between cores; per directory, or per this many entries in a
+/// wide one so the meter still moves, is invisible to a reader.
+const TALLY_EVERY: u64 = 1024;
+
+/// What one directory's listing has found so far, for the progress meter.
+#[derive(Default)]
+struct Tally {
+    files: u64,
+    dirs: u64,
+    bytes: u64,
+}
+
+impl Tally {
+    const fn add(&mut self, node: &Node) {
+        if node.is_dir() {
+            // A subtree taken whole from an earlier scan.
+            self.files += node.files;
+            self.dirs += node.dirs;
+        } else {
+            // A link counts as a file on the meter, as it always has,
+            // though the tree does not count it.
+            self.files += 1;
+        }
+        self.bytes += node.bytes;
+    }
+
+    fn flush(&mut self, progress: &ScanProgress) {
+        progress.add(self.files, self.dirs, self.bytes);
+        *self = Self::default();
+    }
+}
+
 /// Read one directory, spawn a task per subdirectory, then report completion.
 ///
 /// Flat tasks inside the scope: the worker stack never grows with tree depth.
-fn walk(scope: &Scope<'_>, dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
+fn walk<'scope>(
+    scope: &Scope<'scope>,
+    dir: &Arc<PendingDir>,
+    context: &'scope WalkContext,
+) {
     let mut subdirs: Vec<Arc<PendingDir>> = Vec::new();
     let mut leaves: Vec<Node> = Vec::new();
+    let mut tally = Tally::default();
 
-    match fs::read_dir(&dir.path) {
+    match list(&dir.path, context.volume.get().copied()) {
         Ok(entries) => {
             for entry in entries {
                 if context.cancelled() {
                     break;
                 }
                 match entry {
-                    Ok(entry) => match context.classify(&entry) {
-                        Classified::Subdirectory(path) => {
-                            let child = Arc::new(PendingDir::new(
-                                path,
-                                Some(Arc::clone(dir)),
-                                dir.depth + 1,
-                            ));
-                            subdirs.push(child);
+                    Ok(mut entry) => {
+                        match context.classify(&dir.path, &mut entry) {
+                            Classified::Subdirectory { path, name } => {
+                                tally.dirs += 1;
+                                subdirs.push(Arc::new(PendingDir::new(
+                                    path,
+                                    name,
+                                    Some(Arc::clone(dir)),
+                                    dir.depth + 1,
+                                )));
+                            }
+                            Classified::Entry(node) => {
+                                tally.add(&node);
+                                leaves.push(node);
+                            }
+                            Classified::Skipped => {}
                         }
-                        Classified::Entry(node) => leaves.push(node),
-                        Classified::Skipped => {}
-                    },
+                        if tally.files + tally.dirs >= TALLY_EVERY {
+                            tally.flush(&context.progress);
+                        }
+                    }
                     Err(error) => {
                         context.progress.record_error(&dir.path, &error);
                     }
@@ -538,6 +931,7 @@ fn walk(scope: &Scope<'_>, dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
             dir.read_error.store(true, Ordering::Relaxed);
         }
     }
+    tally.flush(&context.progress);
 
     // A depth-limited scan still measures what is directly in the directory,
     // it just does not descend further.
@@ -545,20 +939,30 @@ fn walk(scope: &Scope<'_>, dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
         .options
         .max_depth
         .is_none_or(|max_depth| dir.depth < max_depth);
+    // Sized once for the leaves and every subdirectory to come, before any
+    // subdirectory task can push its node: otherwise that first push
+    // doubles a list just sized to the leaves, and the slack stays in the
+    // finished tree. The leaves are copied, not moved: the list they grew
+    // in carries up to twice their size in slack, and moving it in whole
+    // made a home directory walk a second slower (measured, 5 interleaved
+    // pairs).
+    let spawned = if descend { subdirs.len() } else { 0 };
+    {
+        let mut partial = lock(&dir.partial);
+        partial.children.reserve_exact(leaves.len() + spawned);
+        partial.children.extend(leaves);
+    }
     if descend {
         for subdir in subdirs {
             if context.cancelled() {
                 break;
             }
             dir.pending.fetch_add(1, Ordering::AcqRel);
-            let subdir = Arc::clone(&subdir);
-            let context = Arc::clone(context);
-            scope.spawn(move |scope| walk(scope, &subdir, &context));
+            scope.spawn(move |scope| walk(scope, &subdir, context));
         }
     }
-    lock(&dir.children).extend(leaves);
 
-    signal_done(&Arc::clone(dir), context);
+    signal_done(dir, context);
 }
 
 /// Report that one task for `dir` is done: either its own scan, or one of its
@@ -567,55 +971,48 @@ fn walk(scope: &Scope<'_>, dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
 /// This is the whole reason for the `+1` sentinel: a directory is only built
 /// once its own scan *and* every subdirectory task has finished, no matter
 /// which of them lands last.
-fn signal_done(dir: &Arc<PendingDir>, context: &Arc<WalkContext>) {
+fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
     if dir.pending.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
     }
     let node = dir.build();
-    let Some(parent) = dir.parent.clone() else {
+    let Some(parent) = &dir.parent else {
         *lock(&context.root) = Some(node);
         return;
     };
-    lock(&parent.children).push(node);
-    signal_done(&parent, context);
+    lock(&parent.partial).children.push(node);
+    signal_done(parent, context);
 }
 
-/// Charge a hardlinked file once, then derive every aggregate from the result.
-///
-/// Zeroing `own_bytes` rather than `bytes` is deliberate:
-/// [`crate::tree::aggregate`] recomputes totals from the direct contents, so a
-/// patched `bytes` would be overwritten.
+/// Charge a hardlinked file once, derive every aggregate from the result,
+/// then classify. On the walk's pool: the UI's own work on the global pool
+/// must not queue behind a scan finishing.
 fn finish_tree(mut node: Node, options: &ScanOptions) -> Node {
-    if options.dedup_hardlinks {
-        let mut seen = FxHashSet::default();
-        mark_duplicate_hardlinks(&mut node, &mut seen);
-    }
-    aggregate(&mut node, options.metric);
-    crate::classify::classify(&mut node);
+    WALK_POOL.install(|| {
+        if options.dedup_hardlinks {
+            aggregate_deduped(&mut node, options.metric, &Seen::new());
+        } else {
+            aggregate(&mut node, options.metric);
+        }
+        crate::classify::classify(&mut node);
+    });
     node
 }
 
-fn mark_duplicate_hardlinks(node: &mut Node, seen: &mut FxHashSet<(u64, u64)>) {
-    if !node.is_dir() {
-        if node.inode.is_some_and(|key| !seen.insert(key)) {
-            node.own_bytes = 0;
-        }
-        return;
-    }
-    for child in &mut node.children {
-        mark_duplicate_hardlinks(child, seen);
-    }
-}
-
+/// A leaf. Its identity is kept only when `track` says the walk could meet
+/// the same file again: a hardlink de-duplication set of every file on a
+/// disk is millions of entries, nearly all for files with one name.
 fn leaf_node(
     name: Box<str>,
     kind: NodeKind,
-    size: u64,
-    meta: &Metadata,
+    facts: &Facts,
+    track: bool,
 ) -> Node {
-    let mut node = Node::entry(name, kind, size);
-    node.inode = file_identity(meta);
-    node.modified = modified_seconds(meta);
+    let mut node = Node::entry(name, kind, facts.size);
+    if track {
+        node.inode = facts.identity;
+    }
+    node.modified = facts.modified;
     node
 }
 
@@ -654,8 +1051,39 @@ fn allocated_bytes(meta: &Metadata) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
+const fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
     None
+}
+
+/// Whether a directory's contents are only in the cloud: an iCloud Drive or
+/// File Provider folder macOS has evicted. Listing one makes macOS fetch its
+/// entries from the server, so a disk scan must not; the folder holds no
+/// local blocks, so skipping it loses nothing a scan measures.
+///
+/// A `stat` or `lstat` carries the flag without touching the contents.
+#[cfg(target_os = "macos")]
+fn is_dataless(meta: &Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt as _;
+    // `SF_DATALESS` from <sys/stat.h>; the libc crate does not name it.
+    const SF_DATALESS: u32 = 0x4000_0000;
+    meta.st_flags() & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn is_dataless(_meta: &Metadata) -> bool {
+    false
+}
+
+/// Whether the file has more than one name, so the walk can count it twice.
+#[cfg(unix)]
+fn shares_inode(meta: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+const fn shares_inode(_meta: &Metadata) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -665,13 +1093,15 @@ fn device_of(meta: &Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn device_of(_meta: &Metadata) -> u64 {
+const fn device_of(_meta: &Metadata) -> u64 {
     0
 }
 
 /// `(device, inode)`, or `None` where the platform does not expose them.
 /// Hardlink de-duplication and symlink loop detection both depend on this, so
-/// they are simply unavailable rather than silently wrong elsewhere.
+/// they are simply unavailable rather than silently wrong elsewhere. Windows
+/// has no file id in `Metadata` on stable Rust; its listing carries one
+/// instead (see [`crate::windows`]).
 #[allow(
     clippy::unnecessary_wraps,
     reason = "the Option is the non-Unix answer, so both arms must agree"
@@ -683,8 +1113,21 @@ fn file_identity(meta: &Metadata) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(unix))]
-fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
+const fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
     None
+}
+
+/// The identity of what `path` leads to, `meta` being its followed
+/// metadata: how a walk that follows links recognizes a directory it has
+/// entered before, and a file it has already charged.
+#[cfg(not(windows))]
+fn identity_of(_path: &Path, meta: &Metadata) -> Option<(u64, u64)> {
+    file_identity(meta)
+}
+
+#[cfg(windows)]
+fn identity_of(path: &Path, _meta: &Metadata) -> Option<(u64, u64)> {
+    crate::windows::identity(path)
 }
 
 fn kind_of(meta: &Metadata, file_type: fs::FileType) -> NodeKind {
@@ -701,7 +1144,7 @@ fn kind_of(meta: &Metadata, file_type: fs::FileType) -> NodeKind {
 
 /// The display name of a scanned root: its final component, or the path itself
 /// for `/`.
-fn file_name(path: &Path) -> Box<str> {
+pub(crate) fn file_name(path: &Path) -> Box<str> {
     path.file_name()
         .map_or_else(
             || path.to_string_lossy().into_owned(),
@@ -712,7 +1155,7 @@ fn file_name(path: &Path) -> Box<str> {
 
 /// A poisoned lock means another task panicked; the data is still a valid tree
 /// prefix, and refusing to read it would turn one panic into two.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -838,6 +1281,45 @@ mod tests {
         assert_eq!(without.bytes, 100);
     }
 
+    /// Explorer's hidden attribute counts as hidden, as `AppData` has it.
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_attribute_hides_an_entry_on_windows() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        write(root, "AppData/blob.bin", 900);
+        write(root, "visible.bin", 100);
+        let marked = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(root.join("AppData"))
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(marked, "attrib +h");
+
+        let without = scan_dir(
+            root,
+            &ScanOptions {
+                include_hidden: false,
+                ..options()
+            },
+        );
+        assert_eq!(without.bytes, 100);
+    }
+
+    /// A link to a directory: a symbolic link on Unix, a junction on
+    /// Windows, which needs no privilege to make. `false` if it could not be
+    /// made.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            crate::windows::make_junction(link, target)
+        }
+    }
+
     #[test]
     fn symlinks_are_not_followed_by_default() {
         let temp = TempDir::new().expect("tempdir");
@@ -845,8 +1327,7 @@ mod tests {
         write(outside.path(), "elsewhere.bin", 5000);
         let root = temp.path();
         write(root, "real.bin", 100);
-        std::os::unix::fs::symlink(outside.path(), root.join("link"))
-            .expect("symlink");
+        assert!(link_dir(outside.path(), &root.join("link")), "a link");
 
         let tree = scan_dir(root, &options());
         // Only the real file's bytes; the link itself holds just its target
@@ -862,8 +1343,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path();
         write(root, "sub/leaf.bin", 42);
-        std::os::unix::fs::symlink(root, root.join("sub/loop"))
-            .expect("symlink");
+        assert!(link_dir(root, &root.join("sub/loop")), "a link");
 
         let tree = scan_dir(
             root,
@@ -873,6 +1353,29 @@ mod tests {
             },
         );
         assert_eq!(tree.bytes, 42);
+    }
+
+    /// Disk usage is what the volume allocated, not the length: whole
+    /// blocks, so it covers the data and ends on a block boundary.
+    #[test]
+    fn disk_usage_is_whole_allocation_units() {
+        let temp = TempDir::new().expect("tempdir");
+        // Noise, so a compressing filesystem cannot store it in less.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let noise: Vec<u8> = (0..100_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        fs::write(temp.path().join("data.bin"), noise).expect("write");
+        let tree = scan_dir(temp.path(), &ScanOptions::default());
+        assert!(tree.bytes >= 100_000, "{}", tree.bytes);
+        assert_eq!(tree.bytes % 512, 0, "{}", tree.bytes);
+        let apparent = scan_dir(temp.path(), &options());
+        assert_eq!(apparent.bytes, 100_000);
     }
 
     #[test]
@@ -927,6 +1430,7 @@ mod tests {
         assert_eq!(by_files.children[0].files, 5);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_recorded_not_fatal() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -948,8 +1452,10 @@ mod tests {
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
+            volume: OnceLock::new(),
         });
         let tree = scan_blocking(root, &context).expect("scan still succeeds");
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));
@@ -1040,7 +1546,7 @@ mod tests {
     #[test]
     #[ignore = "walks the whole disk"]
     fn whole_disk_smoke() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        let home = std::env::home_dir().expect("a home directory");
         let root = crate::space::volume_root_for(&home).expect("a volume root");
         let started = std::time::Instant::now();
         let tree = scan(&root, ScanOptions::default()).expect("scan");

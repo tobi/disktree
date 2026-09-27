@@ -19,10 +19,11 @@ env:
 
 jobs:
   release:
-    name: Build and publish
-    # The oldest supported runner: its glibc is what the binary needs at
-    # least, so building here runs on the most systems.
-    runs-on: ubuntu-22.04
+    name: Check the tag and draft the release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -30,8 +31,12 @@ jobs:
 
       - name: Version
         id: version
+        # Through the environment, not spliced into the script: a tag typed
+        # into the dispatch form is text, never shell.
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$TAG"
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "$tag" != "v$version" ]; then
             echo "tag $tag does not match Cargo.toml version $version" >&2
@@ -39,6 +44,34 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # A draft, so nobody downloads from a release still missing half its
+      # builds; `publish` below makes it public once every build is in.
+      - name: Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag \
+              --title "disktree ${TAG#v}" --generate-notes
+          fi
+
+  linux:
+    name: Build (Linux ${{ matrix.arch }})
+    needs: release
+    strategy:
+      matrix:
+        include:
+          # The oldest supported runners: their glibc is what the binary
+          # needs at least, so building there runs on the most systems.
+          - { runner: ubuntu-22.04, arch: x86_64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: System libraries
         run: |
@@ -62,27 +95,176 @@ jobs:
 
       - name: Package
         id: package
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          name="disktree-${{ steps.version.outputs.version }}-x86_64-linux"
+          name="disktree-$VERSION-$ARCH-linux"
           mkdir -p "dist/$name"
           cp target/release/disktree "dist/$name/"
           strip "dist/$name/disktree"
           cp packaging/install.sh packaging/disktree.desktop.in \
              assets/disktree.svg README.md LICENSE "dist/$name/"
-          echo "${{ steps.version.outputs.version }}" > "dist/$name/VERSION"
+          echo "$VERSION" > "dist/$name/VERSION"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+
+  macos:
+    name: Build (macOS ${{ matrix.arch }})
+    needs: release
+    strategy:
+      matrix:
+        include:
+          # `xtask bundle` names the zip after the machine it runs on, so
+          # each architecture builds on its own.
+          - { runner: macos-15, arch: aarch64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Signing and notarizing happen only when the repository has these
+      # secrets; without them the app is signed ad hoc, and a downloaded
+      # copy needs "Open Anyway" in System Settings once.
+      #   MACOS_CERTIFICATE           base64 of the Developer ID .p12
+      #   MACOS_CERTIFICATE_PASSWORD  its password
+      #   MACOS_SIGN_IDENTITY         "Developer ID Application: Name (TEAMID)"
+      #   NOTARY_KEY_P8               base64 of an App Store Connect API key
+      #   NOTARY_KEY_ID, NOTARY_ISSUER  that key's ID and issuer
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+      NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+      NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo xtask test
+
+      # A keychain of its own for the certificate, deleted with the runner.
+      - name: Signing certificate
+        if: env.MACOS_CERTIFICATE != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(uuidgen)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Bundle
+        run: |
+          args=()
+          if [ -n "$MACOS_CERTIFICATE" ]; then
+            args+=(--sign "$MACOS_SIGN_IDENTITY")
+            if [ -n "$NOTARY_KEY_P8" ]; then
+              echo "$NOTARY_KEY_P8" | base64 --decode \
+                > "$RUNNER_TEMP/AuthKey.p8"
+              export NOTARY_KEY="$RUNNER_TEMP/AuthKey.p8"
+              args+=(--notarize)
+            fi
+          fi
+          cargo xtask bundle "${args[@]}"
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          VERSION: ${{ needs.release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          zip="target/bundle/disktree-$VERSION-$ARCH-macos.zip"
+          (cd "$(dirname "$zip")" && shasum -a 256 "$(basename "$zip")" \
+            > "$(basename "$zip").sha256")
+          gh release upload "$TAG" "$zip" "$zip.sha256" --clobber
+
+  windows:
+    name: Build (Windows ${{ matrix.arch }})
+    needs: release
+    strategy:
+      matrix:
+        include:
+          - { runner: windows-2025, arch: x86_64 }
+          - { runner: windows-11-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The C runtime linked in, so disktree.exe also runs where the Visual
+      # C++ runtime was never installed. For the tests too, so both steps
+      # share one build.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo xtask test
+
+      - name: Build
+        run: cargo build --release --locked -p disktree-app
+
+      - name: Package
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          $name = "disktree-$env:VERSION-$env:ARCH-windows"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/disktree.exe, README.md, LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          # The format `sha256sum -c` reads, with a Unix line ending.
+          [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
+          "archive=dist/$name.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+
+  publish:
+    name: Publish
+    needs: [release, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    steps:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
-          else
-            gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
-              --title "disktree ${TAG#v}" --generate-notes
-          fi
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

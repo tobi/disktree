@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by `cargo xtask bundle`, which fills in @VERSION@.
+     The bundle identifier is what macOS keys Full Disk Access and folder
+     permissions to: changing it makes every user grant them again. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.tobi.disktree</string>
+	<key>CFBundleName</key>
+	<string>disktree</string>
+	<key>CFBundleDisplayName</key>
+	<string>disktree</string>
+	<key>CFBundleExecutable</key>
+	<string>disktree</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License</string>
+	<!-- Shown in the prompts macOS raises the first time a scan reaches
+	     each of these. Full Disk Access has no prompt and no string: it is
+	     granted in System Settings, which the app links to. -->
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>disktree measures the Desktop folder to show what is using your disk. It reads sizes and names only.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>disktree measures the Documents folder to show what is using your disk. It reads sizes and names only.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>disktree measures the Downloads folder to show what is using your disk. It reads sizes and names only.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>disktree measures removable disks you scan to show what is using them. It reads sizes and names only.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>disktree measures network disks you scan to show what is using them. It reads sizes and names only.</string>
+</dict>
+</plist>

@@ -5,6 +5,14 @@
 //! live free-space meter. Marking is non-destructive until the review screen
 //! is confirmed.
 
+// A window, not a console program: on Windows, opening it from Explorer or
+// the Start menu should not bring a console window along. `main` attaches to
+// the console of a terminal it was started from, so `--help` and errors still
+// reach one. Ignored elsewhere.
+#![windows_subsystem = "windows"]
+
+mod app_menu;
+mod appearance;
 mod git;
 mod marks;
 mod palette;
@@ -17,6 +25,12 @@ mod views;
 mod widgets;
 
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::{
+    io::IsTerminal as _,
+    os::unix::process::CommandExt as _,
+    process::{Command, Stdio},
+};
 
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
@@ -56,7 +70,40 @@ options:
 ";
 
 fn main() -> Result<()> {
-    let args = parse_args()?;
+    #[cfg(windows)]
+    console::attach();
+    let outcome = run();
+    #[cfg(windows)]
+    console::detach();
+    outcome
+}
+
+fn run() -> Result<()> {
+    let args = parse_args(std::env::args_os().skip(1))?;
+
+    // When the app executable is reached through the command-line symlink,
+    // cmux sends SIGTERM to its foreground process group as AppKit takes
+    // focus. Spawn once into a separate group before AppKit starts. Restrict
+    // this to interactive cmux sessions so scripts retain normal foreground
+    // lifetime; the marker prevents the child from spawning recursively.
+    #[cfg(target_os = "macos")]
+    if std::io::stdin().is_terminal()
+        && std::env::var_os("CMUX_SURFACE_ID").is_some()
+        && std::env::var_os("DISKTREE_CMUX_DETACHED").is_none()
+    {
+        Command::new(std::env::current_exe().context("find disktree")?)
+            .args(std::env::args_os().skip(1))
+            .env("DISKTREE_CMUX_DETACHED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // Zero makes the child the leader of a new process group.
+            .process_group(0)
+            .spawn()
+            .context("start disktree")?;
+        return Ok(());
+    }
+
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
@@ -65,6 +112,12 @@ fn main() -> Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
+            app_menu::install(cx);
+            let home = std::env::home_dir();
+            let native_look = appearance::follows_system(home.as_deref());
+            if native_look {
+                appearance::apply(cx.window_appearance(), cx);
+            }
             let options = args.options.clone();
             let root_for_app = root.clone();
             let window = cx
@@ -82,21 +135,28 @@ fn main() -> Result<()> {
                                     "disktree · {}",
                                     marks::display_path(
                                         &title_root,
-                                        std::env::var_os("HOME")
-                                            .map(PathBuf::from)
-                                            .as_deref(),
+                                        home.as_deref(),
                                     )
                                 )
                                 .into(),
                             ),
                             ..Default::default()
                         }),
+                        // Wayland app id. Hyprland reports it as the window
+                        // class, and the desktop entry's StartupWMClass and
+                        // the documented window rule both match `disktree`.
+                        // Left unset, the class is empty and that rule never
+                        // matches.
+                        app_id: Some("disktree".to_owned()),
                         // Below this the treemap stops being readable, so ask
                         // the compositor not to go there.
                         window_min_size: Some(size(px(900.), px(600.))),
                         ..Default::default()
                     },
-                    move |_, cx| {
+                    move |window, cx| {
+                        if native_look {
+                            appearance::follow(window);
+                        }
                         cx.new(|cx| {
                             Disktree::new(
                                 root_for_app.clone(),
@@ -120,15 +180,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_args() -> Result<Args> {
+/// Read the command line, program name already skipped.
+fn parse_args(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions::default();
     let mut depth = 3_u32;
     let mut disk = false;
-    let mut args = std::env::args().skip(1);
+    // `std::env::args` panics on a name that is not Unicode, and a path is
+    // any name: a restart as administrator hands the root back exactly as
+    // it was, so the caller passes `args_os`.
+    let text = |value: Option<std::ffi::OsString>, need: &str| {
+        value
+            .and_then(|value| value.into_string().ok())
+            .with_context(|| need.to_owned())
+    };
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        match arg.to_str().unwrap_or_default() {
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -142,7 +212,7 @@ fn parse_args() -> Result<Args> {
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
             "-D" | "--disk" => disk = true,
             "-d" | "--depth" => {
-                let value = args.next().context("--depth needs a number")?;
+                let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
                 anyhow::ensure!(
                     (1..=6).contains(&depth),
@@ -150,7 +220,7 @@ fn parse_args() -> Result<Args> {
                 );
             }
             "--metric" => {
-                let value = args.next().context("--metric needs a value")?;
+                let value = text(args.next(), "--metric needs a value")?;
                 options.metric = match value.as_str() {
                     "files" => disktree_core::tree::Metric::Files,
                     "bytes" | "size" => disktree_core::tree::Metric::Bytes,
@@ -159,12 +229,15 @@ fn parse_args() -> Result<Args> {
                     ),
                 };
             }
+            // Launch Services added a process serial number when opening an
+            // app from Finder until OS X 10.9, and some launchers still do.
+            other if other.starts_with("-psn_") => {}
             other if other.starts_with('-') => {
                 anyhow::bail!("unknown option {other}\n\n{USAGE}");
             }
-            path => {
+            _ => {
                 anyhow::ensure!(root.is_none(), "only one path can be scanned");
-                root = Some(PathBuf::from(path));
+                root = Some(PathBuf::from(arg));
             }
         }
     }
@@ -173,21 +246,21 @@ fn parse_args() -> Result<Args> {
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::home_dir();
     let root = match root {
         _ if disk => home
             .as_deref()
             .and_then(disktree_core::space::volume_root_for)
             .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("no path given and HOME is not set")?,
+        None => home.context("no path given and no home directory")?,
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
-    // Canonical, so a later widening recognises this tree in the wider walk.
-    let root = root.canonicalize().unwrap_or(root);
+    // Canonical, so a later widening recognises this tree in the wider walk;
+    // through dunce, so Windows gets `C:\Users\…` rather than the `\\?\C:\…`
+    // form nothing else is written in.
+    let root = dunce::canonicalize(&root).unwrap_or(root);
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
@@ -197,4 +270,36 @@ fn parse_args() -> Result<Args> {
         options,
         depth: depth.clamp(1, 6),
     })
+}
+
+/// The console of the terminal disktree was started from, if any: a
+/// windowed program on Windows gets none of its own.
+#[cfg(windows)]
+mod console {
+    #![allow(
+        unsafe_code,
+        reason = "two Win32 calls that take no pointers to get wrong"
+    )]
+
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole,
+    };
+
+    /// Borrow the parent's console so printed text reaches it. Does
+    /// nothing when started from Explorer, which has none.
+    pub fn attach() {
+        // SAFETY: takes a process id by value, and failure only means
+        // there was no console to attach to.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+
+    /// Let go of it again, so the shell redraws its prompt.
+    pub fn detach() {
+        // SAFETY: no arguments; a process without a console is left as is.
+        unsafe {
+            FreeConsole();
+        }
+    }
 }

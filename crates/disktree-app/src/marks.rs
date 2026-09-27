@@ -107,13 +107,16 @@ pub fn is_hidden(path: &Path) -> bool {
 }
 
 /// Shorten a path for display: `~` for the home directory, and the path with
-/// the home prefix replaced when it is below it.
+/// the home prefix replaced when it is below it. The separator after `~` is
+/// the platform's, so Windows shows `~\AppData\Local`, not `~/AppData\Local`.
 pub fn display_path(path: &Path, home: Option<&Path>) -> String {
     match home
         .and_then(|home| path.strip_prefix(home).ok().map(|rest| (home, rest)))
     {
         Some((_, rest)) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some((_, rest)) => format!("~/{}", rest.display()),
+        Some((_, rest)) => {
+            format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+        }
         None => path.display().to_string(),
     }
 }
@@ -220,9 +223,10 @@ mod tests {
     #[test]
     fn display_path_shortens_the_home_prefix() {
         let home = Path::new("/home/tobi");
+        let separator = std::path::MAIN_SEPARATOR;
         assert_eq!(
-            display_path(Path::new("/home/tobi/.cache/npm"), Some(home)),
-            "~/.cache/npm"
+            display_path(&home.join(".cache").join("npm"), Some(home)),
+            format!("~{separator}.cache{separator}npm")
         );
         assert_eq!(display_path(home, Some(home)), "~");
         assert_eq!(display_path(Path::new("/var/log"), Some(home)), "/var/log");

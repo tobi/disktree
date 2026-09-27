@@ -1,10 +1,12 @@
-//! Check entry points for disktree.
+//! Check and packaging entry points for disktree.
 //!
 //! Each gate is reachable on its own (`cargo xtask fmt`) and through the
 //! aggregate CI runs (`cargo xtask lint`), mirroring how omatrack exposes every
 //! linter both as a build target and as a labelled test. `lint` never fixes
 //! anything: it reports the diff and fails, so a red local run is the same
 //! signal CI gives.
+
+mod bundle;
 
 use std::process::{Command, ExitCode, Stdio};
 
@@ -18,6 +20,10 @@ tasks:
   clippy    clippy --workspace --all-targets -- -D warnings
   test      cargo test --workspace
   ci        lint, then test
+  bundle    macOS: target/bundle/disktree.app and its zip
+              --sign IDENTITY   sign with a Developer ID (default: ad hoc)
+              --notarize        notarize and staple; needs NOTARY_PROFILE, or
+                                NOTARY_KEY, NOTARY_KEY_ID and NOTARY_ISSUER
 ";
 
 fn main() -> ExitCode {
@@ -31,6 +37,7 @@ fn main() -> ExitCode {
         "clippy" => clippy(),
         "test" => test(),
         "ci" => fmt(false).and_then(|()| clippy()).and_then(|()| test()),
+        "bundle" => bundle::bundle(&args[1..]),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

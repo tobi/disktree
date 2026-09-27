@@ -5,10 +5,11 @@
 //! that panics while painting, a binding that never fires, a removal that
 //! reports success without removing anything.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use disktree_core::removal::RemovalMode;
 use disktree_core::scan::{ScanOptions, scan};
+use disktree_core::space::{SpaceInfo, Volume};
 use disktree_core::treemap::Tile;
 use gpui_kit::{
     Bounds, Context, Entity, Pixels, Point, TestAppContext, VisualTestContext,
@@ -501,6 +502,144 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // The picker lists volumes and draws them without panicking; Escape
+    // leaves the scan where it was.
+    press(cx, "v");
+    assert!(read(&view, cx, |app| app.volumes_open));
+    draw(cx);
+    assert!(cx.debug_bounds("disktree-root").is_some());
+    let before = read(&view, cx, |app| app.root_path.clone());
+    press(cx, "down");
+    press(cx, "up");
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
+}
+
+/// Enter must reach the picker even when its dialog owns keyboard focus.
+#[gpui_kit::test]
+fn enter_in_the_focused_volume_picker_scans_the_selected_root(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let target = temp.path().join("junk");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.volumes = vec![disktree_core::space::Volume {
+            point: target.clone(),
+            device: None,
+            space: None,
+        }];
+        app.volume_highlight = 0;
+        app.volumes_open = true;
+    });
+    let focus = read(&view, cx, |app| app.confirm_focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    assert!(!read(&view, cx, Disktree::can_start_over));
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), target);
+    finish_scan(&view, cx);
+    assert!(read(&view, cx, |app| app.tree().is_some()));
+}
+
+#[gpui_kit::test]
+fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Fixed rows, so this is about where the popup lands and not about which
+    // disks the machine running the test happens to have.
+    update(&view, cx, |app, cx| {
+        app.volumes = vec![
+            Volume {
+                point: PathBuf::from("/one"),
+                device: Some("/dev/one".into()),
+                space: Some(SpaceInfo {
+                    total: 1_000,
+                    free: 500,
+                    available: 400,
+                }),
+            },
+            Volume {
+                point: PathBuf::from("/two"),
+                device: None,
+                space: None,
+            },
+        ];
+        app.volumes_open = true;
+        cx.notify();
+    });
+    draw(cx);
+
+    let viewport = cx.update(|window, _| window.viewport_size());
+    let rows = cx.debug_bounds("volume-rows").expect("the rows are drawn");
+    let centre = rows.center();
+    assert!(
+        (centre.x - viewport.width / 2.0).abs() < px(4.),
+        "the popup is not centred across: {centre:?} in {viewport:?}"
+    );
+    assert!(
+        (centre.y - viewport.height / 2.0).abs() < px(150.),
+        "the popup is not centred down: {centre:?} in {viewport:?}"
+    );
+
+    // The wrapper that centres the popup must not swallow the backdrop's
+    // clicks: a click in the corner, outside the popup, still closes it.
+    cx.simulate_click(
+        gpui_kit::point(px(4.), px(4.)),
+        gpui_kit::Modifiers::none(),
+    );
+    draw(cx);
+    assert!(
+        !read(&view, cx, |app| app.volumes_open),
+        "clicking outside the picker closes it"
+    );
+}
+
+#[gpui_kit::test]
+fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // The selection is .cache, the largest; take it away behind the tree.
+    std::fs::remove_dir_all(temp.path().join(".cache")).expect("remove");
+    press(cx, "o");
+    let notice = read(&view, cx, |app| app.notice.clone());
+    let (message, _) = notice.expect("a notice");
+    assert!(message.contains("no longer on disk"), "{message}");
+}
+
+#[gpui_kit::test]
+fn command_chords_are_not_read_as_plain_letters(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // ⌘P and ⌘D are the menu bar's or nobody's; read as `p` and `d` they
+    // would hide the selection and re-scan.
+    let shown = read(&view, cx, |app| app.show_selection);
+    press(cx, "cmd-p cmd-d");
+    assert_eq!(read(&view, cx, |app| app.show_selection), shown);
+    assert!(read(&view, cx, |app| app.options.apparent_size));
+    press(cx, "p");
+    assert_eq!(read(&view, cx, |app| app.show_selection), !shown);
+}
+
+#[gpui_kit::test]
 fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
@@ -594,6 +733,46 @@ fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
     );
     press(cx, "!");
     assert!(read(&view, cx, |app| app.marks.is_empty()));
+}
+
+/// `a` on the review screen copies a prompt for an agent naming the marked
+/// path, and removes nothing.
+#[gpui_kit::test]
+fn the_review_screen_copies_the_list_as_an_agent_prompt(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let junk = temp.path().join("junk");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.marks.toggle(disktree_core::removal::Target {
+            path: junk.clone(),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+
+    press(cx, "a");
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("a prompt on the clipboard");
+    assert!(copied.contains("free up disk space"), "{copied}");
+    assert!(
+        copied.contains(&format!("- {}", junk.display())),
+        "{copied}"
+    );
+    assert!(junk.exists(), "nothing was removed");
+    let notice = read(&view, cx, |app| app.notice.clone());
+    assert!(
+        notice.is_some_and(|(message, _)| message.contains("copied")),
+        "the copy is confirmed"
+    );
 }
 
 /// Escape in the alert dialog cancels: the dialog closes, the review screen
@@ -974,12 +1153,16 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     let (view, cx) = view_over(&inner, cx);
     update(&view, cx, |app, _| {
         app.disk_root = Some(temp.path().to_path_buf());
+        // Stale on purpose: the wider root, a folder, must reset it.
+        app.file_table = true;
     });
     let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
 
-    // The trail runs from "/", and the scanned root sits under its parents.
+    // The trail runs from the top of the filesystem — "/", or a drive such
+    // as "C:\" — and the scanned root sits under its parents.
     let trail = read(&view, cx, Disktree::breadcrumbs);
-    assert_eq!(trail[0].0, "/");
+    let top = temp.path().ancestors().last().expect("a top");
+    assert_eq!(trail[0].0, top.display().to_string());
     assert!(
         trail.contains(&(
             temp.path()
@@ -999,6 +1182,10 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     assert!(read(&view, cx, |app| app.tree().is_some()));
     finish_scan(&view, cx);
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), temp.path());
+    assert!(
+        !read(&view, cx, |app| app.file_table),
+        "the offer follows the root it widened to"
+    );
     let (reused, rest, selected) = read(&view, cx, |app| {
         let tree = app.tree().expect("the wider tree");
         let junk = tree.child_named("junk").map(|node| node.files);
@@ -1198,4 +1385,292 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     // Unmarking the directory unmarks everything.
     update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
     assert!(read(&view, cx, |app| app.marks.is_empty()));
+}
+
+/// `<` and `>` retrace the directories visited, are disabled when there is
+/// nowhere to go, and a fresh move ends what was ahead.
+#[gpui_kit::test]
+fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let can = |view: &Entity<Disktree>, cx: &Window| {
+        read(view, cx, |app| (app.can_go_back(), app.can_go_forward()))
+    };
+    assert_eq!(can(&view, cx), (false, false), "nowhere to go yet");
+
+    let (junk, deeper, keep) = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        let keep = child_crumbs(app, &[], "keep");
+        app.select(Some(deeper.clone()), cx);
+        app.descend(cx);
+        (junk, deeper, keep)
+    });
+    draw(cx);
+    assert_eq!(can(&view, cx), (true, false));
+
+    // Hovering `<` shows the card for where it goes, as hovering a tile
+    // does: here, the scanned root. It hangs below the button, never on it.
+    let back = cx
+        .debug_bounds("history-back")
+        .expect("the button is drawn");
+    cx.simulate_mouse_move(back.center(), None, Modifiers::none());
+    draw(cx);
+    let card = cx.debug_bounds("history-tip").expect("the card is shown");
+    assert!(card.top() >= back.bottom(), "{card:?} covers {back:?}");
+    assert_eq!(
+        read(&view, cx, |app| app.history_target(true)),
+        Some((0, Vec::new()))
+    );
+
+    let click = |cx: &mut Window, selector: &'static str| {
+        let bounds = cx.debug_bounds(selector).expect("the button is drawn");
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        draw(cx);
+    };
+    click(cx, "history-back");
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        Vec::<usize>::new()
+    );
+    assert_eq!(can(&view, cx), (false, true), "back at the start");
+
+    click(cx, "history-forward");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    assert_eq!(can(&view, cx), (true, false));
+
+    // Up a level is a move of its own, and the keys retrace it too.
+    press(cx, "u");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    press(cx, "alt-left");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    press(cx, "alt-left");
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        Vec::<usize>::new()
+    );
+    press(cx, "alt-right");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // Going somewhere new from the middle of the history drops what was
+    // ahead of it, as in a browser.
+    press(cx, "alt-left");
+    update(&view, cx, |app, cx| app.go_to(keep, cx));
+    draw(cx);
+    assert_eq!(can(&view, cx), (true, false), "the forward trail is gone");
+    press(cx, "alt-left");
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        Vec::<usize>::new()
+    );
+}
+
+/// Regression: children are ordered by the metric, so switching between
+/// Size and Files reorders them. The directory on screen and the selection
+/// are found again by path, rather than following their old positions into
+/// a sibling.
+#[gpui_kit::test]
+fn switching_the_metric_keeps_the_directory_and_the_selection(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path();
+    // Largest by size, but fewest files: the two swap places.
+    std::fs::create_dir_all(root.join("big")).expect("mkdir");
+    std::fs::write(root.join("big/one.bin"), vec![b'x'; 500_000])
+        .expect("write");
+    std::fs::write(root.join("big/two.bin"), vec![b'x'; 1_000]).expect("write");
+    for index in 0..5 {
+        let file = root.join(format!("many/{index}.txt"));
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, b"x").expect("write");
+    }
+    let (view, cx) = view_over(root, cx);
+    draw(cx);
+
+    update(&view, cx, |app, cx| {
+        let big = child_crumbs(app, &[], "big");
+        assert_eq!(big, vec![0], "largest first by size");
+        app.go_to(big.clone(), cx);
+        let one = child_crumbs(app, &big, "one.bin");
+        app.select(Some(one), cx);
+    });
+    draw(cx);
+
+    update(&view, cx, |app, cx| app.set_mode(1, cx));
+    draw(cx);
+    let (here, selected) = read(&view, cx, |app| {
+        (
+            app.current_path(),
+            app.selected
+                .as_deref()
+                .and_then(|crumbs| app.path_at(crumbs)),
+        )
+    });
+    assert_eq!(here, root.join("big"));
+    assert_eq!(selected, Some(root.join("big/one.bin")));
+
+    update(&view, cx, |app, cx| app.set_mode(0, cx));
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::current_path), root.join("big"));
+}
+
+/// Escape stops a first scan. What the walk found so far is not shown as a
+/// tree, a late result is ignored, and `r` starts over.
+#[gpui_kit::test]
+fn escape_cancels_the_first_scan_and_r_starts_it_again(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = temp.path().to_path_buf();
+    let (view, cx) =
+        cx.add_window_view(move |_, cx| Disktree::new(root, options(), 3, cx));
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+
+    press(cx, "escape");
+    let (scanning, cancelled) = read(&view, cx, |app| {
+        (app.scan.is_some(), app.progress.cancelled)
+    });
+    assert!(!scanning, "the walk was dropped");
+    assert!(cancelled, "the panel can say it stopped");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let polling = update(&view, cx, |app, cx| app.poll_scan_once(epoch, cx));
+    assert!(!polling, "the old poller stops");
+    assert!(read(&view, cx, |app| app.tree().is_none()));
+    draw(cx);
+
+    press(cx, "r");
+    finish_scan(&view, cx);
+    assert!(read(&view, cx, |app| app.tree().is_some()));
+}
+
+/// Escape stops a widening scan and keeps the tree it started from.
+#[gpui_kit::test]
+fn escape_cancels_widening_and_keeps_the_tree_on_screen(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let inner = temp.path().join("junk");
+    let (view, cx) = view_over(&inner, cx);
+    update(&view, cx, |app, _| {
+        app.disk_root = Some(temp.path().to_path_buf());
+    });
+    let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
+
+    press(cx, "g");
+    assert!(read(&view, cx, |app| app.scan.is_some()));
+    press(cx, "escape");
+    let (scanning, root, scan_root, files) = read(&view, cx, |app| {
+        (
+            app.scan.is_some(),
+            app.root_path.clone(),
+            app.scan_root.clone(),
+            app.tree().map(|tree| tree.files),
+        )
+    });
+    assert!(!scanning);
+    assert_eq!(root, inner);
+    assert_eq!(scan_root, inner, "the trail stops showing a widening");
+    assert_eq!(files, before, "the tree on screen is unchanged");
+}
+
+/// The mouse's back and forward buttons retrace the same history as
+/// alt-arrows and the header buttons, and only on the explore screen.
+#[gpui_kit::test]
+fn mouse_side_buttons_go_back_and_forward(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, NavigationDirection};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+
+    let (junk, deeper) = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        app.select(Some(junk.clone()), cx);
+        app.descend(cx);
+        app.select(Some(deeper.clone()), cx);
+        app.descend(cx);
+        (junk, deeper)
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // Over the mosaic, buttons 8 and 9 step the history, as alt-arrows do.
+    let mosaic = cx.debug_bounds("treemap").expect("the mosaic is drawn");
+    let at = mosaic.center();
+    let press_button = |cx: &mut Window, button: MouseButton| {
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_mouse_down(at, button, Modifiers::none());
+        cx.simulate_mouse_up(at, button, Modifiers::none());
+        draw(cx);
+    };
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Forward));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // On the review screen the same press changes nothing: the marked list
+    // is not somewhere the history can take you back to.
+    update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    press_button(cx, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+}
+
+/// The restart as administrator reopens the same root and options: every
+/// flag it writes is one the command line reads back.
+#[test]
+fn restart_arguments_parse_back_to_the_same_scan() {
+    use disktree_core::tree::Metric;
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path().join("a folder");
+    std::fs::create_dir(&root).expect("mkdir");
+    let root = dunce::canonicalize(&root).expect("canonical root");
+    let changed = ScanOptions {
+        apparent_size: true,
+        follow_links: true,
+        include_hidden: false,
+        one_filesystem: false,
+        metric: Metric::Files,
+        ..ScanOptions::default()
+    };
+    for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
+        let args = crate::state::restart_args(&options, depth, &root);
+        let parsed = crate::parse_args(args.into_iter()).expect("parses");
+        assert_eq!(parsed.root, root);
+        assert_eq!(parsed.depth, depth);
+        let got = &parsed.options;
+        assert_eq!(
+            (
+                got.apparent_size,
+                got.follow_links,
+                got.include_hidden,
+                got.one_filesystem,
+                got.metric,
+            ),
+            (
+                options.apparent_size,
+                options.follow_links,
+                options.include_hidden,
+                options.one_filesystem,
+                options.metric,
+            )
+        );
+    }
 }

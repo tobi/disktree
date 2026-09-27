@@ -1,0 +1,8 @@
+# The workspace's MSRV, pinned so rustup provisions it automatically: a fresh
+# clone builds on a machine whose default stable is older, instead of failing
+# with cargo's `rustc ... is not supported` before anything compiles. CI pins
+# the same version (see .github/workflows), and `make lint` needs clippy and
+# rustfmt, so they come with it.
+[toolchain]
+channel = "1.97"
+components = ["clippy", "rustfmt"]

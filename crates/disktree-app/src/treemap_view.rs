@@ -14,10 +14,10 @@ use std::rc::Rc;
 use disktree_core::treemap::Rect;
 use gpui_kit::{
     App, Bounds, ContentMask, Context, Corners, Edges, Font, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement as _, Pixels, Point, ScrollWheelEvent,
-    SharedString, Size, StatefulInteractiveElement as _, Styled, TextAlign,
-    TextRun, Window, canvas, div, pattern_slash, px, quad,
+    InteractiveElement as _, IntoElement, MouseDownEvent, MouseMoveEvent,
+    ParentElement as _, Pixels, Point, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement as _, Styled, TextAlign, TextRun, Window,
+    canvas, div, pattern_slash, px, quad,
 };
 use gpui_omarchy::{ActiveTheme, Theme};
 
@@ -86,6 +86,7 @@ pub fn mosaic(
 
     div()
         .id("disktree-treemap")
+        .debug_selector(|| "treemap".into())
         .relative()
         .flex_1()
         .min_h_0()
@@ -100,18 +101,13 @@ pub fn mosaic(
         .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
             this.on_mouse_move(event, cx);
         }))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.on_mouse_down(event, cx);
-            }),
-        )
-        .on_mouse_down(
-            MouseButton::Middle,
-            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.on_mouse_down(event, cx);
-            }),
-        )
+        // One listener for every button, because the interesting ones are not
+        // the three the platform names: buttons 8 and 9 arrive as
+        // `MouseButton::Navigate`, and a per-button registration would have
+        // to be repeated for each.
+        .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+            this.on_mouse_down(event, cx);
+        }))
         .on_scroll_wheel(cx.listener(
             |this, event: &ScrollWheelEvent, _, cx| {
                 this.on_scroll_wheel(event, cx);

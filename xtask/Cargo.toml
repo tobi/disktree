@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Check entry points for disktree: one command per gate"
+description = "Check and packaging entry points for disktree: one command per gate"
 
 [lints]
 workspace = true

@@ -12,8 +12,29 @@ workspace = true
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rayon = { workspace = true }
-rustix = { version = "1.1", features = ["fs"] }
 rustc-hash = { workspace = true }
+
+# rustix has no filesystem calls on Windows; `windows.rs` covers them there.
+[target.'cfg(not(windows))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# The Recycle Bin, through the shell's own file operation.
+trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
+winapi-util = "0.1.11"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# The system trash, through NSFileManager: what Finder's Move to Trash does,
+# without asking to control Finder. Only this backend is used; the crate's
+# Linux and Windows code is not built.
+[target.'cfg(target_os = "macos")'.dependencies]
+trash = { version = "5.2.9", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- disktree's mark (assets/disktree.svg) on the macOS icon grid: an 824 pt
+     rounded square centred on a 1024 pt canvas, the rest transparent. A
+     full-bleed square would be shrunk into a grey tile on macOS 26. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <!-- 64 units of the mark become 824 pt. -->
+    <g transform="translate(100 100) scale(12.875)">
+      <rect width="64" height="64" fill="#1a1b26"/>
+      <rect x="5" y="5" width="54" height="54" fill="#3a4152"/>
+      <rect x="5" y="5" width="54" height="9" fill="#7aa2f7"/>
+      <rect x="8" y="17" width="30" height="39" fill="#2a653b"/>
+      <rect x="8" y="17" width="30" height="7" fill="#9ece6a"/>
+      <rect x="41" y="17" width="15" height="24" fill="#362f5e"/>
+      <rect x="41" y="17" width="15" height="6" fill="#bb9af7"/>
+      <rect x="41" y="44" width="15" height="12" fill="#e0af68"/>
+    </g>
+  </g>
+</svg>
