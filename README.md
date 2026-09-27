@@ -167,6 +167,8 @@ machine; see `crates/disktree-core/src/classify.rs`.
 
 Space, X, Enter and the arrows act on the tile under the mouse if the mouse
 moved last, and on the keyboard selection after you use an arrow or Tab.
+Right-click a tile for the same things from a menu: open it, mark it, or show
+it in Finder (or the file manager).
 
 A marked tile takes the danger colour, and so does everything inside it:
 removing a directory takes its contents with it. Marking a directory absorbs

@@ -72,6 +72,8 @@ pub mod size {
     /// A crumb's sibling menu.
     pub const SIBLING_MENU: Rems = Rems(24.0);
     pub const SIBLING_MENU_HEIGHT: Rems = Rems(32.0);
+    /// A tile's context menu.
+    pub const TILE_MENU: Rems = Rems(15.0);
     /// A list row's share bar.
     pub const ROW_BAR: Rems = Rems(5.5);
     /// A legend or identity swatch.

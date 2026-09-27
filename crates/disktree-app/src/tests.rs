@@ -1289,6 +1289,209 @@ fn names_at(names: &[String], index: usize) -> String {
     names.get(index).cloned().unwrap_or_default()
 }
 
+/// A window over the fixture drawn one level deep, so every top-level
+/// directory is a single tile a click can land on.
+fn one_level_view<'a>(
+    root: &Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<Disktree>, &'a mut Window) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) = view_over(root, cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    update(&view, cx, |app, cx| app.adjust_depth(-6, cx));
+    draw(cx);
+    (view, cx)
+}
+
+/// The window point at the middle of the top-level tile named `name`.
+fn tile_centre(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+    name: &str,
+) -> (Vec<usize>, Point<Pixels>) {
+    update(view, cx, |app, _| {
+        let crumbs = child_crumbs(app, &[], name);
+        let base = app.tile_body(&crumbs).expect("drawn");
+        let body = app.view.project(base);
+        let origin = app.treemap_origin.get();
+        let point = gpui_kit::point(
+            origin.x + px(body.x + body.w / 2.0),
+            origin.y + px(body.y + body.h / 2.0),
+        );
+        (crumbs, point)
+    })
+}
+
+fn right_click(cx: &mut Window, at: Point<Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton};
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+    draw(cx);
+}
+
+fn click_menu_row(cx: &mut Window, row: usize) {
+    let bounds = cx
+        .debug_bounds(Box::leak(format!("tile-menu-{row}").into_boxed_str()))
+        .expect("the row is drawn");
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+}
+
+/// A right-click selects the tile and offers what its keys do: open, mark
+/// and show in the file manager, by click or by arrow and Enter.
+#[gpui_kit::test]
+fn right_click_opens_a_menu_for_the_tile(cx: &mut TestAppContext) {
+    use crate::state::TileAction;
+
+    let temp = fixture();
+    let (view, cx) = one_level_view(temp.path(), cx);
+    let (junk, at) = tile_centre(&view, cx, "junk");
+
+    right_click(cx, at);
+    let (menu, selected, actions) = read(&view, cx, |app| {
+        let menu = app.tile_menu.clone().map(|menu| menu.crumbs);
+        let actions = app.tile_actions(&junk);
+        (menu, app.selected.clone(), actions)
+    });
+    assert_eq!(menu.as_ref(), Some(&junk), "the menu is for junk");
+    assert_eq!(selected.as_ref(), Some(&junk), "and junk is selected");
+    assert_eq!(
+        actions,
+        [TileAction::Open, TileAction::Mark, TileAction::Reveal]
+    );
+    assert!(cx.debug_bounds("tile-menu").is_some(), "the menu is drawn");
+
+    // Mark, by click: the menu closes behind it.
+    click_menu_row(cx, 1);
+    let junk_path = temp.path().join("junk");
+    let (marked, open) = read(&view, cx, |app| {
+        (app.marks.contains(&junk_path), app.tile_menu.is_some())
+    });
+    assert!(marked, "marked from the menu");
+    assert!(!open);
+
+    // Unmark, by keys: the rows are Open, Unmark, Show.
+    right_click(cx, at);
+    press(cx, "down");
+    press(cx, "enter");
+    let (marked, open) = read(&view, cx, |app| {
+        (app.marks.contains(&junk_path), app.tile_menu.is_some())
+    });
+    assert!(!marked, "unmarked from the menu");
+    assert!(!open);
+
+    // Open goes in.
+    right_click(cx, at);
+    click_menu_row(cx, 0);
+    let (crumbs, open) = read(&view, cx, |app| {
+        (app.crumbs.clone(), app.tile_menu.is_some())
+    });
+    assert_eq!(crumbs, junk, "went into junk");
+    assert!(!open);
+}
+
+/// A file has nothing to open, so its menu does not offer it.
+#[gpui_kit::test]
+fn a_file_s_tile_menu_has_no_open(cx: &mut TestAppContext) {
+    use crate::state::TileAction;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let actions = read(&view, cx, |app| {
+        let junk = child_crumbs(app, &[], "junk");
+        let blob = child_crumbs(app, &junk, "blob.bin");
+        app.tile_actions(&blob)
+    });
+    assert_eq!(actions, [TileAction::Mark, TileAction::Reveal]);
+}
+
+/// Outside the menu, a click only closes it, as a menu's does; a second
+/// right-click moves it; Escape belongs to it; ctrl-click still marks.
+#[gpui_kit::test]
+fn the_tile_menu_closes_without_acting_behind_it(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton};
+
+    let temp = fixture();
+    let (view, cx) = one_level_view(temp.path(), cx);
+    let (junk, on_junk) = tile_centre(&view, cx, "junk");
+    let (cache, on_cache) = tile_centre(&view, cx, ".cache");
+
+    // A left click on another tile closes the menu and selects nothing.
+    right_click(cx, on_junk);
+    assert!(read(&view, cx, |app| app.tile_menu.is_some()));
+    cx.simulate_click(on_cache, Modifiers::none());
+    draw(cx);
+    let (open, selected) = read(&view, cx, |app| {
+        (app.tile_menu.is_some(), app.selected.clone())
+    });
+    assert!(!open, "the click closed the menu");
+    assert_eq!(selected, Some(junk.clone()), "and went no further");
+
+    // A right-click elsewhere reopens it there.
+    right_click(cx, on_junk);
+    right_click(cx, on_cache);
+    let menu = read(&view, cx, |app| {
+        app.tile_menu.as_ref().map(|menu| menu.crumbs.clone())
+    });
+    assert_eq!(menu, Some(cache.clone()), "the menu moved to .cache");
+
+    // Escape closes the menu, not the selection.
+    press(cx, "escape");
+    let (open, selected) = read(&view, cx, |app| {
+        (app.tile_menu.is_some(), app.selected.clone())
+    });
+    assert!(!open);
+    assert_eq!(selected, Some(cache), "the selection stays");
+
+    // Ctrl-click is macOS's secondary click, but here it keeps marking.
+    cx.simulate_mouse_move(on_junk, None, Modifiers::none());
+    cx.simulate_mouse_down(on_junk, MouseButton::Left, Modifiers::control());
+    cx.simulate_mouse_up(on_junk, MouseButton::Left, Modifiers::control());
+    draw(cx);
+    let junk_path = temp.path().join("junk");
+    let (marked, open) = read(&view, cx, |app| {
+        (app.marks.contains(&junk_path), app.tile_menu.is_some())
+    });
+    assert!(marked, "ctrl-click marked junk");
+    assert!(!open, "and opened no menu");
+
+    // Going somewhere closes it too: its tile is no longer where it hangs.
+    right_click(cx, on_junk);
+    update(&view, cx, |app, cx| app.go_to(junk.clone(), cx));
+    draw(cx);
+    assert!(read(&view, cx, |app| app.tile_menu.is_none()));
+}
+
+/// The menu shows the tile it was opened on, even with the pointer since
+/// moved to another one, and says so when that tile has gone from disk.
+#[gpui_kit::test]
+fn show_in_finder_reveals_the_tile_the_menu_is_for(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    let temp = fixture();
+    let (view, cx) = one_level_view(temp.path(), cx);
+    let (_, on_junk) = tile_centre(&view, cx, "junk");
+    let (_, on_cache) = tile_centre(&view, cx, ".cache");
+
+    right_click(cx, on_junk);
+    // Hovering .cache makes it what `o` would act on; the menu must not care.
+    cx.simulate_mouse_move(on_cache, None, Modifiers::none());
+    draw(cx);
+    std::fs::remove_dir_all(temp.path().join("junk")).expect("rm junk");
+    click_menu_row(cx, 2);
+    let notice = read(&view, cx, |app| {
+        app.notice.as_ref().map(|(text, _)| text.clone())
+    });
+    let notice = notice.expect("a notice");
+    assert!(
+        notice.contains("junk") && notice.contains("no longer on disk"),
+        "{notice}"
+    );
+}
+
 #[gpui_kit::test]
 fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
