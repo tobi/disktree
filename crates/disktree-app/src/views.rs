@@ -8,7 +8,7 @@ use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{RemovalMode, Target};
 use disktree_core::size::human_bytes;
-use disktree_core::tree::Metric;
+use disktree_core::tree::{Metric, Node};
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
@@ -635,7 +635,7 @@ fn sibling_menu(
         if parent.is_empty() {
             crate::marks::display_path(&app.root_path, app.home.as_deref())
         } else {
-            node.name.to_string()
+            node.name().to_string()
         }
     });
     let metric = app.options.metric;
@@ -1007,9 +1007,9 @@ fn trail_and_legend(
 /// flagged in the warning colour when there are any.
 fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
     let tree = app.tree();
-    let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
-    let files = tree.map_or(app.progress.files, |node| node.files);
-    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
+    let bytes = tree.map_or(app.progress.bytes, Node::bytes);
+    let files = tree.map_or(app.progress.files, Node::files);
+    let dirs = tree.map_or(app.progress.dirs, Node::dirs);
     let errors = app.progress.errors;
     div()
         .flex()
@@ -1173,12 +1173,13 @@ fn selection_section(
         );
     };
     let path = app.path_at(&target);
-    let root_value = app.tree().map_or(0, |tree| tree.bytes);
+    let root_value = app.tree().map_or(0, Node::bytes);
     let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
     let covered_by = marks_ancestor(app, path.as_deref());
     let is_current_root = target == app.crumbs;
     let highlight = palette::highlight(theme);
 
+    let accent = palette::category_accent(theme, node.category());
     let identity = div()
         .flex()
         .flex_col()
@@ -1196,7 +1197,7 @@ fn selection_section(
                         .flex_shrink_0()
                         .w(space::XS)
                         .h(text::HEADING)
-                        .bg(palette::category_accent(theme, node.category)),
+                        .bg(accent),
                 )
                 .child(
                     div()
@@ -1206,7 +1207,7 @@ fn selection_section(
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(node.name.to_string()),
+                        .child(node.name().to_string()),
                 ),
         )
         .child(
@@ -1222,10 +1223,10 @@ fn selection_section(
         );
 
     let (number, unit) = match app.options.metric {
-        Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
-        Metric::Files => (widgets::human_count(node.files), "files".into()),
+        Metric::Bytes => widgets::split_size(&human_bytes(node.bytes())),
+        Metric::Files => (widgets::human_count(node.files()), "files".into()),
     };
-    let share = node.bytes as f32 / root_value.max(1) as f32;
+    let share = node.bytes() as f32 / root_value.max(1) as f32;
     let measure = div()
         .flex()
         .flex_col()
@@ -1257,10 +1258,11 @@ fn selection_section(
             cx,
         )
     } else {
-        let kind = node.reclaim.map_or_else(
-            || node.category.label().to_string(),
+        let (category, reclaim) = node.kinds();
+        let kind = reclaim.map_or_else(
+            || category.label().to_string(),
             |reason| {
-                format!("{} \u{00b7} {}", node.category.label(), reason.label())
+                format!("{} \u{00b7} {}", category.label(), reason.label())
             },
         );
         widgets::figure("Kind", kind, theme.bright, cx)
@@ -1275,13 +1277,13 @@ fn selection_section(
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Of scan",
-                    widgets::percent(node.bytes, root_value),
+                    widgets::percent(node.bytes(), root_value),
                     theme.bright,
                     cx,
                 )))
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Files",
-                    widgets::human_count(node.files),
+                    widgets::human_count(node.files()),
                     theme.bright,
                     cx,
                 ))),
@@ -1292,7 +1294,7 @@ fn selection_section(
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Last write",
-                    widgets::ago(crate::state::now_seconds(), node.modified),
+                    widgets::ago(crate::state::now_seconds(), node.modified()),
                     theme.bright,
                     cx,
                 )))
@@ -1311,7 +1313,7 @@ fn selection_section(
             cx,
         ));
     }
-    if node.read_error {
+    if node.read_error() {
         chips.push(widgets::chip("Partly unreadable", theme.warning, cx));
     }
     let badges = (!chips.is_empty()).then(|| {
@@ -1433,7 +1435,7 @@ fn worth_section(
             continue;
         };
         let (title, detail) = insight_text(app, candidate);
-        let accent = palette::category_accent(theme, node.category);
+        let accent = palette::category_accent(theme, node.category());
         let active = selected.as_deref() == Some(candidate.crumbs.as_slice());
         let crumbs = candidate.crumbs.clone();
         section = section.child(
@@ -1509,7 +1511,7 @@ fn insight_text(app: &Disktree, candidate: &Candidate) -> (String, String) {
     let chain = tree
         .map_or_else(Vec::new, |tree| tree.resolve_chain(&candidate.crumbs));
     let names: Vec<&str> =
-        chain.iter().skip(1).map(|node| &*node.name).collect();
+        chain.iter().skip(1).map(|node| node.name()).collect();
     let tail = names[names.len().saturating_sub(2)..].join("/");
     match &candidate.finding {
         Finding::Reclaimable(reason) => (tail, reason.label().to_string()),
@@ -1573,7 +1575,7 @@ fn marked_section(
         let category = app
             .crumbs_for_path(&item.path)
             .and_then(|crumbs| app.node_at(&crumbs))
-            .map_or(Category::Other, |node| node.category);
+            .map_or(Category::Other, Node::category);
         let path = item.path.clone();
         section = section.child(
             div()
@@ -2383,7 +2385,7 @@ fn mark_row(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
-    let root_value = app.tree().map_or(0, |tree| tree.bytes);
+    let root_value = app.tree().map_or(0, Node::bytes);
     let path_text = crate::marks::display_path(&item.path, app.home.as_deref());
     let color = if blocked.is_some() || covered {
         theme.secondary
@@ -3130,9 +3132,9 @@ fn node_card(
     let node = app.node_at(crumbs)?;
     let path = app.path_at(crumbs);
     let parent = crumbs[..crumbs.len().saturating_sub(1)].to_vec();
-    let parent_value = app.node_at(&parent).map_or(0, |node| node.bytes);
+    let parent_value = app.node_at(&parent).map_or(0, Node::bytes);
     let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
-    let hidden = node.name.starts_with('.');
+    let hidden = node.name().starts_with('.');
     let covered = marks_ancestor(app, path.as_deref());
 
     let mut tip = div()
@@ -3159,7 +3161,7 @@ fn node_card(
                         .min_w_0()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.bright)
-                        .child(node.name.to_string()),
+                        .child(node.name().to_string()),
                 ),
         )
         .child(
@@ -3181,10 +3183,10 @@ fn node_card(
                         .text_size(text::TITLE)
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.bright)
-                        .child(human_bytes(node.bytes)),
+                        .child(human_bytes(node.bytes())),
                 )
                 .child(widgets::glyph_bar(
-                    node.bytes,
+                    node.bytes(),
                     parent_value.max(1),
                     10,
                     theme.secondary,
@@ -3194,7 +3196,7 @@ fn node_card(
                     div()
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
-                        .child(widgets::percent(node.bytes, parent_value)),
+                        .child(widgets::percent(node.bytes(), parent_value)),
                 ),
         )
         .child(
@@ -3203,11 +3205,11 @@ fn node_card(
                 .text_color(theme.secondary)
                 .child(format!(
                     "{} files · {} dirs · {} direct",
-                    widgets::human_count(node.files),
+                    widgets::human_count(node.files()),
                     widgets::human_count(
-                        node.dirs.saturating_sub(u64::from(node.is_dir()))
+                        node.dirs().saturating_sub(u64::from(node.is_dir()))
                     ),
-                    human_bytes(node.own_bytes)
+                    human_bytes(node.own_bytes())
                 )),
         );
 

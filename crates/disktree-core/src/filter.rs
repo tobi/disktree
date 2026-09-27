@@ -63,7 +63,7 @@ impl Matches {
     }
 
     /// The value a kept node is laid out by.
-    pub const fn value(keep: Keep, node: &Node, metric: Metric) -> u64 {
+    pub fn value(keep: Keep, node: Node<'_>, metric: Metric) -> u64 {
         match (keep, metric) {
             (Keep::Whole, _) => node.value(metric),
             (Keep::Partial { bytes, .. }, Metric::Bytes) => bytes,
@@ -74,7 +74,7 @@ impl Matches {
 
 /// Search `node`, found at absolute `base`, for names containing `needle`.
 /// `None` for an empty needle: nothing is filtered.
-pub fn filter(node: &Node, base: &[usize], needle: &str) -> Option<Matches> {
+pub fn filter(node: Node<'_>, base: &[usize], needle: &str) -> Option<Matches> {
     let needle = needle.trim().to_ascii_lowercase();
     if needle.is_empty() {
         return None;
@@ -94,19 +94,19 @@ pub fn filter(node: &Node, base: &[usize], needle: &str) -> Option<Matches> {
 /// Returns the bytes and files that matched at or beneath `node`'s
 /// children, recording what to keep.
 fn visit(
-    node: &Node,
+    node: Node<'_>,
     crumbs: &mut Vec<usize>,
     matches: &mut Matches,
 ) -> (u64, u64) {
     let mut total = (0, 0);
-    for (index, child) in node.children.iter().enumerate() {
+    for (index, child) in node.children().enumerate() {
         crumbs.push(index);
-        if contains_ignoring_case(&child.name, &matches.needle) {
+        if contains_ignoring_case(child.name(), &matches.needle) {
             matches.keep.insert(crumbs.clone(), Keep::Whole);
             matches.count += 1;
-            total.0 += child.bytes;
-            total.1 += child.files;
-        } else if !child.children.is_empty() {
+            total.0 += child.bytes();
+            total.1 += child.files();
+        } else if child.has_children() {
             let (bytes, files) = visit(child, crumbs, matches);
             if bytes > 0 || files > 0 {
                 matches
@@ -142,20 +142,20 @@ fn contains_ignoring_case(haystack: &str, lower_needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{NodeKind, aggregate};
+    use crate::tree::{Draft, NodeKind, Tree};
 
-    fn file(name: &str, bytes: u64) -> Node {
-        Node::entry(name, NodeKind::File, bytes)
+    fn file(name: &str, bytes: u64) -> Draft {
+        Draft::entry(name, NodeKind::File, bytes)
     }
 
-    fn dir(name: &str, children: Vec<Node>) -> Node {
-        let mut node = Node::directory(name);
+    fn dir(name: &str, children: Vec<Draft>) -> Draft {
+        let mut node = Draft::directory(name);
         node.children = children;
         node
     }
 
-    fn tree() -> Node {
-        let mut root = dir(
+    fn tree() -> Tree {
+        let root = dir(
             "root",
             vec![
                 dir(
@@ -172,21 +172,19 @@ mod tests {
                 file("readme", 1),
             ],
         );
-        aggregate(&mut root, Metric::Bytes);
-        root
+        Tree::from_draft(root, Metric::Bytes)
     }
 
-    fn crumbs_of(root: &Node, names: &[&str]) -> Vec<usize> {
-        let mut node = root;
+    fn crumbs_of(tree: &Tree, names: &[&str]) -> Vec<usize> {
+        let mut node = tree.root();
         names
             .iter()
             .map(|name| {
                 let index = node
-                    .children
-                    .iter()
-                    .position(|child| &*child.name == *name)
+                    .children()
+                    .position(|child| child.name() == *name)
                     .expect("present");
-                node = &node.children[index];
+                node = node.child(index).expect("present");
                 index
             })
             .collect()
@@ -195,7 +193,7 @@ mod tests {
     #[test]
     fn matches_are_kept_whole_and_their_ancestors_by_what_matched() {
         let root = tree();
-        let found = filter(&root, &[], "APP").expect("a needle");
+        let found = filter(root.root(), &[], "APP").expect("a needle");
         assert_eq!(found.count, 2, "src/App and apps; apple is inside apps");
         assert_eq!(found.bytes, 10 + 107);
         assert_eq!(found.keep(&crumbs_of(&root, &["apps"])), Some(Keep::Whole));
@@ -234,8 +232,8 @@ mod tests {
 
     #[test]
     fn an_empty_needle_filters_nothing() {
-        assert!(filter(&tree(), &[], "  ").is_none());
-        let found = filter(&tree(), &[], "zzz").expect("needle");
+        assert!(filter(tree().root(), &[], "  ").is_none());
+        let found = filter(tree().root(), &[], "zzz").expect("needle");
         assert_eq!(found.count, 0);
         assert!(found.keep.is_empty());
     }

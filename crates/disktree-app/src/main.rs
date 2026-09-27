@@ -264,6 +264,10 @@ fn parse_args(
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
+    // Windows walks and MFT reads keep separate snapshots here, so the
+    // next launch can use the journal instead of measuring everything.
+    options.cache = std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("disktree"));
 
     Ok(Args {
         root,

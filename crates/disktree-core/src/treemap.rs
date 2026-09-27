@@ -145,7 +145,7 @@ impl Default for LayoutOptions {
 /// being drawn: a caller that resolves a tile from the scanned root gets that
 /// tile, at any depth.
 pub fn layout(
-    root: &Node,
+    root: Node<'_>,
     root_crumbs: &[usize],
     area: Rect,
     metric: Metric,
@@ -157,7 +157,7 @@ pub fn layout(
 /// [`layout`], showing only what `filter` keeps: its matches, at the size
 /// of what matched, inside ancestors sized the same way.
 pub fn layout_filtered(
-    root: &Node,
+    root: Node<'_>,
     root_crumbs: &[usize],
     area: Rect,
     metric: Metric,
@@ -185,7 +185,7 @@ struct Placement<'a> {
 }
 
 fn place_children(
-    node: &Node,
+    node: Node<'_>,
     area: Rect,
     place: &Placement<'_>,
     depth: u32,
@@ -193,15 +193,14 @@ fn place_children(
     out: &mut Vec<Tile>,
 ) {
     let (metric, options) = (place.metric, place.options);
-    if node.children.is_empty() || area.w <= 0.0 || area.h <= 0.0 {
+    if !node.has_children() || area.w <= 0.0 || area.h <= 0.0 {
         return;
     }
 
     // Rank by importance ourselves: the tree is already sorted, but a metric
     // switch or a hand-built tree must not produce a bad layout.
     let mut ranked: Vec<(usize, f64)> = node
-        .children
-        .iter()
+        .children()
         .enumerate()
         .filter_map(|(index, child)| {
             let value = match place.filter {
@@ -257,7 +256,9 @@ fn place_children(
             continue;
         };
 
-        let child = &node.children[index];
+        let Some(child) = node.child(index) else {
+            continue;
+        };
         let subdividable = child.is_dir() && depth + 1 < options.max_depth;
         // A directory that is about to be subdivided claims a header band for
         // its own name. When there is no room for one it stays whole: a name
@@ -421,19 +422,21 @@ pub fn hit(tiles: &[Tile], x: f32, y: f32) -> Option<&Tile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::NodeKind;
+    use crate::tree::{Draft, NodeKind, Tree};
 
-    fn file(name: &str, bytes: u64) -> Node {
-        Node::entry(name, NodeKind::File, bytes)
+    fn file(name: &str, bytes: u64) -> Draft {
+        Draft::entry(name, NodeKind::File, bytes)
     }
 
-    /// A directory whose direct contents are the given children, so aggregate
-    /// totals are consistent before layout runs.
-    fn dir(name: &str, children: Vec<Node>) -> Node {
-        let mut node = Node::directory(name);
+    fn dir(name: &str, children: Vec<Draft>) -> Draft {
+        let mut node = Draft::directory(name);
         node.children = children;
-        crate::tree::aggregate(&mut node, Metric::Bytes);
         node
+    }
+
+    /// `root` built, so its totals are consistent before layout runs.
+    fn built(root: Draft) -> Tree {
+        Tree::from_draft(root, Metric::Bytes)
     }
 
     fn area() -> Rect {
@@ -489,16 +492,16 @@ mod tests {
     fn layout_nests_children_inside_their_parent() {
         // Depth first, parent before its own children: that order is what lets
         // the view paint in sequence and hit-test in reverse.
-        let root = dir(
+        let root = built(dir(
             "root",
             vec![
                 dir("big", vec![file("inside", 100), file("also", 50)]),
                 file("small", 10),
             ],
-        );
+        ));
 
         let tiles = layout(
-            &root,
+            root.root(),
             &[],
             area(),
             Metric::Bytes,
@@ -520,25 +523,26 @@ mod tests {
 
     #[test]
     fn layout_depth_one_stops_at_direct_children() {
-        let root = dir("root", vec![dir("big", vec![file("inside", 100)])]);
+        let root =
+            built(dir("root", vec![dir("big", vec![file("inside", 100)])]));
 
         let options = LayoutOptions {
             max_depth: 1,
             ..LayoutOptions::default()
         };
-        let tiles = layout(&root, &[], area(), Metric::Bytes, &options);
+        let tiles = layout(root.root(), &[], area(), Metric::Bytes, &options);
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].crumbs(), &[0]);
     }
 
     #[test]
     fn a_subdivided_directory_keeps_a_header_for_its_own_name() {
-        let root = dir(
+        let root = built(dir(
             "root",
             vec![dir("big", vec![file("inside", 100), file("also", 50)])],
-        );
+        ));
         let tiles = layout(
-            &root,
+            root.root(),
             &[],
             area(),
             Metric::Bytes,
@@ -575,14 +579,15 @@ mod tests {
 
     #[test]
     fn a_tile_without_room_for_a_header_stays_whole() {
-        let root = dir("root", vec![dir("big", vec![file("inside", 100)])]);
+        let root =
+            built(dir("root", vec![dir("big", vec![file("inside", 100)])]));
         let options = LayoutOptions {
             // A band this tall leaves no usable body under it.
             header: 400.0,
             min_tile: 150.0,
             ..LayoutOptions::default()
         };
-        let tiles = layout(&root, &[], area(), Metric::Bytes, &options);
+        let tiles = layout(root.root(), &[], area(), Metric::Bytes, &options);
         assert_eq!(tiles.len(), 1, "the child was not subdivided");
         assert!(tiles[0].header.is_none(), "and it has no band of its own");
     }
@@ -592,9 +597,9 @@ mod tests {
         // Draw the node at [3, 1] of some larger tree: its tiles must be
         // [3, 1, …], or anything resolving them from the scanned root would
         // find a stranger.
-        let node = dir("inner", vec![file("a", 10), file("b", 5)]);
+        let node = built(dir("inner", vec![file("a", 10), file("b", 5)]));
         let tiles = layout(
-            &node,
+            node.root(),
             &[3, 1],
             area(),
             Metric::Bytes,
@@ -609,9 +614,9 @@ mod tests {
 
     #[test]
     fn a_leaf_never_claims_a_header() {
-        let root = dir("root", vec![file("solo", 10)]);
+        let root = built(dir("root", vec![file("solo", 10)]));
         let tiles = layout(
-            &root,
+            root.root(),
             &[],
             area(),
             Metric::Bytes,
@@ -622,15 +627,15 @@ mod tests {
 
     #[test]
     fn layout_merges_the_child_tail_into_one_tile() {
-        let children: Vec<Node> = (0..10)
+        let children: Vec<Draft> = (0..10)
             .map(|index| file(&format!("f{index}"), 10 - index))
             .collect();
-        let root = dir("root", children);
+        let root = built(dir("root", children));
         let options = LayoutOptions {
             max_children: 4,
             ..LayoutOptions::default()
         };
-        let tiles = layout(&root, &[], area(), Metric::Bytes, &options);
+        let tiles = layout(root.root(), &[], area(), Metric::Bytes, &options);
         let others: Vec<&Tile> = tiles
             .iter()
             .filter(|tile| matches!(tile.kind, TileKind::Others { .. }))
@@ -641,13 +646,13 @@ mod tests {
 
     #[test]
     fn hit_returns_the_deepest_tile() {
-        let root = dir(
+        let root = built(dir(
             "root",
             vec![dir("big", vec![file("inside", 100)]), file("small", 1)],
-        );
+        ));
 
         let tiles = layout(
-            &root,
+            root.root(),
             &[],
             area(),
             Metric::Bytes,
@@ -669,17 +674,20 @@ mod tests {
     #[test]
     fn a_filtered_layout_shows_only_the_matches_at_their_size() {
         use crate::filter::filter;
-        use crate::tree::{NodeKind, aggregate};
 
-        let file = |name: &str, bytes| Node::entry(name, NodeKind::File, bytes);
-        let mut src = Node::directory("src");
-        src.children = vec![file("big_test.rs", 300), file("other.rs", 700)];
-        let mut root = Node::directory("root");
-        root.children =
-            vec![src, file("unit_test.txt", 100), file("huge.iso", 5000)];
-        aggregate(&mut root, Metric::Bytes);
+        let root = built(dir(
+            "root",
+            vec![
+                dir(
+                    "src",
+                    vec![file("big_test.rs", 300), file("other.rs", 700)],
+                ),
+                file("unit_test.txt", 100),
+                file("huge.iso", 5000),
+            ],
+        ));
 
-        let matches = filter(&root, &[], "test").expect("needle");
+        let matches = filter(root.root(), &[], "test").expect("needle");
         let area = Rect::new(0.0, 0.0, 400.0, 400.0);
         let options = LayoutOptions {
             padding: 0.0,
@@ -687,7 +695,7 @@ mod tests {
             ..LayoutOptions::default()
         };
         let tiles = layout_filtered(
-            &root,
+            root.root(),
             &[],
             area,
             Metric::Bytes,
@@ -697,7 +705,7 @@ mod tests {
         let names: Vec<String> = tiles
             .iter()
             .filter_map(|tile| root.resolve(tile.crumbs()))
-            .map(|node| node.name.to_string())
+            .map(|node| node.name().to_string())
             .collect();
         assert!(names.contains(&"big_test.rs".to_string()));
         assert!(names.contains(&"unit_test.txt".to_string()));
@@ -714,7 +722,7 @@ mod tests {
                 .iter()
                 .find(|tile| {
                     root.resolve(tile.crumbs())
-                        .is_some_and(|node| &*node.name == name)
+                        .is_some_and(|node| node.name() == name)
                 })
                 .map(|tile| tile.rect.w * tile.rect.h)
                 .expect("drawn")

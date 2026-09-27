@@ -1653,15 +1653,13 @@ mod tests {
             ..crate::scan::ScanOptions::default()
         };
         let tree = crate::scan::scan(scan_root, options.clone()).expect("scan");
+        let root = tree.root();
         for name in ["one", "two", "original"] {
-            assert!(
-                tree.children.iter().any(|child| &*child.name == name),
-                "{name}"
-            );
+            assert!(root.child_named(name).is_some(), "{name}");
         }
-        assert!(!tree.children.iter().any(|child| &*child.name == "alias"));
-        assert_eq!(tree.files, 3);
-        assert_eq!(tree.bytes, 12);
+        assert!(root.child_named("alias").is_none());
+        assert_eq!(root.files(), 3);
+        assert_eq!(root.bytes(), 12);
         assert!(
             std::process::Command::new("mount")
                 .args([
@@ -1677,16 +1675,11 @@ mod tests {
         fs::write(scan_root.join("alias/nested/unique"), b"unique")
             .expect("unique");
         let tree = crate::scan::scan(scan_root, options).expect("rescan");
-        let alias = tree
-            .children
-            .iter()
-            .find(|child| &*child.name == "alias")
-            .expect("alias retained");
+        let alias = tree.root().child_named("alias").expect("alias retained");
         assert!(
             alias
-                .children
-                .iter()
-                .any(|child| &*child.name == "nested" && child.files == 1)
+                .children()
+                .any(|child| child.name() == "nested" && child.files() == 1)
         );
     }
 

@@ -28,10 +28,10 @@ pub fn human_count(value: u64) -> String {
 }
 
 /// The value to show for a node under the active metric.
-pub fn short_value(node: &Node, metric: Metric) -> String {
+pub fn short_value(node: Node<'_>, metric: Metric) -> String {
     match metric {
-        Metric::Bytes => human_bytes_short(node.bytes),
-        Metric::Files => human_count(node.files),
+        Metric::Bytes => human_bytes_short(node.bytes()),
+        Metric::Files => human_count(node.files()),
     }
 }
 

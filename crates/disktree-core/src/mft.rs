@@ -17,11 +17,18 @@
 //! from a refused open to a record layout it does not expect, returns
 //! `None` and the walk measures instead, so this is only ever a faster way
 //! to the same tree.
+//!
+//! With [`ScanOptions::cache`] set, the finished tree one read made is
+//! kept for the next scan, which loads it, reads again only the files the
+//! volume's change journal names, and changes only what those touch: see
+//! `snapshot.rs` and `flat.rs`.
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -32,8 +39,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::scan::{ScanOptions, ScanProgress};
-use crate::tree::{Node, NodeKind};
+use crate::tree::{Seen, Tree};
 use crate::windows::{Aligned, drive_letter};
+
+mod flat;
+mod snapshot;
+
+use snapshot::{Checkpoint, Journal, State};
 
 /// Most bytes read per call: large enough that the disk streams, small
 /// enough that many reads are outstanding at once.
@@ -88,19 +100,143 @@ const EVICTED: u32 =
     FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
 /// What one base file record says.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Info {
     in_use: bool,
     directory: bool,
+    hidden: bool,
+    evicted: bool,
+    reparse: u8,
     /// Bumped each time the record is reused: a reference carrying another
     /// one names a file that is gone.
     sequence: u16,
-    attributes: u32,
-    reparse_tag: u32,
     modified: i64,
     apparent: u64,
     allocated: u64,
     names: u8,
+}
+
+impl Info {
+    const REPARSE: u8 = 1;
+    const TAGGED: u8 = 2;
+    const SURROGATE: u8 = 4;
+
+    const fn set_attributes(&mut self, attributes: u32) {
+        self.hidden = attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+        self.evicted = attributes & EVICTED != 0;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            self.reparse |= Self::REPARSE;
+        } else {
+            self.reparse &= !Self::REPARSE;
+        }
+    }
+
+    const fn has_tag(&self) -> bool {
+        self.reparse & Self::TAGGED != 0
+    }
+
+    const fn is_link(&self) -> bool {
+        self.reparse & (Self::REPARSE | Self::SURROGATE)
+            == (Self::REPARSE | Self::SURROGATE)
+    }
+
+    /// Presence must survive even for non-surrogate tags: otherwise a
+    /// stale name hint or extension could turn a directory into a link.
+    const fn set_tag(&mut self, tag: u32) {
+        self.reparse &= !(Self::TAGGED | Self::SURROGATE);
+        if tag != 0 {
+            self.reparse |= Self::TAGGED;
+        }
+        if tag & NAME_SURROGATE != 0 {
+            self.reparse |= Self::SURROGATE;
+        }
+    }
+}
+
+/// Empty stretches of the MFT need no record storage. A page lookup
+/// keeps access constant-time without a pointer allocation per record.
+#[derive(Default)]
+struct RecordTable {
+    pages: Vec<usize>,
+    values: Vec<Info>,
+    len: usize,
+}
+
+impl RecordTable {
+    const PAGE: usize = 256;
+    const EMPTY: usize = usize::MAX;
+
+    fn offset(pages: &[usize], number: usize) -> Option<usize> {
+        let &page = pages.get(number / Self::PAGE)?;
+        (page != Self::EMPTY).then(|| page + number % Self::PAGE)
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    fn get(&self, number: usize) -> Option<&Info> {
+        if number >= self.len {
+            return None;
+        }
+        self.values.get(Self::offset(&self.pages, number)?)
+    }
+
+    fn get_mut(&mut self, number: usize) -> Option<&mut Info> {
+        if number >= self.len {
+            return None;
+        }
+        let at = Self::offset(&self.pages, number)?;
+        self.values.get_mut(at)
+    }
+
+    /// Allocate all new pages together before a journal patch writes any
+    /// records, so growth copies the existing values at most once.
+    fn reserve(
+        &mut self,
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    ) {
+        let mut count = self.values.len();
+        for range in ranges {
+            self.len = self.len.max(range.end);
+            self.pages
+                .resize(self.len.div_ceil(Self::PAGE), Self::EMPTY);
+            for page in &mut self.pages
+                [range.start / Self::PAGE..range.end.div_ceil(Self::PAGE)]
+            {
+                if *page == Self::EMPTY {
+                    *page = count;
+                    count += Self::PAGE;
+                }
+            }
+        }
+        let added = count - self.values.len();
+        self.values.reserve_exact(added);
+        self.values
+            .par_extend(rayon::iter::repeat_n(Info::default(), added));
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<Info>> for RecordTable {
+    fn from(values: Vec<Info>) -> Self {
+        let mut table = Self::default();
+        table.reserve(values.chunks(Self::PAGE).enumerate().filter_map(
+            |(page, values)| {
+                values
+                    .iter()
+                    .any(|info| info.in_use)
+                    .then_some(page * Self::PAGE..(page + 1) * Self::PAGE)
+            },
+        ));
+        table.len = values.len();
+        for (number, info) in values.into_iter().enumerate() {
+            if let Some(slot) = table.get_mut(number) {
+                *slot = info;
+            }
+        }
+        table
+    }
 }
 
 /// One name of a file: an entry in its parent directory. The name itself
@@ -156,85 +292,176 @@ struct Geometry {
     mft_offset: u64,
     /// The volume's size in bytes: no table can be larger.
     volume: u64,
+    /// The serial number the volume was formatted with.
+    serial: u64,
 }
 
 /// The tree under `root`, read from the volume's file table; `None` when
-/// the table cannot be read and the walk has to measure instead.
+/// the table cannot be read and the walk has to measure instead. The tree
+/// comes back finished: totalled, ordered and classified. It is the tree
+/// kept for the next scan too, written by a thread of its own that shares
+/// it rather than a copy.
 pub fn scan(
     root: &Path,
     canonical: &Path,
     options: &ScanOptions,
     progress: &ScanProgress,
-) -> Option<io::Result<Node>> {
+) -> Option<io::Result<Arc<Tree>>> {
     // A followed link can lead off this volume, or back into it a second
     // time, and the table describes neither: the walk follows them.
     if options.follow_links {
         return None;
     }
-    let path = format!(r"\\.\{}:", drive_letter(canonical)?);
+    let letter = drive_letter(canonical)?;
+    let path = format!(r"\\.\{letter}:");
+    // Its file must not change under the read of it next.
+    crate::scan::wait_for_cache();
     let volume = open_volume(&path).ok()?;
     let geometry = geometry(&volume)?;
-    let (runs, bitmap) = table_layout(&volume, &geometry)?;
-    let reads = plan_reads(
-        &runs,
-        &bitmap,
-        &geometry,
-        GAP_BYTES / geometry.record as u64,
-    );
-    let mut infos = table(&reads, geometry.record);
-    let parsed = read_records(
-        &path,
-        geometry.record,
-        &reads,
-        &mut infos,
-        options.apparent_size,
-        progress,
-    )?;
-    if progress.is_cancelled() {
-        return Some(Err(cancelled()));
-    }
-
-    let (mut names, texts) = merge(parsed, &mut infos);
-    if progress.is_cancelled() {
-        return Some(Err(cancelled()));
-    }
-    if !is_root_directory(&infos) {
-        return None;
-    }
-    names.par_sort_unstable_by_key(|name| name.parent);
-    let starts = starts(&names, infos.len());
-    let table = Table {
-        infos,
-        names,
-        texts,
-        starts,
-        options,
-        progress,
+    // A depth limit leaves out directories a later change can bring into
+    // view, with entries a kept tree would not hold: nothing is kept.
+    let file = options
+        .cache
+        .as_deref()
+        .filter(|_| options.max_depth.is_none())
+        .map(|dir| snapshot::file(dir, letter));
+    let journal = file.as_ref().and_then(|_| snapshot::query(&volume));
+    let resumed = file.as_deref().zip(journal).and_then(|(file, journal)| {
+        snapshot::resume(&path, &volume, &geometry, journal, file, options)
+    });
+    let (tree, checkpoint) = match resumed {
+        Some((mut tree, checkpoint)) => {
+            tree.rename(crate::scan::file_name(root));
+            (Ok(Arc::new(tree)), checkpoint)
+        }
+        None => {
+            match whole(&path, &volume, &geometry, journal, options, progress)?
+            {
+                Ok((mut tree, checkpoint)) => {
+                    tree.rename(crate::scan::file_name(root));
+                    crate::classify::classify(&mut tree);
+                    (Ok(Arc::new(tree)), checkpoint)
+                }
+                Err(stop) => (Err(stop), None),
+            }
+        }
     };
-    let tree = table.directory(ROOT, crate::scan::file_name(root), 0);
-    // Hundreds of megabytes, whose freeing the caller would otherwise
-    // wait out before it can finish the tree.
-    let Table {
-        infos,
-        names,
-        texts,
-        starts,
-        ..
-    } = table;
-    // When no thread can be made, the closure is dropped here instead,
-    // and they are freed in place.
-    let _ = std::thread::Builder::new()
-        .spawn(move || drop((infos, names, texts, starts)));
+    if let (Ok(tree), Some(file), Some(checkpoint)) = (&tree, file, checkpoint)
+        && !progress.is_cancelled()
+    {
+        let tree = Arc::clone(tree);
+        snapshot::save_later(file, &geometry, options, checkpoint, move || {
+            // What patches left behind is not worth keeping; nor is a tree
+            // too large for one segment kept at all.
+            if tree.has_garbage() {
+                tree.compact().map(Arc::new)
+            } else {
+                Some(tree)
+            }
+        });
+    }
     match tree {
         Ok(_) | Err(Stop) if progress.is_cancelled() => Some(Err(cancelled())),
-        Ok(node) => Some(Ok(node)),
+        Ok(tree) => Some(Ok(tree)),
         Err(Stop) => None,
     }
 }
 
+/// What [`whole`] gives: the tree, not yet classified, and the checkpoint.
+type Whole = (Tree, Option<Checkpoint>);
+
+/// The directories changed just before a whole read, with the checkpoint.
+type Recent = (Checkpoint, Vec<u32>);
+
+/// The tree from a whole read of the table, not yet classified, and with
+/// `journal`, where the next scan can pick up. `None` when the table
+/// cannot be read, and [`Stop`] when the read was cancelled or the table
+/// makes no tree.
+fn whole(
+    path: &str,
+    volume: &File,
+    geometry: &Geometry,
+    journal: Option<Journal>,
+    options: &ScanOptions,
+    progress: &ScanProgress,
+) -> Option<Result<Whole, Stop>> {
+    let (mut state, checkpoint) =
+        read_whole(path, volume, geometry, journal, options, progress)?;
+    if progress.is_cancelled() {
+        return Some(Err(Stop));
+    }
+    if !is_root_directory(&state.infos) {
+        return None;
+    }
+    state.names.par_sort_unstable_by_key(|name| name.parent);
+    let checkpoint = checkpoint.map(|(checkpoint, recent)| {
+        // A directory changed just before the read can be on the disk as
+        // it was, or not at all, and what is in it would then find no
+        // place in the tree the next scan starts from. Read again from
+        // NTFS, which has them as they are; their files are read again on
+        // the next scan, with the rest of what changed.
+        let _ = snapshot::reread(path, geometry, &mut state, &recent);
+        checkpoint
+    });
+    let starts = starts(&state.names, state.infos.len());
+    let table = Table::of(state, starts, options, progress);
+    let tree = table.build();
+    // A few large lists, and nothing waits on their freeing.
+    let parts = table.into_parts();
+    let _ = std::thread::Builder::new().spawn(move || drop(parts));
+    Some(tree.map(|tree| (tree, checkpoint)))
+}
+
+/// Every used record of the table, read from the disk; with `journal`,
+/// also where the next scan can pick up from, and the directories changed
+/// just before the read.
+fn read_whole(
+    path: &str,
+    volume: &File,
+    geometry: &Geometry,
+    journal: Option<Journal>,
+    options: &ScanOptions,
+    progress: &ScanProgress,
+) -> Option<(State, Option<Recent>)> {
+    let (runs, bitmap) = table_layout(volume, geometry)?;
+    let reads = plan_reads(
+        &runs,
+        &bitmap,
+        geometry,
+        GAP_BYTES / geometry.record as u64,
+    );
+    let mut infos = table(&reads, geometry.record);
+    // The journal, tens of megabytes read through NTFS, on a thread of its
+    // own while the table is on the disk.
+    let (parsed, checkpoint) = std::thread::scope(|scope| {
+        let checkpoint = journal.map(|journal| {
+            scope.spawn(move || snapshot::after_whole_read(volume, journal))
+        });
+        let parsed = read_records(
+            path,
+            geometry.record,
+            &reads,
+            &mut infos,
+            options.apparent_size,
+            progress,
+        );
+        let checkpoint = checkpoint.and_then(|thread| thread.join().ok()?);
+        (parsed, checkpoint)
+    });
+    let (names, texts) = merge(parsed?, &mut infos);
+    Some((
+        State {
+            infos,
+            names,
+            texts,
+        },
+        checkpoint,
+    ))
+}
+
 /// Whether the root's record reads as an in-use directory; if not, the
 /// table is not what this expects and the walk measures instead.
-fn is_root_directory(infos: &[Info]) -> bool {
+fn is_root_directory(infos: &RecordTable) -> bool {
     infos
         .get(ROOT as usize)
         .is_some_and(|root| root.in_use && root.directory)
@@ -308,6 +535,7 @@ fn geometry_of(boot: &[u8]) -> Option<Geometry> {
         record: usize::try_from(record).ok()?,
         mft_offset,
         volume,
+        serial: u64_at(boot, 0x48)?,
     })
 }
 
@@ -541,28 +769,27 @@ fn decode_runs(attribute: &[u8], cluster: u64) -> Option<Runs> {
     }
 }
 
-/// A slot per record up to the last one read, each empty until a read
-/// fills it: records no read covers are free.
-fn table(reads: &[(u64, u64, u64)], record: usize) -> Vec<Info> {
-    let len = reads.last().map_or(0, |&(_, size, first)| {
-        usize::try_from(first + size / record as u64).unwrap_or(0)
-    });
-    let mut infos = Vec::new();
-    (0..len)
-        .into_par_iter()
-        .map(|_| Info::default())
-        .collect_into_vec(&mut infos);
+/// Only pages touched by a read need slots. Reads are ordered by record,
+/// so each read remains one contiguous stretch of the compact values.
+fn table(reads: &[(u64, u64, u64)], record: usize) -> RecordTable {
+    let mut infos = RecordTable::default();
+    infos.reserve(reads.iter().map(|&(_, size, first)| {
+        let first = usize::try_from(first).unwrap_or(0);
+        first..first + usize::try_from(size).unwrap_or(0) / record
+    }));
     infos
 }
 
 /// Read and parse every used record, each into its slot of `infos`.
 /// Reads run in parallel: one at a time leaves a solid-state disk idle
-/// between requests. One list of reads per thread, each with its own
-/// volume handle and buffer: requests on one handle opened without
-/// overlapped I/O run one at a time, and rayon's `map_init` would open a
-/// handle and zero a buffer per split, hundreds of times. Read `i` goes to
-/// list `i % threads`, so the lists move through the disk together.
-/// Results come back in read order, which `merge` relies on.
+/// between requests. One worker per thread, each with its own volume
+/// handle and buffer: requests on one handle opened without overlapped
+/// I/O run one at a time, and rayon's `map_init` would open a handle and
+/// zero a buffer per split, hundreds of times. Workers take reads from one
+/// queue, largest first: dealt out in advance, one worker's share ran on
+/// after the others were done, and a 16 MiB read taken last kept every
+/// other thread waiting on it. Results come back in read order, which
+/// `merge` relies on.
 ///
 /// Records land in `infos` as they are parsed, while other reads are
 /// still on the disk: gathered into it after the last read, they cost a
@@ -571,49 +798,48 @@ fn read_records(
     path: &str,
     record: usize,
     reads: &[(u64, u64, u64)],
-    infos: &mut [Info],
+    infos: &mut RecordTable,
     apparent_size: bool,
     progress: &ScanProgress,
 ) -> Option<Vec<Parsed>> {
     let threads = rayon::current_num_threads().max(1);
-    let mut stretches: Vec<Vec<&mut [Info]>> =
-        (0..threads).map(|_| Vec::new()).collect();
     // `plan_reads` gives them in record order, none overlapping.
-    let mut rest = infos;
+    let mut stretches = Vec::with_capacity(reads.len());
+    let mut rest = infos.values.as_mut_slice();
     let mut done = 0;
-    for (index, &(_, size, first)) in reads.iter().enumerate() {
-        let skip = usize::try_from(first).ok()?.checked_sub(done)?;
+    for &(_, size, first) in reads {
+        let first =
+            RecordTable::offset(&infos.pages, usize::try_from(first).ok()?)?;
+        let skip = first.checked_sub(done)?;
         let count = usize::try_from(size).ok()? / record;
         let (stretch, tail) =
             rest.get_mut(skip..)?.split_at_mut_checked(count)?;
-        stretches[index % threads].push(stretch);
+        stretches.push(Mutex::new(Some(stretch)));
         rest = tail;
         done += skip + count;
     }
-    let lists = stretches
+    let mut order: Vec<usize> = (0..reads.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(reads[index].1));
+    let next = AtomicUsize::new(0);
+    let lists = (0..threads)
         .into_par_iter()
-        .enumerate()
-        .map(|(list, stretches)| {
+        .map(|_| {
             let volume = open_volume(path).ok()?;
             let mut buffer = Aligned::default();
             let mut parsed = Vec::new();
-            for ((chunk, &(offset, size, first)), stretch) in reads
-                .iter()
-                .enumerate()
-                .skip(list)
-                .step_by(threads)
-                .zip(stretches)
+            while !progress.is_cancelled()
+                && let Some(&index) =
+                    order.get(next.fetch_add(1, Ordering::Relaxed))
             {
-                if progress.is_cancelled() {
-                    break;
-                }
+                let (offset, size, first) = reads[index];
+                let stretch = crate::scan::lock(&stretches[index]).take()?;
                 let buffer = buffer.bytes(usize::try_from(size).ok()?);
                 volume.seek_read_exact(buffer, offset).ok()?;
                 let chunk = parse_chunk(
                     buffer,
                     record,
                     first,
-                    u32::try_from(chunk).ok()?,
+                    u32::try_from(index).ok()?,
                     stretch,
                 );
                 let bytes = if apparent_size {
@@ -622,22 +848,18 @@ fn read_records(
                     chunk.allocated
                 };
                 progress.add(chunk.files, 0, bytes);
-                parsed.push(chunk);
+                parsed.push((index, chunk));
             }
             Some(parsed)
         })
         .collect::<Option<Vec<_>>>()?;
-    // Interleave back: read `i` is item `i / threads` of list `i % threads`.
-    let mut lists: Vec<_> = lists.into_iter().map(Vec::into_iter).collect();
-    let mut parsed = Vec::with_capacity(reads.len());
-    for index in 0..reads.len() {
-        // Short only when cancelled, which the caller checks next.
-        let Some(chunk) = lists[index % threads].next() else {
-            break;
-        };
-        parsed.push(chunk);
+    let mut slots: Vec<Option<Parsed>> =
+        std::iter::repeat_with(|| None).take(reads.len()).collect();
+    for (index, chunk) in lists.into_iter().flatten() {
+        slots[index] = Some(chunk);
     }
-    Some(parsed)
+    // Short only when cancelled, which the caller checks next.
+    Some(slots.into_iter().map_while(|chunk| chunk).collect())
 }
 
 /// `len` bytes at `offset`. Read as whole, aligned 4 KiB blocks: past the
@@ -714,7 +936,20 @@ fn parse_record(
     out: &mut Parsed,
     slot: &mut Info,
 ) {
-    if bytes.get(..4) != Some(b"FILE") || fixup(bytes).is_none() {
+    if fixup(bytes).is_some() {
+        parse_fixed(bytes, number, chunk, out, slot);
+    }
+}
+
+/// [`parse_record`] for a record whose update sequence is already undone.
+fn parse_fixed(
+    bytes: &[u8],
+    number: u32,
+    chunk: u32,
+    out: &mut Parsed,
+    slot: &mut Info,
+) {
+    if bytes.get(..4) != Some(b"FILE") {
         return;
     }
     let Some(flags) = u16_at(bytes, 0x16) else {
@@ -741,6 +976,7 @@ fn parse_record(
     };
     let mut apparent = None;
     let mut allocated = 0_u64;
+    let mut tag = 0;
     // A reparse point's tag is also kept beside each name, which serves
     // when the `$REPARSE_POINT` value is not in the record itself.
     let mut name_tag = 0;
@@ -751,7 +987,7 @@ fn parse_record(
                     info.modified = u64_at(value, 0x08).map_or(0, |ticks| {
                         crate::windows::unix_seconds(ticks.cast_signed())
                     });
-                    info.attributes = u32_at(value, 0x20).unwrap_or(0);
+                    info.set_attributes(u32_at(value, 0x20).unwrap_or(0));
                 }
             }
             FILE_NAME => {
@@ -798,15 +1034,16 @@ fn parse_record(
             }
             REPARSE_POINT => {
                 if let Some(value) = attribute.value() {
-                    info.reparse_tag = u32_at(value, 0).unwrap_or(0);
+                    tag = u32_at(value, 0).unwrap_or(0);
                 }
             }
             _ => {}
         }
     }
-    if info.reparse_tag == 0 {
-        info.reparse_tag = name_tag;
+    if tag == 0 {
+        tag = name_tag;
     }
+    info.set_tag(tag);
     if base & REFERENCE == 0 {
         if !info.directory {
             out.files += 1;
@@ -816,14 +1053,9 @@ fn parse_record(
         info.apparent = apparent.unwrap_or(0);
         info.allocated = allocated;
         *slot = info;
-    } else if apparent.is_some() || allocated != 0 || info.reparse_tag != 0 {
-        out.extra.push((
-            owner,
-            base_sequence,
-            apparent,
-            allocated,
-            info.reparse_tag,
-        ));
+    } else if apparent.is_some() || allocated != 0 || tag != 0 {
+        out.extra
+            .push((owner, base_sequence, apparent, allocated, tag));
     }
 }
 
@@ -959,7 +1191,10 @@ fn attributes(record: &[u8]) -> impl Iterator<Item = Attribute<'_>> {
 
 /// Every chunk's names in one list, and what extension records add to
 /// their base records' slots in `infos`.
-fn merge(parsed: Vec<Parsed>, infos: &mut [Info]) -> (Vec<Entry>, Vec<String>) {
+fn merge(
+    parsed: Vec<Parsed>,
+    infos: &mut RecordTable,
+) -> (Vec<Entry>, Vec<String>) {
     // Copied in parallel, a chunk per task, into a list filled first: one
     // thread appending millions of names made every other one wait. Room
     // for the names from extension records too, pushed after: any system
@@ -1012,28 +1247,64 @@ fn merge(parsed: Vec<Parsed>, infos: &mut [Info]) -> (Vec<Entry>, Vec<String>) {
         if let Some(apparent) = apparent {
             info.apparent = apparent;
         }
-        if info.reparse_tag == 0 {
-            info.reparse_tag = tag;
+        if !info.has_tag() {
+            info.set_tag(tag);
         }
     }
     (names, texts)
 }
 
-/// Why [`Table::directory`] gave up: the scan was cancelled, or the tree
-/// runs deeper than [`MOST_LEVELS`].
+/// Why a tree was not made: the scan was cancelled, or the tree runs
+/// deeper than [`MOST_LEVELS`], or holds more than it can number.
 struct Stop;
 
+/// What a whole read of the table found, ready for `flat` to build the
+/// tree from.
 struct Table<'a> {
-    infos: Vec<Info>,
+    infos: RecordTable,
     /// Sorted by parent; `starts[p]..starts[p + 1]` are `p`'s entries.
     names: Vec<Entry>,
     texts: Vec<String>,
     starts: Vec<u32>,
     options: &'a ScanOptions,
     progress: &'a ScanProgress,
+    /// Files charged already, when hardlinks count once: totals are
+    /// settled as the tree is built, rather than in a pass over it after.
+    seen: Option<Seen>,
 }
 
-impl Table<'_> {
+impl<'a> Table<'a> {
+    fn of(
+        state: State,
+        starts: Vec<u32>,
+        options: &'a ScanOptions,
+        progress: &'a ScanProgress,
+    ) -> Self {
+        let State {
+            infos,
+            names,
+            texts,
+        } = state;
+        Self {
+            infos,
+            names,
+            texts,
+            starts,
+            options,
+            progress,
+            seen: options.dedup_hardlinks.then(Seen::new),
+        }
+    }
+
+    fn into_parts(self) -> (State, Vec<u32>) {
+        let state = State {
+            infos: self.infos,
+            names: self.names,
+            texts: self.texts,
+        };
+        (state, self.starts)
+    }
+
     fn name(&self, entry: &Entry) -> &str {
         let at = entry.at as usize;
         self.texts
@@ -1050,104 +1321,6 @@ impl Table<'_> {
             }
             _ => &[],
         }
-    }
-
-    /// Mirrors what the walk keeps: see `WalkContext::classify`.
-    fn directory(
-        &self,
-        number: u32,
-        name: Box<str>,
-        depth: usize,
-    ) -> Result<Node, Stop> {
-        if depth >= MOST_LEVELS || self.progress.is_cancelled() {
-            return Err(Stop);
-        }
-        let descend = self.options.max_depth.is_none_or(|max| depth < max);
-        let sequence =
-            self.infos.get(number as usize).map(|info| info.sequence);
-        let child = |entry: &Entry| {
-            // A root directory holds hundreds of thousands of files; a
-            // check per entry lets a cancel stop within one.
-            if self.progress.is_cancelled() {
-                return Some(Err(Stop));
-            }
-            // An entry naming a parent whose record has since been reused.
-            if Some(entry.parent_sequence) != sequence {
-                return None;
-            }
-            self.child(entry, depth, descend).transpose()
-        };
-        let entries = self.entries(number);
-        // See `tree::PARALLEL_LEVELS`: parallel only near the top.
-        let children = if depth < crate::tree::PARALLEL_LEVELS {
-            entries
-                .par_iter()
-                .filter_map(child)
-                .collect::<Result<_, _>>()?
-        } else {
-            // Sized up front: nearly every entry becomes a child, and a
-            // list grown by doubling copies its nodes over and over.
-            let mut children = Vec::with_capacity(entries.len());
-            for node in entries.iter().filter_map(child) {
-                children.push(node?);
-            }
-            children
-        };
-        let mut node = Node::directory(name);
-        node.children = children;
-        Ok(node)
-    }
-
-    /// The node for `entry`; `None` for one the walk would not list.
-    fn child(
-        &self,
-        entry: &Entry,
-        depth: usize,
-        descend: bool,
-    ) -> Result<Option<Node>, Stop> {
-        // The root is its own parent.
-        if entry.child == entry.parent || entry.child < FIRST_USER_RECORD {
-            return Ok(None);
-        }
-        let Some(info) = self.infos.get(entry.child as usize) else {
-            return Ok(None);
-        };
-        if !info.in_use {
-            return Ok(None);
-        }
-        let name = self.name(entry);
-        if !self.options.include_hidden
-            && (name.starts_with('.')
-                || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0)
-        {
-            return Ok(None);
-        }
-        let link = info.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            && info.reparse_tag & NAME_SURROGATE != 0;
-        if info.directory && !link {
-            if info.attributes & EVICTED != 0 || !descend {
-                return Ok(None);
-            }
-            return self
-                .directory(entry.child, name.into(), depth + 1)
-                .map(Some);
-        }
-        let size = if self.options.apparent_size {
-            info.apparent
-        } else {
-            info.allocated
-        };
-        let kind = if link {
-            NodeKind::Symlink
-        } else {
-            NodeKind::File
-        };
-        let mut node = Node::entry(name, kind, size);
-        node.modified = info.modified;
-        if info.names > 1 {
-            node.inode = Some((0, u64::from(entry.child)));
-        }
-        Ok(Some(node))
     }
 }
 
@@ -1183,7 +1356,17 @@ fn signed(bytes: &[u8]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
     use super::*;
+    use crate::tree::{Node, NodeKind};
+
+    /// The tree a table makes, the way a scan makes it.
+    fn tree_of(table: &Table<'_>) -> Result<Tree, Stop> {
+        let mut tree = table.build()?;
+        crate::classify::classify(&mut tree);
+        Ok(tree)
+    }
 
     const RECORD: usize = 1024;
     const USA_AT: usize = 0x30;
@@ -1279,7 +1462,7 @@ mod tests {
 
         assert!(info.in_use);
         assert!(!info.directory);
-        assert_eq!(info.attributes, FILE_ATTRIBUTE_HIDDEN);
+        assert!(info.hidden);
         assert_eq!((info.apparent, info.allocated), (5000, 8192));
         // The 8.3 alias is the same entry again, not a second name.
         let [entry] = &out.names[..] else {
@@ -1292,6 +1475,52 @@ mod tests {
             "report for the board.txt"
         );
         assert_eq!(out.files, 1);
+    }
+
+    #[test]
+    fn reparse_tag_precedence_preserves_directory_and_link_kinds() {
+        const ORDINARY: u32 = 0x8000_0017;
+        const SURROGATE: u32 = 0xA000_0003;
+        for (reparse_attribute, tag, hint, extra, kind) in [
+            (true, ORDINARY, SURROGATE, 0, NodeKind::Directory),
+            (true, 0, SURROGATE, 0, NodeKind::Symlink),
+            (true, ORDINARY, 0, SURROGATE, NodeKind::Directory),
+            (true, 0, 0, SURROGATE, NodeKind::Symlink),
+            (false, SURROGATE, 0, 0, NodeKind::Directory),
+        ] {
+            let mut named = name(ROOT, "target", 1);
+            let at = usize::from(u16_at(&named, 0x14).expect("value offset"));
+            named[at + 0x38..at + 0x3C]
+                .copy_from_slice(&FILE_ATTRIBUTE_REPARSE_POINT.to_le_bytes());
+            named[at + 0x3C..at + 0x40].copy_from_slice(&hint.to_le_bytes());
+            let mut base = record(
+                IN_USE | IS_DIRECTORY,
+                0,
+                &[
+                    standard(if reparse_attribute {
+                        FILE_ATTRIBUTE_REPARSE_POINT
+                    } else {
+                        0
+                    }),
+                    named,
+                    resident(REPARSE_POINT, &tag.to_le_bytes()),
+                ],
+            );
+            base[0x10..0x12].copy_from_slice(&1_u16.to_le_bytes());
+            let extension = record(
+                IN_USE,
+                32 | (1 << 48),
+                &[resident(REPARSE_POINT, &extra.to_le_bytes())],
+            );
+            let state = read_all(&[(32, base), (33, extension)]);
+            let info = *state.infos.get(32).expect("base record");
+            let options = ScanOptions::default();
+            let progress = ScanProgress::default();
+            let table =
+                table(&[(32, ROOT, 5, "target", info)], &options, &progress);
+            let tree = tree_of(&table).ok().expect("tree");
+            assert_eq!(tree.root().child(0).expect("entry").kind(), kind);
+        }
     }
 
     #[test]
@@ -1321,6 +1550,7 @@ mod tests {
         parse_record(&mut base, 0x5A, 0, &mut out, &mut infos[0x5A]);
         parse_record(&mut stale, 300, 0, &mut out, &mut infos[300]);
         parse_record(&mut fresh, 301, 0, &mut out, &mut infos[301]);
+        let mut infos = infos.into();
 
         let (names, texts) = merge(vec![out], &mut infos);
         let mut listed: Vec<&str> = names
@@ -1333,21 +1563,141 @@ mod tests {
         listed.sort_unstable();
         assert_eq!(listed, ["current", "second"]);
         // Nor is the stale name counted as a link.
-        assert_eq!(infos[0x5A].names, 2);
+        assert_eq!(infos.get(0x5A).expect("base record").names, 2);
+    }
+
+    /// A file of `size` bytes named `names`, at sequence `sequence`.
+    fn file(sequence: u16, names: &[(u32, &str)], size: u64) -> Vec<u8> {
+        let mut attributes: Vec<Vec<u8>> = names
+            .iter()
+            .map(|&(parent, text)| name(parent, text, 1))
+            .collect();
+        attributes.push(non_resident(DATA, size.next_multiple_of(4096), size));
+        let mut bytes = record(IN_USE, 0, &attributes);
+        bytes[0x10..0x12].copy_from_slice(&sequence.to_le_bytes());
+        bytes
+    }
+
+    /// Every record read the way a whole read of the table does.
+    fn read_all(records: &[(u32, Vec<u8>)]) -> State {
+        let len = records
+            .iter()
+            .map(|(number, _)| *number as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut infos = vec![Info::default(); len];
+        let mut out = Parsed::default();
+        for (number, bytes) in records {
+            let mut bytes = bytes.clone();
+            let slot = &mut infos[*number as usize];
+            parse_record(&mut bytes, *number, 0, &mut out, slot);
+        }
+        let mut infos = infos.into();
+        let (mut names, texts) = merge(vec![out], &mut infos);
+        names.sort_by_key(|entry| entry.parent);
+        State {
+            infos,
+            names,
+            texts,
+        }
+    }
+
+    /// `(parent, child, name, size)` for every name, in order.
+    fn listing(state: &State) -> Vec<(u32, u32, String, u64)> {
+        let mut listed: Vec<_> = state
+            .names
+            .iter()
+            .map(|entry| {
+                let at = entry.at as usize;
+                let text = &state.texts[entry.chunk as usize]
+                    [at..at + usize::from(entry.len)];
+                let info = state.infos.get(entry.child as usize).expect("file");
+                (entry.parent, entry.child, text.to_owned(), info.apparent)
+            })
+            .collect();
+        listed.sort();
+        listed
+    }
+
+    #[test]
+    fn re_reading_the_changed_files_gives_what_a_whole_read_would() {
+        let dir = |sequence: u16| {
+            let mut bytes =
+                record(IN_USE | IS_DIRECTORY, 0, &[name(5, "dir", 1)]);
+            bytes[0x10..0x12].copy_from_slice(&sequence.to_le_bytes());
+            bytes
+        };
+        let before = [
+            (30, dir(2)),
+            (31, file(1, &[(30, "a.txt")], 100)),
+            (32, file(1, &[(30, "b.txt"), (5, "b-link.txt")], 200)),
+            (33, file(1, &[(5, "gone.txt")], 300)),
+            (40, file(1, &[(30, "kept.txt")], 400)),
+        ];
+        // 31 is renamed and grows, 32 loses a link, 33 is deleted and
+        // a record in a previously absent page is made; 40 is untouched.
+        let after = [
+            (30, dir(2)),
+            (31, file(1, &[(30, "a2.txt")], 150)),
+            (32, file(1, &[(30, "b.txt")], 200)),
+            (1024, file(1, &[(30, "new.txt")], 50)),
+            (40, file(1, &[(30, "kept.txt")], 400)),
+        ];
+        let mut state = read_all(&before);
+        // Re-read as NTFS hands records over, update sequence undone, in
+        // two lists as two threads would.
+        let changed = [31, 32, 33, 1024];
+        let lists = changed
+            .chunks(2)
+            .enumerate()
+            .map(|(chunk, numbers)| {
+                let mut out = Parsed::default();
+                let mut bases = Vec::new();
+                for number in numbers {
+                    let Some((_, bytes)) =
+                        after.iter().find(|(n, _)| n == number)
+                    else {
+                        continue;
+                    };
+                    let mut bytes = bytes.clone();
+                    fixup(&mut bytes).expect("fixed up");
+                    let mut info = Info::default();
+                    parse_fixed(
+                        &bytes,
+                        *number,
+                        chunk as u32,
+                        &mut out,
+                        &mut info,
+                    );
+                    bases.push((*number, info));
+                }
+                (bases, out)
+            })
+            .collect();
+        snapshot::apply(&mut state, &changed, lists).expect("applied");
+
+        assert_eq!(listing(&state), listing(&read_all(&after)));
+        assert!(state.names.is_sorted_by_key(|entry| entry.parent));
+        assert!(!state.infos.get(33).is_some_and(|info| info.in_use));
+        assert_eq!(
+            state.infos.get(32).expect("file").names,
+            1,
+            "no longer a hardlink"
+        );
     }
 
     #[test]
     fn a_root_that_is_not_an_in_use_directory_is_refused() {
         let mut infos = vec![Info::default(); 8];
-        assert!(!is_root_directory(&infos));
+        assert!(!is_root_directory(&infos.clone().into()));
         infos[ROOT as usize] = Info {
             in_use: true,
             ..Info::default()
         };
-        assert!(!is_root_directory(&infos));
+        assert!(!is_root_directory(&infos.clone().into()));
         infos[ROOT as usize].directory = true;
-        assert!(is_root_directory(&infos));
-        assert!(!is_root_directory(&infos[..3]));
+        assert!(is_root_directory(&infos.clone().into()));
+        assert!(!is_root_directory(&infos[..3].to_vec().into()));
     }
 
     #[test]
@@ -1379,6 +1729,7 @@ mod tests {
             record: RECORD,
             mft_offset: 0,
             volume: 1 << 30,
+            serial: 0,
         };
         let record = RECORD as u64;
         let gap = GAP_BYTES / record;
@@ -1411,14 +1762,13 @@ mod tests {
 
     #[test]
     fn each_read_parses_into_the_slots_of_its_own_records() {
-        // Records 0..96, each named for its number and sized 100 more,
-        // in an ordinary file: reading it is reading a table, but for the
-        // volume. Reads of 4 records, every third one skipped, handed out
-        // to 3 threads, so no thread's reads are adjacent.
+        // Reads cross page boundaries and leave missing pages between
+        // them. Adjacent reads share a page, but never a record.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("records");
         let mut bytes = Vec::new();
         for number in 0..96_u64 {
+            let number = (number / 8) * 512 + 254 + number % 8;
             bytes.extend(record(
                 IN_USE,
                 0,
@@ -1431,7 +1781,9 @@ mod tests {
         std::fs::write(&path, bytes).expect("records written");
         let reads: Vec<_> = (0..24_u64)
             .filter(|read| read % 3 != 1)
-            .map(|read| (read * 4096, 4096, read * 4))
+            .map(|read| {
+                (read * 4096, 4096, (read / 2) * 512 + 254 + (read % 2) * 4)
+            })
             .collect();
         let mut infos = super::table(&reads, RECORD);
         let progress = ScanProgress::default();
@@ -1453,8 +1805,13 @@ mod tests {
             .expect("the file reads");
         let (names, texts) = merge(parsed, &mut infos);
 
-        for (number, info) in infos.iter().enumerate() {
-            let read = number / 4 % 3 != 1;
+        for number in 0..infos.len() {
+            let info = infos.get(number).copied().unwrap_or_default();
+            let relative = number.checked_sub(254);
+            let read = relative.is_some_and(|relative| {
+                relative % 512 < 8
+                    && ((relative / 512) * 2 + relative % 512 / 4) % 3 != 1
+            });
             assert_eq!(info.in_use, read, "record {number}");
             if read {
                 assert_eq!(info.apparent, number as u64 + 100);
@@ -1558,19 +1915,20 @@ mod tests {
         names.sort_by_key(|entry| entry.parent);
         let starts = starts(&names, infos.len());
         Table {
-            infos,
+            infos: infos.into(),
             names,
             texts: vec![text],
             starts,
             options,
             progress,
+            seen: options.dedup_hardlinks.then(Seen::new),
         }
     }
 
-    fn paths(node: &Node, prefix: &str, out: &mut Vec<(String, NodeKind)>) {
-        for child in &node.children {
-            let path = format!("{prefix}{}", child.name);
-            out.push((path.clone(), child.kind));
+    fn paths(node: Node<'_>, prefix: &str, out: &mut Vec<(String, NodeKind)>) {
+        for child in node.children() {
+            let path = format!("{prefix}{}", child.name());
+            out.push((path.clone(), child.kind()));
             paths(child, &format!("{path}/"), out);
         }
     }
@@ -1583,6 +1941,7 @@ mod tests {
             ..Info::default()
         };
         let dir = Info {
+            in_use: true,
             directory: true,
             sequence: 3,
             ..file
@@ -1596,7 +1955,7 @@ mod tests {
                 5,
                 "hidden.txt",
                 Info {
-                    attributes: FILE_ATTRIBUTE_HIDDEN,
+                    hidden: true,
                     ..file
                 },
             ),
@@ -1606,7 +1965,7 @@ mod tests {
                 5,
                 "evicted",
                 Info {
-                    attributes: FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+                    evicted: true,
                     ..dir
                 },
             ),
@@ -1617,8 +1976,7 @@ mod tests {
                 5,
                 "link",
                 Info {
-                    attributes: FILE_ATTRIBUTE_REPARSE_POINT,
-                    reparse_tag: 0xA000_0003,
+                    reparse: Info::REPARSE | Info::TAGGED | Info::SURROGATE,
                     ..dir
                 },
             ),
@@ -1663,15 +2021,11 @@ mod tests {
                 max_depth,
                 ..ScanOptions::default()
             };
-            let Ok(root) = table(&rows, &options, &progress).directory(
-                ROOT,
-                "C:\\".into(),
-                0,
-            ) else {
+            let Ok(root) = tree_of(&table(&rows, &options, &progress)) else {
                 panic!("the table is not cut short");
             };
             let mut found = Vec::new();
-            paths(&root, "", &mut found);
+            paths(root.root(), "", &mut found);
             found.sort_by(|left, right| left.0.cmp(&right.0));
             let kind = |path: &str| match path {
                 "link" => NodeKind::Symlink,
@@ -1684,9 +2038,12 @@ mod tests {
                 .collect();
             assert_eq!(found, expected, "include_hidden {include_hidden}");
 
-            // Only a file with a second name needs its identity kept.
-            let inode = |name: &str| root.child_named(name).unwrap().inode;
-            assert_eq!(inode("linked.txt"), Some((0, 31)));
+            // Only a file with a second name needs its identity kept: its
+            // record, and the sequence number the record had.
+            let inode = |name: &str| {
+                root.root().child_named(name).and_then(Node::inode)
+            };
+            assert_eq!(inode("linked.txt"), Some((0, flat::reference(31, 1))));
             assert_eq!(inode("visible.txt"), None);
         }
     }
@@ -1707,7 +2064,7 @@ mod tests {
         let options = ScanOptions::default();
         let progress = ScanProgress::default();
         let table = table(&rows, &options, &progress);
-        assert!(table.directory(ROOT, "C:\\".into(), 0).is_err());
+        assert!(tree_of(&table).is_err());
         assert!(!progress.is_cancelled());
     }
 }

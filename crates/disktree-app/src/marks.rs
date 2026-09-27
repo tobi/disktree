@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use disktree_core::removal::Target;
-use disktree_core::tree::{Metric, Node};
+use disktree_core::tree::{Metric, Node, Tree};
 use rustc_hash::FxHashSet;
 
 /// Marked paths, in the order they were marked.
@@ -61,10 +61,10 @@ impl Marks {
 
     /// Re-read sizes from a freshly scanned tree and drop marks whose path no
     /// longer exists, so the tally never claims space that is already gone.
-    pub fn refresh(&mut self, root_path: &Path, root: &Node, metric: Metric) {
+    pub fn refresh(&mut self, root_path: &Path, tree: &Tree, metric: Metric) {
         let mut resolved = Vec::with_capacity(self.items.len());
         for item in &self.items {
-            match find(root_path, root, &item.path) {
+            match find(root_path, tree.root(), &item.path) {
                 Some(node) => resolved.push(Target {
                     bytes: node.value(metric),
                     is_dir: node.is_dir(),
@@ -85,17 +85,13 @@ impl Marks {
 /// one at a time, so a name containing a path separator cannot confuse it.
 pub fn find<'a>(
     root_path: &Path,
-    root: &'a Node,
+    root: Node<'a>,
     path: &Path,
-) -> Option<&'a Node> {
+) -> Option<Node<'a>> {
     let relative = path.strip_prefix(root_path).ok()?;
     let mut node = root;
     for component in relative.components() {
-        let name = component.as_os_str().to_string_lossy();
-        node = node
-            .children
-            .iter()
-            .find(|child| child.name.as_ref() == name)?;
+        node = node.child_named(&component.as_os_str().to_string_lossy())?;
     }
     Some(node)
 }
@@ -124,20 +120,19 @@ pub fn display_path(path: &Path, home: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disktree_core::tree::{NodeKind, aggregate};
+    use disktree_core::tree::{Draft, NodeKind};
 
-    fn file(name: &str, bytes: u64) -> Node {
-        Node::entry(name, NodeKind::File, bytes)
+    fn file(name: &str, bytes: u64) -> Draft {
+        Draft::entry(name, NodeKind::File, bytes)
     }
 
-    fn tree() -> Node {
-        let mut root = Node::directory("home");
-        let mut cache = Node::directory(".cache");
+    fn tree() -> Tree {
+        let mut root = Draft::directory("home");
+        let mut cache = Draft::directory(".cache");
         cache.children.push(file("blob.bin", 900));
         root.children.push(cache);
         root.children.push(file("notes.bin", 100));
-        aggregate(&mut root, Metric::Bytes);
-        root
+        Tree::from_draft(root, Metric::Bytes)
     }
 
     fn target(path: &str, bytes: u64) -> Target {
@@ -189,7 +184,7 @@ mod tests {
         assert!(
             find(
                 Path::new("/home/tobi"),
-                &root,
+                root.root(),
                 Path::new("/home/tobi/.cache")
             )
             .is_some()
@@ -197,7 +192,7 @@ mod tests {
         assert!(
             find(
                 Path::new("/home/tobi"),
-                &root,
+                root.root(),
                 Path::new("/home/tobi/.cache/blob.bin")
             )
             .is_some()
@@ -205,7 +200,7 @@ mod tests {
         assert!(
             find(
                 Path::new("/home/tobi"),
-                &root,
+                root.root(),
                 Path::new("/home/tobi/cache")
             )
             .is_none()
@@ -213,7 +208,7 @@ mod tests {
         assert!(
             find(
                 Path::new("/elsewhere"),
-                &root,
+                root.root(),
                 Path::new("/home/tobi/notes.bin")
             )
             .is_none()

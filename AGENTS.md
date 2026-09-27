@@ -70,10 +70,16 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    allocation, alternate data streams included since they go when the file
    goes, so for a file with alternate streams it can exceed the walk's
    number.
-2. **`own_bytes`/`own_files` are derived, never tracked.** `tree::aggregate`
-   computes the totals from the children. Hardlink de-duplication zeroes a
-   duplicate leaf's weight while that pass runs; anything that patches
-   `bytes` directly will be overwritten.
+2. **Totals are derived, never tracked.** The tree is flat (`tree.rs`): a
+   directory's entries are one run, names sit in text arenas, and a
+   directory totals and orders its run from its entries once they are all
+   in (`Tree::settle`, or the walk's `PendingDir::finish`). A file's weight
+   is what it is charged: with hardlinks counted once, the first name met
+   weighs and the others weigh nothing. `own_bytes`/`own_files` are summed
+   from a run when asked. The file table reader builds the same tree,
+   settled and classified; a resumed scan changes it in place and totals,
+   orders and classifies again only what a change reaches. Tests there
+   hold it to a tree built whole.
 3. **A directory is only built when its own scan *and* every subdirectory task
    has finished.** That is the `+1` sentinel in `PendingDir::pending`. Building
    early silently drops whole subtrees — it has happened once.
@@ -96,6 +102,12 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    base-space pixels and is cached; `screen = (base - origin) * scale`.
 9. **The status bar never claims a saving it cannot measure.** Projections come
    from marked bytes; the final number comes from `statvfs` before and after.
+10. **An elevated scan reads only what an administrator wrote.** Its
+    caches live in `admin`, owned by Administrators under a protected ACL
+    that lets no one else write; `windows::cache_read` checks the very
+    handle it reads, and `cache_write` creates and renames through the
+    directory's handle, never its path. Anything else is a whole scan,
+    never an error.
 
 ## Where changes belong
 
@@ -108,6 +120,10 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
+| starting that read from the last one and the change journal | `crates/disktree-core/src/mft/snapshot.rs` |
+| the elevated tree: built, changed in place | `crates/disktree-core/src/mft/flat.rs` |
+| starting a folder walk from the last one and the change journal | `crates/disktree-core/src/walk_cache.rs`, `walk_cache/store.rs` |
+| where a cache is kept, and which an elevated scan trusts | `crates/disktree-core/src/windows.rs` (`cache_path`, `cache_read`, `cache_write`) |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

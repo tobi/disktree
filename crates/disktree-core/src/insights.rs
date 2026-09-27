@@ -40,10 +40,10 @@ pub struct Candidate {
 
 /// The `limit` largest findings beneath `root`, largest first. `now` is Unix
 /// seconds, passed in so the answer is testable.
-pub fn worth_a_look(root: &Node, now: i64, limit: usize) -> Vec<Candidate> {
+pub fn worth_a_look(root: Node<'_>, now: i64, limit: usize) -> Vec<Candidate> {
     let mut found = Vec::new();
     let mut crumbs = Vec::new();
-    for (index, child) in root.children.iter().enumerate() {
+    for (index, child) in root.children().enumerate() {
         crumbs.push(index);
         visit(child, &mut crumbs, now, &mut found);
         crumbs.pop();
@@ -55,43 +55,41 @@ pub fn worth_a_look(root: &Node, now: i64, limit: usize) -> Vec<Candidate> {
 }
 
 fn visit(
-    node: &Node,
+    node: Node<'_>,
     crumbs: &mut Vec<usize>,
     now: i64,
     found: &mut Vec<Candidate>,
 ) {
     // Nothing beneath a small directory can reach `MIN_BYTES` either, so a
     // scan of millions of files looks at a few thousand directories.
-    if !node.is_dir() || node.bytes < MIN_BYTES {
+    if !node.is_dir() || node.bytes() < MIN_BYTES {
         return;
     }
+    let (category, reclaim) = node.kinds();
     // Topmost only: everything beneath a reclaimable directory goes with it.
-    if let Some(reason) = node.reclaim {
+    if let Some(reason) = reclaim {
         found.push(Candidate {
             crumbs: crumbs.clone(),
-            bytes: node.bytes,
+            bytes: node.bytes(),
             finding: Finding::Reclaimable(reason),
         });
         return;
     }
-    let name = &*node.name;
-    let scratch = node.category == Category::AgentScratch;
+    let name = node.name();
+    let scratch = category == Category::AgentScratch;
     if scratch && name.eq_ignore_ascii_case("worktrees") {
-        let trees: Vec<&Node> = node
-            .children
-            .iter()
-            .filter(|child| child.is_dir())
-            .collect();
+        let trees: Vec<Node<'_>> =
+            node.children().filter(|child| child.is_dir()).collect();
         if !trees.is_empty() {
             let oldest = trees
                 .iter()
-                .map(|tree| tree.modified)
+                .map(|tree| tree.modified())
                 .filter(|&time| time > 0)
                 .min()
                 .unwrap_or(now);
             found.push(Candidate {
                 crumbs: crumbs.clone(),
-                bytes: node.bytes,
+                bytes: node.bytes(),
                 finding: Finding::Worktrees {
                     count: trees.len(),
                     oldest_days: (now - oldest).max(0) / DAY,
@@ -104,14 +102,14 @@ fn visit(
         && (name.eq_ignore_ascii_case("tries")
             || name.eq_ignore_ascii_case("experiments"));
     let mut stale = (0_usize, 0_u64);
-    for (index, child) in node.children.iter().enumerate() {
+    for (index, child) in node.children().enumerate() {
         let is_stale = experiments
             && child.is_dir()
-            && child.modified > 0
-            && now - child.modified > STALE_DAYS * DAY;
+            && child.modified() > 0
+            && now - child.modified() > STALE_DAYS * DAY;
         if is_stale {
             stale.0 += 1;
-            stale.1 += child.bytes;
+            stale.1 += child.bytes();
             // A stale experiment is judged whole; its caches go with it.
             continue;
         }
@@ -132,30 +130,30 @@ fn visit(
 mod tests {
     use super::*;
     use crate::classify::classify;
-    use crate::tree::{Metric, NodeKind, aggregate};
+    use crate::tree::{Draft, Metric, NodeKind, Tree};
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const NOW: i64 = 1_800_000_000;
 
-    fn file(name: &str, bytes: u64, days_old: i64) -> Node {
-        let mut node = Node::entry(name, NodeKind::File, bytes);
+    fn file(name: &str, bytes: u64, days_old: i64) -> Draft {
+        let mut node = Draft::entry(name, NodeKind::File, bytes);
         node.modified = NOW - days_old * DAY;
         node
     }
 
-    fn dir(name: &str, children: Vec<Node>) -> Node {
-        let mut node = Node::directory(name);
+    fn dir(name: &str, children: Vec<Draft>) -> Draft {
+        let mut node = Draft::directory(name);
         node.children = children;
         node
     }
 
-    fn scan(mut root: Node) -> Node {
-        aggregate(&mut root, Metric::Bytes);
-        classify(&mut root);
-        root
+    fn scan(root: Draft) -> Tree {
+        let mut tree = Tree::from_draft(root, Metric::Bytes);
+        classify(&mut tree);
+        tree
     }
 
-    fn home() -> Node {
+    fn home() -> Tree {
         scan(dir(
             "tobi",
             vec![
@@ -197,7 +195,7 @@ mod tests {
 
     #[test]
     fn ranks_findings_largest_first_and_skips_the_tiny() {
-        let found = worth_a_look(&home(), NOW, 10);
+        let found = worth_a_look(home().root(), NOW, 10);
         let kinds: Vec<&Finding> = found.iter().map(|c| &c.finding).collect();
         assert_eq!(
             kinds,
@@ -217,14 +215,14 @@ mod tests {
 
     #[test]
     fn documents_are_never_suggested() {
-        let found = worth_a_look(&home(), NOW, 10);
+        let found = worth_a_look(home().root(), NOW, 10);
         assert!(found.iter().all(|c| c.crumbs != vec![3]));
     }
 
     #[test]
     fn crumbs_address_the_finding_from_the_root() {
         let root = home();
-        for candidate in worth_a_look(&root, NOW, 10) {
+        for candidate in worth_a_look(root.root(), NOW, 10) {
             let node = root.resolve(&candidate.crumbs).expect("resolves");
             assert!(node.is_dir());
         }
@@ -232,7 +230,7 @@ mod tests {
 
     #[test]
     fn the_limit_keeps_the_largest() {
-        let found = worth_a_look(&home(), NOW, 2);
+        let found = worth_a_look(home().root(), NOW, 2);
         assert_eq!(found.len(), 2);
         assert_eq!(
             found[1].finding,

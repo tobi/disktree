@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use disktree_core::removal::RemovalMode;
 use disktree_core::scan::{ScanOptions, scan};
 use disktree_core::space::{SpaceInfo, Volume};
+use disktree_core::tree::Node;
 use disktree_core::treemap::Tile;
 use gpui_kit::{
     Bounds, Context, Entity, Pixels, Point, TestAppContext, VisualTestContext,
@@ -151,7 +152,7 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
             app.layout().map(<[Tile]>::len).unwrap_or_default(),
             app.selected.is_some(),
             app.tree().is_some_and(|tree| {
-                tree.children.iter().any(|c| c.name.starts_with('.'))
+                tree.children().any(|c| c.name().starts_with('.'))
             }),
         )
     });
@@ -174,7 +175,7 @@ fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
     let (selected, name) = read(&view, cx, |app| {
         (
             app.selected.clone(),
-            app.node_at(&[0]).map(|node| node.name.to_string()),
+            app.node_at(&[0]).map(|node| node.name().to_string()),
         )
     });
     assert_eq!(selected, Some(vec![0]));
@@ -217,9 +218,8 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
         let junk = app
             .tree()
             .and_then(|tree| {
-                tree.children
-                    .iter()
-                    .position(|child| &*child.name == "junk")
+                tree.children()
+                    .position(|child| child.name() == "junk")
                     .map(|index| vec![index])
             })
             .expect("the junk directory");
@@ -397,7 +397,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
             tiles
                 .iter()
                 .filter_map(|tile| app.node_at(tile.crumbs()))
-                .map(|node| node.name.to_string())
+                .map(|node| node.name().to_string())
                 .collect::<Vec<_>>()
         })
     };
@@ -411,9 +411,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
     let (count, applied, keep_filtered) = read(&view, cx, |app| {
         let matches = app.matches.as_deref().expect("matching as it is typed");
         let keep = app.tree().and_then(|tree| {
-            tree.children
-                .iter()
-                .position(|child| &*child.name == "keep")
+            tree.children().position(|child| child.name() == "keep")
         });
         (
             matches.count,
@@ -830,9 +828,8 @@ fn interface_zoom_scales_the_rem_and_the_header_band(cx: &mut TestAppContext) {
 fn child_crumbs(app: &Disktree, parent: &[usize], name: &str) -> Vec<usize> {
     let node = app.node_at(parent).expect("the parent");
     let index = node
-        .children
-        .iter()
-        .position(|child| &*child.name == name)
+        .children()
+        .position(|child| child.name() == name)
         .unwrap_or_else(|| panic!("no {name}"));
     let mut crumbs = parent.to_vec();
     crumbs.push(index);
@@ -1122,7 +1119,7 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
         // Stale on purpose: the wider root, a folder, must reset it.
         app.file_table = true;
     });
-    let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
+    let before = read(&view, cx, |app| app.tree().map(Node::files));
 
     // The trail runs from the top of the filesystem — "/", or a drive such
     // as "C:\" — and the scanned root sits under its parents.
@@ -1154,12 +1151,12 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     );
     let (reused, rest, selected) = read(&view, cx, |app| {
         let tree = app.tree().expect("the wider tree");
-        let junk = tree.child_named("junk").map(|node| node.files);
+        let junk = tree.child_named("junk").map(Node::files);
         let selected = app
             .selected
             .as_deref()
             .and_then(|crumbs| app.node_at(crumbs))
-            .map(|node| node.name.to_string());
+            .map(|node| node.name().to_string());
         (junk, tree.child_named("keep").is_some(), selected)
     });
     assert_eq!(reused, before, "junk was reused, not walked again");
@@ -1205,9 +1202,7 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     // Into junk, so the trail ends in a crumb that has siblings.
     let junk = read(&view, cx, |app| {
         app.tree()
-            .and_then(|tree| {
-                tree.children.iter().position(|c| &*c.name == "junk")
-            })
+            .and_then(|tree| tree.children().position(|c| c.name() == "junk"))
             .expect("junk")
     });
     update(&view, cx, |app, cx| app.go_to(vec![junk], cx));
@@ -1256,9 +1251,7 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     });
     let cache = read(&view, cx, |app| {
         app.tree()
-            .and_then(|tree| {
-                tree.children.iter().position(|c| &*c.name == ".cache")
-            })
+            .and_then(|tree| tree.children().position(|c| c.name() == ".cache"))
             .expect(".cache")
     });
     assert_eq!(crumbs, vec![cache], "went sideways into .cache");
@@ -1532,7 +1525,7 @@ fn escape_cancels_widening_and_keeps_the_tree_on_screen(
     update(&view, cx, |app, _| {
         app.disk_root = Some(temp.path().to_path_buf());
     });
-    let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
+    let before = read(&view, cx, |app| app.tree().map(Node::files));
 
     press(cx, "g");
     assert!(read(&view, cx, |app| app.scan.is_some()));
@@ -1542,7 +1535,7 @@ fn escape_cancels_widening_and_keeps_the_tree_on_screen(
             app.scan.is_some(),
             app.root_path.clone(),
             app.scan_root.clone(),
-            app.tree().map(|tree| tree.files),
+            app.tree().map(Node::files),
         )
     });
     assert!(!scanning);

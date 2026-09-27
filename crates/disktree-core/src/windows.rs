@@ -21,24 +21,50 @@ use std::io;
 use std::mem::offset_of;
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::{Component, Path, PathBuf, Prefix};
 
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+    FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, FileRenameInformationEx, NtCreateFile,
+    NtSetInformationFile,
+};
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
-    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE, MAX_PATH,
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED,
+    GENERIC_ALL, GENERIC_WRITE, INVALID_HANDLE_VALUE, MAX_PATH,
+    OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorOwner, INHERIT_ONLY_ACE, IsValidAcl, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    CreateDirectoryW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
-    FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW,
-    GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_EXTD_DIR_INFO,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileDispositionInfo,
+    FileIdExtdDirectoryInfo, FileIdType, FileStandardInfo, FindFirstVolumeW,
+    FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+    GetVolumePathNamesForVolumeNameW, OpenFileById, READ_CONTROL, ReOpenFile,
+    SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::space::SpaceInfo;
 
@@ -106,13 +132,6 @@ impl Entry {
     /// The name as text; see [`Self::file_name`] for what it may lose.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// The name, moved out: the tree keeps it, so nothing copies it. The
-    /// entry's other accessors keep working; `name`, `file_name` and
-    /// `path` do not.
-    pub fn take_name(&mut self) -> Box<str> {
-        std::mem::take(&mut self.name)
     }
 
     pub const fn kind(&self) -> Kind {
@@ -250,6 +269,19 @@ pub fn read_dir(dir: &Path, volume: Option<u64>) -> io::Result<ReadDir> {
         Err(error) => return Err(error),
     };
     Ok(ReadDir { source })
+}
+
+impl ReadDir {
+    /// Identity of the open directory, without opening its path a second
+    /// time. A standard fallback listing has no handle or reliable ids.
+    pub fn identity(&self) -> Option<(u64, u64)> {
+        let Source::Records(records) = &self.source else {
+            return None;
+        };
+        let info = winapi_util::file::information(&records.handle).ok()?;
+        let id = info.file_index();
+        (id != 0 && id != u64::MAX).then(|| (info.volume_serial_number(), id))
+    }
 }
 
 impl Iterator for ReadDir {
@@ -461,6 +493,36 @@ pub fn identity(path: &Path) -> Option<(u64, u64)> {
         .then(|| (info.volume_serial_number(), index))
 }
 
+/// Allocation (or length) and Unix write time from a known file's stream.
+/// Directory entries can retain different allocations for hardlink names.
+/// The identity must match; reparse points are not followed. The open asks
+/// only for attributes, shares read/write/delete, and reads no file data.
+pub fn current_file(
+    path: &Path,
+    expected: (u64, u64),
+    apparent: bool,
+) -> Option<(u64, i64)> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    let info = winapi_util::file::information(&file).ok()?;
+    if (info.volume_serial_number(), info.file_index()) != expected
+        || info.file_attributes() & u64::from(FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return None;
+    }
+    let (length, allocated) = standard_sizes(&file).ok()?;
+    let bytes = if apparent { length } else { allocated };
+    let modified = info
+        .last_write_time()
+        .and_then(|ticks| i64::try_from(ticks).ok())
+        .map_or(0, unix_seconds);
+    Some((bytes, modified))
+}
+
 /// Serial number of the volume every directory under `canonical` is on,
 /// for a walk that does not follow links. Only a local drive has one:
 /// mounted folders there are reparse points the walk takes for links,
@@ -615,10 +677,21 @@ pub fn elevated() -> bool {
 /// a folder or a mounted folder to another file system, is walked either way.
 pub fn file_table_readable(root: &Path) -> bool {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let Some(letter) = drive_letter(&canonical) else {
+    drive_letter(&canonical)
+        .is_some_and(|letter| ntfs(Path::new(&format!("{letter}:\\"))))
+}
+
+/// Whether `path` is on an NTFS volume, where a file id is the file's
+/// record with the record's reuse count in its top 16 bits.
+pub fn on_ntfs(path: &Path) -> bool {
+    volume_root(path).is_some_and(|root| ntfs(&root))
+}
+
+/// Whether the volume mounted at `root`, such as `C:\`, is formatted NTFS.
+fn ntfs(root: &Path) -> bool {
+    let Ok(volume) = wide(root, true) else {
         return false;
     };
-    let volume: Vec<u16> = format!("{letter}:\\\0").encode_utf16().collect();
     let mut name = [0_u16; MAX_PATH as usize + 1];
     let length = u32::try_from(name.len()).unwrap_or(u32::MAX);
     // SAFETY: `volume` is NUL-terminated and outlives the call, `name` is
@@ -864,6 +937,595 @@ pub const fn unix_seconds(ticks: i64) -> i64 {
     }
 }
 
+/// Send control `code` to the device or file behind `handle`, with `input`,
+/// filling `output`: the bytes it wrote.
+pub fn control(
+    handle: &File,
+    code: u32,
+    input: &[u8],
+    output: &mut [u8],
+) -> io::Result<usize> {
+    let mut returned = 0_u32;
+    let (Ok(in_len), Ok(out_len)) =
+        (u32::try_from(input.len()), u32::try_from(output.len()))
+    else {
+        return Err(io::ErrorKind::InvalidInput.into());
+    };
+    // SAFETY: both buffers are live for the lengths passed, `input` is only
+    // read and `output` only written, and without an `OVERLAPPED` the call
+    // is done with them when it returns.
+    let ok = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            handle.as_raw_handle(),
+            code,
+            input.as_ptr().cast(),
+            in_len,
+            output.as_mut_ptr().cast(),
+            out_len,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(returned as usize)
+}
+
+/// A file's length and the bytes allocated to its unnamed stream as NTFS
+/// has them now, the file found by its reference (record number and
+/// sequence number) on `volume`'s volume. Opened for its attributes only,
+/// which no sharing mode refuses, and by number, so no path is needed.
+pub fn sizes_by_id(volume: &File, reference: u64) -> io::Result<(u64, u64)> {
+    let descriptor = FILE_ID_DESCRIPTOR {
+        dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: FileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            FileId: reference.cast_signed(),
+        },
+    };
+    // SAFETY: the descriptor is live for the call, and no security
+    // attributes are passed.
+    let handle = unsafe {
+        OpenFileById(
+            volume.as_raw_handle(),
+            &raw const descriptor,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a handle just opened and owned by nothing else; `File`
+    // closes it.
+    let file = unsafe { File::from_raw_handle(handle) };
+    standard_sizes(&file)
+}
+
+fn standard_sizes(file: &File) -> io::Result<(u64, u64)> {
+    const SIZE: usize = size_of::<FILE_STANDARD_INFO>();
+    // The trailing flags in FILE_STANDARD_INFO are Rust bools; receive
+    // kernel bytes into integers instead, so no invalid bool is made.
+    let mut info = [0_u64; SIZE.div_ceil(8)];
+    // SAFETY: the live file handle fills a writable, aligned buffer of
+    // at least SIZE bytes. No other reference uses it during the call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            info.as_mut_ptr().cast(),
+            SIZE as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        bytes_from(
+            info[offset_of!(FILE_STANDARD_INFO, EndOfFile) / 8].cast_signed(),
+        ),
+        bytes_from(
+            info[offset_of!(FILE_STANDARD_INFO, AllocationSize) / 8]
+                .cast_signed(),
+        ),
+    ))
+}
+
+/// What an elevated process makes its caches with: owned by the
+/// Administrators group, under a protected ACL that grants Administrators
+/// and SYSTEM alone any access. No ordinary process of the user can then
+/// change what an elevated scan reads back and trusts.
+const CACHE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)";
+
+/// Rights that change a file's bytes or attributes, or who may: granted to
+/// anyone but Administrators or SYSTEM, a cache is not trusted. On a
+/// directory the same bits add and delete its entries.
+const CACHE_WRITE_RIGHTS: u32 = GENERIC_ALL
+    | GENERIC_WRITE
+    | DELETE
+    | WRITE_DAC
+    | WRITE_OWNER
+    | FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_DELETE_CHILD
+    | FILE_WRITE_ATTRIBUTES;
+
+/// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE`.
+const ALLOWED_ACE: u8 = 0;
+const DENIED_ACE: u8 = 1;
+
+/// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `_POSIX_SEMANTICS`.
+const RENAME_REPLACE: u32 = 1;
+const RENAME_POSIX: u32 = 2;
+
+/// A security descriptor Win32 allocated, freed when dropped.
+struct CacheSecurity(*mut core::ffi::c_void);
+
+impl Drop for CacheSecurity {
+    fn drop(&mut self) {
+        // SAFETY: Win32 allocated this descriptor with LocalAlloc; this
+        // wrapper alone owns it and drops it once after all calls finish.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+    }
+}
+
+fn cache_security() -> io::Result<CacheSecurity> {
+    descriptor_from_sddl(CACHE_SDDL)
+}
+
+fn descriptor_from_sddl(sddl: &str) -> io::Result<CacheSecurity> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: the NUL-terminated SDDL lives throughout the call; the
+    // output pointer receives a LocalAlloc descriptor owned by the caller.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            1,
+            &raw mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(CacheSecurity(descriptor))
+}
+
+/// Whether `sid` is the Administrators group or SYSTEM.
+fn admin_sid(sid: *mut core::ffi::c_void) -> bool {
+    // SAFETY: callers pass a SID returned by Win32 or one whose complete
+    // byte range was checked inside a validated ACL.
+    unsafe {
+        !sid.is_null()
+            && (IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                || IsWellKnownSid(sid, WinLocalSystemSid) != 0)
+    }
+}
+
+/// Whether `descriptor` holds only what Administrators and SYSTEM can
+/// change: owned by one of them, under a protected ACL, which inheritance
+/// cannot widen later, that grants no one else a right to write.
+fn trusted_descriptor(descriptor: *mut core::ffi::c_void) -> bool {
+    let mut owner = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut present = 0;
+    let mut control = 0;
+    let mut defaulted = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is a live security descriptor from Win32. Each
+    // output is a live local, and the returned pointers live with it.
+    let valid = unsafe {
+        GetSecurityDescriptorOwner(
+            descriptor,
+            &raw mut owner,
+            &raw mut defaulted,
+        ) != 0
+            && GetSecurityDescriptorDacl(
+                descriptor,
+                &raw mut present,
+                &raw mut dacl,
+                &raw mut defaulted,
+            ) != 0
+            && GetSecurityDescriptorControl(
+                descriptor,
+                &raw mut control,
+                &raw mut revision,
+            ) != 0
+    };
+    if !valid
+        || !admin_sid(owner)
+        || present == 0
+        || dacl.is_null()
+        || control & SE_DACL_PROTECTED == 0
+    {
+        return false;
+    }
+    // SAFETY: dacl points into the live descriptor; IsValidAcl verifies
+    // its size and ACE boundaries before GetAce is asked for any entry.
+    if unsafe { IsValidAcl(dacl) } == 0 {
+        return false;
+    }
+    // SAFETY: dacl is valid and still belongs to the live descriptor.
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(count) {
+        let mut ace = std::ptr::null_mut();
+        // SAFETY: a validated ACL has count ACEs; GetAce checks the index
+        // and gives a pointer within the descriptor.
+        if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 {
+            return false;
+        }
+        // SAFETY: GetAce gave a pointer to an ACE_HEADER within the ACL.
+        let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
+        // An inherit-only entry applies to what is made inside later, not
+        // to this; a denial only takes rights away.
+        if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+            || header.AceType == DENIED_ACE
+        {
+            continue;
+        }
+        // Object, callback and other entries that allow: not understood
+        // here, so not trusted.
+        if header.AceType != ALLOWED_ACE {
+            return false;
+        }
+        // The mask, then the SID: revision, count and authority, then the
+        // count's sub-authorities, all within the entry.
+        let sid_at = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let size = usize::from(header.AceSize);
+        if size < sid_at + 8 {
+            return false;
+        }
+        let ace = ace.cast::<u8>();
+        // SAFETY: IsValidAcl checked that the entry's `size` bytes lie in
+        // the ACL, and the mask and the SID's first 8 bytes are within them.
+        let (mask, subs, sid) = unsafe {
+            (
+                ace.add(offset_of!(ACCESS_ALLOWED_ACE, Mask))
+                    .cast::<u32>()
+                    .read_unaligned(),
+                usize::from(*ace.add(sid_at + 1)),
+                ace.add(sid_at),
+            )
+        };
+        if mask & CACHE_WRITE_RIGHTS != 0
+            && (sid_at + 8 + 4 * subs > size || !admin_sid(sid.cast()))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn trusted_handle(file: &File) -> bool {
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: the handle is open with READ_CONTROL and the out parameter
+    // receives a LocalAlloc descriptor. The other outputs are unused.
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if result != 0 || descriptor.is_null() {
+        return false;
+    }
+    let owned = CacheSecurity(descriptor);
+    trusted_descriptor(owned.0)
+}
+
+fn untrusted() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "untrusted cache")
+}
+
+/// Where the cache `name` under `dir` is kept: `mft-<drive>.bin` for a
+/// file table read, `walk-<root>.bin` for a walk. An elevated process
+/// keeps its own apart, in `admin`, and never reads the ones the user's
+/// ordinary processes keep beside it.
+pub fn cache_path(dir: &Path, name: &str) -> PathBuf {
+    if elevated() {
+        dir.join("admin").join(name)
+    } else {
+        dir.join(name)
+    }
+}
+
+/// The directory `dir`, open, and for `create` made first. An elevated
+/// process makes it with the admin-only owner and ACL, and takes it only
+/// while it is still that, and a directory rather than a link to one. It
+/// holds it without share-delete, so no one moves it away meanwhile.
+fn cache_directory(dir: &Path, create: bool, admin: bool) -> io::Result<File> {
+    if !admin {
+        if create {
+            fs::create_dir_all(dir)?;
+        }
+        // The user's own: a folder moved elsewhere and linked back is
+        // followed, as any other path of theirs.
+        return OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir);
+    }
+    if create {
+        let parent = dir
+            .parent()
+            .ok_or_else(|| io::Error::other("cache parent missing"))?;
+        fs::create_dir_all(parent)?;
+        let descriptor = cache_security()?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let name = wide(dir, false)?;
+        // SAFETY: the path is NUL-terminated; the attributes and the
+        // descriptor they point at are live for the call.
+        let made =
+            unsafe { CreateDirectoryW(name.as_ptr(), &raw const attributes) };
+        if made == 0 {
+            // One already there is checked below, like any other.
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS.cast_signed())
+            {
+                return Err(error);
+            }
+        }
+    }
+    let handle = OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir)?;
+    let attributes = winapi_util::file::information(&handle)?.file_attributes();
+    if attributes & u64::from(FILE_ATTRIBUTE_DIRECTORY) == 0
+        || attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !trusted_handle(&handle)
+    {
+        return Err(untrusted());
+    }
+    Ok(handle)
+}
+
+/// Open, or as `disposition` says make, the file `name` in the open
+/// `directory`, through its handle: nothing above it is looked up again. A
+/// link named `name` is opened itself, not followed.
+fn open_in(
+    directory: &File,
+    name: &OsStr,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    security: Option<&CacheSecurity>,
+) -> io::Result<File> {
+    let name: Vec<u16> = name.encode_wide().collect();
+    let length = u16::try_from(name.len() * 2).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache name too long")
+    })?;
+    let object = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: name.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &raw const object,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: security
+            .map_or(std::ptr::null(), |security| security.0.cast()),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: `attributes` and all it points at (the name, the directory's
+    // open handle, the descriptor `security` owns) are live for the call;
+    // the outputs are live locals; no extended attributes are passed.
+    let result = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            access | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            disposition,
+            FILE_NON_DIRECTORY_FILE
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(nt_error(result));
+    }
+    // SAFETY: a handle just made and owned by nothing else; `File` closes
+    // it.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// The cache at `path`, open for reading; `None` sends the scan back to a
+/// whole read. An elevated process reads only a file Administrators own
+/// and alone can change, in a directory the same holds for, and checks
+/// the very handle it then reads.
+pub fn cache_read(path: &Path) -> Option<File> {
+    read_cache(path, elevated())
+}
+
+fn read_cache(path: &Path, admin: bool) -> Option<File> {
+    let directory = cache_directory(path.parent()?, false, admin).ok()?;
+    let file = open_in(
+        &directory,
+        path.file_name()?,
+        READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        None,
+    )
+    .ok()?;
+    let attributes = winapi_util::file::information(&file)
+        .ok()?
+        .file_attributes();
+    (attributes & u64::from(FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && (!admin || trusted_handle(&file)))
+    .then_some(file)
+}
+
+/// Another handle on the file `original` has open, for reads at offsets of
+/// their own: one synchronous handle serializes its reads. Made from the
+/// handle, not the path, so it is the file already checked.
+pub fn cache_reopen(original: &File) -> io::Result<File> {
+    // SAFETY: original is a live file handle; ReOpenFile returns an owned
+    // handle to the same stream, not a path that could be swapped.
+    let handle = unsafe {
+        ReOpenFile(
+            original.as_raw_handle(),
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ReOpenFile returned a new handle owned by this File alone.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Write the cache at `path` whole or not at all: `write` fills another
+/// file beside it, which then takes its name; on any failure that file is
+/// deleted and `path` keeps what it had. Both go through the directory's
+/// handle, not its path, so a link planted above it cannot send either
+/// elsewhere; an elevated process's file has the admin-only owner and ACL
+/// from the moment it exists.
+pub fn cache_write(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    write_cache(path, elevated(), write)
+}
+
+fn write_cache(
+    path: &Path,
+    admin: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a cache is a file in a directory",
+        ));
+    };
+    let directory = cache_directory(dir, true, admin)?;
+    // One such name per cache: what a save cut short by a crash leaves is
+    // overwritten by the next, not left beside it for good, and sharing
+    // it with readers alone keeps a second save out while one writes. In
+    // an elevated process's directory nobody else can have made it.
+    let mut partial = name.to_os_string();
+    partial.push(".partial");
+    let security = if admin { Some(cache_security()?) } else { None };
+    let mut file = open_in(
+        &directory,
+        &partial,
+        DELETE | READ_CONTROL | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+        FILE_OVERWRITE_IF,
+        security.as_ref(),
+    )?;
+    // A file system that keeps no owner or ACL leaves it untrusted, as
+    // does one left with another ACL; deleted below, it is made anew next
+    // time.
+    let written = if admin && !trusted_handle(&file) {
+        Err(untrusted())
+    } else {
+        write(&mut file).and_then(|()| rename_in(&directory, &file, name))
+    };
+    if written.is_err() {
+        let gone = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open with DELETE access; `gone` is live for
+        // the call and as large as the length passed.
+        unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&raw const gone).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            );
+        }
+    }
+    written
+}
+
+/// Give the open `file` the name `name` in the open `directory`, over any
+/// file of that name there: NT looks the name up from the directory's
+/// handle, not from a path. (Win32's `SetFileInformationByHandle` would
+/// turn the name into a path from the current directory first.)
+fn rename_in(directory: &File, file: &File, name: &OsStr) -> io::Result<()> {
+    let name: Vec<u16> = name.encode_wide().collect();
+    let bytes = name.len() * 2;
+    let size = size_of::<FILE_RENAME_INFORMATION>() + bytes;
+    let length = u32::try_from(size).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cache name too long")
+    })?;
+    // In words: aligned as the struct's handle is.
+    let mut buffer = vec![0_u64; size.div_ceil(8)];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    // SAFETY: `buffer` holds `size` bytes aligned for the struct: its fixed
+    // part, then room for the name from `FileName` on. No reference is
+    // made, so the name may run past the declared one-unit array.
+    unsafe {
+        (&raw mut (*info).RootDirectory).write(directory.as_raw_handle());
+        (&raw mut (*info).FileNameLength).write(bytes as u32);
+        (&raw mut (*info).FileName)
+            .cast::<u16>()
+            .copy_from_nonoverlapping(name.as_ptr(), name.len());
+    }
+    // POSIX semantics replace a cache a reader still holds open; a file
+    // system without them gets the plain rename.
+    let mut result = 0;
+    for (class, flags) in [
+        (FileRenameInformationEx, RENAME_REPLACE | RENAME_POSIX),
+        (FileRenameInformation, RENAME_REPLACE),
+    ] {
+        let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: as above; `Flags` shares its first byte with
+        // `ReplaceIfExists`. The handle is open with DELETE access, and
+        // `status` is a live local.
+        result = unsafe {
+            (&raw mut (*info).Anonymous.Flags).write(flags);
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                &raw mut status,
+                info.cast_const().cast(),
+                length,
+                class,
+            )
+        };
+        if result >= 0 {
+            return Ok(());
+        }
+    }
+    Err(nt_error(result))
+}
+
+fn nt_error(status: i32) -> io::Error {
+    // SAFETY: only translates a status code.
+    let code = unsafe { RtlNtStatusToDosError(status) };
+    io::Error::from_raw_os_error(code.cast_signed())
+}
+
 /// Bytes aligned to a page, for reads that bypass the file cache: those
 /// want memory aligned to the disk's sector, which a page always is.
 #[derive(Debug, Default)]
@@ -913,6 +1575,74 @@ pub fn make_junction(link: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn elevated_cache_refuses_untrusted_owner_and_write_grants() {
+        let trusted = cache_security().expect("admin descriptor");
+        assert!(trusted_descriptor(trusted.0));
+        for good in [
+            "O:SYG:SYD:P(A;;FA;;;SY)",
+            // Reading is anyone's; denials and entries only for what is
+            // made inside later take nothing from the admins' hold.
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;FR;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(D;;FA;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;OICIIO;GA;;;BU)",
+        ] {
+            let descriptor = descriptor_from_sddl(good).expect(good);
+            assert!(trusted_descriptor(descriptor.0), "{good}");
+        }
+        for bad in [
+            "O:BUG:BAD:P(A;;FA;;;BA)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;GW;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;GA;;;AU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;SD;;;BU)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;;WD;;;WD)",
+            "O:BAG:BAD:P(A;;FA;;;BA)(A;CI;FA;;;BU)",
+            "O:BAG:BAD:(A;;FA;;;BA)",
+            "O:BAG:BA",
+        ] {
+            let descriptor = descriptor_from_sddl(bad).expect(bad);
+            assert!(!trusted_descriptor(descriptor.0), "{bad}");
+        }
+        // An ordinary file, owned by the user (or by Administrators when
+        // elevated) under the ACL it inherits: never trusted, yet a
+        // process that is not elevated reads it as its own.
+        let temp = TempDir::new().expect("tempdir");
+        let file = temp.path().join("user-owned.bin");
+        fs::write(&file, b"forged tree").expect("write");
+        let handle = OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .open(&file)
+            .expect("open");
+        assert!(!trusted_handle(&handle));
+        assert!(read_cache(&file, true).is_none());
+        assert!(read_cache(&file, false).is_some());
+    }
+
+    #[test]
+    fn a_failed_cache_write_leaves_the_last_one_and_nothing_beside_it() {
+        use std::io::{Read as _, Write as _};
+        let temp = TempDir::new().expect("tempdir");
+        // In a directory the write makes, as an elevated one must.
+        let path = cache_path(&temp.path().join("cache"), "walk.bin");
+        cache_write(&path, |out| out.write_all(b"whole")).expect("written");
+        let failed = cache_write(&path, |out| {
+            out.write_all(b"half")?;
+            Err(io::Error::other("stopped"))
+        });
+        assert!(failed.is_err());
+        let mut kept = String::new();
+        cache_read(&path)
+            .expect("kept")
+            .read_to_string(&mut kept)
+            .expect("read");
+        assert_eq!(kept, "whole");
+        let names: Vec<_> = fs::read_dir(path.parent().expect("dir"))
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["walk.bin"]);
+    }
 
     #[test]
     fn quoted_arguments_survive_the_command_line() {

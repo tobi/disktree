@@ -21,7 +21,7 @@ use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{
     SpaceInfo, device_for, space_info, volume_root_for,
 };
-use disktree_core::tree::{Metric, Node, path_of};
+use disktree_core::tree::{Metric, Node, Tree, path_of};
 use disktree_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
 };
@@ -327,7 +327,7 @@ pub struct Disktree {
     pub root_path: PathBuf,
     pub home: Option<PathBuf>,
     pub options: ScanOptions,
-    pub tree: Option<Arc<Node>>,
+    pub tree: Option<Arc<Tree>>,
     pub scan: Option<ScanHandle>,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
@@ -561,7 +561,7 @@ impl Disktree {
     #[cfg(test)]
     pub fn with_tree(
         root_path: PathBuf,
-        tree: Node,
+        tree: Arc<Tree>,
         options: ScanOptions,
         depth: u32,
         cx: &mut Context<'_, Self>,
@@ -573,7 +573,7 @@ impl Disktree {
         }
         app.scan_epoch += 1;
         app.marks.refresh(&app.root_path, &tree, app.options.metric);
-        app.tree = Some(Arc::new(tree));
+        app.tree = Some(tree);
         app.cache = None;
         app.refresh_insights();
         app.select_largest(cx);
@@ -741,7 +741,7 @@ impl Disktree {
     fn refresh_insights(&mut self) {
         self.scanned_at = now_seconds();
         self.insights = self.tree.as_deref().map_or_else(Vec::new, |tree| {
-            worth_a_look(tree, self.scanned_at, INSIGHT_LIMIT)
+            worth_a_look(tree.root(), self.scanned_at, INSIGHT_LIMIT)
         });
     }
 
@@ -869,7 +869,7 @@ impl Disktree {
             return true;
         };
         match outcome {
-            Ok(node) => {
+            Ok(tree) => {
                 // A widening scan lands on a new root: move the view up to it,
                 // with the directory it came from selected.
                 let came_from = (self.scan_root != self.root_path)
@@ -882,8 +882,8 @@ impl Disktree {
                     self.file_table = file_table_readable(&self.root_path);
                 }
                 let metric = self.options.metric;
-                self.marks.refresh(&self.root_path, &node, metric);
-                discard(self.tree.replace(Arc::new(node)));
+                self.marks.refresh(&self.root_path, &tree, metric);
+                discard(self.tree.replace(tree));
                 self.cache = None;
                 self.refresh_insights();
                 self.scan_elapsed =
@@ -959,18 +959,17 @@ impl Disktree {
 
     // ── navigation ──────────────────────────────────────────────────────
 
-    pub fn tree(&self) -> Option<&Node> {
-        self.tree.as_deref()
+    /// The scanned root.
+    pub fn tree(&self) -> Option<Node<'_>> {
+        self.tree.as_deref().map(Tree::root)
     }
 
     /// The node the treemap is currently rooted at.
-    pub fn current(&self) -> Option<&Node> {
-        self.tree
-            .as_ref()
-            .and_then(|tree| tree.resolve(&self.crumbs))
+    pub fn current(&self) -> Option<Node<'_>> {
+        self.node_at(&self.crumbs)
     }
 
-    pub fn node_at(&self, crumbs: &[usize]) -> Option<&Node> {
+    pub fn node_at(&self, crumbs: &[usize]) -> Option<Node<'_>> {
         self.tree.as_ref().and_then(|tree| tree.resolve(crumbs))
     }
 
@@ -1010,7 +1009,7 @@ impl Disktree {
                 break;
             };
             crumbs.push(index);
-            trail.push((node.name.to_string(), Crumb::Tree(crumbs.clone())));
+            trail.push((node.name().to_string(), Crumb::Tree(crumbs.clone())));
         }
         trail
     }
@@ -1023,14 +1022,13 @@ impl Disktree {
             return (Vec::new(), 0);
         };
         let mut rows: Vec<Sibling> = node
-            .children
-            .iter()
+            .children()
             .enumerate()
             .map(|(index, child)| Sibling {
                 index,
-                name: child.name.to_string(),
+                name: child.name().to_string(),
                 value: child.value(metric),
-                category: child.category,
+                category: child.category(),
                 is_dir: child.is_dir(),
             })
             .collect();
@@ -1167,7 +1165,7 @@ impl Disktree {
         let Some(node) = self.node_at(&target) else {
             return;
         };
-        if !node.is_dir() || node.children.is_empty() {
+        if !node.is_dir() || !node.has_children() {
             return;
         }
         self.remember();
@@ -1214,9 +1212,9 @@ impl Disktree {
             .rev()
             .map(|length| hovered[..length].to_vec())
             .find(|crumbs| {
-                self.node_at(crumbs).is_some_and(|node| {
-                    node.is_dir() && !node.children.is_empty()
-                }) && self.tile_body(crumbs).is_some()
+                self.node_at(crumbs)
+                    .is_some_and(|node| node.is_dir() && node.has_children())
+                    && self.tile_body(crumbs).is_some()
             })
     }
 
@@ -1374,7 +1372,7 @@ impl Disktree {
     fn travel(&mut self, target: Vec<usize>, cx: &mut Context<'_, Self>) {
         let enterable = self
             .node_at(&target)
-            .is_some_and(|node| node.is_dir() && !node.children.is_empty());
+            .is_some_and(|node| node.is_dir() && node.has_children());
         if target.len() > self.crumbs.len()
             && target.starts_with(&self.crumbs)
             && enterable
@@ -1532,7 +1530,7 @@ impl Disktree {
         let Some(node) = self.node_at(&parent) else {
             return Vec::new();
         };
-        (0..node.children.len())
+        (0..node.child_count())
             .map(|index| {
                 let mut crumbs = parent.clone();
                 crumbs.push(index);
@@ -1695,11 +1693,12 @@ impl Disktree {
                 TileKind::Node { crumbs } => self.node_at(crumbs),
                 TileKind::Others { .. } => None,
             };
-            let category = node.map_or_else(Default::default, |n| n.category);
-            let age_bucket = (age && node.is_some_and(|n| n.modified > 0))
+            let (category, reclaim) =
+                node.map_or_else(Default::default, Node::kinds);
+            let age_bucket = (age && node.is_some_and(|n| n.modified() > 0))
                 .then(|| {
                     let days =
-                        (now - node.map_or(now, |n| n.modified)) / 86_400;
+                        (now - node.map_or(now, Node::modified)) / 86_400;
                     crate::palette::age_bucket(days)
                 });
             let filtered = match self.matches.as_deref().map(|m| m.keep(crumbs))
@@ -1719,9 +1718,9 @@ impl Disktree {
                 depth: tile.depth,
                 category,
                 age_bucket,
-                reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
+                reclaimable: reclaim.is_some(),
                 filtered,
-                unreadable: node.is_some_and(|n| n.read_error),
+                unreadable: node.is_some_and(Node::read_error),
                 marked: is_marked,
                 covered: is_covered,
                 hovered: hovered.as_deref() == Some(crumbs),
@@ -1746,7 +1745,7 @@ impl Disktree {
                         continue;
                     };
                     labels.push(Label {
-                        text: node.name.to_string(),
+                        text: node.name().to_string(),
                         rect: self.animated_rect(tile.rect),
                         header: tile
                             .header
@@ -1792,15 +1791,13 @@ impl Disktree {
         // The path is relative to the scanned root, so the walk starts there,
         // not at the directory currently drawn.
         let relative = path.strip_prefix(&self.root_path).ok()?;
-        let tree = self.tree.clone()?;
-        let mut node: &Node = &tree;
+        let tree = self.tree.as_deref()?;
+        let mut node = tree.root();
         let mut crumbs = Vec::new();
         for component in relative.components() {
             let name = component.as_os_str().to_string_lossy();
-            let index = node
-                .children
-                .iter()
-                .position(|child| child.name.as_ref() == name)?;
+            let index =
+                node.children().position(|child| child.name() == name)?;
             crumbs.push(index);
             node = node.child(index)?;
         }
@@ -1944,16 +1941,11 @@ impl Disktree {
         let directory = self.current_path();
         let selected = self.selected.as_deref().and_then(|c| self.path_at(c));
         self.options.metric = self.options.metric.toggled();
-        if let Some(tree) = &self.tree {
-            let mut tree = (**tree).clone();
-            disktree_core::tree::aggregate(&mut tree, self.options.metric);
-            discard(self.tree.replace(Arc::new(tree)));
-            let metric = self.options.metric;
-            self.marks.refresh(
-                &self.root_path,
-                self.tree.as_ref().unwrap(),
-                metric,
-            );
+        let metric = self.options.metric;
+        if let Some(tree) = &mut self.tree {
+            // In place; a copy only while a background job still shares it.
+            Arc::make_mut(tree).reorder(metric);
+            self.marks.refresh(&self.root_path, tree, metric);
         }
         self.crumbs = self.crumbs_for_path(&directory).unwrap_or_default();
         self.selected = selected.and_then(|path| self.crumbs_for_path(&path));
@@ -2243,7 +2235,7 @@ impl Disktree {
             .filter(|(_, keep)| **keep == Keep::Whole)
             .filter_map(|(crumbs, _)| {
                 let node = tree.as_deref()?.resolve(crumbs)?;
-                Some((node.bytes, crumbs))
+                Some((node.bytes(), crumbs))
             })
             .max_by_key(|(bytes, _)| *bytes)
             .map(|(_, crumbs)| crumbs.clone());
@@ -2997,9 +2989,9 @@ pub fn now_seconds() -> i64 {
         })
 }
 
-/// Let go of a tree off the UI thread: freeing a disk's millions of nodes
-/// takes a good part of a second, and nothing waits on it.
-fn discard(tree: Option<Arc<Node>>) {
+/// Let go of a tree off the UI thread: handing hundreds of megabytes back
+/// to the system takes long enough to drop a frame, and nothing waits on it.
+fn discard(tree: Option<Arc<Tree>>) {
     if let Some(tree) = tree {
         // When no thread can be made, the closure is dropped here instead,
         // and the tree is freed in place rather than taking the window down.
