@@ -149,6 +149,16 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   colour. Top-level directories carry a strip of their colour and a name
   band; deeper open directories a slim label row. In **Age** mode colour is
   the last write instead, from this week to older.
+- **List** (`w`, or **Treemap | List** at the top): the same tree as rows
+  instead of squares. The directory on screen heads the list, then its
+  children, nested as deep as you open them — click a chevron, or press
+  `→`, to open a row and `←` to close it. `→` on an already-open row goes
+  into it, and `[` / `]` close everything or open one more level. A click
+  selects a row, and a click on the selected row opens it the way `→` does;
+  `enter` goes in — so a pointer never changes directory under itself. Each
+  row carries its name, files, folders, a share bar and percentage, its size
+  and its last write. Marking, the selection, the filter, the age colours
+  and the review screen are the same in both views.
 - **Panel:** the selection (its size set large, share of the scan, files,
   last write, and for a checkout what git says — changes, stashes, unpushed
   commits); *Worth a look*, the largest things that could plausibly go;
@@ -220,6 +230,7 @@ and shows how much free space was actually gained.
 | `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
 | `c` | review the marked list |
 | `t` | rank by size or by file count |
+| `w` | the treemap, or the list |
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
@@ -394,6 +405,7 @@ gone while their neighbours are not.
 | `crates/disktree-app/src/state.rs` | every action the interface can take, and the key map |
 | `crates/disktree-app/src/views.rs` | the screens |
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |
+| `crates/disktree-app/src/list_view.rs` | the list's rows and their columns |
 | `crates/disktree-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
 | `crates/disktree-app/src/tests.rs` | end-to-end tests through a real window |
 | `packaging/`, `assets/`, `Makefile` | the desktop entry, the icon, and install |

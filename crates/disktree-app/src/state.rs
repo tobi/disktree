@@ -5,6 +5,7 @@
 //! re-scan — live here so they can be reasoned about in one place.
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -73,6 +74,113 @@ pub struct Sibling {
 /// Rows a sibling menu lists; the rest are counted.
 pub const SIBLING_ROWS: usize = 24;
 
+/// One row of the list view, resolved: everything drawn in it is here, so the
+/// view is a pure reading of this and the state.
+///
+/// `PartialEq` but not `Eq`: the share is a fraction, and an exact comparison
+/// of two of those is not a claim anyone should make.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListRow {
+    /// Absolute crumbs from the scanned root, as everywhere else.
+    pub crumbs: Vec<usize>,
+    /// Nesting below the head row, which is `0`. The indentation, and what the
+    /// mosaic would have drawn as depth.
+    pub depth: u32,
+    pub name: String,
+    pub is_dir: bool,
+    /// The directory on screen, which heads the list with its own totals.
+    pub is_current: bool,
+    /// A directory with something inside, so the row has a chevron to press.
+    pub has_children: bool,
+    /// That chevron is open: its children are listed below this row.
+    pub expanded: bool,
+    pub marked: bool,
+    /// Inside another marked directory, so it goes with that one.
+    pub covered: bool,
+    pub selected: bool,
+    pub hovered: bool,
+    /// Part of it could not be read, as a tile flags.
+    pub unreadable: bool,
+    /// Its space can be had back, as a tile hatches.
+    pub reclaimable: bool,
+    /// How it stands against the find text. The same verdict the mosaic gives
+    /// the tile at these crumbs, so the two views cannot disagree.
+    pub filtered: Filtered,
+    pub bytes: u64,
+    pub files: u64,
+    pub dirs: u64,
+    /// Newest write at or beneath it, in Unix seconds; `0` when unknown.
+    pub modified: i64,
+    pub category: disktree_core::classify::Category,
+    /// In age mode, which [`crate::palette::AGE_BUCKETS`] entry it falls in.
+    pub age_bucket: Option<usize>,
+    /// Share of the directory on screen, `0.0`–`1.0`.
+    pub share: f32,
+}
+
+/// The rows the list would show, as a flat index: no per-row allocation,
+/// so a frame can ask how many there are, and build one, without building
+/// the rest. Every row's crumbs are concatenated, and `starts` says where
+/// each one ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlatRows {
+    crumbs: Vec<usize>,
+    depths: Vec<u32>,
+    /// One more than the row count: `starts[i]..starts[i + 1]` is row `i`.
+    starts: Vec<u32>,
+}
+
+impl FlatRows {
+    pub const fn len(&self) -> usize {
+        self.depths.len()
+    }
+
+    /// Row `index`'s crumbs, as a slice into the index.
+    pub fn crumbs(&self, index: usize) -> Option<&[usize]> {
+        let start = usize::try_from(*self.starts.get(index)?).ok()?;
+        let end = usize::try_from(*self.starts.get(index + 1)?).ok()?;
+        self.crumbs.get(start..end)
+    }
+
+    pub fn depth(&self, index: usize) -> u32 {
+        self.depths.get(index).copied().unwrap_or(0)
+    }
+
+    /// The deepest level below the head, which is the list's depth.
+    pub fn deepest(&self) -> u32 {
+        self.depths.iter().copied().max().unwrap_or(1).max(1)
+    }
+
+    /// The row `crumbs` is on, if it is one of the rows.
+    pub fn index_of(&self, crumbs: &[usize]) -> Option<usize> {
+        (0..self.len()).find(|&index| self.crumbs(index) == Some(crumbs))
+    }
+
+    /// Add one row: its crumbs, its depth, and where the next row's crumbs
+    /// begin.
+    pub fn push(&mut self, crumbs: &[usize], depth: u32) {
+        self.crumbs.extend_from_slice(crumbs);
+        self.depths.push(depth);
+        self.starts
+            .push(u32::try_from(self.crumbs.len()).unwrap_or(u32::MAX));
+    }
+}
+
+/// How many rows the walk produces at most. A whole disk's root is the one
+/// place this can be reached, and the count says so rather than pretending the
+/// list is the whole tree.
+pub const LIST_ROW_LIMIT: usize = 2_000;
+
+/// A row's share of `total`, as a fraction. An empty directory is all of
+/// itself rather than a division by zero.
+fn share_of(bytes: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (bytes as f64 / total as f64) as f32
+    }
+}
+
 /// One step of the trail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Crumb {
@@ -114,6 +222,18 @@ pub enum Screen {
     Running,
     /// The removal finished; show what happened.
     Done,
+}
+
+/// How the directory on screen is drawn. Both show the same tree and the same
+/// marks; the mosaic is for seeing shape, the list for reading names and
+/// numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Nested squares sized by disk usage.
+    #[default]
+    Mosaic,
+    /// One row per entry, ranked, with its figures in columns.
+    List,
 }
 
 /// The treemap view transform: `screen = (base - origin) * scale`.
@@ -406,6 +526,14 @@ pub struct Disktree {
     pub crumb_menu: Option<CrumbMenu>,
 
     pub color_mode: ColorMode,
+    /// Mosaic or list: how the directory on screen is drawn.
+    pub view_mode: ViewMode,
+    /// Directories whose children the list is showing, by absolute crumbs.
+    ///
+    /// The mosaic nests by drawing depth; the list nests by opening a row. Both
+    /// read the same tree, and this is the list's own record of which rows are
+    /// open, so it survives a re-scan the way the marks do.
+    pub expanded: FxHashSet<Vec<usize>>,
     /// The largest things worth clearing, recomputed when a scan lands.
     pub insights: Vec<Candidate>,
     /// What git knows about each checkout that has been selected; `None`
@@ -518,6 +646,8 @@ impl Disktree {
             focus: cx.focus_handle(),
             crumb_menu: None,
             color_mode: ColorMode::Kind,
+            view_mode: ViewMode::default(),
+            expanded: FxHashSet::from_iter([Vec::new()]),
             insights: Vec::new(),
             git: FxHashMap::default(),
             git_pending: FxHashSet::default(),
@@ -1173,6 +1303,7 @@ impl Disktree {
         self.remember();
         self.selected = Some(target.clone());
         self.crumbs = target;
+        self.open_head();
         self.forget_hover();
         self.cache = None;
         let area = self.treemap_size.get();
@@ -1241,6 +1372,7 @@ impl Disktree {
         let child_crumbs = self.crumbs.clone();
         let src = self.view.visible_base(area);
         self.crumbs.clone_from(&ancestor);
+        self.open_head();
         self.forget_hover();
         self.cache = None;
         self.selected = Some(ancestor);
@@ -1272,6 +1404,7 @@ impl Disktree {
             self.remember();
         }
         self.crumbs.clone_from(&crumbs);
+        self.open_head();
         self.selected = Some(crumbs);
         self.forget_hover();
         self.view = View::IDENTITY;
@@ -1930,9 +2063,43 @@ impl Disktree {
 
     /// Change how many levels are drawn, which is the other meaning of zoom in
     /// a treemap: seeing further in without changing what is on screen.
+    /// How many levels below the head are drawn at once, and how deep either
+    /// view will go. The mosaic nests by drawing depth; the list by opening
+    /// rows, but both answer to this one control, and both stop here.
+    pub const MAX_DEPTH: u32 = 6;
+
+    /// The depth the control at the top should show, for whichever view is on
+    /// screen.
+    pub fn depth_drawn(&self) -> u32 {
+        match self.view_mode {
+            ViewMode::Mosaic => self.layout_options.max_depth,
+            ViewMode::List => self.list_depth(),
+        }
+    }
+
+    /// How many levels below the head the list is showing. One below is the
+    /// children of the head, which is what a newly entered directory shows.
+    pub fn list_depth(&self) -> u32 {
+        self.flat_rows().deepest().min(Self::MAX_DEPTH)
+    }
+
+    /// One level more or less of the tree at once. Which of the two it means
+    /// depends on the view, and the control at the top and the `[` and `]`
+    /// keys both come through here, so they cannot disagree.
     pub fn adjust_depth(&mut self, step: i32, cx: &mut Context<'_, Self>) {
+        if self.view_mode == ViewMode::List {
+            if step < 0 {
+                // Down is "close everything" rather than one level shallower:
+                // a half-closed depth is not a depth anyone can picture, and
+                // the list has no per-level record to unwind one row at a time.
+                self.collapse_all(cx);
+            } else {
+                self.expand_to_depth(self.list_depth() + 1, cx);
+            }
+            return;
+        }
         let depth = (self.layout_options.max_depth.cast_signed() + step)
-            .clamp(1, 6) as u32;
+            .clamp(1, Self::MAX_DEPTH.cast_signed()) as u32;
         self.layout_options.max_depth = depth;
         self.cache = None;
         cx.notify();
@@ -1987,6 +2154,422 @@ impl Disktree {
             (ColorMode::Age, _) => 2,
             (ColorMode::Kind, Metric::Files) => 1,
             (ColorMode::Kind, Metric::Bytes) => 0,
+        }
+    }
+
+    // ── mosaic or list ───────────────────────────────────────────────────
+
+    /// Draw the tree as a mosaic or as a list. The marks, the selection and
+    /// the directory on screen are the same either way, so switching only
+    /// changes how they are drawn.
+    pub fn set_view_mode(
+        &mut self,
+        mode: ViewMode,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        // Hover belongs to the mosaic's tiles; a stale one would be drawn by
+        // the list as a selection it does not have.
+        self.forget_hover();
+        cx.notify();
+    }
+
+    /// The list view, flattened: the directory on screen, then every child of
+    /// every open directory, deepest last within each one.
+    ///
+    /// The crumbs are absolute from the scanned root, as everywhere else, and
+    /// the walk stops at [`LIST_ROW_LIMIT`], so the root of a whole disk —
+    /// hundreds of thousands of entries one level down — costs the frame a
+    /// bounded index and not a single row: the rows wait for
+    /// [`Self::list_rows`]. Nothing is allocated per row either, so asking for
+    /// the count the virtual list needs and, once, to find the row under the
+    /// pointer is cheap. Asking it per row is not, and that is what
+    /// [`Self::list_rows`] is for.
+    pub fn flat_rows(&self) -> FlatRows {
+        let Some(root) = self.current() else {
+            return FlatRows::default();
+        };
+        let mut flat = FlatRows {
+            starts: vec![0],
+            ..FlatRows::default()
+        };
+        let mut crumbs = self.crumbs.clone();
+        flat.push(&crumbs, 0);
+        self.push_flat(&mut crumbs, &root.children, 1, &mut flat);
+        flat
+    }
+
+    /// Add `children` as rows under the row at `parent`, and recurse into the
+    /// ones that are open. Stops at [`LIST_ROW_LIMIT`]: past that the rows
+    /// stop being the tree, and the view says so.
+    ///
+    /// `parent` is the walk's scratch buffer: a row's crumbs are built by
+    /// pushing one index and popping it again, not by copying its ancestors. A
+    /// whole disk's first level comes through here, and a `Vec` per entry would
+    /// be a `Vec` per row.
+    fn push_flat(
+        &self,
+        parent: &mut Vec<usize>,
+        children: &[Node],
+        depth: u32,
+        flat: &mut FlatRows,
+    ) {
+        for (index, child) in children.iter().enumerate() {
+            if flat.len() >= LIST_ROW_LIMIT {
+                return;
+            }
+            parent.push(index);
+            // An applied filter leaves a non-match out, and everything under
+            // it with it, as `layout_filtered` does for the mosaic.
+            if !self.filter_applied || self.keep_of(parent).is_some() {
+                flat.push(parent, depth);
+                if self.is_expanded(parent) {
+                    self.push_flat(parent, &child.children, depth + 1, flat);
+                }
+            }
+            parent.pop();
+        }
+    }
+
+    /// How the find text stands at `crumbs`: `None` means out. The one place
+    /// that is decided, so a row and the tile over it cannot disagree.
+    fn keep_of(&self, crumbs: &[usize]) -> Option<Keep> {
+        self.matches.as_deref()?.keep(crumbs)
+    }
+
+    /// The rows for `range`, built in one pass, each with the index it is on.
+    ///
+    /// The virtual list asks for the rows on screen on every frame, so the
+    /// index and the marks are read once here rather than once per row: a
+    /// frame of forty rows that rebuilt them per row would rebuild the whole
+    /// index — a disk root's level and all — forty times over. The index comes
+    /// back with the row because it is what the row's element id is keyed by.
+    ///
+    /// The figures come from the same [`Node`] fields the mosaic weights its
+    /// tiles by, and the filter verdict is the one `prepare` gives the tile at
+    /// these crumbs, so a number or a dimmed row here is what a tile says
+    /// there.
+    ///
+    /// A `range` past the end is clamped rather than a panic: the heights the
+    /// virtual list was given and the rows there are can be a frame apart,
+    /// when a row closed or a filter was applied underneath it.
+    pub fn list_rows(&self, range: Range<usize>) -> Vec<(usize, ListRow)> {
+        let flat = self.flat_rows();
+        let end = range.end.min(flat.len());
+        let start = range.start.min(end);
+        let total = self.current().map_or(0, |node| node.bytes);
+        let marked = self.marked_crumbs();
+        (start..end)
+            .filter_map(|index| {
+                let row = self.list_row_of(&flat, index, total, &marked)?;
+                Some((index, row))
+            })
+            .collect()
+    }
+
+    /// One row out of an index that is already built, with the marks as crumbs
+    /// and the size every share is a share of.
+    fn list_row_of(
+        &self,
+        flat: &FlatRows,
+        index: usize,
+        total: u64,
+        marked: &FxHashSet<Vec<usize>>,
+    ) -> Option<ListRow> {
+        let crumbs = flat.crumbs(index)?;
+        let node = self.node_at(crumbs)?;
+        Some(self.list_row(
+            crumbs.to_vec(),
+            node,
+            total,
+            flat.depth(index),
+            index == 0,
+            marked,
+        ))
+    }
+
+    /// Whether the list is showing the children of `crumbs`.
+    pub fn is_expanded(&self, crumbs: &[usize]) -> bool {
+        self.expanded.contains(crumbs)
+    }
+
+    /// Open the head row. A new directory always starts with its children
+    /// listed, or the list would be one row long and say nothing.
+    fn open_head(&mut self) {
+        self.expanded.insert(self.crumbs.clone());
+    }
+
+    /// The row under the pointer, or nothing when it has left every row. The
+    /// list's rows are the mosaic's tiles in another shape, so the hover that
+    /// decides what Space and Enter act on is the same field.
+    pub fn hover_row(&mut self, crumbs: Option<&[usize]>) {
+        if self.hovered.as_deref() == crumbs {
+            return;
+        }
+        self.hovered = crumbs.map(<[usize]>::to_vec);
+        self.pointer_active = crumbs.is_some();
+    }
+
+    /// Open or close the row at `crumbs`.
+    pub fn toggle_expand(
+        &mut self,
+        crumbs: &[usize],
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.expanded.remove(crumbs) {
+            self.expanded.insert(crumbs.to_vec());
+        }
+        cx.notify();
+    }
+
+    /// Close every open row: the list's answer to the mosaic's shallowest
+    /// depth, and what a new root starts as.
+    pub fn collapse_all(&mut self, cx: &mut Context<'_, Self>) {
+        self.expanded.clear();
+        // The head stays open, or the list would be one row long.
+        self.expanded.insert(self.crumbs.clone());
+        cx.notify();
+    }
+
+    /// Open every directory down to `depth` levels below the head, the way the
+    /// mosaic's depth control opens more levels at once.
+    pub fn expand_to_depth(&mut self, depth: u32, cx: &mut Context<'_, Self>) {
+        let Some(root) = self.current() else {
+            return;
+        };
+        let base = self.crumbs.clone();
+        let mut open = vec![base.clone()];
+        // The head's children sit one level down, so opening them is the first
+        // level; anything deeper is the walk's business.
+        for (index, child) in root.children.iter().enumerate() {
+            if depth < 2 {
+                break;
+            }
+            if !child.is_dir() || child.children.is_empty() {
+                continue;
+            }
+            let mut crumbs = base.clone();
+            crumbs.push(index);
+            open.push(crumbs.clone());
+            Self::expand_walk(&crumbs, child, depth - 2, &mut open);
+        }
+        self.expanded.extend(open);
+        cx.notify();
+    }
+
+    /// Open the directories `levels` more levels down under `parent`, a level
+    /// at a time, so a deep request cannot walk further than it was asked for.
+    ///
+    /// A free function, not a method: it reads nothing but its arguments, and
+    /// the tree it walks is passed in whole.
+    fn expand_walk(
+        parent: &[usize],
+        node: &Node,
+        levels: u32,
+        open: &mut Vec<Vec<usize>>,
+    ) {
+        if levels == 0 || !node.is_dir() {
+            return;
+        }
+        for (index, child) in node.children.iter().enumerate() {
+            if !child.is_dir() || child.children.is_empty() {
+                continue;
+            }
+            let mut crumbs = parent.to_vec();
+            crumbs.push(index);
+            open.push(crumbs.clone());
+            Self::expand_walk(&crumbs, child, levels - 1, open);
+        }
+    }
+
+    /// The marked paths as crumbs, so a row can ask "is this marked?" without
+    /// building its path first. The marks are few and the rows are many, and
+    /// `prepare` resolves them the same way for the mosaic's tiles.
+    fn marked_crumbs(&self) -> FxHashSet<Vec<usize>> {
+        self.marks
+            .items()
+            .iter()
+            .filter_map(|item| self.crumbs_for_path(&item.path))
+            .collect()
+    }
+
+    /// One row, with the marks, the selection, the hover and the filter
+    /// resolved, so the view never has to look any of them up.
+    fn list_row(
+        &self,
+        crumbs: Vec<usize>,
+        node: &Node,
+        total: u64,
+        depth: u32,
+        is_current: bool,
+        marked: &FxHashSet<Vec<usize>>,
+    ) -> ListRow {
+        let is_marked = marked.contains(&crumbs);
+        // Everything inside a marked directory goes with it, as on the mosaic.
+        let covered = !marked.is_empty()
+            && (1..crumbs.len())
+                .any(|length| marked.contains(&crumbs[..length]));
+        let selected =
+            !is_current && self.selected.as_deref() == Some(crumbs.as_slice());
+        let hovered = self.hovered.as_deref() == Some(crumbs.as_slice());
+        let expanded = !is_current && self.is_expanded(&crumbs);
+        let age_bucket = (self.color_mode == ColorMode::Age
+            && node.modified > 0)
+            .then(|| {
+                let days = (self.scanned_at - node.modified) / 86_400;
+                crate::palette::age_bucket(days)
+            });
+        // The same verdict the mosaic gives the tile here, so the two views
+        // cannot disagree about what the find text matches.
+        let filtered = match self.matches.as_deref().map(|m| m.keep(&crumbs)) {
+            None | Some(Some(Keep::Whole)) => Filtered::Shown,
+            Some(Some(Keep::Partial { .. })) => Filtered::Holds,
+            Some(None) => Filtered::Out,
+        };
+        ListRow {
+            expanded,
+            crumbs,
+            depth,
+            name: if is_current {
+                self.current_label()
+            } else {
+                node.name.to_string()
+            },
+            is_dir: node.is_dir(),
+            is_current,
+            has_children: node.is_dir() && !node.children.is_empty(),
+            marked: is_marked,
+            covered,
+            selected,
+            hovered,
+            unreadable: node.read_error,
+            reclaimable: node.reclaim.is_some(),
+            filtered,
+            bytes: node.bytes,
+            files: node.files,
+            dirs: node.dirs,
+            modified: node.modified,
+            category: node.category,
+            age_bucket,
+            share: share_of(node.bytes, total),
+        }
+    }
+
+    /// What the list calls the directory on screen: the scanned root is the
+    /// volume it lives on, since that is what the scan is of.
+    pub fn current_label(&self) -> String {
+        let node = self.current();
+        node.map_or_else(String::new, |node| {
+            if self.crumbs.is_empty() {
+                self.disk_root
+                    .as_deref()
+                    .unwrap_or(&self.root_path)
+                    .display()
+                    .to_string()
+            } else {
+                node.name.to_string()
+            }
+        })
+    }
+
+    /// The list's own keys: a row is a line here, not a rectangle, so the
+    /// arrows mean row and directory rather than the mosaic's geometry. Every
+    /// other key in the explore map still applies.
+    pub fn on_list_key(
+        &mut self,
+        key: &str,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        match key {
+            "up" | "k" => self.step_row(-1, cx),
+            "down" | "j" => self.step_row(1, cx),
+            // Open the row, or go in when it is already open: what the mosaic's
+            // one Enter does, split into the two things it can mean here.
+            "right" | "l" => self.open_selected(cx),
+            // Close it, or go up a level when there is nothing to close.
+            "left" | "h" | "backspace" | "u" => self.close_selected(cx),
+            // The mosaic's depth control, as the list's own version of it: both
+            // go through `adjust_depth`, so the buttons and the keys are one
+            // thing.
+            "[" => self.adjust_depth(-1, cx),
+            "]" => self.adjust_depth(1, cx),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Open the row at `crumbs`: select it, then do what its own arrow does —
+    /// open it in place, or go in when it is already open.
+    ///
+    /// What a click on the row that is already selected means. The first click
+    /// only selects: the list is somewhere to read a directory, and a
+    /// directory that took the screen away under the pointer reading it would
+    /// say something the row's own arrow does not.
+    pub fn open_row(&mut self, crumbs: Vec<usize>, cx: &mut Context<'_, Self>) {
+        self.selected = Some(crumbs);
+        self.open_selected(cx);
+    }
+
+    /// Open the selected row, or descend into it when it is already open.
+    fn open_selected(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(selected) = self.selected.clone() else {
+            self.descend(cx);
+            return;
+        };
+        let enterable = self
+            .node_at(&selected)
+            .is_some_and(|node| node.is_dir() && !node.children.is_empty());
+        if !enterable {
+            // A file, or an empty directory: nothing to open, so go in and let
+            // the mosaic's own rule decide where that lands.
+            self.descend(cx);
+        } else if self.is_expanded(&selected) {
+            self.descend(cx);
+        } else {
+            self.expanded.insert(selected);
+            cx.notify();
+        }
+    }
+
+    /// Close the selected row, or go up a level when it is already closed.
+    fn close_selected(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(selected) = self.selected.clone()
+            && self.is_expanded(&selected)
+        {
+            self.expanded.remove(&selected);
+            cx.notify();
+            return;
+        }
+        self.ascend(cx);
+    }
+
+    /// Move the selection one visible row up or down. Past the first or last
+    /// row it stops, as the mosaic does at its edge.
+    fn step_row(&mut self, step: isize, cx: &mut Context<'_, Self>) {
+        self.pointer_active = false;
+        let flat = self.flat_rows();
+        if flat.len() < 2 {
+            return;
+        }
+        let at = self
+            .selected
+            .as_deref()
+            .and_then(|selected| flat.index_of(selected))
+            .map_or_else(
+                || usize::from(step > 0),
+                |index| {
+                    // A clamp rather than a wrap: a list is read top to
+                    // bottom, and wrapping would hide the ends.
+                    (index.cast_signed() + step)
+                        .clamp(0, flat.len().cast_signed() - 1)
+                        as usize
+                },
+            );
+        if let Some(crumbs) = flat.crumbs(at) {
+            self.select(Some(crumbs.to_vec()), cx);
         }
     }
 
@@ -2547,6 +3130,13 @@ impl Disktree {
                 cx.notify();
             }
             "enter" => self.descend(cx),
+            // The list has no geometry, so its arrows step rows and open and
+            // close directories; the mosaic's own handling is below.
+            "right" | "left" | "up" | "down" | "h" | "j" | "k" | "l"
+            | "backspace" | "u" | "[" | "]"
+                if self.view_mode == ViewMode::List
+                    && !control
+                    && self.on_list_key(key, cx) => {}
             "right" | "l" if !control => {
                 self.move_selection(Direction::Right, cx);
             }
@@ -2607,6 +3197,15 @@ impl Disktree {
             "0" => self.reset_view(cx),
             "t" if !control => {
                 self.set_mode((self.mode_index() + 1) % 3, cx);
+            }
+            // Mosaic or list, on the same key as the mode it ranks by: `w` is
+            // the shape of the view, `t` what it measures.
+            "w" if !control => {
+                let next = match self.view_mode {
+                    ViewMode::Mosaic => ViewMode::List,
+                    ViewMode::List => ViewMode::Mosaic,
+                };
+                self.set_view_mode(next, cx);
             }
             "r" if !control => self.start_scan(cx),
             "g" if !control => self.go_to_disk(cx),

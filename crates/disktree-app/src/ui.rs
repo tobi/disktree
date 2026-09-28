@@ -82,6 +82,29 @@ pub mod size {
     pub const SCANNING_METER: Rems = Rems(26.25);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
+    /// The Treemap | List choice in the settings row. Wide enough for the
+    /// longer of its two labels, or the group overflows onto the next one.
+    pub const VIEW_CHOICE: Rems = Rems(8.0);
+    /// The list view's figure lanes. Fixed, so the numbers line up down the
+    /// list and can be compared by eye, like the review list's.
+    pub const LIST_COUNT: Rems = Rems(4.5);
+    /// The share bar's lane. Wide enough for the bar to be read as a
+    /// proportion rather than a tick, since it is the column the eye actually
+    /// compares down the list.
+    pub const LIST_SHARE: Rems = Rems(6.0);
+    /// The percentage beside the share bar, so a row says the share and shows
+    /// it.
+    pub const LIST_PERCENT: Rems = Rems(3.5);
+    pub const LIST_SIZE: Rems = Rems(5.0);
+    /// Wide enough for the longest age, "18 months ago", to stay on the one
+    /// line a row has at the row's own type step.
+    pub const LIST_AGE: Rems = Rems(7.0);
+    /// One level of the list's indentation, so a child sits visibly under its
+    /// parent rather than merely deeper in the file.
+    pub const LIST_INDENT: Rems = Rems(0.875);
+    /// A list row's height. Fixed, and the same for every row, because the
+    /// virtual list is told how tall each one is and has to be right.
+    pub const LIST_ROW: Rems = Rems(1.75);
     /// The review screen's summary column.
     pub const REVIEW_SUMMARY: Rems = Rems(22.5);
     /// The review list's share-bar lane.

@@ -84,18 +84,34 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    inside a profile stays removable.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a
    re-scan; `Marks::refresh` re-reads their sizes and drops what is gone.
-6. **The treemap is painted, not composed of elements.** Thousands of
+6. **The treemap is painted, not composed from elements.** Thousands of
    rectangles belong in one canvas callback; labels are shaped there too so they
-   clip to their own tile.
-7. **Tile crumbs are absolute.** `treemap::layout` takes the drawn node's
+   clip to their own tile. The list is composed, because its rows have to be
+   individually clickable and hoverable — but it is **virtualized**: opening
+   rows makes a list as long as the tree is deep, and `list_view.rs` builds only
+   the rows the viewport can show. `Disktree::flat_rows` is the row index, and
+   `Disktree::list_rows` builds the rows a frame asks for — once, from one
+   index. A frame must never build the whole list.
+7. **Mosaic and list are two drawings of one state.** `ViewMode` changes what
+   is drawn and nothing else — the same crumbs, the same selection, the same
+   marks, the same figures from the same `Node` fields, the same filter
+   verdict and the same age bucket. Anything one view shows and the other does
+   not is a bug, not a feature. The list nests by opening a row
+   (`Disktree::expanded`); the mosaic nests by drawing depth. A click is one
+   rule in both: it selects, and a click on what is already selected opens it —
+   the mosaic enters the directory, the list opens the row the way its own
+   arrow does.
+8. **Tile crumbs are absolute.** `treemap::layout` takes the drawn node's
    crumbs and every tile extends them, so a tile resolves from the scanned
    root at any depth. Relative crumbs look right at `~` and silently point
-   at other directories after descending — including for marks. Any code that
-   turns a path into crumbs walks from the scanned root, too.
-8. **The view transform is the only thing zoom changes.** Layout runs in
+   at other directories after descending — including for marks, and for the
+   list's rows. Any code that turns a path into crumbs walks from the scanned
+   root, too.
+9. **The view transform is the only thing zoom changes.** Layout runs in
    base-space pixels and is cached; `screen = (base - origin) * scale`.
-9. **The status bar never claims a saving it cannot measure.** Projections come
-   from marked bytes; the final number comes from `statvfs` before and after.
+10. **The status bar never claims a saving it cannot measure.** Projections
+    come from marked bytes; the final number comes from `statvfs` before and
+    after.
 
 ## Where changes belong
 
@@ -111,6 +127,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
+| the list's rows and their columns | `crates/disktree-app/src/list_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
 
@@ -121,6 +138,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
   against real temporary trees.
 * The screens are covered by window-harness tests that draw frames and press
   keys, including one that marks a directory, confirms the removal and checks
-  the files are gone while unmarked neighbours are untouched.
+  the files are gone while unmarked neighbours are untouched, and ones that
+  switch between the mosaic and the list, open and close its rows, step them
+  with the arrows, click a row without leaving the directory it is in, mark
+  from one, filter it, and check the two settings choices do not overlap.
 * Rendering was verified by those tests and by running the app against a real
-  home directory; it has not been eyeballed in every theme and font size.
+  home directory; it has not been eyeballed in every theme and font size. The
+  list is virtualized, and a test asserts that a row far below the window is
+  never composed — composing the whole list was what made it lag.

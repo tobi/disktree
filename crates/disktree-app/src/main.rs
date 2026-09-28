@@ -14,6 +14,7 @@
 mod app_menu;
 mod appearance;
 mod git;
+mod list_view;
 mod marks;
 mod palette;
 mod state;

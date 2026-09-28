@@ -92,6 +92,18 @@ fn read<R>(
     view.read_with(cx, |app, _| f(app))
 }
 
+/// Every list row, built. The tests want the whole list at once, where a frame
+/// asks for the rows on screen; both go through one call, and each row comes
+/// back with the index it is on, so the two cannot disagree about which row is
+/// which.
+fn rows(app: &Disktree) -> Vec<crate::state::ListRow> {
+    let count = app.flat_rows().len();
+    app.list_rows(0..count)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
 #[gpui_kit::test]
 fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
@@ -452,6 +464,592 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
     assert!(read(&view, cx, |app| app.matches.is_none()
         && !app.filter_applied));
     assert!(names_drawn(&view, cx).contains(&"deeper".to_string()));
+}
+
+/// The list view is the same tree as rows, and `w` swaps between the two
+/// without losing where you are or what is marked.
+#[gpui_kit::test]
+fn w_switches_between_the_treemap_and_the_list(cx: &mut TestAppContext) {
+    use crate::state::ViewMode;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.view_mode), ViewMode::Mosaic);
+    assert!(cx.debug_bounds("treemap").is_some(), "the mosaic is drawn");
+
+    // A mark made on the mosaic has to survive the switch, or the list would
+    // be a second, disagreeing copy of the same state.
+    let junk = update(&view, cx, |app, _| child_crumbs(app, &[], "junk"));
+    update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
+    let before = read(&view, cx, |app| app.crumbs.clone());
+
+    press(cx, "w");
+    assert_eq!(read(&view, cx, |app| app.view_mode), ViewMode::List);
+    assert!(cx.debug_bounds("list").is_some(), "the list is drawn");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), before);
+    assert!(
+        read(&view, cx, |app| app
+            .marks
+            .contains(&temp.path().join("junk"))),
+        "the mark survived the switch"
+    );
+
+    press(cx, "w");
+    assert_eq!(read(&view, cx, |app| app.view_mode), ViewMode::Mosaic);
+    assert!(cx.debug_bounds("treemap").is_some());
+}
+
+/// The list heads with the directory on screen and then lists its children,
+/// largest first, with the figures the scan measured.
+#[gpui_kit::test]
+fn the_list_ranks_the_directory_it_is_in(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+
+    let listed = read(&view, cx, rows);
+    assert!(listed[0].is_current, "the first row is where you are");
+    let names: Vec<&str> =
+        listed[1..].iter().map(|row| row.name.as_str()).collect();
+    // The fixture: .cache 300k, junk 300k, keep 1k, and children are already
+    // ordered by the metric, so the two big ones lead.
+    assert!(
+        names.contains(&"junk") && names.contains(&".cache"),
+        "{names:?}"
+    );
+    assert_eq!(names.len(), 3, "{names:?}");
+    let junk = listed
+        .iter()
+        .find(|row| row.name == "junk")
+        .expect("junk is listed");
+    let cache = listed
+        .iter()
+        .find(|row| row.name == ".cache")
+        .expect(".cache is listed");
+    assert!(
+        junk.bytes >= cache.bytes,
+        "rows are ranked: {} then {}",
+        junk.bytes,
+        cache.bytes
+    );
+    // The directory on screen is all of itself; a child is its share of it.
+    assert!(
+        (listed[0].share - 1.0).abs() < f32::EPSILON,
+        "{}",
+        listed[0].share
+    );
+    assert!(junk.share > 0.0 && junk.share < 1.0, "{}", junk.share);
+    assert!(junk.files > 0 && junk.dirs > 0, "{}", junk.files);
+
+    // The rows are really on screen, not just in the state: the directory on
+    // screen heads the list, and the first child follows it.
+    assert!(cx.debug_bounds("list-current").is_some(), "the head row");
+    assert!(cx.debug_bounds("list-row-1").is_some(), "a child row");
+}
+
+/// In the list, up and down step the visible rows and right opens a row, then
+/// goes into it: a row is a line, not a rectangle, so the mosaic's geometric
+/// arrows have nothing to move through.
+#[gpui_kit::test]
+fn the_list_arrows_step_rows_open_and_close(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+
+    // Down lands on the first child, up goes back to the one before it.
+    press(cx, "down");
+    let first = read(&view, cx, |app| {
+        app.selected
+            .as_ref()
+            .and_then(|crumbs| app.node_at(crumbs))
+            .map(|node| node.name.to_string())
+    });
+    assert!(first.is_some(), "down selected a row");
+    press(cx, "up");
+    let above = read(&view, cx, |app| {
+        app.selected
+            .as_ref()
+            .and_then(|crumbs| app.node_at(crumbs))
+            .map(|node| node.name.to_string())
+    });
+    assert_ne!(above, first, "up moved the selection");
+
+    // Right opens the row where it stands: its children are listed under it
+    // and the head does not move, which is the point of the depth.
+    let junk = update(&view, cx, |app, _| child_crumbs(app, &[], "junk"));
+    let deeper = update(&view, cx, |app, _| child_crumbs(app, &junk, "deeper"));
+    update(&view, cx, |app, cx| app.select(Some(junk.clone()), cx));
+    let before = read(&view, cx, |app| rows(app).len());
+    press(cx, "right");
+    let (opened, head, after) = read(&view, cx, |app| {
+        (app.is_expanded(&junk), app.crumbs.clone(), rows(app).len())
+    });
+    assert!(opened, "right opened the row");
+    assert!(head.is_empty(), "the head did not move: {head:?}");
+    assert!(
+        after > before,
+        "its children are listed: {before} then {after}"
+    );
+    assert!(
+        read(&view, cx, |app| {
+            rows(app).iter().any(|row| row.crumbs == deeper)
+        }),
+        "the nested child is a row of its own"
+    );
+
+    // Left closes it, and closes it before it goes up a level.
+    press(cx, "left");
+    assert!(
+        !read(&view, cx, |app| app.is_expanded(&junk)),
+        "left closed the row"
+    );
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()), "and stayed");
+
+    // Open, then go in: right twice is what the mosaic's one Enter did.
+    press(cx, "right");
+    press(cx, "right");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    press(cx, "left");
+    press(cx, "left");
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()));
+}
+/// A click selects a row; a click on the row that is already selected opens it,
+/// which is what its own arrow does.
+///
+/// It used to go into the directory at once, which took the whole screen away
+/// from a pointer that was only reading the list and gave a click a meaning the
+/// row's arrow did not have. Enter is still the way in from the keyboard; with
+/// a pointer it is a click on the row that is already open.
+#[gpui_kit::test]
+fn a_click_selects_a_row_and_a_second_click_opens_it(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+    draw(cx);
+
+    let junk = update(&view, cx, |app, _| child_crumbs(app, &[], "junk"));
+    let before = read(&view, cx, |app| (app.crumbs.clone(), rows(app).len()));
+    // A row's element id is its place in the flat list, so the row under test
+    // is found in the state rather than counted out by hand: what sits above
+    // junk depends on the fixture and on what the list is ranked by.
+    let at = read(&view, cx, |app| {
+        rows(app)
+            .iter()
+            .position(|row| row.crumbs == junk)
+            .expect("junk is a row")
+    });
+    let row: &'static str =
+        Box::leak(format!("list-row-{at}").into_boxed_str());
+
+    let bounds = cx.debug_bounds(row).expect("junk's row is drawn");
+    cx.simulate_click(bounds.center(), Modifiers::none());
+    draw(cx);
+
+    let clicked = read(&view, cx, |app| {
+        (app.crumbs.clone(), app.selected.clone(), rows(app).len())
+    });
+    assert_eq!(clicked.0, before.0, "the click left the directory alone");
+    assert_eq!(clicked.1, Some(junk.clone()), "and selected the row");
+    assert_eq!(clicked.2, before.1, "with nothing opened under it");
+    assert!(
+        !read(&view, cx, |app| app.is_expanded(&junk)),
+        "a first click opens nothing either"
+    );
+
+    // The second click is the row's arrow: it opens where it stands, so the
+    // directory on screen does not move.
+    let bounds = cx.debug_bounds(row).expect("junk's row is still drawn");
+    cx.simulate_click(bounds.center(), Modifiers::none());
+    draw(cx);
+    let opened = read(&view, cx, |app| {
+        (app.crumbs.clone(), app.is_expanded(&junk), rows(app).len())
+    });
+    assert_eq!(opened.0, before.0, "opened in place, not entered");
+    assert!(opened.1, "the second click opened the row");
+    assert!(opened.2 > before.1, "its children are rows now");
+
+    // And a click on the row that is already open is `→` on an open row: in.
+    let bounds = cx.debug_bounds(row).expect("junk's row is still drawn");
+    cx.simulate_click(bounds.center(), Modifiers::none());
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        junk,
+        "clicking the open row goes into it"
+    );
+}
+
+/// The depth keys do on the list what they do on the mosaic: one closes
+/// everything, the other opens one more level everywhere.
+#[gpui_kit::test]
+fn the_depth_keys_open_and_close_the_whole_list(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+
+    let flat = read(&view, cx, |app| app.flat_rows().len());
+    press(cx, "]");
+    let deeper = read(&view, cx, |app| app.flat_rows().len());
+    assert!(
+        deeper > flat,
+        "one more level everywhere: {flat} then {deeper}"
+    );
+    assert!(
+        read(&view, cx, |app| app.flat_rows().deepest() > 1),
+        "a row is nested two deep"
+    );
+
+    press(cx, "[");
+    let closed = read(&view, cx, |app| (rows(app).len(), app.expanded.len()));
+    assert_eq!(closed, (flat, 1), "everything closed but the head");
+}
+
+/// The find filter reaches the list, and says about a row what the mosaic says
+/// about the tile at the same place.
+#[gpui_kit::test]
+fn typing_a_filter_marks_the_rows_it_matches(cx: &mut TestAppContext) {
+    use crate::state::Filtered;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+
+    press(cx, "/");
+    cx.simulate_input("BLOB");
+    cx.run_until_parked();
+    draw(cx);
+
+    let verdicts = read(&view, cx, |app| {
+        rows(app)
+            .into_iter()
+            .map(|row| (row.name, row.filtered))
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        verdicts
+            .iter()
+            .any(|(name, v)| name == "junk" && *v == Filtered::Holds),
+        "{verdicts:?}"
+    );
+    assert!(
+        verdicts
+            .iter()
+            .any(|(name, v)| name == "keep" && *v == Filtered::Out),
+        "a directory with no match in it is out: {verdicts:?}"
+    );
+
+    // Enter applies it: the non-matches leave the rows, as they leave the
+    // mosaic.
+    press(cx, "enter");
+    let applied = read(&view, cx, rows);
+    let names: Vec<&str> =
+        applied.iter().map(|row| row.name.as_str()).collect();
+    assert!(!names.contains(&"keep"), "{names:?}");
+    press(cx, "escape");
+    assert!(read(&view, cx, |app| rows(app).len()) > applied.len());
+}
+
+/// Age mode says in a row what it says in a tile: the age, not the kind.
+#[gpui_kit::test]
+fn age_mode_gives_the_list_rows_an_age_bucket(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+
+    // In size mode there is no bucket, so a row is coloured by its kind.
+    press(cx, "w");
+    assert!(read(&view, cx, |app| {
+        rows(app).iter().all(|row| row.age_bucket.is_none())
+    }));
+
+    press(cx, "t");
+    press(cx, "t");
+    assert_eq!(read(&view, cx, Disktree::mode_index), 2, "age mode");
+    let buckets = read(&view, cx, |app| {
+        rows(app)
+            .into_iter()
+            .map(|row| row.age_bucket)
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        buckets.iter().any(Option::is_some),
+        "a row carries an age: {buckets:?}"
+    );
+}
+
+/// A row under the pointer is what a key acts on, as a tile is.
+#[gpui_kit::test]
+fn the_row_under_the_pointer_becomes_the_target(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+
+    let row = cx.debug_bounds("list-row-1").expect("a child row is drawn");
+    cx.simulate_mouse_move(row.center(), None, Modifiers::none());
+    draw(cx);
+    let hovered = read(&view, cx, |app| app.hovered.clone());
+    assert!(hovered.is_some(), "the row is hovered");
+    assert!(read(&view, cx, |app| app.pointer_active));
+    assert_eq!(
+        read(&view, cx, Disktree::action_target),
+        hovered,
+        "and it is what a key acts on"
+    );
+}
+
+/// A directory far longer than the window. The list is virtualized, so only
+/// the rows on screen are composed: the first few exist as elements and the
+/// rest do not, however many the tree holds. Composing a row per entry is what
+/// made the list lag.
+#[gpui_kit::test]
+fn the_list_builds_only_the_rows_on_screen(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    for index in 0..300 {
+        std::fs::write(temp.path().join(format!("entry-{index:03}.bin")), b"x")
+            .expect("write");
+    }
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+    draw(cx);
+
+    let listed = read(&view, cx, rows);
+    assert!(listed.len() > 200, "the tree is long: {}", listed.len());
+    // The index knows every row, and building it costs no row.
+    let flat = read(&view, cx, Disktree::flat_rows);
+    assert_eq!(flat.len(), listed.len(), "the index and the rows agree");
+
+    assert!(
+        cx.debug_bounds("list-row-1").is_some(),
+        "the first is drawn"
+    );
+    assert!(
+        cx.debug_bounds("list-row-250").is_none(),
+        "the last is not: only the window is built"
+    );
+}
+/// A request for rows past the end is clamped, not a panic, and each row knows
+/// which index it is on.
+///
+/// The virtual list works out which rows to build from the heights it was
+/// given, and those heights are the frame's: a row that closed, or a filter
+/// applied under the list, leaves it asking for rows that are no longer there.
+/// The index travelling with the row is what the row's element id is keyed by,
+/// so a clamped range that renumbered its rows would hand one row another's
+/// identity.
+#[gpui_kit::test]
+fn a_range_past_the_end_is_clamped_and_keeps_its_indices(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+    draw(cx);
+
+    let count = read(&view, cx, |app| app.flat_rows().len());
+    let asked = read(&view, cx, |app| {
+        app.list_rows(0..count + 500)
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        asked,
+        (0..count).collect::<Vec<_>>(),
+        "the range is clamped to the rows there are, each on its own index"
+    );
+    let past = read(&view, cx, |app| app.list_rows(count..count + 500).len());
+    assert_eq!(past, 0, "and a range wholly past the end is empty");
+}
+
+/// The headings sit over the columns they name.
+///
+/// A row and the header are laid out by different parents — the header is a
+/// plain flex child, a row is composed inside the virtual list — so nothing
+/// forces the two sets of lanes to agree, and a lane added to one and not the
+/// other slides every heading after it off its column. The figure a heading
+/// names has to be the figure under it, or the table cannot be read.
+#[gpui_kit::test]
+fn the_list_headings_sit_over_their_columns(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+    draw(cx);
+
+    for (heading, lane) in [
+        ("head-share", "list-lane-share"),
+        ("head-size", "list-lane-size"),
+    ] {
+        let head = cx
+            .debug_bounds(heading)
+            .unwrap_or_else(|| panic!("{heading} is drawn"));
+        let row = cx
+            .debug_bounds(lane)
+            .unwrap_or_else(|| panic!("{lane} is drawn"));
+        assert_eq!(
+            head.size.width, row.size.width,
+            "{heading} and {lane} are the same width"
+        );
+        assert_eq!(head.origin.x, row.origin.x, "{heading} sits over {lane}");
+    }
+}
+
+/// A row is exactly as tall as the slot the virtual list reserved for it.
+///
+/// The list is told each row's height up front and lays them out by it, so a
+/// row that paints taller than its slot overlaps the next one. This is the
+/// invariant that keeps the list a table rather than a pile: equal pitch, and
+/// each row filling exactly the line it was given.
+#[gpui_kit::test]
+fn list_rows_are_exactly_as_tall_as_their_slot(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+    draw(cx);
+
+    let first = cx
+        .debug_bounds("list-row-1")
+        .expect("the first child row is drawn");
+    let second = cx
+        .debug_bounds("list-row-2")
+        .expect("the second child row is drawn");
+    let third = cx
+        .debug_bounds("list-row-3")
+        .expect("the third child row is drawn");
+
+    // The list lays rows out by the height it was promised for each, so a row
+    // that paints taller than that overlaps the next one. Equal spacing and a
+    // painted height equal to that spacing is the whole promise.
+    let pitch = second.origin.y - first.origin.y;
+    assert_eq!(
+        third.origin.y - second.origin.y,
+        pitch,
+        "every row gets the same slot"
+    );
+    assert_eq!(
+        first.size.height, pitch,
+        "a row is exactly its slot: no padding beyond the fixed height"
+    );
+}
+
+/// The depth control at the top is the same control in both views: its buttons
+/// and its `[` / `]` keys go through one function, and the number it shows is
+/// the depth of the view actually on screen. It was once the mosaic's alone, so
+/// it did nothing at all over a list.
+#[gpui_kit::test]
+fn the_depth_control_drives_both_views(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Over the mosaic it is the drawing depth.
+    let deeper_button =
+        cx.debug_bounds("depth-more").expect("the depth stepper");
+    assert_eq!(read(&view, cx, Disktree::depth_drawn), 3);
+    cx.simulate_click(deeper_button.center(), Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::depth_drawn), 4);
+    assert_eq!(read(&view, cx, |app| app.layout_options.max_depth), 4);
+
+    // Over the list it is the open depth, and it changes the rows.
+    press(cx, "w");
+    let listed = read(&view, cx, rows);
+    assert_eq!(
+        read(&view, cx, Disktree::depth_drawn),
+        1,
+        "one level: the head's children"
+    );
+    let deeper_button =
+        cx.debug_bounds("depth-more").expect("the depth stepper");
+    cx.simulate_click(deeper_button.center(), Modifiers::none());
+    draw(cx);
+    let deeper = read(&view, cx, rows);
+    assert!(deeper.len() > listed.len(), "the button opened a level");
+    assert_eq!(read(&view, cx, Disktree::depth_drawn), 2);
+    assert!(
+        deeper.iter().any(|row| row.depth > 1),
+        "and a row is nested under another"
+    );
+
+    // The less button closes everything again, from the same control.
+    let less_button = cx.debug_bounds("depth-less").expect("the depth stepper");
+    cx.simulate_click(less_button.center(), Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::depth_drawn), 1);
+    assert_eq!(read(&view, cx, rows).len(), listed.len());
+}
+
+/// The Treemap | List group and the Size | Files | Age group sit beside each
+/// other, not on top of each other: the first was once too narrow for its
+/// labels and ran into the second.
+#[gpui_kit::test]
+fn the_settings_row_does_not_overlap(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let choice = cx
+        .debug_bounds("view-choice")
+        .expect("the Treemap | List choice");
+    let ranking = cx
+        .debug_bounds("ranking-choice")
+        .expect("the Size | Files | Age choice");
+    assert!(
+        ranking.left() >= choice.right(),
+        "the two choices overlap: {choice:?} then {ranking:?}"
+    );
+}
+
+/// Marking works from the list, since it is the same selection and the same
+/// marks: a row marked here is the same mark the review screen removes.
+#[gpui_kit::test]
+fn space_marks_the_row_the_list_has_selected(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    press(cx, "w");
+
+    let junk = update(&view, cx, |app, _| child_crumbs(app, &[], "junk"));
+    update(&view, cx, |app, cx| app.select(Some(junk.clone()), cx));
+    press(cx, "space");
+    assert!(
+        read(&view, cx, |app| app
+            .marks
+            .contains(&temp.path().join("junk"))),
+        "the selected row is marked"
+    );
+    // The marked row is drawn as marked, which is what tells a person it went.
+    let marked_row = read(&view, cx, |app| {
+        rows(app)
+            .into_iter()
+            .find(|row| row.crumbs == junk)
+            .map(|row| row.marked)
+    });
+    assert_eq!(marked_row, Some(true));
+
+    press(cx, "space");
+    assert!(!read(&view, cx, |app| app
+        .marks
+        .contains(&temp.path().join("junk"))));
 }
 
 #[gpui_kit::test]
@@ -1040,16 +1638,23 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     assert_eq!(hatched, 1, "exactly the marked tile is hatched");
 }
 
-/// Drive the scan the view started until its tree lands.
+/// Drive the scan the view started until it finishes and its tree is up.
+///
+/// The scan is what is waited on, not the tree. A widen keeps the tree it
+/// already has on screen while the wider root is read, so `tree().is_some()`
+/// is true from the first frame, and waiting on that returned before the new
+/// tree had landed — leaving the assertions after it racing the walk. The
+/// handle is gone only once `poll_scan_once` has applied the result, so this
+/// waits for the state the callers actually want.
 fn finish_scan(view: &Entity<Disktree>, cx: &mut Window) {
     let epoch = read(view, cx, |app| app.scan_epoch);
     for _ in 0..600 {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let ready = update(view, cx, |app, cx| {
+        let landed = update(view, cx, |app, cx| {
             app.poll_scan_once(epoch, cx);
-            app.tree().is_some()
+            app.scan.is_none() && app.tree().is_some()
         });
-        if ready {
+        if landed {
             return;
         }
     }
@@ -1144,8 +1749,10 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     std::fs::write(inner.join("late.bin"), vec![0_u8; 4096]).expect("write");
 
     press(cx, "g");
-    // The old tree stays on screen while the wider one is read.
-    assert!(read(&view, cx, |app| app.tree().is_some()));
+    // The old tree stays on screen while the wider one is read, and the scan
+    // is still in flight: waiting for a tree to exist would already be over
+    // here, which is what made the assertions below race the walk.
+    assert!(read(&view, cx, |app| app.tree().is_some() && app.scan.is_some()));
     finish_scan(&view, cx);
     assert_eq!(read(&view, cx, |app| app.root_path.clone()), temp.path());
     assert!(
@@ -1217,11 +1824,25 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     let chevron = cx
         .debug_bounds(Box::leak(format!("crumb-{last}-menu").into_boxed_str()))
         .expect("the current crumb has a menu");
+    let trail = cx.debug_bounds("trail");
+    // The trail clips to its own box when the bar is tight, and a crumb outside
+    // that box is drawn but not clickable: wider metrics put the ▾ past the
+    // edge, and the menu then never opened at all.
+    assert!(
+        trail.is_some_and(|trail| {
+            let x = chevron.center().x;
+            trail.origin.x <= x && x < trail.origin.x + trail.size.width
+        }),
+        "the current crumb's menu button is inside the trail; \
+         chevron={chevron:?} trail={trail:?}"
+    );
     cx.simulate_click(chevron.center(), Modifiers::none());
     draw(cx);
+    let opened = read(&view, cx, |app| app.crumb_menu.is_some());
     assert!(
         cx.debug_bounds("sibling-menu").is_some(),
-        "the menu is drawn"
+        "the menu is drawn; crumb_menu={opened} chevron={chevron:?} \
+         trail={trail:?}"
     );
     let (names, highlighted) = read(&view, cx, |app| {
         let menu = app.crumb_menu.clone().expect("open");
