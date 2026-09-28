@@ -2899,8 +2899,10 @@ impl Disktree {
                 }
             }
             // A secondary click: a two-finger click, or the right button.
-            // Ctrl-click is not one here; it arrives as `Left` with control
-            // held, and marks, as it always has.
+            // On macOS the platform layer rewrites ctrl-left-click into a
+            // right-click, so this arm is what ctrl-click does there too;
+            // the `Left` + control arm above is for Linux and Windows,
+            // where no such rewrite happens.
             MouseButton::Right => match crumbs {
                 Some(crumbs) => self.open_tile_menu(crumbs, event.position, cx),
                 None => self.close_tile_menu(cx),
@@ -2928,8 +2930,6 @@ impl Disktree {
         event: &ScrollWheelEvent,
         cx: &mut Context<'_, Self>,
     ) {
-        // Zooming moves the tile out from under a menu hanging beside it.
-        self.close_tile_menu(cx);
         let origin = self.treemap_origin.get();
         let x = (event.position.x - origin.x).as_f32();
         let y = (event.position.y - origin.y).as_f32();

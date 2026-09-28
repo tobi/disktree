@@ -1446,7 +1446,10 @@ fn the_tile_menu_closes_without_acting_behind_it(cx: &mut TestAppContext) {
     assert!(!open);
     assert_eq!(selected, Some(cache), "the selection stays");
 
-    // Ctrl-click is macOS's secondary click, but here it keeps marking.
+    // Ctrl-click keeps marking where it arrives as Left + control, which
+    // is Linux and Windows; on macOS the platform layer rewrites it into a
+    // right-click, so there it opens this menu instead. The harness sends
+    // events without that rewrite, so this is the non-macOS path.
     cx.simulate_mouse_move(on_junk, None, Modifiers::none());
     cx.simulate_mouse_down(on_junk, MouseButton::Left, Modifiers::control());
     cx.simulate_mouse_up(on_junk, MouseButton::Left, Modifiers::control());
