@@ -13,7 +13,7 @@ use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
+    MouseButton, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, TileAction, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -105,7 +105,10 @@ pub fn root(
         .font_family(theme.font)
         .text_size(text::BODY)
         .child(body);
-    if let Some(tip) = cursor_tooltip(app, window, cx) {
+    // An open menu is what the pointer is about; a tooltip would cover it.
+    if let Some(menu) = tile_menu(app, cx) {
+        root = root.child(menu);
+    } else if let Some(tip) = cursor_tooltip(app, window, cx) {
         root = root.child(tip);
     }
     if app.show_help {
@@ -736,6 +739,123 @@ fn sibling_menu(
         );
     }
     panel
+}
+
+/// What the tile menu calls the reveal, in each platform's own words.
+const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(windows) {
+    "Show in File Explorer"
+} else {
+    "Show in file manager"
+};
+
+/// A tile's context menu: what Enter, Space and `o` do, for the tile that
+/// was right-clicked, each row naming its key so the menu teaches them.
+///
+/// A layer of the root view, like the cursor tooltip, so the mosaic's edge
+/// never clips it. The layer covers the window: a click outside the menu
+/// only closes it, as a menu's does, except a right-click, which goes on to
+/// open the menu again on the tile it landed on.
+fn tile_menu(
+    app: &Disktree,
+    cx: &Context<'_, Disktree>,
+) -> Option<Stateful<Div>> {
+    let menu = app.tile_menu.clone()?;
+    let theme = cx.omarchy().clone();
+    let node = app.node_at(&menu.crumbs)?;
+    let marked = app
+        .path_at(&menu.crumbs)
+        .is_some_and(|path| app.marks.contains(&path));
+    let mut card = div()
+        .id("tile-menu")
+        .debug_selector(|| "tile-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .w(size::TILE_MENU)
+        .p(space::XS)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.control_border())
+        .shadow_lg()
+        // A press on the menu is the menu's own, not a click outside it.
+        .on_any_mouse_down(
+            |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+            },
+        )
+        .child(
+            div()
+                .px(space::SM)
+                .py(space::XS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.8))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(node.name.to_string()),
+        );
+    for (row, action) in app.tile_actions(&menu.crumbs).into_iter().enumerate()
+    {
+        let (label, key) = match action {
+            TileAction::Open => ("Open", "enter"),
+            TileAction::Mark if marked => ("Unmark", "space"),
+            TileAction::Mark => ("Mark for removal", "space"),
+            TileAction::Reveal => (REVEAL_LABEL, "o"),
+        };
+        card = card.child(
+            div()
+                .id(ElementId::Name(format!("tile-menu-{row}").into()))
+                .debug_selector(move || format!("tile-menu-{row}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::MD)
+                .px(space::SM)
+                .py(space::XS)
+                .when(row == menu.highlighted, |this| {
+                    this.bg(theme.hover_fill())
+                })
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_tile_action(action, cx);
+                    window.focus(&this.focus, cx);
+                }))
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.bright)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(key),
+                ),
+        );
+    }
+    let close = cx.entity().downgrade();
+    Some(
+        div()
+            .id("tile-menu-outside")
+            .absolute()
+            .inset_0()
+            .on_any_mouse_down(move |event, _, cx| {
+                if event.button != MouseButton::Right {
+                    cx.stop_propagation();
+                }
+                let _ = close.update(cx, Disktree::close_tile_menu);
+            })
+            .child(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            ),
+    )
 }
 
 /// Four tiles in category colours, and the name.
@@ -3262,6 +3382,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let rows = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
+        ("right-click", "Open, mark or show it, from a menu"),
         ("enter", "Open that directory, at any depth"),
         ("\u{232b} / esc", "Go up one directory"),
         (

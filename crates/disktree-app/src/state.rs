@@ -73,6 +73,30 @@ pub struct Sibling {
 /// Rows a sibling menu lists; the rest are counted.
 pub const SIBLING_ROWS: usize = 24;
 
+/// A tile's context menu, open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileMenu {
+    /// The tile it was opened on, which is also the selection.
+    pub crumbs: Vec<usize>,
+    /// Where the right-click landed, in window space: the menu hangs from it.
+    pub position: Point<Pixels>,
+    /// The row the arrow keys are on, as an index into
+    /// [`Disktree::tile_actions`].
+    pub highlighted: usize,
+}
+
+/// What a tile's context menu offers. Each is a key already, so the menu
+/// is a way to find them rather than a second set of behaviours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileAction {
+    /// Go into the directory, as Enter does.
+    Open,
+    /// Mark or unmark it, as Space does.
+    Mark,
+    /// Show it in Finder or the file manager, as `o` does.
+    Reveal,
+}
+
 /// One step of the trail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Crumb {
@@ -404,6 +428,8 @@ pub struct Disktree {
     pub focus: FocusHandle,
     /// A trail crumb's sibling menu, when open.
     pub crumb_menu: Option<CrumbMenu>,
+    /// A tile's context menu, when open.
+    pub tile_menu: Option<TileMenu>,
 
     pub color_mode: ColorMode,
     /// The largest things worth clearing, recomputed when a scan lands.
@@ -517,6 +543,7 @@ impl Disktree {
             show_selection: true,
             focus: cx.focus_handle(),
             crumb_menu: None,
+            tile_menu: None,
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
             git: FxHashMap::default(),
@@ -816,6 +843,7 @@ impl Disktree {
         self.crumbs.clear();
         self.selected = None;
         self.hovered = None;
+        self.tile_menu = None;
         self.view = View::default();
         self.cache = None;
         self.insights.clear();
@@ -1433,10 +1461,12 @@ impl Disktree {
     }
 
     /// After the layout changes under a still pointer, its hover is stale
-    /// until the pointer moves again.
+    /// until the pointer moves again. So is a tile menu: it would hang where
+    /// its tile no longer is.
     fn forget_hover(&mut self) {
         self.hovered = None;
         self.pointer_active = false;
+        self.tile_menu = None;
     }
 
     pub fn move_selection(
@@ -2385,7 +2415,16 @@ impl Disktree {
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
         let crumbs =
             self.action_target().unwrap_or_else(|| self.crumbs.clone());
-        let Some(path) = self.path_at(&crumbs) else {
+        self.reveal_in_file_manager(&crumbs, cx);
+    }
+
+    /// Show the node at `crumbs` in Finder (or the file manager), selected.
+    fn reveal_in_file_manager(
+        &mut self,
+        crumbs: &[usize],
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(path) = self.path_at(crumbs) else {
             return;
         };
         // GPUI's reveal cannot report failure, so check what it can't.
@@ -2401,6 +2440,106 @@ impl Disktree {
             return;
         }
         cx.reveal_path(&path);
+    }
+
+    /// What a tile's context menu lists for the node at `crumbs`, in order.
+    /// Only a directory can be opened: Enter on a file opens the directory
+    /// it is in, which is where the menu already is.
+    pub fn tile_actions(&self, crumbs: &[usize]) -> Vec<TileAction> {
+        let mut actions = Vec::with_capacity(3);
+        if self.node_at(crumbs).is_some_and(Node::is_dir) {
+            actions.push(TileAction::Open);
+        }
+        actions.extend([TileAction::Mark, TileAction::Reveal]);
+        actions
+    }
+
+    /// Select the tile at `crumbs` and open its context menu at `position`,
+    /// in window space.
+    pub fn open_tile_menu(
+        &mut self,
+        crumbs: Vec<usize>,
+        position: Point<Pixels>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.crumb_menu = None;
+        self.selected = Some(crumbs.clone());
+        self.tile_menu = Some(TileMenu {
+            crumbs,
+            position,
+            highlighted: 0,
+        });
+        cx.notify();
+    }
+
+    pub fn close_tile_menu(&mut self, cx: &mut Context<'_, Self>) {
+        if self.tile_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Do what a row of the tile menu says, to the tile it was opened on.
+    pub fn choose_tile_action(
+        &mut self,
+        action: TileAction,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(menu) = self.tile_menu.take() else {
+            return;
+        };
+        match action {
+            TileAction::Open => {
+                self.select(Some(menu.crumbs), cx);
+                self.descend(cx);
+            }
+            // Through the selection, so the scanned root is refused with
+            // the same notice Space gives.
+            TileAction::Mark => {
+                self.selected = Some(menu.crumbs);
+                self.toggle_mark_selected(cx);
+            }
+            TileAction::Reveal => self.reveal_in_file_manager(&menu.crumbs, cx),
+        }
+        cx.notify();
+    }
+
+    /// Keys while a tile menu is open: it owns the arrows, Enter and
+    /// Escape, and any other key closes it before acting, as in the
+    /// sibling menu.
+    fn on_tile_menu_key(
+        &mut self,
+        key: &str,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(menu) = self.tile_menu.clone() else {
+            return false;
+        };
+        let actions = self.tile_actions(&menu.crumbs);
+        let last = actions.len().saturating_sub(1);
+        let highlight = |this: &mut Self, row: usize| {
+            if let Some(menu) = &mut this.tile_menu {
+                menu.highlighted = row;
+            }
+        };
+        match key {
+            "down" | "j" => highlight(self, (menu.highlighted + 1).min(last)),
+            "up" | "k" => highlight(self, menu.highlighted.saturating_sub(1)),
+            "home" => highlight(self, 0),
+            "end" => highlight(self, last),
+            "enter" | "space" => {
+                if let Some(&action) = actions.get(menu.highlighted) {
+                    self.choose_tile_action(action, cx);
+                }
+            }
+            "escape" => self.tile_menu = None,
+            _ => {
+                self.tile_menu = None;
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
     }
 
     /// Every binding, in reading order of the hint bar, so the keys and the
@@ -2447,6 +2586,9 @@ impl Disktree {
         }
 
         if self.crumb_menu.is_some() && self.on_menu_key(key, cx) {
+            return;
+        }
+        if self.tile_menu.is_some() && self.on_tile_menu_key(key, cx) {
             return;
         }
 
@@ -2756,6 +2898,15 @@ impl Disktree {
                     self.toggle_mark(&crumbs, cx);
                 }
             }
+            // A secondary click: a two-finger click, or the right button.
+            // On macOS the platform layer rewrites ctrl-left-click into a
+            // right-click, so this arm is what ctrl-click does there too;
+            // the `Left` + control arm above is for Linux and Windows,
+            // where no such rewrite happens.
+            MouseButton::Right => match crumbs {
+                Some(crumbs) => self.open_tile_menu(crumbs, event.position, cx),
+                None => self.close_tile_menu(cx),
+            },
             // Buttons 8 and 9. gpui-pre maps them on X11, Wayland and
             // Windows; a mouse with no side buttons never sends them, and
             // then the header `<` / `>` and alt-arrows are the whole story.
@@ -2769,7 +2920,8 @@ impl Disktree {
             {
                 self.go_forward(cx);
             }
-            _ => {}
+            // Side buttons off the explore screen.
+            MouseButton::Navigate(_) => {}
         }
     }
 
