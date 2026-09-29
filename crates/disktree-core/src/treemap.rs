@@ -73,8 +73,23 @@ pub enum TileKind {
     /// A real node at `crumbs`, which are child indices from the scanned root.
     Node { crumbs: Vec<usize> },
     /// The tail of a long child list, merged so its area is still accounted
-    /// for instead of silently dropped.
-    Others { crumbs: Vec<usize>, count: usize },
+    /// for instead of silently dropped. `crumbs` are its folder's, then
+    /// [`REST`]; `bytes` and `files` total what it stands for, filtered like
+    /// the rest of the layout.
+    Others {
+        crumbs: Vec<usize>,
+        count: usize,
+        bytes: u64,
+        files: u64,
+    },
+}
+
+/// The last crumb of a merged tail: an index no child has, so its crumbs
+/// resolve to no node and nothing acts on its folder through it.
+pub const REST: usize = usize::MAX;
+
+pub fn is_rest(crumbs: &[usize]) -> bool {
+    crumbs.last() == Some(&REST)
 }
 
 /// One rectangle of the mosaic.
@@ -99,6 +114,18 @@ impl Tile {
                 crumbs
             }
         }
+    }
+
+    /// Where a subdivided directory's children sit: below its name band.
+    pub fn body(&self) -> Rect {
+        self.header.map_or(self.rect, |header| {
+            Rect::new(
+                self.rect.x,
+                header.bottom(),
+                self.rect.w,
+                self.rect.bottom() - header.bottom(),
+            )
+        })
     }
 }
 
@@ -151,11 +178,15 @@ pub fn layout(
     metric: Metric,
     options: &LayoutOptions,
 ) -> Vec<Tile> {
-    layout_filtered(root, root_crumbs, area, metric, options, None)
+    layout_filtered(root, root_crumbs, area, metric, options, None, 0)
 }
 
-/// [`layout`], showing only what `filter` keeps: its matches, at the size
-/// of what matched, inside ancestors sized the same way.
+/// [`layout`], showing only what `filter` keeps and leaving out the root's
+/// `skipping` largest children.
+///
+/// A filtered layout shows the matches at the size of what matched, inside
+/// ancestors sized the same way. Skipping lets the children a tail stood for
+/// be laid out on their own.
 pub fn layout_filtered(
     root: &Node,
     root_crumbs: &[usize],
@@ -163,6 +194,7 @@ pub fn layout_filtered(
     metric: Metric,
     options: &LayoutOptions,
     filter: Option<&Matches>,
+    skipping: usize,
 ) -> Vec<Tile> {
     let mut tiles = Vec::new();
     let mut crumbs = root_crumbs.to_vec();
@@ -171,7 +203,7 @@ pub fn layout_filtered(
         options,
         filter,
     };
-    place_children(root, area, &place, 0, &mut crumbs, &mut tiles);
+    place_children(root, area, &place, 0, skipping, &mut crumbs, &mut tiles);
     tiles
 }
 
@@ -184,79 +216,140 @@ struct Placement<'a> {
     filter: Option<&'a Matches>,
 }
 
+/// A child as the layout weighs it, with what it stands for in bytes and
+/// files, filtered like its weight.
+#[derive(Clone, Copy)]
+pub(crate) struct Ranked {
+    pub index: usize,
+    pub value: f64,
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// `node`'s children the filter keeps, heaviest first. Ties break by
+/// index, so a later page starts exactly where the one before it ended.
+pub(crate) fn rank(
+    node: &Node,
+    metric: Metric,
+    filter: Option<&Matches>,
+    crumbs: &mut Vec<usize>,
+) -> Vec<Ranked> {
+    let mut ranked: Vec<Ranked> = node
+        .children
+        .iter()
+        .enumerate()
+        .filter_map(|(index, child)| {
+            let keep = match filter {
+                None => Keep::Whole,
+                Some(filter) => {
+                    crumbs.push(index);
+                    let keep = filter.keep(crumbs);
+                    crumbs.pop();
+                    keep?
+                }
+            };
+            let value = Matches::value(keep, child, metric);
+            (value > 0).then(|| Ranked {
+                index,
+                value: value as f64,
+                bytes: Matches::value(keep, child, Metric::Bytes),
+                files: Matches::value(keep, child, Metric::Files),
+            })
+        })
+        .collect();
+    ranked.sort_by(|left, right| {
+        right
+            .value
+            .total_cmp(&left.value)
+            .then(left.index.cmp(&right.index))
+    });
+    ranked
+}
+
+/// The merged tail standing for `rest`, as a tile of its own.
+pub(crate) fn others(
+    crumbs: &[usize],
+    rest: &[Ranked],
+    rect: Rect,
+    depth: u32,
+) -> Tile {
+    let mut tail = crumbs.to_vec();
+    tail.push(REST);
+    Tile {
+        kind: TileKind::Others {
+            crumbs: tail,
+            count: rest.len(),
+            bytes: rest.iter().map(|entry| entry.bytes).sum(),
+            files: rest.iter().map(|entry| entry.files).sum(),
+        },
+        rect,
+        depth,
+        header: None,
+    }
+}
+
 fn place_children(
     node: &Node,
     area: Rect,
     place: &Placement<'_>,
     depth: u32,
+    skipping: usize,
     crumbs: &mut Vec<usize>,
     out: &mut Vec<Tile>,
 ) {
-    let (metric, options) = (place.metric, place.options);
+    let options = place.options;
     if node.children.is_empty() || area.w <= 0.0 || area.h <= 0.0 {
         return;
     }
 
     // Rank by importance ourselves: the tree is already sorted, but a metric
     // switch or a hand-built tree must not produce a bad layout.
-    let mut ranked: Vec<(usize, f64)> = node
-        .children
-        .iter()
-        .enumerate()
-        .filter_map(|(index, child)| {
-            let value = match place.filter {
-                None => child.value(metric),
-                Some(filter) => {
-                    crumbs.push(index);
-                    let keep = filter.keep(crumbs);
-                    crumbs.pop();
-                    Matches::value(keep?, child, metric)
-                }
-            };
-            Some((index, value as f64))
-        })
-        .filter(|(_, value)| *value > 0.0)
-        .collect();
+    let mut ranked = rank(node, place.metric, place.filter, crumbs);
+    ranked.drain(..skipping.min(ranked.len()));
     if ranked.is_empty() {
         return;
     }
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
 
-    let kept = ranked.len().min(options.max_children);
-    let mut values: Vec<f64> =
-        ranked[..kept].iter().map(|(_, value)| *value).collect();
-    let mut sources: Vec<Option<usize>> = ranked[..kept]
-        .iter()
-        .map(|(index, _)| Some(*index))
-        .collect();
-    let tail_count = ranked.len() - kept;
-    if tail_count > 0 {
-        values.push(ranked[kept..].iter().map(|(_, value)| *value).sum());
-        sources.push(None);
+    let padding = if depth == 0 {
+        options.padding_outer
+    } else {
+        options.padding
+    };
+    let squarified = |kept: usize| -> Vec<Rect> {
+        let mut values: Vec<f64> =
+            ranked[..kept].iter().map(|entry| entry.value).collect();
+        if kept < ranked.len() {
+            values.push(ranked[kept..].iter().map(|entry| entry.value).sum());
+        }
+        squarify(&values, area)
+            .iter()
+            .map(|rect| rect.inset(padding))
+            .collect()
+    };
+    let too_small =
+        |rect: &Rect| rect.w < options.min_tile || rect.h < options.min_tile;
+    // A child too small to draw joins the tail, so a page that skips the
+    // drawn children misses nothing. Each pass gives the tail more room, and
+    // a handful settle it.
+    let mut kept = ranked.len().min(options.max_children);
+    let mut rects = squarified(kept);
+    for _ in 0..8 {
+        let Some(small) = rects[..kept].iter().position(too_small) else {
+            break;
+        };
+        kept = small;
+        rects = squarified(kept);
     }
 
-    for (slot, raw) in squarify(&values, area).iter().enumerate() {
-        let rect = raw.inset(if depth == 0 {
-            options.padding_outer
-        } else {
-            options.padding
-        });
-        if rect.w < options.min_tile || rect.h < options.min_tile {
+    for (slot, rect) in rects.into_iter().enumerate() {
+        if too_small(&rect) {
             continue;
         }
-        let Some(index) = sources[slot] else {
-            out.push(Tile {
-                kind: TileKind::Others {
-                    crumbs: crumbs.clone(),
-                    count: tail_count,
-                },
-                rect,
-                depth,
-                header: None,
-            });
+        if slot >= kept {
+            out.push(others(crumbs, &ranked[kept..], rect, depth));
             continue;
-        };
-
+        }
+        let index = ranked[slot].index;
         let child = &node.children[index];
         let subdividable = child.is_dir() && depth + 1 < options.max_depth;
         // A directory that is about to be subdivided claims a header band for
@@ -267,21 +360,17 @@ fn place_children(
             .then(|| header_band(rect, options, depth))
             .flatten();
         crumbs.push(index);
-        out.push(Tile {
+        let tile = Tile {
             kind: TileKind::Node {
                 crumbs: crumbs.clone(),
             },
             rect,
             depth,
             header,
-        });
-        if let Some(header) = header {
-            let body = Rect::new(
-                rect.x,
-                header.bottom(),
-                rect.w,
-                rect.bottom() - header.bottom(),
-            );
+        };
+        let body = tile.body();
+        out.push(tile);
+        if header.is_some() {
             // Beneath a match everything is shown; above one, only matches.
             let inner = Placement {
                 filter: place
@@ -289,7 +378,7 @@ fn place_children(
                     .filter(|filter| filter.keep(crumbs) != Some(Keep::Whole)),
                 ..*place
             };
-            place_children(child, body, &inner, depth + 1, crumbs, out);
+            place_children(child, body, &inner, depth + 1, 0, crumbs, out);
         }
         crumbs.pop();
     }
@@ -640,6 +729,110 @@ mod tests {
     }
 
     #[test]
+    fn the_tail_names_no_node_and_totals_what_it_stands_for() {
+        let children: Vec<Node> = (0..10)
+            .map(|index| file(&format!("f{index}"), 10 - index))
+            .collect();
+        let root = dir("root", children);
+        let options = LayoutOptions {
+            max_children: 4,
+            ..LayoutOptions::default()
+        };
+        let tiles = layout(&root, &[7], area(), Metric::Bytes, &options);
+        let tail = tiles
+            .iter()
+            .find(|tile| is_rest(tile.crumbs()))
+            .expect("a tail");
+        assert_eq!(tail.crumbs(), &[7, REST]);
+        assert!(root.resolve(&tail.crumbs()[1..]).is_none());
+        // f4..f9 weigh 6, 5, 4, 3, 2 and 1.
+        assert!(matches!(
+            tail.kind,
+            TileKind::Others {
+                count: 6,
+                bytes: 21,
+                files: 6,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn children_too_small_to_draw_join_the_tail() {
+        // One large file and many tiny ones: the tiny ones cannot be drawn,
+        // and every one of them is counted in the tail rather than lost.
+        let mut children = vec![file("big", 100_000)];
+        children.extend((0..150).map(|index| file(&format!("s{index}"), 20)));
+        let root = dir("root", children);
+        let tiles = layout(
+            &root,
+            &[],
+            area(),
+            Metric::Bytes,
+            &LayoutOptions::default(),
+        );
+        let drawn = tiles
+            .iter()
+            .filter(|tile| tile.depth == 0 && !is_rest(tile.crumbs()))
+            .count();
+        let hidden = tiles
+            .iter()
+            .find_map(|tile| match tile.kind {
+                TileKind::Others { count, .. } => Some(count),
+                TileKind::Node { .. } => None,
+            })
+            .expect("a tail");
+        assert_eq!(drawn + hidden, 151);
+        assert!(hidden > 100, "{hidden} in the tail");
+    }
+
+    #[test]
+    fn skipping_lays_out_what_the_tail_stood_for() {
+        let root =
+            dir("root", vec![file("big", 900), file("a", 60), file("b", 40)]);
+        let options = LayoutOptions {
+            padding: 0.0,
+            padding_outer: 0.0,
+            ..LayoutOptions::default()
+        };
+        let tiles = layout_filtered(
+            &root,
+            &[],
+            area(),
+            Metric::Bytes,
+            &options,
+            None,
+            1,
+        );
+        let crumbs: Vec<&[usize]> = tiles.iter().map(Tile::crumbs).collect();
+        assert_eq!(crumbs, vec![&[1][..], &[2]]);
+        // The page's own total is the whole area.
+        let share = tiles[0].rect.area() / area().area();
+        assert!((share - 0.6).abs() < 0.01, "share {share}");
+    }
+
+    #[test]
+    fn a_body_is_the_tile_below_its_band() {
+        let root = dir(
+            "root",
+            vec![dir("big", vec![file("inside", 100), file("also", 50)])],
+        );
+        let tiles = layout(
+            &root,
+            &[],
+            area(),
+            Metric::Bytes,
+            &LayoutOptions::default(),
+        );
+        let parent = &tiles[0];
+        let header = parent.header.expect("a band");
+        let body = parent.body();
+        assert!((body.y - header.bottom()).abs() < f32::EPSILON);
+        assert!((body.bottom() - parent.rect.bottom()).abs() < 0.001);
+        assert!((tiles[1].body().area() - tiles[1].rect.area()).abs() < 0.001);
+    }
+
+    #[test]
     fn hit_returns_the_deepest_tile() {
         let root = dir(
             "root",
@@ -693,6 +886,7 @@ mod tests {
             Metric::Bytes,
             &options,
             Some(&matches),
+            0,
         );
         let names: Vec<String> = tiles
             .iter()

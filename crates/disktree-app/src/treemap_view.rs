@@ -15,14 +15,15 @@ use disktree_core::treemap::Rect;
 use gpui_kit::{
     App, Bounds, ContentMask, Context, Corners, Edges, Font, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, MouseDownEvent, MouseMoveEvent,
-    ParentElement as _, Pixels, Point, ScrollWheelEvent, SharedString, Size,
-    StatefulInteractiveElement as _, Styled, TextAlign, TextRun, Window,
-    canvas, div, pattern_slash, px, quad,
+    ParentElement as _, PathBuilder, PinchEvent, Pixels, Point,
+    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement as _,
+    Styled, TextAlign, TextRun, Window, canvas, div, pattern_slash, px, quad,
 };
 use gpui_omarchy::{ActiveTheme, Theme};
 
 use disktree_core::classify::Category;
 
+use crate::charts::{Chart, ChartGeometry};
 use crate::palette;
 use crate::state::{Disktree, Filtered, Label, View};
 
@@ -52,11 +53,29 @@ pub struct TileDeco {
 }
 
 /// Everything the mosaic needs for one frame.
+///
+/// A sunburst's tiles and labels stay in the partition's unit space, which
+/// `geometry` maps to rings; every other chart's are in pixels, before
+/// `view`.
 #[derive(Clone, Debug, Default)]
 pub struct Mosaic {
     pub tiles: Vec<TileDeco>,
     pub labels: Vec<Label>,
     pub view: View,
+    pub chart: Chart,
+    pub geometry: Option<ChartGeometry>,
+    /// The directory a sunburst is drawn around, named in its hole.
+    pub center: Option<CenterLabel>,
+}
+
+/// What a sunburst's hole says.
+#[derive(Clone, Debug)]
+pub struct CenterLabel {
+    pub name: String,
+    pub size_text: String,
+    pub hovered: bool,
+    /// Clicking it goes somewhere: there is a level above.
+    pub can_ascend: bool,
 }
 
 /// Build the treemap viewport: canvas, input, and the cursor tooltip.
@@ -80,7 +99,20 @@ pub fn mosaic(
         tiles,
         labels,
         view,
+        chart,
+        geometry,
+        center,
     } = mosaic;
+    let text = Type {
+        font: Font {
+            family: font,
+            ..Font::default()
+        },
+        name: name_size,
+        size: size_size,
+        center: rem_px(0.875, rem),
+        figure: rem_px(1.375, rem),
+    };
     let canvas_origin = Rc::clone(&origin);
     let canvas_measured = Rc::clone(&measured);
 
@@ -113,6 +145,9 @@ pub fn mosaic(
                 this.on_scroll_wheel(event, cx);
             },
         ))
+        .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| {
+            this.on_pinch(event, cx);
+        }))
         .child(
             canvas(
                 move |bounds, window, _| {
@@ -126,17 +161,52 @@ pub fn mosaic(
                     }
                     bounds.size
                 },
-                move |bounds, _, window, cx| {
-                    paint_tiles(&tiles, bounds, view, &colors, window);
-                    paint_labels(
-                        &labels, bounds, view, &colors, &font, name_size,
-                        size_size, window, cx,
-                    );
+                move |bounds, _, window, cx| match geometry {
+                    Some(geometry) if chart == Chart::Sunburst => {
+                        paint_sunburst(
+                            &tiles, &geometry, bounds, &colors, window,
+                        );
+                        paint_sunburst_labels(
+                            &labels, &geometry, bounds, &colors, &text, window,
+                            cx,
+                        );
+                        if let Some(center) = &center {
+                            paint_center(
+                                center, &geometry, bounds, &colors, &text,
+                                window, cx,
+                            );
+                        }
+                    }
+                    _ => {
+                        paint_tiles(&tiles, bounds, view, &colors, window);
+                        paint_labels(
+                            &labels,
+                            bounds,
+                            view,
+                            &colors,
+                            &text.font.family,
+                            text.name,
+                            text.size,
+                            window,
+                            cx,
+                        );
+                    }
                 },
             )
             .absolute()
             .inset_0(),
         )
+}
+
+/// The type a frame's labels are set in, at the window's `rem`.
+struct Type {
+    font: Font,
+    name: Pixels,
+    size: Pixels,
+    /// The name in a sunburst's hole.
+    center: Pixels,
+    /// The size under it.
+    figure: Pixels,
 }
 
 /// Theme colours resolved once per frame.
@@ -547,4 +617,419 @@ fn to_window(rect: &Rect, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
 
 fn rem_px(rems: f32, rem_size: Pixels) -> Pixels {
     px(rems * rem_size.as_f32())
+}
+
+/// A shape as polygons, filled under the even-odd rule.
+type Outline = Vec<Vec<Point<Pixels>>>;
+
+fn ellipsized(characters: &[char]) -> String {
+    characters
+        .iter()
+        .chain(std::iter::once(&'\u{2026}'))
+        .collect()
+}
+
+/// The gap left between neighbouring wedges, in pixels.
+const WEDGE_GAP: f32 = 1.5;
+
+/// A point at `radius` from the chart's centre, `turn` of the way round
+/// clockwise from twelve o'clock.
+fn polar(centre: Point<Pixels>, radius: f32, turn: f32) -> Point<Pixels> {
+    let angle =
+        turn.mul_add(std::f32::consts::TAU, -std::f32::consts::FRAC_PI_2);
+    Point::new(
+        centre.x + px(radius * angle.cos()),
+        centre.y + px(radius * angle.sin()),
+    )
+}
+
+/// The outline of a sunburst tile, spanning `low` to `high` in radius, with
+/// half a gap taken off every side so neighbours part without the layout
+/// leaving room.
+fn wedge(rect: Rect, centre: Point<Pixels>, low: f32, high: f32) -> Outline {
+    let (low, high) = (low + WEDGE_GAP / 2.0, high - WEDGE_GAP / 2.0);
+    if high <= low {
+        return Vec::new();
+    }
+    let circle = |radius: f32| -> Vec<Point<Pixels>> {
+        let steps = 120;
+        (0..steps)
+            .map(|step| polar(centre, radius, step as f32 / steps as f32))
+            .collect()
+    };
+    // A whole turn drawn as one arc closes on itself; as two circles it is
+    // a ring under the even-odd rule.
+    if rect.w >= 1.0 - 1e-6 {
+        return vec![circle(high), circle(low)];
+    }
+    let arc = |radius: f32| -> (f32, f32) {
+        let inset = (WEDGE_GAP / 2.0) / (radius * std::f32::consts::TAU);
+        if rect.w > inset * 2.0 {
+            (rect.x + inset, rect.right() - inset)
+        } else {
+            (rect.x, rect.right())
+        }
+    };
+    let steps = ((rect.w * 180.0).ceil() as usize).max(1);
+    let (outer_start, outer_end) = arc(high);
+    let (inner_start, inner_end) = arc(low);
+    let mut points = Vec::with_capacity(steps * 2 + 2);
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        points.push(polar(
+            centre,
+            high,
+            (outer_end - outer_start).mul_add(t, outer_start),
+        ));
+    }
+    for step in (0..=steps).rev() {
+        let t = step as f32 / steps as f32;
+        points.push(polar(
+            centre,
+            low,
+            (inner_end - inner_start).mul_add(t, inner_start),
+        ));
+    }
+    vec![points]
+}
+
+fn path(
+    outline: &[Vec<Point<Pixels>>],
+    stroke: Option<f32>,
+) -> Option<gpui_kit::Path<Pixels>> {
+    let mut builder = stroke
+        .map_or_else(PathBuilder::fill, |width| PathBuilder::stroke(px(width)));
+    for polygon in outline {
+        builder.add_polygon(polygon, true);
+    }
+    builder.build().ok()
+}
+
+fn paint_sunburst(
+    tiles: &[TileDeco],
+    geometry: &ChartGeometry,
+    bounds: Bounds<Pixels>,
+    colors: &Colors,
+    window: &mut Window,
+) {
+    let (cx, cy) = geometry.centre();
+    let centre = Point::new(bounds.origin.x + px(cx), bounds.origin.y + px(cy));
+    let radius = |level: f32| geometry.ring().mul_add(level, geometry.hole());
+    let mut outlines: Vec<(u8, Outline, f32, Hsla)> = Vec::new();
+    for tile in tiles {
+        let outline = wedge(
+            tile.rect,
+            centre,
+            radius(tile.rect.y),
+            radius(tile.rect.bottom()),
+        );
+        if outline.is_empty() {
+            continue;
+        }
+        if let Some(fill) = path(&outline, None) {
+            window.paint_path(fill, colors.fill(tile));
+        }
+        if tile.reclaimable
+            && !tile.marked
+            && !tile.covered
+            && tile.filtered == Filtered::Shown
+            && let Some(hatch) = path(&outline, None)
+        {
+            window.paint_path(hatch, pattern_slash(colors.hatch, 1.0, 6.0));
+        }
+        // A first-level wedge carries a strip of its colour at its inner
+        // edge, as a top-level tile carries one along its top.
+        if tile.depth == 0
+            && tile.age_bucket.is_none()
+            && tile.filtered != Filtered::Out
+        {
+            let inner = radius(tile.rect.y);
+            let strip =
+                wedge(tile.rect, centre, inner, inner + 3.0 + WEDGE_GAP);
+            if let Some(strip) = path(&strip, None) {
+                window.paint_path(
+                    strip,
+                    colors.strip[category_index(tile.category)],
+                );
+            }
+        }
+        let outline_style = if tile.selected {
+            Some((3, 2.5, colors.selected_border))
+        } else if tile.hovered {
+            Some((2, 1.5, colors.hover_border))
+        } else if tile.marked {
+            Some((1, 2.0, colors.marked_border))
+        } else {
+            None
+        };
+        if let Some((rank, width, color)) = outline_style {
+            outlines.push((rank, outline, width, color));
+        }
+    }
+    outlines.sort_by_key(|(rank, ..)| *rank);
+    for (_, outline, width, color) in outlines {
+        if let Some(ring) = path(&outline, Some(width)) {
+            window.paint_path(ring, color);
+        }
+    }
+}
+
+/// Labels set level at the middle of their wedge, where the wedge is wide
+/// and tall enough for them there: text cannot turn with the ring.
+fn paint_sunburst_labels(
+    labels: &[Label],
+    geometry: &ChartGeometry,
+    bounds: Bounds<Pixels>,
+    colors: &Colors,
+    text: &Type,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (cx_, cy) = geometry.centre();
+    let centre =
+        Point::new(bounds.origin.x + px(cx_), bounds.origin.y + px(cy));
+    let text_system = window.text_system().clone();
+    let line_height = text.name * 1.35;
+    let padding = text.name.as_f32() * 0.5;
+    for label in labels {
+        let inner = geometry.ring().mul_add(label.rect.y, geometry.hole());
+        let thickness = geometry.ring() * label.rect.h;
+        let middle = inner + thickness / 2.0;
+        let turn = label.rect.x + label.rect.w / 2.0;
+        let half = label.rect.w * std::f32::consts::PI;
+        let chord = if half >= std::f32::consts::FRAC_PI_2 {
+            middle * 2.0
+        } else {
+            2.0 * middle * half.sin()
+        };
+        // The wedge as a box around its middle, `chord` along the ring and
+        // `thickness` across it: how far a level line through the middle
+        // runs before it leaves.
+        let angle = turn * std::f32::consts::TAU;
+        let (along, across) = (angle.cos().abs(), angle.sin().abs());
+        let fits = |tangent: f32, radial: f32| {
+            (chord / tangent.max(1e-3)).min(thickness / radial.max(1e-3))
+        };
+        let width = fits(along, across) - padding * 2.0;
+        let height = fits(across, along);
+        if width < text.name.as_f32() * 3.3 || height < line_height.as_f32() {
+            continue;
+        }
+        let color = if label.marked {
+            colors.marked_label
+        } else if label.dim {
+            colors.label_dim
+        } else {
+            colors.label(label.depth)
+        };
+        let weight = if label.depth == 0 {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        let Some(name) = fitted(
+            &text_system,
+            &label.text,
+            &Font {
+                weight,
+                ..text.font.clone()
+            },
+            text.name,
+            color,
+            px(width),
+        ) else {
+            continue;
+        };
+        let stacked = !label.size_text.is_empty()
+            && height >= line_height.as_f32().mul_add(2.0, padding);
+        let point = polar(centre, middle, turn);
+        let top = if stacked {
+            point.y - line_height
+        } else {
+            point.y - line_height / 2.0
+        };
+        let _ = name.paint(
+            Point::new(point.x - name.width() / 2.0, top),
+            line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+        if stacked {
+            let size = shape(
+                &text_system,
+                &label.size_text,
+                &text.font,
+                text.size,
+                colors.label_dim,
+            );
+            if size.width().as_f32() <= width {
+                let _ = size.paint(
+                    Point::new(
+                        point.x - size.width() / 2.0,
+                        top + line_height * 0.95,
+                    ),
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+}
+
+/// The directory a sunburst is drawn around, in its hole: its name and
+/// size, and when pointed at, that a click goes up.
+fn paint_center(
+    center: &CenterLabel,
+    geometry: &ChartGeometry,
+    bounds: Bounds<Pixels>,
+    colors: &Colors,
+    text: &Type,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (cx_, cy) = geometry.centre();
+    let centre =
+        Point::new(bounds.origin.x + px(cx_), bounds.origin.y + px(cy));
+    let hole = geometry.hole();
+    if center.hovered && center.can_ascend {
+        let ring = vec![
+            (0..120)
+                .map(|step| polar(centre, hole - 4.0, step as f32 / 120.0))
+                .collect::<Vec<_>>(),
+        ];
+        if let Some(ring) = path(&ring, Some(1.5)) {
+            window.paint_path(ring, colors.hover_border);
+        }
+    }
+    let text_system = window.text_system().clone();
+    let room = px(hole * 1.6);
+    let Some(name) = fitted(
+        &text_system,
+        &center.name,
+        &Font {
+            weight: FontWeight::SEMIBOLD,
+            ..text.font.clone()
+        },
+        text.center,
+        colors.label(0),
+        room,
+    ) else {
+        return;
+    };
+    let size = shape(
+        &text_system,
+        &center.size_text,
+        &text.font,
+        text.figure,
+        colors.label(0),
+    );
+    let name_line = text.center * 1.3;
+    let size_line = text.figure * 1.2;
+    let hint = (center.hovered && center.can_ascend)
+        .then(|| {
+            shape(
+                &text_system,
+                "click to go up",
+                &text.font,
+                text.size,
+                colors.label_dim,
+            )
+        })
+        .filter(|hint| hint.width() <= room);
+    let hint_line = text.size * 1.4;
+    let total =
+        name_line + size_line + hint.as_ref().map_or(px(0.), |_| hint_line);
+    let mut top = centre.y - total / 2.0;
+    let _ = name.paint(
+        Point::new(centre.x - name.width() / 2.0, top),
+        name_line,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+    top += name_line;
+    if size.width() <= room {
+        let _ = size.paint(
+            Point::new(centre.x - size.width() / 2.0, top),
+            size_line,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+    top += size_line;
+    if let Some(hint) = hint {
+        let _ = hint.paint(
+            Point::new(centre.x - hint.width() / 2.0, top),
+            hint_line,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+}
+
+fn shape(
+    text_system: &std::sync::Arc<gpui_kit::WindowTextSystem>,
+    text: &str,
+    font: &Font,
+    size: Pixels,
+    color: Hsla,
+) -> gpui_kit::ShapedLine {
+    let run = TextRun {
+        len: text.len(),
+        font: font.clone(),
+        color,
+        ..TextRun::default()
+    };
+    text_system.shape_line(
+        SharedString::from(text.to_owned()),
+        size,
+        &[run],
+        None,
+    )
+}
+
+/// `text` shaped to fit `width`, cut short with an ellipsis if it must be,
+/// or `None` when not even a few letters would.
+fn fitted(
+    text_system: &std::sync::Arc<gpui_kit::WindowTextSystem>,
+    text: &str,
+    font: &Font,
+    size: Pixels,
+    color: Hsla,
+    width: Pixels,
+) -> Option<gpui_kit::ShapedLine> {
+    let line = shape(text_system, text, font, size, color);
+    if line.width() <= width {
+        return Some(line);
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let (mut low, mut high) = (0, characters.len());
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let candidate = ellipsized(&characters[..middle]);
+        if shape(text_system, &candidate, font, size, color).width() <= width {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    (low >= 2).then(|| {
+        shape(
+            text_system,
+            &ellipsized(&characters[..low]),
+            font,
+            size,
+            color,
+        )
+    })
 }

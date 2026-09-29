@@ -96,6 +96,17 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    base-space pixels and is cached; `screen = (base - origin) * scale`.
 9. **The status bar never claims a saving it cannot measure.** Projections come
    from marked bytes; the final number comes from `statvfs` before and after.
+10. **A "+N more" tile's crumbs are its directory's plus `treemap::REST`.**
+    They name no node, so nothing that resolves crumbs may treat them as the
+    directory: `rest_at` reads what the tile stands for, it opens as a page
+    (`rest_pages`), and it is never marked whole.
+11. **Painting and hit-testing a chart share one geometry.** A sunburst and
+    an icicle lay out in unit space (`partition`), and `ChartGeometry` alone
+    maps that to the screen, both ways.
+12. **A level change is drawn, never waited on.** `LevelTransition` moves
+    the old level and the new one through the camera while the state has
+    already changed; input that would change level again is dropped until
+    it has played, and Reduce Motion skips it.
 
 ## Where changes belong
 
@@ -104,6 +115,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | measurement, filtering, parallelism | `crates/disktree-core/src/scan.rs` |
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
+| a sunburst's or icicle's layout, in unit space | `crates/disktree-core/src/partition.rs` |
+| how a level change moves | `crates/disktree-core/src/camera.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
@@ -111,6 +124,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
+| where a chart's unit space lands on screen | `crates/disktree-app/src/charts.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
 

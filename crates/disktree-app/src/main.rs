@@ -13,6 +13,7 @@
 
 mod app_menu;
 mod appearance;
+mod charts;
 mod git;
 mod marks;
 mod palette;
@@ -64,10 +65,12 @@ options:
   -X, --cross-filesystems
                         also measure other disks, network shares and pseudo
                         filesystems mounted below PATH (off by default)
-  -d, --depth N         how many levels to draw at once (1-6, default 3)
+  -d, --depth N         how many levels to draw at once (1-6, default 4)
       --metric files    rank by file count instead of bytes
   -h, --help            show this help
 ";
+
+const DEFAULT_DEPTH: u32 = 4;
 
 fn main() -> Result<()> {
     #[cfg(windows)]
@@ -186,7 +189,7 @@ fn parse_args(
 ) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions::default();
-    let mut depth = 3_u32;
+    let mut depth = DEFAULT_DEPTH;
     let mut disk = false;
     // `std::env::args` panics on a name that is not Unicode, and a path is
     // any name: a restart as administrator hands the root back exactly as

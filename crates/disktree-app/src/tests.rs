@@ -839,33 +839,28 @@ fn child_crumbs(app: &Disktree, parent: &[usize], name: &str) -> Vec<usize> {
     crumbs
 }
 
-/// Regression: the wheel magnified toward the deepest directory under the
-/// pointer, then went into the *top-level* one containing it, so the screen
-/// after the descent was never the area that was zoomed into.
+/// Pointing at a directory two levels down, the wheel magnifies toward the
+/// outermost of them and goes into that one: a level at a time, so the
+/// screen after going in is the area that was zoomed into. Going out is a
+/// level at a time too.
 #[gpui_kit::test]
-fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
+fn the_wheel_goes_in_and_out_one_level_at_a_time(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
 
-    // Point at the middle of junk/deeper's contents: a directory one level
-    // below a top-level one.
-    let (deeper, point) = update(&view, cx, |app, _| {
+    let (junk, point) = update(&view, cx, |app, _| {
         let junk = child_crumbs(app, &[], "junk");
         let deeper = child_crumbs(app, &junk, "deeper");
         let body = app.tile_body(&deeper).expect("deeper is drawn");
-        (deeper, (body.x + body.w / 2.0, body.y + body.h / 2.0))
+        (junk, (body.x + body.w / 2.0, body.y + body.h / 2.0))
     });
 
     let mut entered = None;
     for _ in 0..40 {
         let crumbs = update(&view, cx, |app, cx| {
-            let (x, y) = app.view.unproject(point.0, point.1);
-            let screen = app
-                .view
-                .project(disktree_core::treemap::Rect::new(x, y, 0.0, 0.0));
-            app.zoom_at(screen.x, screen.y, 1.15, true, cx);
+            app.zoom_at(point.0, point.1, 1.15, true, cx);
             app.crumbs.clone()
         });
         draw(cx);
@@ -874,11 +869,24 @@ fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
             break;
         }
     }
-    assert_eq!(
-        entered.as_deref(),
-        Some(deeper.as_slice()),
-        "descended into the pointed-at directory, not its top-level ancestor"
-    );
+    assert_eq!(entered, Some(junk.clone()), "into junk, not junk/deeper");
+
+    let changing = read(&view, cx, Disktree::changing_level);
+    if changing {
+        update(&view, cx, |app, cx| {
+            app.zoom_at(point.0, point.1, 1.0 / 1.15, true, cx);
+        });
+        assert_eq!(
+            read(&view, cx, |app| app.crumbs.clone()),
+            junk,
+            "a notch while the level changes is dropped"
+        );
+    }
+    update(&view, cx, |app, cx| {
+        app.level_change = None;
+        app.zoom_at(point.0, point.1, 1.0 / 1.15, true, cx);
+    });
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()), "back out");
 }
 
 /// Regression, keyboard side: Enter on a deep selection enters that
@@ -992,6 +1000,8 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     draw(cx);
 
     let (paths, labels) = update(&view, cx, |app, _| {
+        // The level it left is drawn too, until the change has played.
+        app.level_change = None;
         let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
         let paths: Vec<_> = tiles
             .iter()
@@ -1639,4 +1649,252 @@ fn restart_arguments_parse_back_to_the_same_scan() {
             )
         );
     }
+}
+
+/// One large file and more small ones than a level draws: past the cap,
+/// the smallest share one "+N more" tile, with room enough to be drawn.
+fn fixture_with_tail() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path();
+    std::fs::write(root.join("big.bin"), vec![b'x'; 1_000_000]).expect("write");
+    for index in 0..300 {
+        std::fs::write(
+            root.join(format!("small-{index:03}.txt")),
+            vec![b'x'; 3_000],
+        )
+        .expect("write");
+    }
+    temp
+}
+
+fn rest_tile(app: &mut Disktree) -> Option<Vec<usize>> {
+    app.layout()?
+        .iter()
+        .map(|tile| tile.crumbs().to_vec())
+        .find(|crumbs| disktree_core::treemap::is_rest(crumbs))
+}
+
+/// "+N more" is many items nobody has looked at: Space refuses to mark it,
+/// Enter opens it as a page of its own with a crumb, and going up closes the
+/// page before it leaves the directory.
+#[gpui_kit::test]
+fn a_tail_of_small_items_opens_as_a_page_of_its_own(cx: &mut TestAppContext) {
+    use crate::state::Crumb;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture_with_tail();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let rest = update(&view, cx, |app, _| rest_tile(app))
+        .expect("a +N more tile is drawn");
+    let count =
+        read(&view, cx, |app| app.rest_at(&rest).map(|rest| rest.count))
+            .expect("the tile stands for something");
+    assert!(count > 1, "{count}");
+    update(&view, cx, |app, cx| app.select(Some(rest.clone()), cx));
+    press(cx, "space");
+    assert!(
+        read(&view, cx, |app| app.marks.is_empty()),
+        "nothing marked"
+    );
+
+    press(cx, "enter");
+    let (pages, crumbs, trail) = read(&view, cx, |app| {
+        (app.rest_pages.len(), app.crumbs.clone(), app.breadcrumbs())
+    });
+    assert_eq!(pages, 1);
+    assert!(crumbs.is_empty(), "still in the same directory");
+    assert_eq!(trail.last().map(|(_, step)| step), Some(&Crumb::Rest(1)));
+    let names = update(&view, cx, |app, _| {
+        let crumbs: Vec<Vec<usize>> = app
+            .layout()
+            .unwrap_or_default()
+            .iter()
+            .map(|tile| tile.crumbs().to_vec())
+            .collect();
+        crumbs
+            .iter()
+            .filter_map(|crumbs| app.node_at(crumbs))
+            .map(|node| node.name.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        names.iter().any(|name| name.starts_with("small-")),
+        "the page draws what the tile held: {names:?}"
+    );
+    assert!(!names.iter().any(|name| name == "big.bin"), "{names:?}");
+
+    press(cx, "backspace");
+    assert_eq!(read(&view, cx, |app| app.rest_pages.len()), 0);
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()));
+}
+
+/// `V` goes treemap, sunburst, icicle and back, and every chart draws.
+#[gpui_kit::test]
+fn shift_v_cycles_the_charts_and_each_one_draws(cx: &mut TestAppContext) {
+    use crate::charts::Chart;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    for expected in [Chart::Sunburst, Chart::Icicle, Chart::Treemap] {
+        press(cx, "shift-v");
+        draw(cx);
+        let (chart, tiles) = update(&view, cx, |app, _| {
+            (app.chart, app.layout().map_or(0, <[Tile]>::len))
+        });
+        assert_eq!(chart, expected);
+        assert!(tiles >= 3, "{chart:?} laid out {tiles} tiles");
+    }
+}
+
+/// A sunburst's hole is the directory drawn: clicking it goes up a level.
+#[gpui_kit::test]
+fn clicking_a_sunburst_hole_goes_up(cx: &mut TestAppContext) {
+    use crate::charts::Chart;
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        app.set_chart(Chart::Sunburst, cx);
+        app.go_to(junk, cx);
+    });
+    draw(cx);
+    draw(cx);
+
+    let centre = read(&view, cx, |app| {
+        let (x, y) = app.chart_geometry().centre();
+        let origin = app.treemap_origin.get();
+        gpui_kit::point(origin.x + px(x), origin.y + px(y))
+    });
+    cx.simulate_click(centre, Modifiers::none());
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()), "went up");
+}
+
+fn middle_of(app: &mut Disktree, crumbs: &[usize]) -> Point<Pixels> {
+    let body = app.tile_body(crumbs).expect("the tile is drawn");
+    let origin = app.treemap_origin.get();
+    gpui_kit::point(
+        origin.x + px(body.x + body.w / 2.0),
+        origin.y + px(body.y + body.h / 2.0),
+    )
+}
+
+fn right_click(cx: &mut Window, at: Point<Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton};
+
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+    draw(cx);
+}
+
+/// A right-click opens a menu over the tile, and its rows act on that
+/// tile, not on whatever else is selected.
+#[gpui_kit::test]
+fn a_right_click_menu_acts_on_the_tile_it_opened_over(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let at = update(&view, cx, |app, _| {
+        let junk = child_crumbs(app, &[], "junk");
+        let blob = child_crumbs(app, &junk, "blob.bin");
+        middle_of(app, &blob)
+    });
+    right_click(cx, at);
+    assert!(
+        cx.debug_bounds("context-menu").is_some(),
+        "the menu is drawn"
+    );
+    let mark = read(&view, cx, |app| {
+        app.context_rows()
+            .iter()
+            .position(|row| row.label == "Mark for removal")
+    })
+    .expect("a file can be marked from its menu");
+
+    let row = cx
+        .debug_bounds(Box::leak(format!("context-row-{mark}").into_boxed_str()))
+        .expect("the row is drawn");
+    cx.simulate_click(row.center(), Modifiers::none());
+    draw(cx);
+    let blob = temp.path().join("junk/blob.bin");
+    assert!(read(&view, cx, |app| app.marks.contains(&blob)));
+    assert!(
+        read(&view, cx, |app| app.context_menu.is_none()),
+        "it closes"
+    );
+
+    right_click(cx, at);
+    press(cx, "escape");
+    assert!(read(&view, cx, |app| app.context_menu.is_none()));
+}
+
+/// The menu over "+N more" names the folder the items are in, and Open
+/// opens the page, as Enter does.
+#[gpui_kit::test]
+fn the_menu_over_a_tail_opens_its_page(cx: &mut TestAppContext) {
+    use crate::state::{MenuAction, MenuTarget};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture_with_tail();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let at = update(&view, cx, |app, _| {
+        let rest = rest_tile(app).expect("a +N more tile is drawn");
+        middle_of(app, &rest)
+    });
+    right_click(cx, at);
+    let (target, rows) = read(&view, cx, |app| {
+        (
+            app.context_menu.as_ref().map(|menu| menu.target.clone()),
+            app.context_rows(),
+        )
+    });
+    let root = dunce::canonicalize(temp.path()).expect("canonical");
+    let folder = match target {
+        Some(MenuTarget::Rest(folder)) => folder,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(dunce::canonicalize(folder).expect("canonical"), root);
+    assert!(
+        !rows.iter().any(|row| row.action == MenuAction::ToggleMark),
+        "the tail cannot be marked whole"
+    );
+    let open = rows
+        .iter()
+        .position(|row| row.action == MenuAction::OpenRest)
+        .expect("Open");
+    update(&view, cx, |app, cx| app.choose_context(open, cx));
+    assert_eq!(read(&view, cx, |app| app.rest_pages.len()), 1);
+}
+
+/// Regression: a mark made while ranking by file count recorded the count
+/// as its size, so the review promised to free a few bytes.
+#[gpui_kit::test]
+fn a_mark_made_in_files_mode_keeps_its_size_in_bytes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let bytes = update(&view, cx, |app, cx| {
+        app.set_mode(1, cx);
+        let junk = child_crumbs(app, &[], "junk");
+        app.toggle_mark(&junk, cx);
+        app.marks
+            .items()
+            .iter()
+            .map(|target| target.bytes)
+            .sum::<u64>()
+    });
+    assert_eq!(bytes, 300_000);
 }

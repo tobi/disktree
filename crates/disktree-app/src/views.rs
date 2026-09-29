@@ -18,16 +18,17 @@ use gpui_kit::{
     pattern_slash, px, relative,
 };
 use gpui_omarchy::{
-    ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
-    button_group, checkbox, dialog_button, dialog_description, dialog_popup,
-    dialog_title, separator, with_tooltip,
+    ActiveTheme, ButtonVariant, ChoiceItem, IconName, Theme, alert_dialog,
+    button, button_group, checkbox, dialog_button, dialog_description,
+    dialog_popup, dialog_title, separator, with_tooltip,
 };
 
 use gpui_kit::prelude::FluentBuilder as _;
 
+use crate::charts::Chart;
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    ColorMode, Crumb, Disktree, PANEL_REMS, Rest, Screen, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -105,8 +106,13 @@ pub fn root(
         .font_family(theme.font)
         .text_size(text::BODY)
         .child(body);
-    if let Some(tip) = cursor_tooltip(app, window, cx) {
+    if app.context_menu.is_none()
+        && let Some(tip) = cursor_tooltip(app, window, cx)
+    {
         root = root.child(tip);
+    }
+    if let Some(menu) = context_menu(app, cx) {
+        root = root.child(menu);
     }
     if app.show_help {
         root = root.child(help_overlay(app, cx));
@@ -248,6 +254,65 @@ fn centred_popup(
                 )
                 .child(card),
         )
+}
+
+/// A tile's right-click menu, where it was opened. The app draws it, as it
+/// draws the crumbs' menus, so the arrow keys and a click elsewhere treat it
+/// the same way on every platform.
+fn context_menu(
+    app: &Disktree,
+    cx: &Context<'_, Disktree>,
+) -> Option<impl IntoElement> {
+    let menu = app.context_menu.as_ref()?;
+    let theme = cx.omarchy().clone();
+    let mut list = div()
+        .id("context-menu")
+        .debug_selector(|| "context-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .min_w(size::CONTEXT_MENU)
+        .py(space::XS)
+        .border_1()
+        .border_color(theme.control_border())
+        .bg(theme.surface)
+        .text_size(text::BODY)
+        .font_family(theme.font.clone())
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.context_menu = None;
+            cx.notify();
+        }));
+    for (index, row) in app.context_rows().into_iter().enumerate() {
+        if row.separated {
+            list =
+                list.child(div().my(space::XS).h(px(1.)).bg(theme.divider()));
+        }
+        let highlighted = index == menu.highlighted;
+        list = list.child(
+            div()
+                .id(ElementId::NamedInteger("context-row".into(), index as u64))
+                .debug_selector(move || format!("context-row-{index}"))
+                .px(space::MD)
+                .py(space::XS)
+                .text_color(theme.foreground)
+                .when(highlighted, |this| this.bg(theme.hover_fill()))
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_context(index, cx);
+                    window.focus(&this.focus, cx);
+                }))
+                .child(row.label),
+        );
+    }
+    Some(
+        deferred(
+            anchored()
+                .position(menu.position)
+                .snap_to_window_with_margin(px(8.))
+                .child(list),
+        )
+        .with_priority(3),
+    )
 }
 
 /// The one question disktree asks: a permanent deletion cannot be undone, so
@@ -476,10 +541,12 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
     } else {
         0..0
     };
+    // Squeezed, the trail gives up its start: where you are is its end.
     let mut row = div()
         .flex()
         .flex_row()
         .items_center()
+        .justify_end()
         .gap(space::XXS)
         .min_w_0()
         .overflow_hidden();
@@ -520,6 +587,11 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
             Crumb::Tree(path) => {
                 tree_crumb(app, theme, id, label, path, index == last, cx)
             }
+            Crumb::Rest(pages) => widgets::crumb(id, label, index == last, cx)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.show_rest_pages(pages, cx);
+                }))
+                .into_any_element(),
         };
         row = row.child(crumb);
     }
@@ -813,6 +885,36 @@ fn view_settings(
         .p(space::XXS)
     };
 
+    let chart = {
+        let entity = entity.clone();
+        let focus = focus.clone();
+        with_tooltip(
+            div().id("chart").child(
+                button_group(
+                    "chart",
+                    Chart::ALL
+                        .iter()
+                        .map(|chart| {
+                            ChoiceItem::new(chart.key(), chart.label())
+                        })
+                        .collect(),
+                    Some(app.chart.index()),
+                    move |index, window, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.set_chart(Chart::ALL[index], cx);
+                        });
+                        window.focus(&focus, cx);
+                    },
+                    window,
+                    cx,
+                )
+                .w(size::CHART_CHOICE)
+                .p(space::XXS),
+            ),
+            "How the folder is drawn \u{00b7} V",
+        )
+    };
+
     let check = |on: bool| {
         if on {
             CheckboxState::Checked
@@ -974,6 +1076,7 @@ fn view_settings(
         .gap(space::SM)
         .flex_shrink_0()
         .child(history)
+        .child(chart)
         .child(mode)
         .child(hidden)
         .child(apparent)
@@ -1165,6 +1268,9 @@ fn selection_section(
         .gap(space::MD)
         .child(widgets::eyebrow("Selection", cx));
     let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
+    if let Some(rest) = app.rest_at(&target) {
+        return rest_details(section, app, theme, &rest, target, cx);
+    }
     let Some(node) = app.node_at(&target) else {
         return section.child(
             div()
@@ -1384,9 +1490,124 @@ fn selection_section(
     section
         .child(identity)
         .child(measure)
-        .child(grid)
         .children(badges)
         .child(actions)
+        .child(grid)
+}
+
+/// A "+N more" tile is many items, and marking it would mark what nobody
+/// has looked at; opening it is the way to them.
+fn rest_details(
+    section: Div,
+    app: &Disktree,
+    theme: &Theme,
+    rest: &Rest,
+    target: Vec<usize>,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let root_value = app.tree().map_or(0, |tree| tree.bytes);
+    let folder = app.path_at(&rest.parent).map_or_else(String::new, |path| {
+        crate::marks::display_path(&path, app.home.as_deref())
+    });
+    let highlight = palette::highlight(theme);
+    let (number, unit) = match app.options.metric {
+        Metric::Bytes => widgets::split_size(&human_bytes(rest.bytes)),
+        Metric::Files => (widgets::human_count(rest.files), "files".into()),
+    };
+    let identity =
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::XS)
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::SM)
+                    .child(
+                        div().flex_shrink_0().w(space::XS).h(text::HEADING).bg(
+                            palette::category_accent(theme, Category::Other),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(text::HEADING)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.bright)
+                            .child(format!(
+                                "+{} more",
+                                widgets::human_count(rest.count as u64)
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(format!("The smaller items in {folder}")),
+            );
+    let on = palette::on_highlight(theme);
+    let open = button(
+        "open-rest",
+        "Open to mark them one by one",
+        ButtonVariant::Primary,
+        cx,
+    )
+    .tab_stop(false)
+    .flex_1()
+    .justify_center()
+    .bg(highlight)
+    .border_color(highlight)
+    .text_color(on)
+    .font_weight(FontWeight::SEMIBOLD)
+    .hover(move |style| {
+        style.bg(highlight.opacity(0.85)).border_color(highlight)
+    })
+    .on_click(cx.listener(move |this, _, window, cx| {
+        this.open_rest(&target, cx);
+        window.focus(&this.focus, cx);
+    }));
+    let grid = div()
+        .flex()
+        .flex_row()
+        .child(div().flex_1().min_w_0().child(widgets::figure(
+            "Of scan",
+            widgets::percent(rest.bytes, root_value),
+            theme.bright,
+            cx,
+        )))
+        .child(div().flex_1().min_w_0().child(widgets::figure(
+            "Items",
+            widgets::human_count(rest.count as u64),
+            theme.bright,
+            cx,
+        )));
+    section
+        .child(identity)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::SM)
+                .child(widgets::measure(
+                    number,
+                    text::DISPLAY,
+                    unit,
+                    text::TITLE,
+                    cx,
+                ))
+                .child(widgets::bar(
+                    rest.bytes as f32 / root_value.max(1) as f32,
+                    highlight,
+                    cx,
+                )),
+        )
+        .child(div().flex().flex_row().child(open))
+        .child(grid)
 }
 
 /// The biggest things that could plausibly go, with their total.
@@ -1978,7 +2199,7 @@ fn review_button(
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
+    let hints: [(&str, &str); 12] = [
         ("space", "mark"),
         ("enter", "open"),
         ("\u{232b}", "up"),
@@ -1987,6 +2208,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         ("/", "filter"),
         ("[ ]", "depth"),
         ("t", "mode"),
+        ("V", "chart"),
         ("0", "reset"),
         ("v", "volumes"),
         ("r", "rescan"),
@@ -3109,6 +3331,9 @@ fn history_card(app: &Disktree, back: bool, cx: &gpui_kit::App) -> Div {
 /// The tooltip content for the hovered tile: everything the tile cannot show.
 pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
     let crumbs = app.hovered.as_deref()?;
+    if let Some(rest) = app.rest_at(crumbs) {
+        return Some(rest_card(app, &rest, cx));
+    }
     let is_dir = app.node_at(crumbs)?.is_dir();
     let keys = if is_dir {
         "space mark · enter open"
@@ -3116,6 +3341,88 @@ pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
         "space mark"
     };
     node_card(app, crumbs, keys, cx)
+}
+
+fn rest_card(app: &Disktree, rest: &Rest, cx: &gpui_kit::App) -> Div {
+    let theme = cx.omarchy();
+    let parent_value = app.node_at(&rest.parent).map_or(0, |node| node.bytes);
+    let folder = app.path_at(&rest.parent).map_or_else(String::new, |path| {
+        crate::marks::display_path(&path, app.home.as_deref())
+    });
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::XS)
+                .child(
+                    gpui_omarchy::icon(IconName::LayoutDashboard)
+                        .size(icon::SM)
+                        .text_color(theme.secondary),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.bright)
+                        .child(format!(
+                            "+{} more",
+                            widgets::human_count(rest.count as u64)
+                        )),
+                ),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!("The smaller items in {folder}")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child(human_bytes(rest.bytes)),
+                )
+                .child(widgets::glyph_bar(
+                    rest.bytes,
+                    parent_value.max(1),
+                    10,
+                    theme.secondary,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(widgets::percent(rest.bytes, parent_value)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!(
+                    "{} items \u{00b7} {} files",
+                    widgets::human_count(rest.count as u64),
+                    widgets::human_count(rest.files)
+                )),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.7))
+                .child("enter open, to mark them one by one"),
+        )
 }
 
 /// What is known about the node at `crumbs`, as a card: name, path, size and
@@ -3249,6 +3556,11 @@ const MODIFIER_ZOOM: &str = if cfg!(target_os = "macos") {
 } else {
     "ctrl = / - / 0"
 };
+const SCROLL_ZOOM: &str = if cfg!(target_os = "macos") {
+    "scroll / pinch"
+} else {
+    "scroll"
+};
 const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
     "\u{2318}O"
 } else {
@@ -3259,10 +3571,13 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows = [
+    let rows: [(&str, &str); 31] = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
-        ("enter", "Open that directory, at any depth"),
+        (
+            "enter",
+            "Open that directory at any depth, or what \u{201c}+N more\u{201d} stands for",
+        ),
         ("\u{232b} / esc", "Go up one directory"),
         (
             "alt \u{2190} / \u{2192}",
@@ -3273,7 +3588,10 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
             "Move between tiles at this level",
         ),
         ("tab", "Next largest sibling"),
-        ("scroll", "Zoom toward a directory, then go into it"),
+        (
+            SCROLL_ZOOM,
+            "Zoom toward a directory, then go into it, a level at a time",
+        ),
         ("shift-scroll", "Pan the magnified view"),
         ("[ / ]", "Draw fewer or more levels at once"),
         ("- / = / 0", "Magnify, shrink, or reset the view"),
@@ -3284,6 +3602,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ),
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
+        ("V", "Treemap, sunburst or icicle"),
         ("r", "Scan again from the same root"),
         ("esc", "Stop a scan in progress"),
         ("v", "Scan another volume"),
@@ -3292,6 +3611,14 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
         ("p", "Show or hide the selection line"),
+        (
+            "right-click",
+            if cfg!(target_os = "macos") {
+                "Open, mark, reveal in Finder, copy the path"
+            } else {
+                "Open, mark, reveal, copy the path"
+            },
+        ),
         (
             "o",
             if cfg!(target_os = "macos") {
