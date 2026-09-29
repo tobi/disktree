@@ -16,9 +16,11 @@ mod appearance;
 mod git;
 mod marks;
 mod palette;
+mod settings;
 mod state;
 #[cfg(test)]
 mod tests;
+mod themes;
 mod treemap_view;
 mod ui;
 mod views;
@@ -35,7 +37,9 @@ use std::{
 use anyhow::{Context as _, Result};
 use disktree_core::scan::ScanOptions;
 use gpui_kit::{AppContext as _, WindowOptions, px, size};
+use settings::Settings;
 use state::Disktree;
+use themes::ThemeChoice;
 
 /// What the command line asked for.
 #[derive(Debug)]
@@ -107,77 +111,117 @@ fn run() -> Result<()> {
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
+    let settings = Settings::path()
+        .map(|path| Settings::load(&path))
+        .unwrap_or_default();
 
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx| {
-            gpui_omarchy::init(cx);
-            app_menu::install(cx);
-            let home = std::env::home_dir();
-            let native_look = appearance::follows_system(home.as_deref());
-            if native_look {
-                appearance::apply(cx.window_appearance(), cx);
-            }
-            let options = args.options.clone();
-            let root_for_app = root.clone();
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(gpui_kit::WindowBounds::Windowed(
-                            gpui_kit::Bounds::new(
-                                gpui_kit::point(px(120.), px(90.)),
-                                size(px(1440.), px(900.)),
-                            ),
-                        )),
-                        titlebar: Some(gpui_kit::TitlebarOptions {
-                            title: Some(
-                                format!(
-                                    "disktree · {}",
-                                    marks::display_path(
-                                        &title_root,
-                                        home.as_deref(),
-                                    )
-                                )
-                                .into(),
-                            ),
-                            ..Default::default()
-                        }),
-                        // Wayland app id. Hyprland reports it as the window
-                        // class, and the desktop entry's StartupWMClass and
-                        // the documented window rule both match `disktree`.
-                        // Left unset, the class is empty and that rule never
-                        // matches.
-                        app_id: Some("disktree".to_owned()),
-                        // Below this the treemap stops being readable, so ask
-                        // the compositor not to go there.
-                        window_min_size: Some(size(px(900.), px(600.))),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        if native_look {
-                            appearance::follow(window);
-                        }
-                        cx.new(|cx| {
-                            Disktree::new(
-                                root_for_app.clone(),
-                                options.clone(),
-                                depth,
-                                cx,
-                            )
-                        })
-                    },
-                )
-                .expect("open the disktree window");
-
-            // The treemap owns the keyboard from the first frame; there is no
-            // text field to focus first.
-            let _ = window.update(cx, |this, window, cx| {
-                let focus = this.focus.clone();
-                window.focus(&focus, cx);
-            });
-            cx.activate(true);
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    app.run(move |cx| {
+        gpui_omarchy::init(cx);
+        app_menu::install(cx);
+        let home = std::env::home_dir();
+        let native_look = appearance::follows_system(home.as_deref());
+        let theme = settings.theme.unwrap_or_default();
+        // gpui-omarchy follows the Omarchy theme already.
+        if native_look || theme != ThemeChoice::System {
+            themes::apply(theme, native_look, cx);
+        }
+        let options = args.options.clone();
+        let root_for_app = root.clone();
+        let zoom = settings.zoom;
+        let bounds = saved_bounds(&settings, cx).unwrap_or_else(|| {
+            gpui_kit::Bounds::new(
+                gpui_kit::point(px(120.), px(90.)),
+                size(px(1440.), px(900.)),
+            )
         });
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(gpui_kit::WindowBounds::Windowed(
+                        bounds,
+                    )),
+                    titlebar: Some(gpui_kit::TitlebarOptions {
+                        title: Some(
+                            format!(
+                                "disktree · {}",
+                                marks::display_path(
+                                    &title_root,
+                                    home.as_deref(),
+                                )
+                            )
+                            .into(),
+                        ),
+                        ..Default::default()
+                    }),
+                    // Wayland app id. Hyprland reports it as the window
+                    // class, and the desktop entry's StartupWMClass and
+                    // the documented window rule both match `disktree`.
+                    // Left unset, the class is empty and that rule never
+                    // matches.
+                    app_id: Some("disktree".to_owned()),
+                    // Below this the treemap stops being readable, so ask
+                    // the compositor not to go there.
+                    window_min_size: Some(size(px(900.), px(600.))),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    appearance::follow(window);
+                    if let Some(zoom) = zoom {
+                        window.set_rem_size(px(ui::BASE_REM * zoom));
+                    }
+                    cx.new(|cx| {
+                        let app = Disktree::new(
+                            root_for_app.clone(),
+                            options.clone(),
+                            depth,
+                            cx,
+                        );
+                        cx.observe_window_bounds(window, |this, window, _| {
+                            this.remember_frame(window);
+                        })
+                        .detach();
+                        cx.on_app_quit(|this, _| {
+                            this.save_settings();
+                            async {}
+                        })
+                        .detach();
+                        app
+                    })
+                },
+            )
+            .expect("open the disktree window");
+
+        // The treemap owns the keyboard from the first frame; there is no
+        // text field to focus first.
+        let _ = window.update(cx, |this, window, cx| {
+            let focus = this.focus.clone();
+            window.focus(&focus, cx);
+        });
+        cx.activate(true);
+    });
     Ok(())
+}
+
+/// The frame the window had when disktree last quit, if it still lands on
+/// a display. Only where an app places its own window: a tiling compositor
+/// decides for itself.
+fn saved_bounds(
+    settings: &Settings,
+    cx: &gpui_kit::App,
+) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    if !cfg!(any(target_os = "macos", windows)) {
+        return None;
+    }
+    let frame = settings.frame?;
+    let bounds = gpui_kit::Bounds::new(
+        gpui_kit::point(px(frame.x), px(frame.y)),
+        size(px(frame.width.max(900.)), px(frame.height.max(600.))),
+    );
+    cx.displays()
+        .iter()
+        .any(|display| display.bounds().intersects(&bounds))
+        .then_some(bounds)
 }
 
 /// Read the command line, program name already skipped.

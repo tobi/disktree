@@ -18,9 +18,10 @@ use gpui_kit::{
     pattern_slash, px, relative,
 };
 use gpui_omarchy::{
-    ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
-    button_group, checkbox, dialog_button, dialog_description, dialog_popup,
-    dialog_title, separator, with_tooltip,
+    ActiveTheme, ButtonVariant, ChoiceItem, IconName, MenuItem, Theme,
+    alert_dialog, button, button_group, checkbox, dialog_button,
+    dialog_description, dialog_popup, dialog_title, menu, separator,
+    with_tooltip,
 };
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -29,6 +30,7 @@ use crate::palette;
 use crate::state::{
     ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
 };
+use crate::themes::ThemeChoice;
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
 use crate::widgets;
@@ -813,6 +815,44 @@ fn view_settings(
         .p(space::XXS)
     };
 
+    let theme_menu = {
+        let entity = entity.clone();
+        let focus = focus.clone();
+        let items = ThemeChoice::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let item =
+                    MenuItem::new(choice.label()).checked(app.theme == choice);
+                // Following the system, then the light themes, then the dark.
+                if index == 1 || choice == ThemeChoice::Dark {
+                    item.separator_before()
+                } else {
+                    item
+                }
+            })
+            .collect();
+        menu(
+            "theme",
+            with_tooltip(
+                button("theme-menu", "", ButtonVariant::Secondary, cx)
+                    .tab_stop(false)
+                    .accessibility_label("Theme")
+                    .child(
+                        gpui_omarchy::icon(IconName::Palette).size(icon::MD),
+                    ),
+                "Theme",
+            ),
+            items,
+            move |index, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.set_theme(ThemeChoice::ALL[index], cx);
+                });
+                window.focus(&focus, cx);
+            },
+        )
+    };
+
     let check = |on: bool| {
         if on {
             CheckboxState::Checked
@@ -978,6 +1018,7 @@ fn view_settings(
         .child(hidden)
         .child(apparent)
         .child(depth_control)
+        .child(theme_menu)
 }
 
 // ── trail and legend ────────────────────────────────────────────────────

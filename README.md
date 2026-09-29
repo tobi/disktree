@@ -136,7 +136,8 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 ### The screen
 
 - **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+  **Age**, **Hidden files**, **Apparent size** — the depth drawn, and the
+  theme. In the
   tree a crumb goes there, and its ▾ lists its siblings, largest first with
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
@@ -155,6 +156,14 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   what is marked; and the disk, free now and after the marks, with the way
   to the review screen. Drag its left edge to resize it; double-click the
   edge to reset.
+
+A theme can be chosen from the palette button: eight of disktree's own,
+light and dark, or **Match System**, the default, which follows Omarchy's
+theme where there is one and the system's appearance elsewhere. The choice,
+the interface zoom and, on macOS and Windows, the window frame are kept in
+`disktree/settings` under the platform's settings directory
+(`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%`
+on Windows).
 
 One colour is kept apart: amber marks the selection, the main action, and
 what can be had back.

@@ -1,14 +1,14 @@
-//! Light or dark when there is no Omarchy theme to follow.
+//! What the system says about how the app should look.
 //!
 //! On Omarchy, gpui-omarchy follows the desktop's theme files. Elsewhere there
 //! are none, and gpui-omarchy would then stay on its dark default whatever
 //! the system is set to; there the app follows the system appearance instead,
 //! with the crate's own dark and light palettes, and switches when it does.
+//! See [`crate::themes`] for the themes that do the same.
 
 use std::path::Path;
 
-use gpui_kit::{App, Window, WindowAppearance};
-use gpui_omarchy::Theme;
+use gpui_kit::Window;
 
 /// Whether the system appearance, rather than an Omarchy theme, decides the
 /// colours: unless an Omarchy theme is installed, on macOS and Windows, and
@@ -35,24 +35,12 @@ fn states_a_preference(desktop: &str) -> bool {
         })
 }
 
-/// Apply the palette for `appearance`. Applying an explicit theme also stops
-/// gpui-omarchy watching for theme files that are not there.
-pub fn apply(appearance: WindowAppearance, cx: &mut App) {
-    let theme = match appearance {
-        WindowAppearance::Light | WindowAppearance::VibrantLight => {
-            Theme::flexoki_light()
-        }
-        WindowAppearance::Dark | WindowAppearance::VibrantDark => {
-            Theme::tokyo_night()
-        }
-    };
-    theme.apply(cx);
-}
-
-/// Follow `window`'s appearance from now on.
+/// Follow `window`'s appearance from now on, for the themes that do.
 pub fn follow(window: &Window) {
     window
-        .observe_window_appearance(|window, cx| apply(window.appearance(), cx))
+        .observe_window_appearance(|window, cx| {
+            crate::themes::follow_appearance(window.appearance(), cx);
+        })
         .detach();
 }
 

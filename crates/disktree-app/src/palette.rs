@@ -41,26 +41,29 @@ const fn dark(theme: &Theme) -> bool {
 /// The fill for a tile of `category`, `depth` levels into the view.
 pub fn category_fill(theme: &Theme, category: Category, depth: u32) -> Hsla {
     let (h, chroma) = hue(category);
+    let tone = crate::themes::tone(theme);
     let step = depth.min(4) as f32;
-    let (s, l) = if dark(theme) {
-        (0.26 * chroma, step.mul_add(0.028, 0.215))
-    } else {
-        (0.30 * chroma, step.mul_add(-0.03, 0.84))
-    };
+    let s = tone.fill_saturation * chroma;
+    let l = step.mul_add(tone.depth_step, tone.fill_lightness);
     // Pulled a little toward the theme surface, so each theme tints it.
-    mix(Hsla { h, s, l, a: 1.0 }, theme.inset, 0.12)
+    mix(Hsla { h, s, l, a: 1.0 }, theme.inset, tone.inset_mix)
 }
 
 /// The saturated version of a category's hue: the strip over a top-level
 /// directory and the legend swatch.
 pub fn category_accent(theme: &Theme, category: Category) -> Hsla {
     let (h, chroma) = hue(category);
-    let (s, l) = if dark(theme) {
-        (0.42 * chroma, 0.52)
-    } else {
-        (0.45 * chroma, 0.46)
-    };
-    Hsla { h, s, l, a: 1.0 }
+    let tone = crate::themes::tone(theme);
+    Hsla {
+        h,
+        s: tone.accent_saturation * chroma,
+        l: tone.accent_lightness,
+        a: 1.0,
+    }
+}
+
+pub fn marked_fill(theme: &Theme) -> Hsla {
+    mix(theme.inset, theme.danger, 0.16)
 }
 
 /// The age ramp, newest first: this week, this month, this half-year, this
@@ -85,17 +88,13 @@ pub fn age_bucket(days: i64) -> usize {
 /// drains out of a tile as it goes untouched.
 pub fn age_fill(theme: &Theme, bucket: usize, depth: u32) -> Hsla {
     let fade = bucket.min(AGE_BUCKETS.len() - 1) as f32 / 4.0;
-    let step = depth.min(4) as f32;
+    let tone = crate::themes::tone(theme);
+    let lift =
+        (depth.min(4) as f32).mul_add(tone.depth_step, tone.age_lightness);
     let (s, l) = if dark(theme) {
-        (
-            (1.0 - fade).mul_add(0.34, 0.03),
-            step.mul_add(0.028, 0.29 - fade * 0.09),
-        )
+        ((1.0 - fade).mul_add(0.34, 0.03), fade.mul_add(-0.09, lift))
     } else {
-        (
-            (1.0 - fade).mul_add(0.36, 0.04),
-            step.mul_add(-0.03, 0.74 + fade * 0.1),
-        )
+        ((1.0 - fade).mul_add(0.36, 0.04), fade.mul_add(0.1, lift))
     };
     mix(
         Hsla {
