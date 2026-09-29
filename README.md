@@ -150,11 +150,27 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   band; deeper open directories a slim label row. In **Age** mode colour is
   the last write instead, from this week to older.
 - **Panel:** the selection (its size set large, share of the scan, files,
-  last write, and for a checkout what git says — changes, stashes, unpushed
-  commits); *Worth a look*, the largest things that could plausibly go;
+  last write, its kind), and for a checkout or a folder of worktrees what
+  git says about it (below); *Worth a look*, the largest things that could
+  plausibly go;
   what is marked; and the disk, free now and after the marks, with the way
   to the review screen. Drag its left edge to resize it; double-click the
   edge to reset.
+
+**Git checkouts and worktrees.** Pointing at a checkout, or at a folder
+holding nothing but one (a `dev tree`'s `trees/<name>` around its `src`),
+adds a card under the selection: its branch and the branches checked out
+there before, whether its work is on `origin/main` (merged, or
+squash-merged and found by its patch), what is uncommitted and unpushed,
+and what removing the folder would lose. A linked worktree's branches and
+commits stay in its repository, so what goes with the folder is its
+uncommitted changes, commits on no branch, and what git never keeps:
+checkouts nested inside it and ignored `.env` files and databases. A folder
+of worktrees is worth a look for the worktrees' size alone; it lists each
+with its state, largest first, and **Mark N merged and clean** marks the
+ones that have landed and lose nothing. They still go through the review,
+whose rows say again what git says. Git is only read: nothing is fetched,
+so `origin/main` is as of the last fetch, and the card says when that was.
 
 One colour is kept apart: amber marks the selection, the main action, and
 what can be had back.
@@ -358,9 +374,11 @@ tested:
   pacman, paccache or `journalctl --vacuum` are the tools;
 - a symlink is unlinked, never followed;
 - nothing is passed through a shell — a file called `-rf` is just a file;
-- selecting a checkout never runs a program it names: git is asked with its
-  fsmonitor, hooks and pager off, and a checkout that defines its own filter
-  drivers is not asked for its status at all ("changes unknown").
+- reading a checkout never runs a program it names: git is asked with its
+  fsmonitor, hooks, pager, signature verifiers, external diffs and text
+  conversions off, with no network. A filter driver runs only when your own
+  git config defines it, as `git lfs install` does; one only the checkout
+  defines is switched off for the read.
 
 ## On Hyprland
 

@@ -6,9 +6,12 @@
 //! be built and tested without GPUI, a display, or a GPU.
 
 pub mod access;
+pub mod checkout;
 pub mod classify;
+pub mod details;
 pub mod export;
 pub mod filter;
+pub mod git;
 pub mod insights;
 #[cfg(windows)]
 mod mft;

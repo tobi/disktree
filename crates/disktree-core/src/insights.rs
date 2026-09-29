@@ -5,8 +5,11 @@
 //! and experiments nobody has written to in a month. Findings never nest, so
 //! their total is space that really exists once.
 
+use std::path::Path;
+
 use crate::classify::{Category, Reclaim};
-use crate::tree::Node;
+use crate::details::{CheckoutKind, checkout_item};
+use crate::tree::{Node, NodeKind, path_of};
 
 /// Seconds in a day.
 const DAY: i64 = 86_400;
@@ -38,28 +41,44 @@ pub struct Candidate {
     pub finding: Finding,
 }
 
-/// The `limit` largest findings beneath `root`, largest first. `now` is Unix
-/// seconds, passed in so the answer is testable.
-pub fn worth_a_look(root: &Node, now: i64, limit: usize) -> Vec<Candidate> {
-    let mut found = Vec::new();
+/// The walk's constants, and what it has found so far.
+struct Look<'a> {
+    root: &'a Node,
+    root_path: &'a Path,
+    now: i64,
+    found: Vec<Candidate>,
+}
+
+/// The `limit` largest findings beneath `root`, which is at `root_path`,
+/// largest first. `now` is Unix seconds, passed in so the answer is
+/// testable.
+pub fn worth_a_look(
+    root: &Node,
+    root_path: &Path,
+    now: i64,
+    limit: usize,
+) -> Vec<Candidate> {
+    let mut look = Look {
+        root,
+        root_path,
+        now,
+        found: Vec::new(),
+    };
     let mut crumbs = Vec::new();
     for (index, child) in root.children.iter().enumerate() {
         crumbs.push(index);
-        visit(child, &mut crumbs, now, &mut found);
+        visit(child, &mut crumbs, &mut look);
         crumbs.pop();
     }
+    let mut found = look.found;
     found.retain(|candidate| candidate.bytes >= MIN_BYTES);
     found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
     found.truncate(limit);
     found
 }
 
-fn visit(
-    node: &Node,
-    crumbs: &mut Vec<usize>,
-    now: i64,
-    found: &mut Vec<Candidate>,
-) {
+fn visit(node: &Node, crumbs: &mut Vec<usize>, look: &mut Look<'_>) {
+    let now = look.now;
     // Nothing beneath a small directory can reach `MIN_BYTES` either, so a
     // scan of millions of files looks at a few thousand directories.
     if !node.is_dir() || node.bytes < MIN_BYTES {
@@ -67,7 +86,7 @@ fn visit(
     }
     // Topmost only: everything beneath a reclaimable directory goes with it.
     if let Some(reason) = node.reclaim {
-        found.push(Candidate {
+        look.found.push(Candidate {
             crumbs: crumbs.clone(),
             bytes: node.bytes,
             finding: Finding::Reclaimable(reason),
@@ -83,28 +102,27 @@ fn visit(
             .filter(|child| child.is_dir())
             .collect();
         if !trees.is_empty() {
-            let oldest = trees
-                .iter()
-                .map(|tree| tree.modified)
-                .filter(|&time| time > 0)
-                .min()
-                .unwrap_or(now);
-            found.push(Candidate {
-                crumbs: crumbs.clone(),
-                bytes: node.bytes,
-                finding: Finding::Worktrees {
-                    count: trees.len(),
-                    oldest_days: (now - oldest).max(0) / DAY,
-                },
-            });
+            look.found.push(worktrees(&trees, crumbs, node.bytes, now));
             return;
         }
+    }
+    // Linked worktrees side by side are worth a look whatever the folder is
+    // called, for their own size: what else sits beside them stays out.
+    let linked = linked_worktrees(node, crumbs, look);
+    if linked.len() >= 2 {
+        let trees: Vec<&Node> =
+            linked.iter().map(|&index| &node.children[index]).collect();
+        let bytes = trees.iter().map(|tree| tree.bytes).sum();
+        look.found.push(worktrees(&trees, crumbs, bytes, now));
     }
     let experiments = scratch
         && (name.eq_ignore_ascii_case("tries")
             || name.eq_ignore_ascii_case("experiments"));
     let mut stale = (0_usize, 0_u64);
     for (index, child) in node.children.iter().enumerate() {
+        if linked.len() >= 2 && linked.contains(&index) {
+            continue;
+        }
         let is_stale = experiments
             && child.is_dir()
             && child.modified > 0
@@ -116,16 +134,79 @@ fn visit(
             continue;
         }
         crumbs.push(index);
-        visit(child, crumbs, now, found);
+        visit(child, crumbs, look);
         crumbs.pop();
     }
     if stale.0 > 0 {
-        found.push(Candidate {
+        look.found.push(Candidate {
             crumbs: crumbs.clone(),
             bytes: stale.1,
             finding: Finding::StaleExperiments { count: stale.0 },
         });
     }
+}
+
+fn worktrees(
+    trees: &[&Node],
+    crumbs: &[usize],
+    bytes: u64,
+    now: i64,
+) -> Candidate {
+    let oldest = trees
+        .iter()
+        .map(|tree| tree.modified)
+        .filter(|&time| time > 0)
+        .min()
+        .unwrap_or(now);
+    Candidate {
+        crumbs: crumbs.to_vec(),
+        bytes,
+        finding: Finding::Worktrees {
+            count: trees.len(),
+            oldest_days: (now - oldest).max(0) / DAY,
+        },
+    }
+}
+
+/// Children that are, or wrap, a linked worktree. Only a child whose tree
+/// shows a `.git` file is read from disk, so a whole-disk scan reads a few
+/// files rather than every folder; a submodule's `.git` file is told apart
+/// there.
+fn linked_worktrees(
+    node: &Node,
+    crumbs: &[usize],
+    look: &Look<'_>,
+) -> Vec<usize> {
+    let mut path = crumbs.to_vec();
+    node.children
+        .iter()
+        .enumerate()
+        .filter(|(_, child)| child.is_dir() && shows_git_file(child))
+        .filter(|&(index, child)| {
+            path.push(index);
+            let at = path_of(look.root_path, look.root, &path);
+            path.pop();
+            checkout_item(child, &at).is_some_and(|item| {
+                matches!(item.kind, CheckoutKind::Worktree { .. })
+            })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn shows_git_file(node: &Node) -> bool {
+    let is_file = |node: &Node| {
+        node.child_named(".git")
+            .is_some_and(|git| git.kind == NodeKind::File)
+    };
+    if is_file(node) {
+        return true;
+    }
+    let mut directories = node.children.iter().filter(|child| child.is_dir());
+    matches!(
+        (directories.next(), directories.next()),
+        (Some(only), None) if is_file(only)
+    )
 }
 
 #[cfg(test)]
@@ -197,7 +278,7 @@ mod tests {
 
     #[test]
     fn ranks_findings_largest_first_and_skips_the_tiny() {
-        let found = worth_a_look(&home(), NOW, 10);
+        let found = worth_a_look(&home(), Path::new("/home/tobi"), NOW, 10);
         let kinds: Vec<&Finding> = found.iter().map(|c| &c.finding).collect();
         assert_eq!(
             kinds,
@@ -217,14 +298,14 @@ mod tests {
 
     #[test]
     fn documents_are_never_suggested() {
-        let found = worth_a_look(&home(), NOW, 10);
+        let found = worth_a_look(&home(), Path::new("/home/tobi"), NOW, 10);
         assert!(found.iter().all(|c| c.crumbs != vec![3]));
     }
 
     #[test]
     fn crumbs_address_the_finding_from_the_root() {
         let root = home();
-        for candidate in worth_a_look(&root, NOW, 10) {
+        for candidate in worth_a_look(&root, Path::new("/home/tobi"), NOW, 10) {
             let node = root.resolve(&candidate.crumbs).expect("resolves");
             assert!(node.is_dir());
         }
@@ -232,7 +313,7 @@ mod tests {
 
     #[test]
     fn the_limit_keeps_the_largest() {
-        let found = worth_a_look(&home(), NOW, 2);
+        let found = worth_a_look(&home(), Path::new("/home/tobi"), NOW, 2);
         assert_eq!(found.len(), 2);
         assert_eq!(
             found[1].finding,
