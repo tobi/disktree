@@ -217,7 +217,7 @@ impl Colors {
                     ladder(&|depth| palette::age_fill(theme, bucket, depth))
                 })
                 .collect(),
-            marked_fill: palette::mix(theme.inset, theme.danger, 0.16),
+            marked_fill: palette::marked_fill(theme),
             inset: theme.inset,
         }
     }

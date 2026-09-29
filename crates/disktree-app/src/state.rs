@@ -36,6 +36,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::git::GitState;
 
 use crate::marks::{Marks, display_path, is_hidden};
+use crate::settings::Settings;
+use crate::themes::ThemeChoice;
 use crate::treemap_view::{Mosaic, TileDeco};
 
 /// What a tile's colour says.
@@ -404,6 +406,10 @@ pub struct Disktree {
     pub focus: FocusHandle,
     /// A trail crumb's sibling menu, when open.
     pub crumb_menu: Option<CrumbMenu>,
+    pub theme: ThemeChoice,
+    /// Where settings are kept; `None` keeps them for this run only.
+    settings_path: Option<PathBuf>,
+    pub settings: Settings,
 
     pub color_mode: ColorMode,
     /// The largest things worth clearing, recomputed when a scan lands.
@@ -458,6 +464,12 @@ impl Disktree {
         let home = std::env::home_dir();
         let space = space_info(&root_path).ok();
         let trash_backend = detect_trash_backend();
+        // Tests start from the defaults, whatever this machine keeps.
+        let settings_path = if cfg!(test) { None } else { Settings::path() };
+        let settings = settings_path
+            .as_deref()
+            .map(Settings::load)
+            .unwrap_or_default();
         let mut tree = Self {
             root_path,
             home,
@@ -517,6 +529,9 @@ impl Disktree {
             show_selection: true,
             focus: cx.focus_handle(),
             crumb_menu: None,
+            theme: settings.theme.unwrap_or_default(),
+            settings_path,
+            settings,
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
             git: FxHashMap::default(),
@@ -2048,21 +2063,73 @@ impl Disktree {
         if !(keystroke.modifiers.control || keystroke.modifiers.platform) {
             return false;
         }
+        let step = match keystroke.key.as_str() {
+            "=" | "+" => Some(1),
+            "-" => Some(-1),
+            "0" => None,
+            _ => return false,
+        };
+        self.step_interface_zoom(step, window);
+        true
+    }
+
+    /// One interface zoom step up or down, or back to 100% for `None`.
+    pub fn step_interface_zoom(
+        &mut self,
+        step: Option<i32>,
+        window: &mut Window,
+    ) {
         let steps = crate::ui::ZOOM_STEPS;
         let current = window.rem_size().as_f32() / crate::ui::BASE_REM;
         let index = steps
             .iter()
-            .position(|step| (step - current).abs() < 0.01)
-            .unwrap_or(2);
-        let next = match keystroke.key.as_str() {
-            "=" | "+" => (index + 1).min(steps.len() - 1),
-            "-" => index.saturating_sub(1),
-            "0" => 2,
-            _ => return false,
-        };
+            .position(|zoom| (zoom - current).abs() < 0.01)
+            .unwrap_or(DEFAULT_ZOOM);
+        let next = step.map_or(DEFAULT_ZOOM, |step| {
+            (index.cast_signed() + step as isize)
+                .clamp(0, steps.len().cast_signed() - 1) as usize
+        });
         window.set_rem_size(px(crate::ui::BASE_REM * steps[next]));
+        self.settings.zoom = Some(steps[next]);
+        self.save_settings();
         self.cache = None;
-        true
+    }
+
+    /// Apply `choice`, and keep it for the next launch.
+    pub fn set_theme(
+        &mut self,
+        choice: ThemeChoice,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.theme = choice;
+        let native = crate::appearance::follows_system(self.home.as_deref());
+        crate::themes::apply(choice, native, cx);
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub fn save_settings(&mut self) {
+        self.settings.theme = Some(self.theme);
+        if let Some(path) = &self.settings_path {
+            self.settings.save(path);
+        }
+    }
+
+    /// The window's frame, kept for the next launch where the platform lets
+    /// an app place its own window.
+    pub fn remember_frame(&mut self, window: &Window) {
+        if !cfg!(any(target_os = "macos", windows)) {
+            return;
+        }
+        if let gpui_kit::WindowBounds::Windowed(bounds) = window.window_bounds()
+        {
+            self.settings.frame = Some(crate::settings::Frame {
+                x: bounds.origin.x.as_f32(),
+                y: bounds.origin.y.as_f32(),
+                width: bounds.size.width.as_f32(),
+                height: bounds.size.height.as_f32(),
+            });
+        }
     }
 
     pub fn begin_removal(&mut self, cx: &mut Context<'_, Self>) {
@@ -2905,6 +2972,9 @@ const HEADER_REMS: f32 = 1.375;
 
 /// Height of the slim label row a deeper open directory keeps, in rem.
 const HEADER_INNER_REMS: f32 = 1.0;
+
+/// Where [`crate::ui::ZOOM_STEPS`] is at 100%.
+const DEFAULT_ZOOM: usize = 2;
 
 /// A trail step's label: the directory's own name, or `/` for the root.
 fn crumb_label(path: &Path) -> String {

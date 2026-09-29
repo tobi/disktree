@@ -111,6 +111,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
+| a theme of disktree's own | `crates/disktree-app/src/themes.rs` |
+| what is kept for the next launch | `crates/disktree-app/src/settings.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
 
