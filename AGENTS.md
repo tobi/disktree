@@ -14,13 +14,14 @@ the removal mode, the confirmation). Marking is never destructive.
 
 ```sh
 make build                      # release build
+cargo build --release -p disktree-tui  # terminal build on each OS
 make run                        # build and run, scanning $HOME
 make install                    # ~/.local: binary, desktop entry, icon
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
 make bundle                     # macOS: target/bundle/disktree.app and its zip
 make lint                       # rustfmt --check, then clippy --all-targets -D warnings
-make test                       # core and window-harness tests
+make test                       # core, window-harness and terminal tests
 make ci                         # lint, then test
 make fmt                        # format in place
 ```
@@ -106,13 +107,18 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
-| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
+| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — filesystem `unsafe` is isolated here |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
+| terminal keys, marks and screen transitions | `crates/disktree-tui/src/app.rs` |
+| terminal mosaic and screen layout | `crates/disktree-tui/src/render.rs` |
+| terminal palette and optional Omarchy theme | `crates/disktree-tui/src/theme.rs` |
+| terminal lifetime and CLI arguments | `crates/disktree-tui/src/main.rs` |
+| terminal Windows console encoding | `crates/disktree-tui/src/windows_console.rs` |
 
 ## Verification expectations
 
@@ -122,5 +128,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 * The screens are covered by window-harness tests that draw frames and press
   keys, including one that marks a directory, confirms the removal and checks
   the files are gone while unmarked neighbours are untouched.
+* Terminal tests draw compact and wide frames, exercise the review and agent
+  handoff, and confirm removal leaves unmarked neighbours untouched.
 * Rendering was verified by those tests and by running the app against a real
   home directory; it has not been eyeballed in every theme and font size.

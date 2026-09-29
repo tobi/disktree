@@ -48,6 +48,13 @@ jobs:
       - name: Test
         run: cargo xtask test
 
+      - name: Portable Linux TUI
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked -p disktree-tui \
+            --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/disktree-tui --help
+
   check-macos:
     name: Lint and test (macOS)
     # Apple silicon. No system libraries to install, and no Metal toolchain
@@ -69,6 +76,11 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+      - name: Terminal release build
+        run: |
+          cargo build --release --locked -p disktree-tui
+          target/release/disktree-tui --help
 
       # The app bundle, signed ad hoc: catches a broken Info.plist, icon or
       # signature before a release does.
@@ -98,6 +110,12 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+      - name: Terminal release build
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p disktree-tui
+          .\target\release\disktree-tui.exe --help
 
       - name: Check embedded executable icon
         shell: pwsh
@@ -152,3 +170,14 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+      - name: Terminal release build
+        run: cargo build --release --locked -p disktree-tui
+
+      - name: Portable ARM Linux TUI
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          cargo build --release --locked -p disktree-tui \
+            --target aarch64-unknown-linux-musl
+          target/aarch64-unknown-linux-musl/release/disktree-tui --help

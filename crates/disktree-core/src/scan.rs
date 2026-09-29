@@ -309,25 +309,24 @@ impl WalkContext {
             }
         };
 
-        if !self.options.include_hidden
-            && (entry.name().starts_with('.') || entry.hidden())
-        {
+        let hidden = entry.name().starts_with('.') || entry.hidden();
+        if !self.options.include_hidden && hidden {
             return Classified::Skipped;
         }
 
         let kind = match listing {
             Listing::Symlink => {
                 let path = entry.entry_path(dir);
-                return self.classify_symlink(&path, entry.take_name());
+                return self.classify_symlink(&path, entry.take_name(), hidden);
             }
             Listing::Directory => {
                 let path = entry.entry_path(dir);
-                return self.classify_dir(entry, path);
+                return self.classify_dir(entry, path, hidden);
             }
             Listing::Leaf(kind) => kind,
         };
         match entry.facts(self.options.apparent_size) {
-            Ok(facts) => self.leaf(entry.take_name(), kind, &facts),
+            Ok(facts) => self.leaf(entry.take_name(), kind, &facts, hidden),
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
                 Classified::Skipped
@@ -339,6 +338,7 @@ impl WalkContext {
         &self,
         entry: &mut impl Listed,
         path: PathBuf,
+        hidden: bool,
     ) -> Classified {
         if self
             .never_scanned
@@ -367,6 +367,7 @@ impl WalkContext {
         {
             let mut tree = (*known.tree).clone();
             tree.name = entry.take_name();
+            tree.hidden = hidden;
             return Classified::Entry(tree);
         }
         if self.options.one_filesystem
@@ -394,10 +395,16 @@ impl WalkContext {
         Classified::Subdirectory {
             path,
             name: entry.take_name(),
+            hidden,
         }
     }
 
-    fn classify_symlink(&self, path: &Path, name: Box<str>) -> Classified {
+    fn classify_symlink(
+        &self,
+        path: &Path,
+        name: Box<str>,
+        hidden: bool,
+    ) -> Classified {
         if !self.options.follow_links {
             // Not followed: the link occupies only its target string, which
             // `du` reports as a handful of bytes or nothing at all.
@@ -409,6 +416,7 @@ impl WalkContext {
                         NodeKind::Symlink,
                         &facts,
                         facts.shared,
+                        hidden,
                     ))
                 }
                 Err(error) => {
@@ -443,6 +451,7 @@ impl WalkContext {
             return Classified::Subdirectory {
                 path: path.to_path_buf(),
                 name,
+                hidden,
             };
         }
 
@@ -450,7 +459,7 @@ impl WalkContext {
         // What the link leads to, so a file that is also reached directly is
         // charged once.
         facts.identity = identity_of(path, &meta);
-        self.leaf(name, kind_of(&meta, meta.file_type()), &facts)
+        self.leaf(name, kind_of(&meta, meta.file_type()), &facts, hidden)
     }
 
     fn leaf(
@@ -458,11 +467,12 @@ impl WalkContext {
         name: Box<str>,
         kind: NodeKind,
         facts: &Facts,
+        hidden: bool,
     ) -> Classified {
         // A followed link reaches a file a second way, whatever its link
         // count says.
         let track = self.options.follow_links || facts.shared;
-        Classified::Entry(leaf_node(name, kind, facts, track))
+        Classified::Entry(leaf_node(name, kind, facts, track, hidden))
     }
 }
 
@@ -520,6 +530,7 @@ enum Listing {
 /// What a leaf contributes.
 struct Facts {
     size: u64,
+    alternate_size: u64,
     identity: Option<(u64, u64)>,
     modified: i64,
     /// The file may have another name the walk could meet: its identity is
@@ -531,6 +542,7 @@ impl Facts {
     fn of(meta: &Metadata, apparent_size: bool) -> Self {
         Self {
             size: measure(meta, apparent_size),
+            alternate_size: measure(meta, !apparent_size),
             identity: file_identity(meta),
             modified: modified_seconds(meta),
             shared: shares_inode(meta),
@@ -615,6 +627,11 @@ impl Listed for crate::windows::Entry {
             } else {
                 self.allocated()
             },
+            alternate_size: if apparent_size {
+                self.allocated()
+            } else {
+                self.apparent()
+            },
             identity: self.identity(),
             modified: self.modified(),
             // The listing has no link count; a file id is free here, so
@@ -666,7 +683,11 @@ fn list(
 /// What a directory entry turned out to be.
 enum Classified {
     /// Descend into this directory on a new task.
-    Subdirectory { path: PathBuf, name: Box<str> },
+    Subdirectory {
+        path: PathBuf,
+        name: Box<str>,
+        hidden: bool,
+    },
     /// A leaf that contributes size.
     Entry(Node),
     /// Filtered out, unreadable, or a symlink we chose not to follow.
@@ -693,6 +714,7 @@ struct PendingDir {
 #[derive(Debug, Default)]
 struct Partial {
     name: Box<str>,
+    hidden: bool,
     children: Vec<Node>,
 }
 
@@ -700,6 +722,7 @@ impl PendingDir {
     const fn new(
         path: PathBuf,
         name: Box<str>,
+        hidden: bool,
         parent: Option<Arc<Self>>,
         depth: usize,
     ) -> Self {
@@ -709,6 +732,7 @@ impl PendingDir {
             pending: AtomicUsize::new(1),
             partial: Mutex::new(Partial {
                 name,
+                hidden,
                 children: Vec::new(),
             }),
             read_error: AtomicBool::new(false),
@@ -729,11 +753,14 @@ impl PendingDir {
             kind: NodeKind::Directory,
             bytes: 0,
             own_bytes: 0,
+            measured_bytes: 0,
+            alternate_bytes: 0,
             files: 0,
             own_files: 0,
             dirs: 1,
             inode: None,
             read_error: self.read_error.load(Ordering::Relaxed),
+            hidden: partial.hidden,
             modified: 0,
             category: crate::classify::Category::Other,
             reclaim: None,
@@ -812,6 +839,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     let root_dir = Arc::new(PendingDir::new(
         root.to_path_buf(),
         file_name(root),
+        false,
         None,
         0,
     ));
@@ -901,11 +929,12 @@ fn walk<'scope>(
                 match entry {
                     Ok(mut entry) => {
                         match context.classify(&dir.path, &mut entry) {
-                            Classified::Subdirectory { path, name } => {
+                            Classified::Subdirectory { path, name, hidden } => {
                                 tally.dirs += 1;
                                 subdirs.push(Arc::new(PendingDir::new(
                                     path,
                                     name,
+                                    hidden,
                                     Some(Arc::clone(dir)),
                                     dir.depth + 1,
                                 )));
@@ -1007,8 +1036,11 @@ fn leaf_node(
     kind: NodeKind,
     facts: &Facts,
     track: bool,
+    hidden: bool,
 ) -> Node {
     let mut node = Node::entry(name, kind, facts.size);
+    node.alternate_bytes = facts.alternate_size;
+    node.hidden = hidden;
     if track {
         node.inode = facts.identity;
     }

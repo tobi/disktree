@@ -36,7 +36,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
     FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
-    GetVolumeInformationW, GetVolumePathNameW,
+    GetLogicalDriveStringsW, GetVolumeInformationW, GetVolumePathNameW,
     GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
 };
 
@@ -534,11 +534,10 @@ pub fn volume_root(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_wide(&root[..end])))
 }
 
-/// Every place a volume is mounted: drive roots such as `D:\`, and folders
-/// a volume is mounted on, such as `C:\Data\Disk2\`. The mount table
-/// Windows has in place of `/proc/self/mounts`.
+/// Every drive letter and volume mount point. Logical drives include mapped
+/// network letters that the local volume mount enumeration does not list.
 pub fn mount_points() -> Vec<PathBuf> {
-    let mut points = Vec::new();
+    let mut points = logical_drive_roots();
     // A volume GUID path, `\\?\Volume{…}\`, is 49 units with its NUL.
     let mut volume = [0_u16; 64];
     let length = u32::try_from(volume.len()).unwrap_or(u32::MAX);
@@ -548,7 +547,11 @@ pub fn mount_points() -> Vec<PathBuf> {
         return points;
     }
     loop {
-        points.extend(volume_paths(&volume));
+        for point in volume_paths(&volume) {
+            if !points.iter().any(|known| same(known, &point)) {
+                points.push(point);
+            }
+        }
         // SAFETY: `find` is a live search handle, and `volume` is writable
         // for the length passed.
         if unsafe { FindNextVolumeW(find, volume.as_mut_ptr(), length) } == 0 {
@@ -558,6 +561,33 @@ pub fn mount_points() -> Vec<PathBuf> {
     // SAFETY: `find` is a live search handle, closed once.
     unsafe { FindVolumeClose(find) };
     points
+}
+
+fn logical_drive_roots() -> Vec<PathBuf> {
+    // SAFETY: a zero length asks for the buffer size without writing data.
+    let needed = unsafe { GetLogicalDriveStringsW(0, std::ptr::null_mut()) };
+    let Some(length) =
+        usize::try_from(needed).ok().filter(|&length| length > 0)
+    else {
+        return Vec::new();
+    };
+    let mut names = vec![0_u16; length.saturating_add(1)];
+    let Ok(capacity) = u32::try_from(names.len()) else {
+        return Vec::new();
+    };
+    // SAFETY: `names` is writable for `capacity` UTF-16 units.
+    let copied =
+        unsafe { GetLogicalDriveStringsW(capacity, names.as_mut_ptr()) };
+    if copied == 0
+        || usize::try_from(copied).unwrap_or(usize::MAX) >= names.len()
+    {
+        return Vec::new();
+    }
+    names
+        .split(|&unit| unit == 0)
+        .take_while(|name| !name.is_empty())
+        .map(|name| PathBuf::from(OsString::from_wide(name)))
+        .collect()
 }
 
 /// The paths the volume named by the NUL-terminated `volume` is mounted at.
