@@ -82,6 +82,10 @@ pub mod size {
     pub const SCANNING_METER: Rems = Rems(26.25);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
+    /// The Treemap | Sunburst | Icicle choice beside it.
+    pub const CHART_CHOICE: Rems = Rems(15.0);
+    /// A tile's right-click menu, at its narrowest.
+    pub const CONTEXT_MENU: Rems = Rems(13.0);
     /// The review screen's summary column.
     pub const REVIEW_SUMMARY: Rems = Rems(22.5);
     /// The review list's share-bar lane.

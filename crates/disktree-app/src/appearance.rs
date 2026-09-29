@@ -1,4 +1,4 @@
-//! Light or dark when there is no Omarchy theme to follow.
+//! What the system says about how the app should look and move.
 //!
 //! On Omarchy, gpui-omarchy follows the desktop's theme files. Elsewhere there
 //! are none, and gpui-omarchy would then stay on its dark default whatever
@@ -54,6 +54,39 @@ pub fn follow(window: &Window) {
     window
         .observe_window_appearance(|window, cx| apply(window.appearance(), cx))
         .detach();
+}
+
+/// Whether the system asks apps to keep motion to a minimum: Reduce Motion
+/// on macOS, animations turned off on GNOME. A level change then lands at
+/// once instead of flying there.
+pub fn reduces_motion() -> bool {
+    let read = |program: &str, arguments: &[&str]| {
+        std::process::Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            })
+    };
+    if cfg!(target_os = "macos") {
+        read(
+            "/usr/bin/defaults",
+            &["read", "com.apple.universalaccess", "reduceMotion"],
+        )
+        .is_some_and(|value| value == "1")
+    } else if cfg!(windows) {
+        false
+    } else {
+        read(
+            "gsettings",
+            &["get", "org.gnome.desktop.interface", "enable-animations"],
+        )
+        .is_some_and(|value| value == "false")
+    }
 }
 
 #[cfg(test)]
