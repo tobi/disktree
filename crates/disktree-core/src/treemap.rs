@@ -122,6 +122,8 @@ pub struct LayoutOptions {
     /// open. A directory drawn closed has no band: its label sits in its
     /// corner, over nothing but its own fill.
     pub header_inner: f32,
+    /// Width needed to reserve a readable header and draw children beneath it.
+    pub min_header_width: f32,
 }
 
 impl Default for LayoutOptions {
@@ -134,6 +136,7 @@ impl Default for LayoutOptions {
             padding_outer: 3.0,
             header: 20.0,
             header_inner: 15.0,
+            min_header_width: 44.0,
         }
     }
 }
@@ -310,7 +313,7 @@ fn header_band(
         options.header_inner
     };
     let body = rect.h - height;
-    if rect.w < 44.0 || body < options.min_tile * 3.0 {
+    if rect.w < options.min_header_width || body < options.min_tile * 3.0 {
         return None;
     }
     Some(Rect::new(rect.x, rect.y, rect.w, height))
@@ -571,6 +574,23 @@ mod tests {
         let centre = (header.x + header.w / 2.0, header.y + header.h / 2.0);
         let hit_tile = hit(&tiles, centre.0, centre.1).expect("a hit");
         assert_eq!(hit_tile.crumbs(), &[0]);
+    }
+
+    #[test]
+    fn a_narrower_presentation_can_keep_a_header() {
+        let root = dir("root", vec![dir("big", vec![file("inside", 100)])]);
+        let area = Rect::new(0.0, 0.0, 30.0, 100.0);
+        let default =
+            layout(&root, &[], area, Metric::Bytes, &LayoutOptions::default());
+        assert_eq!(default.len(), 1, "GUI width keeps this tile whole");
+
+        let options = LayoutOptions {
+            min_header_width: 20.0,
+            ..LayoutOptions::default()
+        };
+        let narrow = layout(&root, &[], area, Metric::Bytes, &options);
+        assert_eq!(narrow.len(), 2, "terminal width shows the child");
+        assert!(narrow[0].header.is_some());
     }
 
     #[test]

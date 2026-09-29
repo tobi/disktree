@@ -77,13 +77,36 @@ fn clippy() -> Result<(), String> {
 }
 
 fn test() -> Result<(), String> {
-    run(&["test", "--workspace"])
+    run_configured(&["test", "--workspace"], |command| {
+        // Omarchy watches HOME for theme changes. Its inotify callback can
+        // reach GPUI's deterministic test scheduler from another thread.
+        // Preserve Rust's package paths while disabling that watcher.
+        if let Some(home) = std::env::home_dir() {
+            for (key, folder) in
+                [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")]
+            {
+                if std::env::var_os(key).is_none() {
+                    command.env(key, home.join(folder));
+                }
+            }
+        }
+        command.env_remove("HOME");
+    })
 }
 
 fn run(args: &[&str]) -> Result<(), String> {
+    run_configured(args, |_| {})
+}
+
+fn run_configured(
+    args: &[&str],
+    configure: impl FnOnce(&mut Command),
+) -> Result<(), String> {
     let cargo = option_env!("CARGO").unwrap_or("cargo");
     let display = format!("{cargo} {}", args.join(" "));
-    let status = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    configure(&mut command);
+    let status = command
         .args(args)
         .stdin(Stdio::null())
         .status()

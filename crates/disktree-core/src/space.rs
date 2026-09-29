@@ -669,7 +669,8 @@ pub fn volumes() -> Vec<Volume> {
 
 /// Every place a volume is mounted that can be scanned.
 ///
-/// Drive roots such as `D:\` and folders a volume is mounted on. Unready
+/// Drive roots such as `D:\`, mapped drive letters, and folders a volume is
+/// mounted on. Unready
 /// drives (an empty card reader reports a path but no space) are left out,
 /// since there is nothing to measure there.
 #[cfg(windows)]
