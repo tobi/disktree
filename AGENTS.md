@@ -95,7 +95,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 8. **The view transform is the only thing zoom changes.** Layout runs in
    base-space pixels and is cached; `screen = (base - origin) * scale`.
 9. **The status bar never claims a saving it cannot measure.** Projections come
-   from marked bytes; the final number comes from `statvfs` before and after.
+   from marked bytes *on the volume the meter measures*, which is the scan's own
+   notion of a volume — the mount *source* — so a mark on a disk mounted inside
+   the tree, which `-X` and the media exception allow, is reported and never
+   added to this volume's free space; see `space::attribution`. The final number
+   comes from `statvfs` before and after.
 
 ## Where changes belong
 

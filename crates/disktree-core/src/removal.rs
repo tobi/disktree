@@ -78,11 +78,38 @@ pub struct Plan {
     pub blocked: Vec<Blocked>,
     /// The scanned root the targets were judged against.
     pub root: PathBuf,
+    /// Bytes the targets free on `root`'s volume; see [`Self::reclaim`].
+    reclaim: u64,
+    /// Bytes the targets free on other volumes; see [`Self::foreign`].
+    foreign: u64,
 }
 
 impl Plan {
     pub fn bytes(&self) -> u64 {
         self.targets.iter().map(|target| target.bytes).sum()
+    }
+
+    /// Bytes the targets free on the volume `root` is on: the only ones the
+    /// free space meter may add to that volume's projection.
+    ///
+    /// [`Self::bytes`] counts every target, which is what a delete list
+    /// wants. A mark on another volume — `-X` crosses filesystems, and a
+    /// disk mounted under the root can be marked — gives its space back
+    /// there, so projecting it here would lend one disk another's bytes.
+    pub const fn reclaim(&self) -> u64 {
+        self.reclaim
+    }
+
+    /// Bytes the targets free on other volumes, which the meter leaves out.
+    pub const fn foreign(&self) -> u64 {
+        self.foreign
+    }
+
+    /// Bytes whose volume could not be told: no saving is claimed for them
+    /// either, since a projection the meter cannot stand behind is worse
+    /// than a smaller one.
+    pub fn unattributed(&self) -> u64 {
+        self.bytes().saturating_sub(self.reclaim + self.foreign)
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -95,6 +122,15 @@ impl Plan {
 /// Paths outside `root` are blocked rather than removed: the tree the user was
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
+    plan_against(targets, root, &mount_points())
+}
+
+/// [`plan`] against a given read of the mount table, for testing.
+///
+/// One read answers both what may be removed and which volume each target's
+/// bytes belong to, so the projection cannot be built from a state of the
+/// machine the guards never saw.
+fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     let root = normalize(root);
     let mut plan = Plan {
         root: root.clone(),
@@ -105,7 +141,6 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     if targets.is_empty() {
         return plan;
     }
-    let mounts = mount_points();
     // Once per plan, not per target: the review screen plans every frame.
     let home = std::env::home_dir().map(|home| Home::of(&home));
     let real_root = fs::canonicalize(&root).ok();
@@ -145,6 +180,21 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
         }
     }
     plan.targets = outer;
+
+    // Which volume each target's bytes come back to. Only what comes back to
+    // the scanned volume may be shown against its free space.
+    for target in &plan.targets {
+        let bytes = target.bytes;
+        match crate::space::attribution(
+            mounts.mounts.as_deref(),
+            &plan.root,
+            &target.path,
+        ) {
+            crate::space::Attribution::Scanned => plan.reclaim += bytes,
+            crate::space::Attribution::Other => plan.foreign += bytes,
+            crate::space::Attribution::Unknown => {}
+        }
+    }
     plan
 }
 
@@ -544,19 +594,28 @@ const MOUNTS_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
 struct MountTable {
     points: Vec<PathBuf>,
     media: Vec<PathBuf>,
+    /// The table itself where the platform keeps one, which tells the
+    /// scanned volume from another for the meter's projection. `None` where
+    /// there is none to read, and the platform's own device test answers.
+    mounts: Option<Vec<crate::space::Mount>>,
 }
 
 fn read_mount_table() -> MountTable {
+    // The same table the scan reads for its volume, so a projection is
+    // judged by the rule the tree itself was built under.
+    let mounts = crate::space::mount_table();
     if let Ok(table) = fs::read_to_string("/proc/self/mountinfo") {
         let views = crate::space::parse_mountinfo(&table);
         return MountTable {
             points: views.iter().map(|mount| guard_key(&mount.point)).collect(),
             media: media_roots(&views),
+            mounts,
         };
     }
     MountTable {
         points: read_mount_points(),
         media: Vec::new(),
+        mounts,
     }
 }
 
@@ -1706,6 +1765,70 @@ mod tests {
         assert_eq!(plan.covered.len(), 1);
         assert_eq!(plan.covered[0].path, inner.path);
         assert_eq!(plan.bytes(), 30);
+    }
+
+    /// Marks may sit on another volume — `-X` crosses filesystems, and a
+    /// disk mounted under the root can be marked — but the meter measures
+    /// the scanned volume, so only the marks whose bytes come back to it may
+    /// be projected onto its free space.
+    #[test]
+    fn only_the_scanned_volumes_marks_are_projected() {
+        let table = "\
+/dev/mapper/root / btrfs rw,subvol=/@ 0 0
+/dev/mapper/root /home btrfs rw,subvol=/@home 0 0
+/dev/mapper/root /.snapshots btrfs rw,subvol=/@snapshots 0 0
+/dev/mapper/data /data ext4 rw 0 0
+";
+        let mounts = MountTable {
+            points: crate::space::parse_mounts(table)
+                .iter()
+                .map(|mount| guard_key(&mount.point))
+                .collect(),
+            media: Vec::new(),
+            mounts: Some(crate::space::parse_mounts(table)),
+        };
+        let marked = [
+            target(Path::new("/home/tobi/junk"), 100),
+            target(Path::new("/data/junk"), 200),
+            target(Path::new("/.snapshots/7/junk"), 400),
+        ];
+        let plan = plan_against(&marked, Path::new("/"), &mounts);
+        assert!(
+            plan.blocked.is_empty(),
+            "a mark inside another volume is legal: {:?}",
+            plan.blocked
+        );
+        assert_eq!(plan.bytes(), 700);
+        assert_eq!(plan.reclaim(), 100, "the Btrfs subvolume is this disk");
+        assert_eq!(plan.foreign(), 600, "another disk, and a snapshot");
+        assert_eq!(plan.unattributed(), 0);
+
+        // A mark inside another is removed with it, so its bytes are counted
+        // once here as they are in the total.
+        let nested = [
+            target(Path::new("/home/tobi/junk"), 100),
+            target(Path::new("/home/tobi/junk/deeper"), 60),
+        ];
+        let plan = plan_against(&nested, Path::new("/"), &mounts);
+        assert_eq!(plan.covered.len(), 1);
+        assert_eq!(plan.bytes(), 100);
+        assert_eq!(plan.reclaim(), 100);
+
+        // Where the table cannot place the paths, nothing is claimed: a
+        // projection the meter cannot stand behind is worse than none.
+        let partial = MountTable {
+            mounts: Some(crate::space::parse_mounts(
+                "/dev/mapper/data /data ext4 rw 0 0\n",
+            )),
+            ..MountTable::default()
+        };
+        let root = Path::new("/disktree-untabled");
+        let plan =
+            plan_against(&[target(&root.join("junk"), 50)], root, &partial);
+        assert_eq!(plan.bytes(), 50);
+        assert_eq!(plan.reclaim(), 0);
+        assert_eq!(plan.foreign(), 0);
+        assert_eq!(plan.unattributed(), 50, "no saving may be claimed");
     }
 
     #[test]

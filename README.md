@@ -253,6 +253,14 @@ escaped in the prompt, so it cannot pass for another path.
 - **Hardlinks once.** Two names for one inode cost one file.
 - **Hidden entries included**, because `~/.cache` is often the biggest thing in
   a home directory. Symlinks are not followed.
+- **The projection counts one volume.** The meter shows the scanned volume's
+  free space, so it adds up only the marks whose bytes come back to that
+  volume, by the same rule the scan bounds the volume with. With `-X`, a mark
+  on a disk mounted inside the tree, on a network share or in a snapshot
+  subvolume is left out of the projection — removing it gives its space back
+  somewhere else, or, in a snapshot, shares its blocks with the live files —
+  and the panel and the review screen say what was left out. A mark whose
+  volume cannot be told is not claimed either.
 
 The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built
@@ -289,7 +297,8 @@ device number: btrfs gives each subvolume its own `st_dev`, so `/home`,
 points are left out (checked by path, so an automounted NAS is never
 mounted just to be measured). Snapshot subvolumes are left out too: their
 files share blocks with the live ones, and counting them would count the disk
-twice. `-X` crosses into everything.
+twice. `-X` crosses into everything: a mark that lands on another volume is
+still removed, but it is not added to the metered volume's free space.
 
 Without root, some system directories cannot be read; they are counted as
 unreadable in the top bar rather than guessed at.

@@ -179,6 +179,170 @@ fn is_snapshot(mount: &Mount) -> bool {
         })
 }
 
+/// The mount table `/proc/self/mounts` holds, where the platform keeps one.
+///
+/// `None` on macOS and Windows, which have no such table and tell a path's
+/// volume from the path itself, and wherever `/proc` cannot be read. Read
+/// once by whoever asks per frame: [`attribution`] takes it, because the
+/// review screen plans on every frame.
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn mount_table() -> Option<Vec<Mount>> {
+    std::fs::read_to_string("/proc/self/mounts")
+        .ok()
+        .map(|table| parse_mounts(&table))
+}
+
+/// [`mount_table`] where there is no `/proc/self/mounts` to read.
+#[cfg(any(target_os = "macos", windows))]
+pub const fn mount_table() -> Option<Vec<Mount>> {
+    None
+}
+
+/// Which volume's free space a removal gives back, as far as the meter can
+/// tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attribution {
+    /// The scanned volume: what is removed here is what the meter, which
+    /// measures this volume, sees come back.
+    Scanned,
+    /// Another volume. The space comes back there, so projecting it here
+    /// would lend one disk another's bytes.
+    Other,
+    /// Nothing says which: no saving is claimed.
+    Unknown,
+}
+
+/// Which volume's free space removing `path` gives back, judged against the
+/// volume `root` is on.
+///
+/// The scan's own rule decides ([`foreign_mounts`]): a volume is the mount
+/// *source* and type, not a device number, so `/home` on its own Btrfs
+/// subvolume is part of the `/` a user scans, while another disk, a tmpfs, a
+/// network share and a snapshot subvolume are not. Marks are not bounded by
+/// that rule — `-X` crosses filesystems, and a disk mounted under the root
+/// can be marked — so the meter, which measures one volume, has to ask.
+///
+/// `mounts` is a read of [`mount_table`], kept by the caller because this is
+/// asked for every frame; `None` falls back to what the platform itself
+/// calls the disk a path is on, the test the scan falls back to when the
+/// table cannot be read.
+pub fn attribution(
+    mounts: Option<&[Mount]>,
+    root: &Path,
+    path: &Path,
+) -> Attribution {
+    match mounts {
+        Some(mounts) => attribution_in(mounts, root, path),
+        None => attributed_by_platform(root, path),
+    }
+}
+
+/// [`attribution`] over a given mount table.
+fn attribution_in(mounts: &[Mount], root: &Path, path: &Path) -> Attribution {
+    let (Some(own), Some(other)) =
+        (covering(mounts, root), covering(mounts, path))
+    else {
+        // A path no mount point covers, as one reached through a spelling
+        // the table does not carry: there is nothing to attribute it to.
+        return Attribution::Unknown;
+    };
+    if same_volume(own, other) {
+        Attribution::Scanned
+    } else {
+        Attribution::Other
+    }
+}
+
+/// The mount a path is shown by: the longest of the points above it.
+fn covering<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
+    mounts
+        .iter()
+        .filter(|mount| path.starts_with(&mount.point))
+        .max_by_key(|mount| mount.point.as_os_str().len())
+}
+
+/// Whether two mounts are one volume, as the scan counts one: one mount, or
+/// two mounts of the same source — a Btrfs subvolume beside its filesystem,
+/// a bind mount of the same disk, the same disk mounted twice.
+///
+/// A snapshot subvolume is not its filesystem even though it shares the
+/// source: its files share their blocks with the live ones, so removing them
+/// gives back almost nothing, and the scan keeps out of it for the same
+/// reason. The mount the scan itself asked for is kept at all events, since
+/// removing something there empties the very space the meter reads.
+fn same_volume(own: &Mount, other: &Mount) -> bool {
+    if own.point == other.point {
+        return true;
+    }
+    own.source == other.source
+        && own.fstype == other.fstype
+        && !is_snapshot(own)
+        && !is_snapshot(other)
+}
+
+/// [`attribution`] with no table to go by: what the platform itself says
+/// about the path, which is what the scan compares in the same straits.
+///
+/// The device number is all Unix has without `/proc/self/mounts`: an equal
+/// number is certainly the same filesystem, and a different one may be
+/// another disk or another Btrfs subvolume of this one, which only the table
+/// could tell apart, so nothing is claimed for it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn attributed_by_platform(root: &Path, path: &Path) -> Attribution {
+    use std::os::unix::fs::MetadataExt as _;
+    let (Ok(own), Ok(other)) =
+        (std::fs::metadata(root), std::fs::metadata(path))
+    else {
+        return Attribution::Unknown;
+    };
+    if own.dev() == other.dev() {
+        Attribution::Scanned
+    } else {
+        Attribution::Unknown
+    }
+}
+
+/// [`attribution`] with no table to go by on macOS: the disk a path is
+/// mounted on, with the Data volume's mount folded into `/` by
+/// [`volume_root_for`], so `/Users` is the `/` the user thinks of.
+#[cfg(target_os = "macos")]
+fn attributed_by_platform(root: &Path, path: &Path) -> Attribution {
+    compared(root, path, volume_root_for)
+}
+
+/// [`attribution`] with no table to go by on Windows: the volume a path is
+/// mounted on, folded the way Windows folds spellings, so `C:\` and `c:\`.
+#[cfg(windows)]
+fn attributed_by_platform(root: &Path, path: &Path) -> Attribution {
+    compared(root, path, |path| {
+        crate::windows::volume_root(path)
+            .map(|root| crate::windows::guard_key(&root))
+    })
+}
+
+/// Two platform-named volume roots: one root is one volume.
+#[cfg(any(target_os = "macos", windows))]
+fn compared(
+    root: &Path,
+    path: &Path,
+    volume: impl Fn(&Path) -> Option<PathBuf>,
+) -> Attribution {
+    let (Some(own), Some(other)) = (volume(root), volume(path)) else {
+        return Attribution::Unknown;
+    };
+    if own == other {
+        Attribution::Scanned
+    } else {
+        Attribution::Other
+    }
+}
+
+/// There is no way to tell one volume from another here.
+#[cfg(not(any(unix, windows)))]
+const fn attributed_by_platform(_root: &Path, _path: &Path) -> Attribution {
+    Attribution::Unknown
+}
+
 /// The top of the disk `path` lives on.
 ///
 /// The shortest mount point above it with the same source. On Omarchy the home directory is the `@home`
@@ -918,6 +1082,110 @@ portal /run/user/1000/doc fuse.portal rw 0 0
     fn a_home_scan_has_no_foreign_mounts_here() {
         let mounts = parse_mounts(OMARCHY);
         assert!(foreign_mounts(&mounts, Path::new("/home/tobi")).is_empty());
+    }
+
+    #[test]
+    fn a_volume_keeps_its_subvolumes_and_loses_everything_else() {
+        let mounts = parse_mounts(OMARCHY);
+        let there = |path: &str| {
+            attribution(Some(&mounts), Path::new("/"), Path::new(path))
+        };
+        assert_eq!(there("/home/tobi/cache"), Attribution::Scanned);
+        assert_eq!(there("/var/log/journal"), Attribution::Scanned);
+        assert_eq!(there("/boot/vmlinuz"), Attribution::Other);
+        assert_eq!(there("/mnt/nas-home/x"), Attribution::Other);
+        assert_eq!(there("/tmp/x"), Attribution::Other);
+        assert_eq!(
+            there("/.snapshots/12/x"),
+            Attribution::Other,
+            "snapshot blocks are shared with the live files"
+        );
+        // Asking for the snapshot itself measures the snapshot, so its own
+        // files are the space that report goes up by.
+        assert_eq!(
+            attribution(
+                Some(&mounts),
+                Path::new("/.snapshots"),
+                Path::new("/.snapshots/12/x")
+            ),
+            Attribution::Scanned
+        );
+        // The same disk under a home of its own is one volume throughout,
+        // and the root disk beside it is not.
+        let separate = parse_mounts(
+            "/dev/sda1 / ext4 rw 0 0\n/dev/sdb1 /home ext4 rw 0 0\n",
+        );
+        assert_eq!(
+            attribution(
+                Some(&separate),
+                Path::new("/home/tobi"),
+                Path::new("/home/tobi/x")
+            ),
+            Attribution::Scanned
+        );
+        assert_eq!(
+            attribution(
+                Some(&separate),
+                Path::new("/home/tobi"),
+                Path::new("/var/tmp/x")
+            ),
+            Attribution::Other
+        );
+    }
+
+    #[test]
+    fn a_table_that_does_not_place_a_path_claims_nothing() {
+        let partial = parse_mounts("/dev/sdb1 /data ext4 rw 0 0\n");
+        assert_eq!(
+            attribution(
+                Some(&partial),
+                Path::new("/srv/scan"),
+                Path::new("/srv/scan/x")
+            ),
+            Attribution::Unknown,
+            "the root is not in the table"
+        );
+        assert_eq!(
+            attribution(
+                Some(&partial),
+                Path::new("/data/scan"),
+                Path::new("/srv/scan/x")
+            ),
+            Attribution::Unknown,
+            "the marked path is not in it either"
+        );
+        assert_eq!(
+            attribution(Some(&[]), Path::new("/"), Path::new("/x")),
+            Attribution::Unknown,
+            "an empty table places nothing"
+        );
+    }
+
+    #[test]
+    fn without_a_table_the_same_place_is_one_volume() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let marked = temp.path().join("marked");
+        std::fs::write(&marked, b"x").expect("write");
+        assert_eq!(
+            attribution(None, temp.path(), &marked),
+            Attribution::Scanned,
+            "one place cannot be two volumes"
+        );
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn the_machine_table_places_a_path_on_this_volume() {
+        let Some(mounts) = mount_table() else {
+            return;
+        };
+        let temp = std::env::temp_dir();
+        assert_eq!(
+            attribution(Some(&mounts), &temp, &temp),
+            Attribution::Scanned,
+            "{:?}",
+            mounts.iter().map(|mount| &mount.point).collect::<Vec<_>>()
+        );
     }
 
     #[test]
