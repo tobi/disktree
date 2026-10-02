@@ -131,19 +131,7 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
     assert!(read(&view, cx, |app| app.tree().is_none()));
     assert!(cx.debug_bounds("disktree-root").is_some());
 
-    let epoch = read(&view, cx, |app| app.scan_epoch);
-    let mut ready = false;
-    for _ in 0..600 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        ready = update(&view, cx, |app, cx| {
-            app.poll_scan_once(epoch, cx);
-            app.tree().is_some()
-        });
-        if ready {
-            break;
-        }
-    }
-    assert!(ready, "the scan landed");
+    finish_scan(&view, cx);
     draw(cx);
 
     let (tiles, selected, hidden_present) = update(&view, cx, |app, _| {
@@ -1040,16 +1028,28 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     assert_eq!(hatched, 1, "exactly the marked tile is hatched");
 }
 
-/// Drive the scan the view started until its tree lands.
+/// Drive the scan the view started until its outcome has been applied.
+///
+/// The scan is what is waited on, not the tree: widening keeps the old tree
+/// on screen while the wider root is read, so a tree being there does not
+/// mean the requested scan has completed.
 fn finish_scan(view: &Entity<Disktree>, cx: &mut Window) {
+    // Without a scan in flight the poller reports "stopped" at once, and the
+    // wait would pass without having waited for anything.
+    assert!(
+        read(view, cx, |app| app.scan.is_some()),
+        "no scan to finish"
+    );
     let epoch = read(view, cx, |app| app.scan_epoch);
     for _ in 0..600 {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let ready = update(view, cx, |app, cx| {
-            app.poll_scan_once(epoch, cx);
-            app.tree().is_some()
-        });
-        if ready {
+        let running = update(view, cx, |app, cx| app.poll_scan_once(epoch, cx));
+        if !running {
+            let (error, tree) = read(view, cx, |app| {
+                (app.scan_error.clone(), app.tree().is_some())
+            });
+            assert_eq!(error, None, "the scan failed");
+            assert!(tree, "the scan landed without a tree");
             return;
         }
     }
