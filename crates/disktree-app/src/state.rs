@@ -2875,6 +2875,14 @@ impl Disktree {
                     self.toggle_mark(&crumbs, cx);
                 }
             }
+            // What `o` does, for the tile under the pointer: select it, then
+            // show it in Finder, File Explorer or the file manager.
+            MouseButton::Right => {
+                if let Some(crumbs) = crumbs {
+                    self.select(Some(crumbs), cx);
+                    self.reveal_target(cx);
+                }
+            }
             // Buttons 8 and 9. gpui-pre maps them on X11, Wayland and
             // Windows; a mouse with no side buttons never sends them, and
             // then the header `<` / `>` and alt-arrows are the whole story.
@@ -2888,7 +2896,8 @@ impl Disktree {
             {
                 self.go_forward(cx);
             }
-            _ => {}
+            // Side buttons off the explore screen.
+            MouseButton::Navigate(_) => {}
         }
     }
 

@@ -229,6 +229,7 @@ and shows how much free space was actually gained.
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
 | `o` | show it in Finder, File Explorer or the file manager |
+| right-click | show that tile in Finder, File Explorer or the file manager |
 | `?` | every key |
 | `q` | quit |
 

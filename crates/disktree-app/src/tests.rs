@@ -384,6 +384,68 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let (at, target, path) = update(&view, cx, |app, _| {
+        let biggest = app
+            .layout()
+            .and_then(|tiles| {
+                tiles
+                    .iter()
+                    .max_by(|left, right| {
+                        left.rect.area().total_cmp(&right.rect.area())
+                    })
+                    .map(|tile| tile.crumbs().to_vec())
+            })
+            .expect("a tile");
+        let rect = app.tile_rect(&biggest).expect("a rectangle");
+        let screen = app.view.project(rect);
+        let (x, y) = (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0);
+        // The deepest tile there, which is what a click resolves to.
+        let target = app.tile_at(x, y).expect("a tile under the pointer");
+        let path = app.path_at(&target).expect("a path");
+        let origin = app.treemap_origin.get();
+        (Point::new(origin.x + px(x), origin.y + px(y)), target, path)
+    });
+
+    // The test platform cannot open a file manager, so take the path away
+    // first: the reveal then reports it instead of reaching the platform.
+    if path.is_dir() {
+        std::fs::remove_dir_all(&path).expect("remove");
+    } else {
+        std::fs::remove_file(&path).expect("remove");
+    }
+
+    cx.simulate_mouse_down(
+        at,
+        gpui_kit::MouseButton::Right,
+        gpui_kit::Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        at,
+        gpui_kit::MouseButton::Right,
+        gpui_kit::Modifiers::none(),
+    );
+    draw(cx);
+
+    let (selected, notice) = read(&view, cx, |app| {
+        (
+            app.selected.clone(),
+            app.notice.as_ref().map(|(text, _)| text.clone()),
+        )
+    });
+    assert_eq!(selected, Some(target), "the clicked tile is selected");
+    assert!(
+        notice.is_some_and(|text| text.contains("no longer on disk")),
+        "the reveal ran for it"
+    );
+}
+
+#[gpui_kit::test]
 fn typing_filters_live_and_enter_shows_only_the_matches(
     cx: &mut TestAppContext,
 ) {
