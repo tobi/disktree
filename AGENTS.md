@@ -106,7 +106,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
-| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
+| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` in core |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |

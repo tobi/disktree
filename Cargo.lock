@@ -1448,6 +1448,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "disktree-du"
+version = "0.10.1"
+dependencies = [
+ "chrono",
+ "disktree-core",
+ "libc",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "rustix",
+ "tempfile",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,32 @@
+[package]
+name = "disktree-du"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GNU du, answered from disktree's walker and a persistent index"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "disktree-du"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+disktree-core = { workspace = true }
+rayon = { workspace = true }
+rustc-hash = { workspace = true }
+
+# GNU du is a Unix program: the walk needs st_dev, st_ino and st_blocks,
+# which Windows does not have. On Windows the binary only says so.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+# getattrlistbulk, for a directory's stats in one call; see bulk.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
