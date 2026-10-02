@@ -15,10 +15,11 @@
 //! poll without locking, and cooperative cancellation so a re-scan can abandon
 //! a walk of a large home directory instead of queueing behind it.
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -494,10 +495,12 @@ impl WalkContext {
 
 /// What the walk reads about one directory entry.
 ///
-/// `std::fs::DirEntry` everywhere but Windows. There the standard listing
-/// has neither the allocated size nor a file id, so measuring like `du`
-/// would cost an open per file; [`crate::windows`] lists a directory with
-/// both instead.
+/// `std::fs::DirEntry` everywhere but Windows and macOS. On Windows the
+/// standard listing has neither the allocated size nor a file id, so
+/// measuring like `du` would cost an open per file; [`crate::windows`] lists
+/// a directory with both instead. On macOS it would cost an `lstat` per
+/// entry, and [`crate::macos`] lists a directory with everything a stat
+/// says.
 trait Listed {
     /// The entry's path inside `dir`, the directory it was listed from.
     fn entry_path(&self, dir: &Path) -> PathBuf;
@@ -514,7 +517,8 @@ trait Listed {
     fn directory(&self) -> io::Result<Directory>;
     /// Hidden by an attribute rather than by a leading dot: on Windows,
     /// where the listing carries it, so `AppData` is hidden as Explorer
-    /// hides it. macOS's `UF_HIDDEN` would cost a stat per entry.
+    /// hides it. Finder's `UF_HIDDEN` is not asked for: on macOS, hidden
+    /// means a leading dot, as on Linux.
     fn hidden(&self) -> bool {
         false
     }
@@ -565,13 +569,13 @@ impl Facts {
 }
 
 /// A standard directory entry with its name decoded once, up front.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 struct Named {
     entry: DirEntry,
     name: Box<str>,
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl Listed for Named {
     fn entry_path(&self, _dir: &Path) -> PathBuf {
         self.entry.path()
@@ -608,6 +612,50 @@ impl Listed for Named {
         self.entry.metadata().map(|meta| Directory {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Listed for crate::macos::Entry {
+    fn entry_path(&self, dir: &Path) -> PathBuf {
+        self.path(dir)
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        self.take_name()
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        Ok(match self.kind() {
+            crate::macos::Kind::Link => Listing::Symlink,
+            crate::macos::Kind::Directory => Listing::Directory,
+            crate::macos::Kind::File => Listing::Leaf(NodeKind::File),
+            crate::macos::Kind::Other => Listing::Leaf(NodeKind::Other),
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        Ok(Facts {
+            size: if apparent_size {
+                self.apparent()
+            } else {
+                self.allocated()
+            },
+            identity: Some(self.identity()),
+            modified: self.modified(),
+            shared: self.shared(),
+        })
+    }
+
+    fn directory(&self) -> io::Result<Directory> {
+        Ok(Directory {
+            device: self.device(),
+            evicted: self.evicted(),
         })
     }
 }
@@ -665,7 +713,7 @@ impl Listed for crate::windows::Entry {
 }
 
 /// List a directory the way [`Listed`] describes.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn list(
     path: &Path,
     _volume: Option<u64>,
@@ -679,6 +727,14 @@ fn list(
             entry,
         })
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn list(
+    path: &Path,
+    _volume: Option<u64>,
+) -> io::Result<crate::macos::ReadDir> {
+    crate::macos::read_dir(path)
 }
 
 #[cfg(windows)]
@@ -745,18 +801,16 @@ impl PendingDir {
     /// Turn a completed directory into a node. Only called when `pending` has
     /// reached zero, so every child is already in `self.partial`.
     ///
-    /// `bytes` and `own_bytes` are left at zero on purpose: the walk cannot
-    /// know the aggregate, and [`crate::tree::aggregate`] derives both from the
-    /// children once every child is present.
+    /// `bytes` is left at zero on purpose: the walk cannot know the
+    /// aggregate, and [`crate::tree::aggregate`] derives it from the children
+    /// once every child is present.
     fn build(&self) -> Node {
         let partial = std::mem::take(&mut *lock(&self.partial));
         Node {
             name: partial.name,
             kind: NodeKind::Directory,
             bytes: 0,
-            own_bytes: 0,
             files: 0,
-            own_files: 0,
             dirs: 1,
             inode: None,
             read_error: self.read_error.load(Ordering::Relaxed),
@@ -839,7 +893,7 @@ fn scan_on_pool(
             let node = finish_tree(node, &context.options, pool);
             // The reader counted every file on the volume; the tree may
             // hold fewer.
-            progress.settle(node.files, node.dirs, node.bytes);
+            progress.settle(node.files, u64::from(node.dirs), node.bytes);
             return Ok(node);
         }
         // The reader gave up, or never started: the walk counts from nothing.
@@ -956,7 +1010,7 @@ impl Tally {
         if node.is_dir() {
             // A subtree taken whole from an earlier scan.
             self.files += node.files;
-            self.dirs += node.dirs;
+            self.dirs += node.dirs as u64;
         } else {
             // A link counts as a file on the meter, as it always has,
             // though the tree does not count it.
@@ -1146,7 +1200,9 @@ fn leaf_node(
 ) -> Node {
     let mut node = Node::entry(name, kind, facts.size);
     if track {
-        node.inode = facts.identity;
+        node.inode = facts
+            .identity
+            .and_then(|(device, file)| Some((device, NonZeroU64::new(file)?)));
     }
     node.modified = facts.modified;
     node
@@ -1454,8 +1510,8 @@ mod tests {
         write(root, "sub/deep.bin", 300);
 
         let tree = scan_dir(root, &options());
-        assert_eq!(tree.own_bytes, 700);
-        assert_eq!(tree.own_files, 1);
+        assert_eq!(tree.own_bytes(), 700);
+        assert_eq!(tree.own_files(), 1);
         assert_eq!(tree.bytes, 1000);
         assert_eq!(tree.files, 2);
     }
@@ -1614,7 +1670,7 @@ mod tests {
                 ..options()
             },
         );
-        assert_eq!(tree.own_bytes, 10);
+        assert_eq!(tree.own_bytes(), 10);
         let a = child(&tree, "a");
         assert_eq!(
             a.bytes, 20,

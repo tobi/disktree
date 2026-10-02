@@ -20,6 +20,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::num::NonZeroU64;
 use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
@@ -1145,7 +1146,8 @@ impl Table<'_> {
         let mut node = Node::entry(name, kind, size);
         node.modified = info.modified;
         if info.names > 1 {
-            node.inode = Some((0, u64::from(entry.child)));
+            node.inode = NonZeroU64::new(u64::from(entry.child))
+                .map(|record| (0, record));
         }
         Ok(Some(node))
     }
@@ -1685,7 +1687,7 @@ mod tests {
             assert_eq!(found, expected, "include_hidden {include_hidden}");
 
             // Only a file with a second name needs its identity kept.
-            let inode = |name: &str| root.child_named(name).unwrap().inode;
+            let inode = |name: &str| root.child_named(name).unwrap().identity();
             assert_eq!(inode("linked.txt"), Some((0, 31)));
             assert_eq!(inode("visible.txt"), None);
         }

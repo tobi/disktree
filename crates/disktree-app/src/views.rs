@@ -1212,7 +1212,7 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
     let files = tree.map_or(app.progress.files, |node| node.files);
-    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
+    let dirs = tree.map_or(app.progress.dirs, |node| u64::from(node.dirs));
     let errors = app.progress.errors;
     div()
         .flex()
@@ -3408,9 +3408,10 @@ fn node_card(
                     "{} files · {} dirs · {} direct",
                     widgets::human_count(node.files),
                     widgets::human_count(
-                        node.dirs.saturating_sub(u64::from(node.is_dir()))
+                        u64::from(node.dirs)
+                            .saturating_sub(u64::from(node.is_dir()))
                     ),
-                    human_bytes(node.own_bytes)
+                    human_bytes(node.own_bytes())
                 )),
         );
 

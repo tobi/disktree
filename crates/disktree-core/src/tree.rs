@@ -1,5 +1,6 @@
 //! The scanned tree.
 
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -54,28 +55,26 @@ impl Metric {
 
 /// One entry in the scanned tree.
 ///
-/// Totals and direct figures are both kept: `own_bytes` and `own_files` are
-/// what sits directly in a directory, `bytes` and `files` are the subtree
-/// totals the treemap draws. The selection line needs both, and keeping them means
-/// no second traversal when one of them is displayed.
+/// `bytes` and `files` are the subtree totals the treemap draws; what sits
+/// directly in a directory is [`Self::own_bytes`] and [`Self::own_files`],
+/// read from its children when the selection line asks. A disk holds tens
+/// of millions of nodes, so every field is paid that many times: the size
+/// is held by a test.
 #[derive(Clone, Debug)]
 pub struct Node {
     pub name: Box<str>,
     pub kind: NodeKind,
-    /// Subtree total: direct contents plus every descendant.
+    /// Subtree total: direct contents plus every descendant. A file's own
+    /// size, or nothing for a second name of a file already charged.
     pub bytes: u64,
-    /// Bytes of the leaf entries directly in this directory, or this file's
-    /// own size. Derived by [`aggregate`].
-    pub own_bytes: u64,
     /// Files at or beneath this node; `1` for a file.
     pub files: u64,
-    /// Files directly in this directory; `1` for a file. Derived by
-    /// [`aggregate`].
-    pub own_files: u64,
-    /// Directories at or beneath this node; `1` for a directory.
-    pub dirs: u64,
-    /// `(device, inode)` for files, used to de-duplicate hardlinks.
-    pub inode: Option<(u64, u64)>,
+    /// Directories at or beneath this node; `1` for a directory. Four
+    /// billion is more than any volume holds.
+    pub dirs: u32,
+    /// `(device, inode)` for files, used to de-duplicate hardlinks. No file
+    /// has inode zero, which lets `None` cost nothing.
+    pub inode: Option<(u64, NonZeroU64)>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
     /// Newest write time at or beneath this node, in Unix seconds; `0` when
@@ -101,9 +100,7 @@ impl Node {
             name: name.into(),
             kind: NodeKind::Directory,
             bytes: 0,
-            own_bytes: 0,
             files: 0,
-            own_files: 0,
             dirs: 1,
             inode: None,
             read_error: false,
@@ -124,9 +121,7 @@ impl Node {
             name: name.into(),
             kind,
             bytes,
-            own_bytes: bytes,
             files: u64::from(kind == NodeKind::File),
-            own_files: u64::from(kind == NodeKind::File),
             dirs: 0,
             inode: None,
             read_error: false,
@@ -139,6 +134,35 @@ impl Node {
 
     pub const fn is_dir(&self) -> bool {
         self.kind.is_dir()
+    }
+
+    /// Bytes of the leaf entries directly in this directory, or this file's
+    /// own size.
+    pub fn own_bytes(&self) -> u64 {
+        if !self.is_dir() {
+            return self.bytes;
+        }
+        self.children
+            .iter()
+            .filter(|child| !child.is_dir())
+            .fold(0, |sum, child| child.bytes.saturating_add(sum))
+    }
+
+    /// Files directly in this directory; `1` for a file.
+    pub fn own_files(&self) -> u64 {
+        if !self.is_dir() {
+            return self.files;
+        }
+        self.children
+            .iter()
+            .filter(|child| !child.is_dir())
+            .map(|child| child.files)
+            .sum()
+    }
+
+    /// [`Self::inode`] as the plain pair a platform reports.
+    pub fn identity(&self) -> Option<(u64, u64)> {
+        self.inode.map(|(device, file)| (device, file.get()))
     }
 
     /// The value a treemap should weight this node by.
@@ -231,14 +255,14 @@ impl Node {
     }
 }
 
-/// Recompute `bytes`, `files`, `dirs` and the direct totals bottom-up, then
-/// order children by `metric`, largest first.
+/// Recompute `bytes`, `files` and `dirs` bottom-up, then order children by
+/// `metric`, largest first.
 ///
-/// `bytes` and `files` are the subtree totals; `own_bytes` and `own_files` are
-/// the direct contents, derived from the leaf children rather than tracked
-/// separately. Deriving them is what keeps the two consistent: hardlink
-/// de-duplication rewrites a leaf's weight, and every total above it —
-/// including its parent's "direct" figure — follows without a second pass.
+/// A leaf's `bytes` is its measured size and the only input; every total is
+/// derived from the leaves, as are the direct figures [`Node::own_bytes`]
+/// and [`Node::own_files`]. Deriving them is what keeps them consistent:
+/// hardlink de-duplication rewrites a leaf's weight, and every total above
+/// it follows without a second pass.
 pub fn aggregate(node: &mut Node, metric: Metric) {
     aggregate_at(node, metric, 0, None);
 }
@@ -331,24 +355,19 @@ fn aggregate_at(
     if !node.is_dir() {
         // Every name of a file has the file's size, so one that weighs
         // nothing need not be remembered to be charged once.
-        if node.own_bytes > 0
+        if node.bytes > 0
             && let Some(seen) = seen
-            && let Some(key) = node.inode
+            && let Some(key) = node.identity()
             && !seen.insert(key)
         {
-            node.own_bytes = 0;
+            node.bytes = 0;
         }
-        node.bytes = node.own_bytes;
-        node.files = node.own_files;
-        node.dirs = 0;
         return;
     }
 
     let mut bytes = 0;
     let mut files = 0;
-    let mut own_bytes = 0;
-    let mut own_files = 0;
-    let mut dirs: u64 = 1;
+    let mut dirs: u32 = 1;
     let mut modified = 0;
     if depth < PARALLEL_LEVELS {
         node.children
@@ -365,15 +384,9 @@ fn aggregate_at(
         bytes = child.bytes.saturating_add(bytes);
         files += child.files;
         dirs += child.dirs;
-        if !child.is_dir() {
-            own_bytes = child.bytes.saturating_add(own_bytes);
-            own_files += child.files;
-        }
     }
     node.bytes = bytes;
     node.files = files;
-    node.own_bytes = own_bytes;
-    node.own_files = own_files;
     node.dirs = dirs;
     node.modified = modified;
 
@@ -414,6 +427,14 @@ mod tests {
         Node::entry(name, NodeKind::File, bytes)
     }
 
+    /// A home directory is tens of millions of nodes: every byte here is
+    /// tens of megabytes there.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_node_stays_small() {
+        assert_eq!(size_of::<Node>(), 88);
+    }
+
     #[test]
     fn seen_charges_an_identity_once_in_either_store() {
         let seen = Seen::new();
@@ -443,7 +464,7 @@ mod tests {
             ("newer again", 8192, newer),
         ] {
             let mut file = leaf(name, bytes);
-            file.inode = Some(key);
+            file.inode = Some((key.0, NonZeroU64::new(key.1).unwrap()));
             root.children.push(file);
         }
         aggregate_deduped(&mut root, Metric::Bytes, &Seen::new());
@@ -460,12 +481,12 @@ mod tests {
         root.children.push(leaf("small", 9));
 
         aggregate(&mut root, Metric::Bytes);
-        assert_eq!(root.own_bytes, 5 + 9, "direct leaves only");
+        assert_eq!(root.own_bytes(), 5 + 9, "direct leaves only");
         assert_eq!(root.bytes, 5 + 9 + 7);
         assert_eq!(root.files, 3);
-        assert_eq!(root.own_files, 2);
+        assert_eq!(root.own_files(), 2);
         assert_eq!(root.dirs, 2);
-        assert_eq!(child_named(&root, "child").own_bytes, 7);
+        assert_eq!(child_named(&root, "child").own_bytes(), 7);
         assert_eq!(&*root.children[0].name, "small", "9 bytes, largest first");
         assert_eq!(&*root.children[2].name, "direct");
 
@@ -473,7 +494,7 @@ mod tests {
         let mut single = leaf("solo", 3);
         aggregate(&mut single, Metric::Bytes);
         assert_eq!(single.bytes, 3);
-        assert_eq!(single.own_bytes, 3);
+        assert_eq!(single.own_bytes(), 3);
         assert_eq!(single.files, 1);
         assert_eq!(single.dirs, 0);
     }
