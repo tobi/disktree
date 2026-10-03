@@ -2177,23 +2177,58 @@ fn review_button(
 
 // ── key bar ─────────────────────────────────────────────────────────────
 
+/// Build a single hint element with an optional tooltip. The caller supplies
+/// the tooltip text; when it is `None` we just return the plain div.
+fn build_hint(
+    keys: &str,
+    label: &str,
+    tooltip: Option<&str>,
+    cx: &App,
+) -> gpui_kit::AnyElement {
+    let theme = cx.omarchy();
+    let elem = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::XS)
+        .child(gpui_omarchy::keycap(keys, cx))
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(label.to_string()),
+        )
+        .flex_shrink_0();
+    if let Some(tip) = tooltip {
+        with_tooltip(elem.id(ElementId::Name(keys.into())), tip)
+            .into_any_element()
+    } else {
+        elem.into_any_element()
+    }
+}
+
 /// The keys, quietly: outlines and light labels, there when needed. The key
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
-        ("space", "mark"),
-        ("enter", "open"),
-        ("\u{232b}", "up"),
-        ("c", "review"),
-        ("hjkl", "move"),
-        ("/", "filter"),
-        ("[ ]", "depth"),
-        ("t", "mode"),
-        ("0", "reset"),
-        ("v", "volumes"),
-        ("r", "rescan"),
+    let hints: [(&str, &str, Option<&str>); 11] = [
+        (
+            "space",
+            "mark",
+            Some("mark or unmark the tile under cursor"),
+        ),
+        ("enter", "open", Some("descend into that directory")),
+        ("u", "up", Some("go up one level in the tree")),
+        ("c", "review", Some("see what is marked for removal")),
+        ("hjkl", "move", Some("move between tiles at this level")),
+        ("/", "filter", Some("narrow to matching names only")),
+        ("[ ]", "depth", Some("draw fewer or more levels at once")),
+        ("t", "mode", Some("size · files (count) · age (last write)")),
+        ("0", "reset", Some("reset zoom and pan to default view")),
+        ("v", "volumes", Some("choose a mounted volume to scan")),
+        ("r", "rescan", Some("run the scan again from this root")),
     ];
+
     let mut lane = div()
         .flex()
         .flex_row()
@@ -2202,8 +2237,8 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .flex_1()
         .min_w_0()
         .overflow_hidden();
-    for (keys, label) in hints {
-        lane = lane.child(widgets::hint(keys, label, cx).flex_shrink_0());
+    for (keys, label, tooltip) in hints {
+        lane = lane.child(build_hint(keys, label, tooltip, cx));
     }
 
     let mut row = div()
@@ -2245,14 +2280,19 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
             widgets::human_count(app.progress.files)
         )
     };
-    row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary.opacity(0.7))
-                .child(scan),
-        )
+    row.child(build_hint(
+        "?",
+        "all keys",
+        Some("open the full key reference"),
+        cx,
+    ))
+    .child(
+        div()
+            .flex_shrink_0()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary.opacity(0.7))
+            .child(scan),
+    )
 }
 
 /// What the viewport shows while the first scan is running.
@@ -3466,7 +3506,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
-        ("\u{232b} / esc", "Go up one directory"),
+        ("u / esc", "Go up one directory"),
         (
             "alt \u{2190} / \u{2192}",
             "Back or forward, as do the mouse's side buttons",
