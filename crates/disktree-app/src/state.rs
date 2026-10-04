@@ -380,6 +380,13 @@ pub struct Disktree {
     pub focus_request: Option<FocusTarget>,
     /// What the titlebar says, so it is only set when it changes.
     window_title: String,
+    /// Where a press on the header landed, while the app draws its own title
+    /// bar and the press may still become a window move; see `chrome`.
+    pub titlebar_press: Option<Point<Pixels>>,
+    /// The window's own chrome as a test needs it: the test window always
+    /// reports server-side decorations, so a test stands in for GNOME here.
+    #[cfg(test)]
+    pub forced_frame: Option<crate::chrome::Frame>,
     /// The window's `rem` in pixels, read each frame. The mosaic is laid out
     /// in pixels, so its header band and label thresholds are scaled by this
     /// to follow interface zoom like the rest of the interface.
@@ -511,6 +518,9 @@ impl Disktree {
             confirm_focus: cx.focus_handle(),
             focus_request: None,
             window_title: String::new(),
+            titlebar_press: None,
+            #[cfg(test)]
+            forced_frame: None,
             rem: crate::ui::BASE_REM,
             run: None,
             run_epoch: 0,
@@ -3179,6 +3189,25 @@ pub enum FocusTarget {
     Root,
     /// The permanent-deletion alert dialog.
     Dialog,
+}
+
+impl Disktree {
+    /// The chrome the app draws for `window`: none under the compositor's
+    /// title bar; see `chrome`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unused_self,
+            reason = "only a test build reads the frame a test forced"
+        )
+    )]
+    pub fn frame(&self, window: &Window) -> Option<crate::chrome::Frame> {
+        #[cfg(test)]
+        if self.forced_frame.is_some() {
+            return self.forced_frame;
+        }
+        crate::chrome::Frame::of(window)
+    }
 }
 
 impl Render for Disktree {

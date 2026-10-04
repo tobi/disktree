@@ -98,6 +98,8 @@ pub mod size {
     pub const TOOLTIP: Rems = Rems(16.75);
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
+    /// A window control's square, when the app draws its own title bar.
+    pub const WINDOW_CONTROL: Rems = Rems(2.0);
     /// The key column of the keyboard overlay.
     pub const KEY_LANE: Rems = Rems(7.0);
 }
