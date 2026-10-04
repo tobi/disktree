@@ -1946,3 +1946,49 @@ fn without_a_compositors_title_bar_the_header_is_one(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("window-minimize").is_none());
     assert!(cx.debug_bounds("window-close").is_some());
 }
+
+/// The selection's name and path are text a person can select: a drag across
+/// either, then Ctrl+C (⌘C), puts exactly that text on the clipboard. The
+/// chord is not read as `c`, so it does not open the review screen.
+#[gpui_kit::test]
+fn dragging_across_the_selections_name_and_path_copies_them(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::{Modifiers, MouseButton};
+
+    cx.update(gpui_omarchy::init);
+    cx.update(crate::app_menu::install);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.selected.clone()), Some(vec![0]));
+
+    // From an element's first character to past its last, then the chord.
+    let copy = if cfg!(target_os = "macos") {
+        "cmd-c"
+    } else {
+        "ctrl-c"
+    };
+    let copy_across = |cx: &mut Window, selector: &'static str| {
+        let text = cx.debug_bounds(selector).expect("the panel is shown");
+        let from = Point::new(text.left() + px(1.), text.center().y);
+        let to = Point::new(text.right() + px(40.), text.center().y);
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        press(cx, copy);
+        cx.read_from_clipboard().and_then(|item| item.text())
+    };
+
+    assert_eq!(copy_across(cx, "selection-name").as_deref(), Some(".cache"));
+    let path = read(&view, cx, |app| {
+        crate::marks::display_path(
+            &temp.path().join(".cache"),
+            app.home.as_deref(),
+        )
+    });
+    assert_eq!(copy_across(cx, "selection-path"), Some(path));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+}

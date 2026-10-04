@@ -6,6 +6,7 @@
 use disktree_core::size::{human_bytes, human_bytes_short, share, share_bar};
 use disktree_core::space::SpaceInfo;
 use disktree_core::tree::{Metric, Node};
+use gpui_kit::base::SelectableText;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Div, ElementId, FontWeight, Hsla, InteractiveElement as _,
@@ -16,6 +17,17 @@ use gpui_omarchy::{ActiveTheme, Status};
 use crate::ui::{space, text};
 
 use crate::state::Disktree;
+
+/// Text a person can select and copy with Ctrl+C (⌘C).
+///
+/// `key` names the run among the others on screen and must not repeat
+/// there, so a list row puts its index in it. The text is part of the id
+/// too: when the words change, the run is a new one, and a selection never
+/// outlives what it selected.
+pub fn selectable(key: &str, text: impl Into<SharedString>) -> SelectableText {
+    let text: SharedString = text.into();
+    SelectableText::new(ElementId::Name(format!("{key}:{text}").into()), text)
+}
 
 /// The scanned root, shortened to `~` where it is the home directory.
 pub fn display_root(app: &Disktree) -> String {
@@ -42,6 +54,8 @@ pub fn stat(
     cx: &App,
 ) -> Div {
     let theme = cx.omarchy();
+    let label: SharedString = label.into();
+    let key = format!("stat-{label}");
     div()
         .flex()
         .flex_col()
@@ -50,14 +64,14 @@ pub fn stat(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.75))
-                .child(label.into()),
+                .child(selectable(&key, label)),
         )
         .child(
             div()
                 .text_size(text::TITLE)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.bright)
-                .child(value.into()),
+                .child(selectable(&key, value)),
         )
 }
 
@@ -69,6 +83,8 @@ pub fn stat_colored(
     cx: &App,
 ) -> Div {
     let theme = cx.omarchy();
+    let label: SharedString = label.into();
+    let key = format!("stat-{label}");
     div()
         .flex()
         .flex_col()
@@ -77,14 +93,14 @@ pub fn stat_colored(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.75))
-                .child(label.into()),
+                .child(selectable(&key, label)),
         )
         .child(
             div()
                 .text_size(text::TITLE)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(color)
-                .child(value.into()),
+                .child(selectable(&key, value)),
         )
 }
 
@@ -112,6 +128,8 @@ pub fn meter_row(
     cx: &App,
 ) -> Div {
     let theme = cx.omarchy();
+    let label: SharedString = label.into();
+    let key = format!("meter-{label}");
     div()
         .flex()
         .flex_col()
@@ -123,12 +141,12 @@ pub fn meter_row(
                 .justify_between()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(div().child(label.into()))
+                .child(div().child(selectable(&key, label)))
                 .child(
                     div()
                         .text_color(theme.bright)
                         .font_weight(FontWeight::MEDIUM)
-                        .child(value.into()),
+                        .child(selectable(&key, value)),
                 ),
         )
         .child(
@@ -184,7 +202,7 @@ pub fn space_meter(space: SpaceInfo, reclaiming: u64, cx: &App) -> Div {
                 .justify_between()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(div().child(label)),
+                .child(div().child(selectable("space-meter", label))),
         )
         .child(
             div()
@@ -244,7 +262,7 @@ pub fn hint(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(label.into()),
+                .child(selectable("hint", label)),
         )
 }
 
@@ -255,7 +273,7 @@ pub fn section(label: impl Into<SharedString>, cx: &App) -> Div {
         .text_size(text::CAPTION)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.secondary.opacity(0.85))
-        .child(label.into())
+        .child(selectable("section", label))
 }
 
 /// A definition row: label on the left, value on the right.
@@ -265,14 +283,25 @@ pub fn row(
     cx: &App,
 ) -> Div {
     let theme = cx.omarchy();
+    let label: SharedString = label.into();
+    let key = format!("row-{label}");
     div()
         .flex()
         .flex_row()
         .justify_between()
         .gap(space::SM)
         .text_size(text::CAPTION)
-        .child(div().text_color(theme.secondary).child(label.into()))
-        .child(div().min_w_0().text_color(theme.bright).child(value.into()))
+        .child(
+            div()
+                .text_color(theme.secondary)
+                .child(selectable(&key, label)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .text_color(theme.bright)
+                .child(selectable(&key, value)),
+        )
 }
 
 /// A block-glyph share bar, which reads as a bar at any font size.
@@ -346,7 +375,7 @@ pub fn eyebrow(label: impl Into<SharedString>, cx: &App) -> Div {
         .text_size(text::CAPTION)
         .text_color(theme.secondary.opacity(0.7))
         .whitespace_nowrap()
-        .child(SharedString::from(label.to_uppercase()))
+        .child(selectable("eyebrow", label.to_uppercase()))
 }
 
 /// An eyebrow over a value, for the top bar and the selection grid.
@@ -356,6 +385,8 @@ pub fn figure(
     color: Hsla,
     cx: &App,
 ) -> Div {
+    let label: SharedString = label.into();
+    let key = format!("figure-{label}");
     div()
         .flex()
         .flex_col()
@@ -368,7 +399,7 @@ pub fn figure(
                 .text_color(color)
                 .whitespace_nowrap()
                 .overflow_hidden()
-                .child(value.into()),
+                .child(selectable(&key, value)),
         )
 }
 
@@ -490,6 +521,8 @@ pub fn measure(
 ) -> Div {
     let theme = cx.omarchy();
     let lift = gpui_kit::Rems((number_size.0 - unit_size.0) * DESCENT);
+    let unit: SharedString = unit.into();
+    let key = format!("measure-{unit}");
     div()
         .flex()
         .flex_row()
@@ -501,7 +534,7 @@ pub fn measure(
                 .line_height(number_size)
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme.bright)
-                .child(number.into()),
+                .child(selectable(&key, number)),
         )
         .child(
             div()
@@ -510,7 +543,7 @@ pub fn measure(
                 .pb(lift)
                 .text_color(theme.secondary)
                 .whitespace_nowrap()
-                .child(unit.into()),
+                .child(selectable(&key, unit)),
         )
 }
 
