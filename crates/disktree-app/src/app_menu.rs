@@ -39,6 +39,8 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
+            /// Copy the text selected in the window.
+            Copy,
         ]
     );
 }
@@ -60,8 +62,9 @@ pub fn install(cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    // `Rescan`, `OpenFolder`, `ShowInFinder` and the history are handled by
-    // the window, which owns the scan and the selection; see `views::root`.
+    // `Rescan`, `OpenFolder`, `ShowInFinder`, the history and `Copy` are
+    // handled by the window, which owns the scan and the selection; see
+    // `views::root`.
     if !cfg!(target_os = "macos") {
         cx.bind_keys([
             KeyBinding::new("ctrl-q", Quit, None),
@@ -70,6 +73,7 @@ pub fn install(cx: &mut App) {
             KeyBinding::new("ctrl-r", Rescan, None),
             KeyBinding::new("f5", Rescan, None),
             KeyBinding::new("ctrl-shift-r", ShowInFinder, None),
+            KeyBinding::new("ctrl-c", Copy, None),
         ]);
         return;
     }
@@ -89,6 +93,7 @@ pub fn install(cx: &mut App) {
         // Finder's and Safari's back and forward; alt-arrows work too.
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-]", GoForward, None),
+        KeyBinding::new("cmd-c", Copy, None),
     ]);
     cx.set_menus([
         Menu::new("disktree").items([
@@ -108,6 +113,7 @@ pub fn install(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
         ]),
+        Menu::new("Edit").items([MenuItem::action("Copy", Copy)]),
         Menu::new("Go").items([
             MenuItem::action("Back", GoBack),
             MenuItem::action("Forward", GoForward),

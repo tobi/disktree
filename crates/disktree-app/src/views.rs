@@ -9,11 +9,12 @@ use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{Plan, RemovalMode, Target};
 use disktree_core::size::human_bytes;
 use disktree_core::tree::Metric;
-use gpui_kit::base::CheckboxState;
+use gpui_kit::base::{CheckboxState, TextSelection, TextSelectionLayer};
 use gpui_kit::{
-    App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
-    Focusable as _, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
+    App, AppContext as _, ClickEvent, ClipboardItem, Context, Div,
+    DragMoveEvent, ElementId, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
@@ -32,7 +33,7 @@ use crate::state::{
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
-use crate::widgets;
+use crate::widgets::{self, selectable};
 
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
@@ -94,6 +95,24 @@ pub fn root(
                 }
             },
         ))
+        // Ctrl+C (⌘C) copies the text selected anywhere in the window. With
+        // nothing selected the chord is left for whoever else wants it.
+        .on_action(cx.listener(|_, _: &crate::app_menu::Copy, window, cx| {
+            let text = TextSelection::selected_text(window, cx);
+            if text.is_empty() {
+                cx.propagate();
+                return;
+            }
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }))
+        // gpui-kit moves a selection's end as the pointer drags but leaves
+        // the redraw to the app. Without one the highlight only catches up
+        // when something else repaints, and dragging feels stuck.
+        .on_mouse_move(|event: &MouseMoveEvent, window, cx| {
+            if event.dragging() && TextSelection::has_selection(window, cx) {
+                window.refresh();
+            }
+        })
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if this.zoom_interface(event, window) {
                 cx.notify();
@@ -115,6 +134,9 @@ pub fn root(
         .text_color(theme.foreground)
         .font_family(theme.font)
         .text_size(text::BODY)
+        // Selection and copy of the text drawn as `SelectableText`, for the
+        // whole window; gpui-kit asks for one layer, ahead of the content.
+        .child(TextSelectionLayer)
         .child(body)
         .children(chrome::resize_edges(frame));
     if let Some(tip) = cursor_tooltip(app, window, cx) {
@@ -1370,16 +1392,23 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         .flex_shrink_0()
         .text_size(text::CAPTION)
         .text_color(theme.secondary)
-        .child(div().text_color(theme.foreground).child(human_bytes(bytes)))
-        .child(format!(
-            "· {} files · {} dirs",
-            widgets::human_count(files),
-            widgets::human_count(dirs)
+        .child(
+            div()
+                .text_color(theme.foreground)
+                .child(selectable("totals-bytes", human_bytes(bytes))),
+        )
+        .child(selectable(
+            "totals-counts",
+            format!(
+                "· {} files · {} dirs",
+                widgets::human_count(files),
+                widgets::human_count(dirs)
+            ),
         ))
         .when(errors > 0, |this| {
-            this.child(div().text_color(theme.warning).child(format!(
-                "· {} unreadable",
-                widgets::human_count(errors)
+            this.child(div().text_color(theme.warning).child(selectable(
+                "totals-errors",
+                format!("· {} unreadable", widgets::human_count(errors)),
             )))
         })
 }
@@ -1399,7 +1428,7 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 div()
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
-                    .child(label),
+                    .child(selectable("legend", label)),
             )
     };
     let mut lane = div()
@@ -1519,11 +1548,12 @@ fn selection_section(
         .child(widgets::eyebrow("Selection", cx));
     let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
     let Some(node) = app.node_at(&target) else {
-        return section.child(
-            div()
-                .text_color(theme.secondary)
-                .child("Point at a tile or select one with the arrows"),
-        );
+        return section.child(div().text_color(theme.secondary).child(
+            selectable(
+                "selection-empty",
+                "Point at a tile or select one with the arrows",
+            ),
+        ));
     };
     let path = app.path_at(&target);
     let root_value = app.tree().map_or(0, |tree| tree.bytes);
@@ -1553,25 +1583,33 @@ fn selection_section(
                 )
                 .child(
                     div()
+                        .debug_selector(|| "selection-name".into())
                         .text_size(text::HEADING)
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.bright)
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(node.name.to_string()),
+                        .child(selectable(
+                            "selection-name",
+                            node.name.to_string(),
+                        )),
                 ),
         )
         .child(
             div()
+                .debug_selector(|| "selection-path".into())
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(path.as_deref().map_or_else(String::new, |path| {
-                    crate::marks::display_path(path, app.home.as_deref())
-                })),
+                .child(selectable(
+                    "selection-path",
+                    path.as_deref().map_or_else(String::new, |path| {
+                        crate::marks::display_path(path, app.home.as_deref())
+                    }),
+                )),
         );
 
     let (number, unit) = match app.options.metric {
@@ -1765,7 +1803,7 @@ fn worth_section(
                     div()
                         .text_size(text::CAPTION)
                         .text_color(highlight)
-                        .child(human_bytes(total)),
+                        .child(selectable("worth-total", human_bytes(total))),
                 )
             }),
     );
@@ -1774,11 +1812,14 @@ fn worth_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(if app.tree().is_some() {
-                    "Nothing obviously disposable"
-                } else {
-                    "Waiting for the scan"
-                }),
+                .child(selectable(
+                    "worth-empty",
+                    if app.tree().is_some() {
+                        "Nothing obviously disposable"
+                    } else {
+                        "Waiting for the scan"
+                    },
+                )),
         );
     }
     let selected = app.action_target();
@@ -1910,7 +1951,10 @@ fn marked_section(
                 div()
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
-                    .child(human_bytes(plan.bytes())),
+                    .child(selectable(
+                        "marked-total",
+                        human_bytes(plan.bytes()),
+                    )),
             )
         });
     let mut section = div().flex().flex_col().gap(space::XS).child(header);
@@ -1919,7 +1963,10 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Space marks the tile you point at"),
+                .child(selectable(
+                    "marked-empty",
+                    "Space marks the tile you point at",
+                )),
         );
     }
     for (index, item) in app.marks.items().iter().take(MARKED_ROWS).enumerate()
@@ -1951,17 +1998,20 @@ fn marked_section(
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(crate::marks::display_path(
-                            &item.path,
-                            app.home.as_deref(),
+                        .child(selectable(
+                            &format!("marked-path-{index}"),
+                            crate::marks::display_path(
+                                &item.path,
+                                app.home.as_deref(),
+                            ),
                         )),
                 )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(theme.secondary)
-                        .child(human_bytes(item.bytes)),
-                )
+                .child(div().flex_shrink_0().text_color(theme.secondary).child(
+                    selectable(
+                        &format!("marked-bytes-{index}"),
+                        human_bytes(item.bytes),
+                    ),
+                ))
                 .child(
                     div()
                         .id(ElementId::Name(format!("unmark-{index}").into()))
@@ -1982,9 +2032,12 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "+{} more on the review screen",
-                    count - MARKED_ROWS
+                .child(selectable(
+                    "marked-more",
+                    format!(
+                        "+{} more on the review screen",
+                        count - MARKED_ROWS
+                    ),
                 )),
         );
     }
@@ -1993,10 +2046,13 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} nested \u{00b7} {} kept back",
-                    plan.covered.len(),
-                    plan.blocked.len()
+                .child(selectable(
+                    "marked-nested",
+                    format!(
+                        "{} nested \u{00b7} {} kept back",
+                        plan.covered.len(),
+                        plan.blocked.len()
+                    ),
                 )),
         );
     }
@@ -2022,7 +2078,7 @@ fn notice_line(app: &Disktree, theme: &Theme, cx: &App) -> Option<Div> {
             .border_color(color.opacity(0.5))
             .text_color(color)
             .text_size(text::CAPTION)
-            .child(message),
+            .child(selectable("notice", message)),
     )
 }
 
@@ -2053,11 +2109,14 @@ fn privacy_line(
             .border_1()
             .border_color(color.opacity(0.5))
             .text_size(text::CAPTION)
-            .child(div().text_color(color).child(format!(
-                "macOS kept {} {noun} unreadable. Give disktree Full Disk \
-                 Access, or your terminal if you started it there, then \
-                 reopen it.",
-                widgets::human_count(errors)
+            .child(div().text_color(color).child(selectable(
+                "privacy",
+                format!(
+                    "macOS kept {} {noun} unreadable. Give disktree Full \
+                     Disk Access, or your terminal if you started it there, \
+                     then reopen it.",
+                    widgets::human_count(errors)
+                ),
             )))
             .child(
                 button(
@@ -2135,7 +2194,11 @@ fn administrator_line(
             .border_1()
             .border_color(color.opacity(0.5))
             .text_size(text::CAPTION)
-            .child(div().text_color(color).child(message))
+            .child(
+                div()
+                    .text_color(color)
+                    .child(selectable("administrator", message)),
+            )
             .child(
                 button(
                     "administrator",
@@ -2174,7 +2237,7 @@ fn disk_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.6))
-                .child(device),
+                .child(selectable("disk-device", device)),
         )
         .child(div().flex_1())
         .child(
@@ -2191,7 +2254,10 @@ fn disk_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Free space is not available here"),
+                .child(selectable(
+                    "disk-unavailable",
+                    "Free space is not available here",
+                )),
         );
     };
     let plan = app.plan();
@@ -2229,9 +2295,9 @@ fn disk_section(
                             (text::FIGURE.0 - text::TITLE.0) * 0.2,
                         ))
                         .text_color(highlight)
-                        .child(format!(
-                            "→ {} free",
-                            human_bytes(after.available)
+                        .child(selectable(
+                            "disk-after",
+                            format!("→ {} free", human_bytes(after.available)),
                         )),
                 )
             }),
@@ -2273,7 +2339,10 @@ fn disk_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("not counted here: {left_out}")),
+                .child(selectable(
+                    "disk-not-counted",
+                    format!("not counted here: {left_out}"),
+                )),
         );
     }
     section
@@ -2283,9 +2352,15 @@ fn disk_section(
                 .flex_row()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("{} used", human_bytes(space_info.used())))
+                .child(selectable(
+                    "disk-used",
+                    format!("{} used", human_bytes(space_info.used())),
+                ))
                 .child(div().flex_1())
-                .child(format!("{} total", human_bytes(space_info.total))),
+                .child(selectable(
+                    "disk-total",
+                    format!("{} total", human_bytes(space_info.total)),
+                )),
         )
         .children(
             (!app.marks.is_empty())
@@ -2406,7 +2481,10 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 .flex_shrink_0()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("{:.1}\u{00d7}", app.view.scale)),
+                .child(selectable(
+                    "zoom",
+                    format!("{:.1}\u{00d7}", app.view.scale),
+                )),
         );
     }
     let scan = if app.scan.is_some() || app.remote_scan.is_some() {
@@ -2431,7 +2509,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 .flex_shrink_0()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.7))
-                .child(scan),
+                .child(selectable("key-bar-scan", scan)),
         )
 }
 
@@ -2462,18 +2540,21 @@ fn scanning_panel(
         .bg(theme.inset)
         .text_size(text::BODY)
         .text_color(theme.secondary)
-        .child(if error.is_some() {
-            "Scan failed"
-        } else if app.progress.cancelled {
-            "Indexing stopped"
-        } else {
-            "Waiting for the first indexed entries…"
-        })
+        .child(selectable(
+            "scan-status",
+            if error.is_some() {
+                "Scan failed"
+            } else if app.progress.cancelled {
+                "Indexing stopped"
+            } else {
+                "Waiting for the first indexed entries…"
+            },
+        ))
         .children(error.map(|error| {
             div()
                 .max_w(size::HELP)
                 .text_color(theme.danger)
-                .child(error.clone())
+                .child(selectable("scan-error", error.clone()))
         }))
         .when(!app.is_indexing(), |panel| {
             panel.child(
@@ -2777,12 +2858,13 @@ fn review(
         .bg(theme.inset);
 
     if items.is_empty() {
-        list = list.child(
-            div()
-                .p(space::XXL)
-                .text_color(theme.secondary)
-                .child("Nothing is marked. Go back and mark what should go."),
-        );
+        list =
+            list.child(div().p(space::XXL).text_color(theme.secondary).child(
+                selectable(
+                    "review-empty",
+                    "Nothing is marked. Go back and mark what should go.",
+                ),
+            ));
     }
 
     for (index, item) in items.iter().take(LIST_LIMIT).enumerate() {
@@ -2809,9 +2891,12 @@ fn review(
                 .py(space::SM)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} more are marked and will be removed too. Unmark them in the treemap.",
-                    items.len() - LIST_LIMIT
+                .child(selectable(
+                    "review-more",
+                    format!(
+                        "{} more are marked and will be removed too. Unmark them in the treemap.",
+                        items.len() - LIST_LIMIT
+                    ),
                 )),
         );
     }
@@ -2891,17 +2976,18 @@ fn mark_row(
                 .gap(space::XXS)
                 .min_w_0()
                 .flex_1()
-                .child(
-                    div()
-                        .min_w_0()
-                        .text_color(color)
-                        .child(short_name(&item.path)),
-                )
+                .child(div().min_w_0().text_color(color).child(selectable(
+                    &format!("mark-name-{index}"),
+                    short_name(&item.path),
+                )))
                 .child(
                     div()
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
-                        .child(path_text),
+                        .child(selectable(
+                            &format!("mark-path-{index}"),
+                            path_text,
+                        )),
                 ),
         )
         .children(covered.then(|| {
@@ -2927,7 +3013,10 @@ fn mark_row(
                 .flex()
                 .justify_end()
                 .text_color(theme.bright)
-                .child(human_bytes(item.bytes)),
+                .child(selectable(
+                    &format!("mark-bytes-{index}"),
+                    human_bytes(item.bytes),
+                )),
         )
         .child(
             button(
@@ -3020,7 +3109,7 @@ fn review_summary(
                     div()
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
-                        .child(explanation),
+                        .child(selectable("review-explanation", explanation)),
                 ),
         )
         .child(
@@ -3070,15 +3159,14 @@ fn review_summary(
 
     if !plan.blocked.is_empty() {
         let mut blocked = div().flex().flex_col().gap(space::XS);
-        for item in plan.blocked.iter().take(6) {
+        for (index, item) in plan.blocked.iter().take(6).enumerate() {
             blocked = blocked.child(
                 div()
                     .text_size(text::CAPTION)
                     .text_color(theme.warning)
-                    .child(format!(
-                        "{}: {}",
-                        short_name(&item.path),
-                        item.reason
+                    .child(selectable(
+                        &format!("blocked-{index}"),
+                        format!("{}: {}", short_name(&item.path), item.reason),
                     )),
             );
         }
@@ -3248,12 +3336,15 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} available",
-                    app.space.map_or_else(
-                        || "?".into(),
-                        |space| human_bytes(space.available)
-                    )
+                .child(selectable(
+                    "review-available",
+                    format!(
+                        "{} available",
+                        app.space.map_or_else(
+                            || "?".into(),
+                            |space| human_bytes(space.available)
+                        )
+                    ),
                 )),
         )
 }
@@ -3284,7 +3375,9 @@ fn running(
         .border_1()
         .border_color(theme.border)
         .bg(theme.inset);
-    for (path, outcome) in app.run_log.iter().rev().take(200) {
+    for (index, (path, outcome)) in
+        app.run_log.iter().rev().take(200).enumerate()
+    {
         let ok = outcome.is_ok();
         log = log.child(
             div()
@@ -3317,13 +3410,19 @@ fn running(
                         } else {
                             theme.danger
                         })
-                        .child(short_name(path)),
+                        .child(selectable(
+                            &format!("run-name-{index}"),
+                            short_name(path),
+                        )),
                 )
                 .children(outcome.as_ref().err().map(|error| {
                     div()
                         .text_size(text::CAPTION)
                         .text_color(theme.warning)
-                        .child(error.clone())
+                        .child(selectable(
+                            &format!("run-error-{index}"),
+                            error.clone(),
+                        ))
                 })),
         );
     }
@@ -3402,11 +3501,12 @@ fn done(
     };
 
     let mut failures = div().flex().flex_col().gap(space::XXS);
-    for (path, outcome) in app
+    for (index, (path, outcome)) in app
         .run_log
         .iter()
         .filter(|(_, outcome)| outcome.is_err())
         .take(40)
+        .enumerate()
     {
         failures = failures.child(
             div()
@@ -3414,10 +3514,14 @@ fn done(
                 .flex_row()
                 .gap(space::SM)
                 .text_size(text::CAPTION)
-                .child(div().text_color(theme.danger).child(short_name(path)))
-                .child(div().text_color(theme.secondary).child(
+                .child(div().text_color(theme.danger).child(selectable(
+                    &format!("failed-name-{index}"),
+                    short_name(path),
+                )))
+                .child(div().text_color(theme.secondary).child(selectable(
+                    &format!("failed-error-{index}"),
                     outcome.as_ref().err().cloned().unwrap_or_default(),
-                )),
+                ))),
         );
     }
 
@@ -3467,7 +3571,10 @@ fn done(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("The treemap is being re-scanned so the numbers on screen match the disk again."),
+                .child(selectable(
+                    "done-rescan",
+                    "The treemap is being re-scanned so the numbers on screen match the disk again.",
+                )),
         );
 
     if let Some(space) = app.space {
