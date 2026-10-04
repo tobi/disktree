@@ -13,6 +13,7 @@
 
 mod app_menu;
 mod appearance;
+mod chrome;
 mod git;
 mod marks;
 mod palette;

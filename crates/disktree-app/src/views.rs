@@ -25,6 +25,7 @@ use gpui_omarchy::{
 
 use gpui_kit::prelude::FluentBuilder as _;
 
+use crate::chrome::{self, Frame};
 use crate::palette;
 use crate::state::{
     ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
@@ -48,11 +49,12 @@ pub fn root(
     }
     app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
+    let frame = app.frame(window);
     let body = match app.screen {
-        Screen::Explore => explore(app, window, cx),
-        Screen::Review => review(app, window, cx),
-        Screen::Running => running(app, cx),
-        Screen::Done => done(app, cx),
+        Screen::Explore => explore(app, frame, window, cx),
+        Screen::Review => review(app, frame, window, cx),
+        Screen::Running => running(app, frame, cx),
+        Screen::Done => done(app, frame, cx),
     };
 
     let mut root = div()
@@ -113,7 +115,8 @@ pub fn root(
         .text_color(theme.foreground)
         .font_family(theme.font)
         .text_size(text::BODY)
-        .child(body);
+        .child(body)
+        .children(chrome::resize_edges(frame));
     if let Some(tip) = cursor_tooltip(app, window, cx) {
         root = root.child(tip);
     }
@@ -418,6 +421,7 @@ fn delete_dialog(
 
 fn explore(
     app: &mut Disktree,
+    frame: Option<Frame>,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
@@ -484,7 +488,7 @@ fn explore(
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(top_bar(app, &theme, window, cx))
+        .child(top_bar(app, &theme, frame, window, cx))
         .child(
             div()
                 .id("explore-body")
@@ -574,10 +578,11 @@ impl gpui_kit::Render for NoGhost {
 fn top_bar(
     app: &Disktree,
     theme: &Theme,
+    frame: Option<Frame>,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
-) -> Div {
-    div()
+) -> Stateful<Div> {
+    let header = div()
         .flex()
         .flex_row()
         .items_center()
@@ -595,9 +600,10 @@ fn top_bar(
             "Choose local or SSH source · v",
         ))
         // Where you are is navigation, and it belongs to the whole window.
-        .child(trail(app, theme, cx))
+        .child(chrome::no_drag(trail(app, theme, cx), frame))
         .child(div().flex_1())
-        .child(view_settings(app, window, cx))
+        .child(chrome::no_drag(view_settings(app, window, cx), frame));
+    chrome::titlebar(header, frame, cx)
 }
 
 /// The trail, from `/`. Above the scanned root, a crumb widens the scan;
@@ -2749,6 +2755,7 @@ fn marks_ancestor(
 
 fn review(
     app: &Disktree,
+    frame: Option<Frame>,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
@@ -2823,6 +2830,7 @@ fn review(
                 human_bytes(plan.bytes())
             ),
             &theme,
+            frame,
             cx,
         ))
         .child(
@@ -3252,7 +3260,11 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
 
 // ── running ─────────────────────────────────────────────────────────────
 
-fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
+fn running(
+    app: &Disktree,
+    frame: Option<Frame>,
+    cx: &gpui_kit::Context<'_, Disktree>,
+) -> Div {
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
     let done = summary.removed + summary.failed as u64;
@@ -3325,6 +3337,7 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
             "Removing",
             &format!("{} of {} done", done, summary.total),
             &theme,
+            frame,
             cx,
         ))
         .child(
@@ -3371,7 +3384,11 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
 
 // ── done ────────────────────────────────────────────────────────────────
 
-fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
+fn done(
+    app: &Disktree,
+    frame: Option<Frame>,
+    cx: &gpui_kit::Context<'_, Disktree>,
+) -> Div {
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
     let measured = match (app.space_baseline, app.space) {
@@ -3477,7 +3494,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(screen_header("Done", "removal finished", &theme, cx))
+        .child(screen_header("Done", "removal finished", &theme, frame, cx))
         .child(body)
         .child(
             div()
@@ -3508,10 +3525,10 @@ fn screen_header(
     title: &str,
     subtitle: &str,
     theme: &Theme,
-    cx: &gpui_kit::App,
-) -> Div {
-    let _ = cx;
-    div()
+    frame: Option<Frame>,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let header = div()
         .flex()
         .flex_row()
         .items_center()
@@ -3533,6 +3550,9 @@ fn screen_header(
                 .text_color(theme.secondary)
                 .child(subtitle.to_string()),
         )
+        // The window controls, when there are any, go at the far end.
+        .child(div().flex_1());
+    chrome::titlebar(header, frame, cx)
 }
 
 /// A tooltip that follows the cursor above everything else in the window.
