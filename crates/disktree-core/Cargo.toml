@@ -34,6 +34,7 @@ windows-sys = { version = "0.61", features = [
 # without asking to control Finder. Only this backend is used; the crate's
 # Linux and Windows code is not built.
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 trash = { version = "5.2.9", default-features = false }
 
 [dev-dependencies]

@@ -31,3 +31,6 @@ gpui-kit = { version = "=0.6.6", default-features = false, features = [
     "assets",
     "test-support",
 ] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", features = ["fs"] }

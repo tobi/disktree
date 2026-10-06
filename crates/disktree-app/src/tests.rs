@@ -5,6 +5,7 @@
 //! that panics while painting, a binding that never fires, a removal that
 //! reports success without removing anything.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use disktree_core::removal::RemovalMode;
@@ -46,6 +47,29 @@ fn options() -> ScanOptions {
         apparent_size: true,
         ..ScanOptions::default()
     }
+}
+
+#[test]
+fn du_mode_is_selected_only_at_the_headless_dispatch_point() {
+    let args = [OsString::from("--du"), OsString::from("-sh")];
+    let (program, rest) =
+        super::du_invocation(OsStr::new("/usr/bin/disktree"), args.into_iter())
+            .expect("--du mode");
+    assert_eq!(program, b"du");
+    assert_eq!(rest, [OsString::from("-sh")]);
+
+    let args = [OsString::from("-sh")];
+    let (program, rest) =
+        super::du_invocation(OsStr::new("/tmp/du"), args.into_iter())
+            .expect("du multicall");
+    assert_eq!(program, b"/tmp/du");
+    assert_eq!(rest, [OsString::from("-sh")]);
+
+    let args = [OsString::from("--help")];
+    assert!(
+        super::du_invocation(OsStr::new("/usr/bin/disktree"), args.into_iter())
+            .is_none()
+    );
 }
 
 type Window = VisualTestContext;

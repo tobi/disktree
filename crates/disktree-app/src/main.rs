@@ -25,7 +25,9 @@ mod ui;
 mod views;
 mod widgets;
 
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 #[cfg(target_os = "macos")]
 use std::{
     io::IsTerminal as _,
@@ -81,13 +83,40 @@ options:
   -h, --help            show this help
 ";
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     #[cfg(windows)]
     console::attach();
-    let outcome = run();
+    let mut argv = std::env::args_os();
+    let argv0 = argv.next().unwrap_or_else(|| OsString::from("disktree"));
+    let outcome = match du_invocation(&argv0, argv) {
+        Some((program, arguments)) => {
+            Ok(disktree_core::du::run(&program, &arguments))
+        }
+        None => run().map(|()| ExitCode::SUCCESS),
+    };
     #[cfg(windows)]
     console::detach();
     outcome
+}
+
+/// Select the `du` personality before loading settings or starting GPUI.
+///
+/// Keeping headless personalities at this boundary also leaves one obvious
+/// dispatch point for a future text-tree mode such as issue #74 proposes.
+fn du_invocation(
+    argv0: &OsStr,
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Option<(Vec<u8>, Vec<OsString>)> {
+    if Path::new(argv0).file_name() == Some(OsStr::new("du")) {
+        return Some((
+            argv0.to_owned().into_encoded_bytes(),
+            arguments.collect(),
+        ));
+    }
+    if arguments.next().as_deref() == Some(OsStr::new("--du")) {
+        return Some((b"du".to_vec(), arguments.collect()));
+    }
+    None
 }
 
 fn run() -> Result<()> {

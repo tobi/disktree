@@ -372,6 +372,85 @@ tested:
   fsmonitor, hooks and pager off, and a checkout that defines its own filter
   drivers is not asked for its status at all ("changes unknown").
 
+## As `du`
+
+`disktree --du` is GNU du: the same options, output, messages and exit
+status. It runs headless from the existing `disktree` binary, so it needs no
+display and adds no second binary to install. Everything after `--du` is a
+GNU du argument.
+
+```sh
+disktree --du -sh ~/src
+ln -s "$(command -v disktree)" ~/.local/bin/du  # early on PATH
+du -sh ~/src
+```
+
+When invoked through a link whose basename is `du`, the same binary enters
+this mode automatically. Existing scripts and coding agents can keep calling
+`du` without learning a new command.
+
+It follows coreutils 9.11. `crates/disktree-app/tests/gnu.rs` runs 78 argument
+sets against the GNU du it finds (`gdu` from Homebrew's coreutils, or a `du`
+that is GNU's) and compares output, messages and exit status. GNU du 9.4 and
+later match, apart from two corner cases GNU changed since then:
+`--max-depth` below zero, and the wording of a bad `--time-style`.
+
+It is faster three ways:
+
+- The walk runs on every core. Each directory is still visited in the order
+  GNU's `fts` visits it, so hard links, `-x`, `--exclude`, depths and
+  thresholds come out the same.
+- On macOS, `getattrlistbulk` reads a directory's entries and their sizes in
+  one system call instead of one per file.
+- Every walk is kept as a snapshot, in `~/Library/Caches/disktree/du` on
+  macOS and `~/.cache/disktree/du` elsewhere (`DISKTREE_DU_INDEX_DIR` moves
+  it). With `--max-age=AGE`, a snapshot younger than `AGE` is brought up to
+  date instead of walked again. On macOS the FSEvents journal names every
+  directory that changed since, and only those are read. Elsewhere every
+  directory is stat'ed and read again if it changed.
+
+On a 670 GB tree of 6.65 million entries (Apple M5 Max, APFS, warm cache):
+
+| command | time |
+| --- | --- |
+| GNU du 9.11, `du -s` | 148 s |
+| `disktree --du -s` | 25 s |
+| `disktree --du -s --max-age=1h`, through the journal | 2 to 3 s |
+| `disktree --du -s --max-age=1h`, by directory | 3.4 s |
+
+Without `--max-age` every answer is a full walk, so it is what GNU du would
+say. With it, two things can be missed. A file still open for writing is not
+in the journal until it is closed, so files modified within an hour of the
+snapshot are stat'ed again every time, which covers the usual case, a log or
+a build still being written. And by directory, a file that grew in place
+without its directory changing is only caught if it was one of those recent
+files. Either way `AGE` counts from the last full walk, and a catch-up does
+not reset it, so nothing can go unseen for longer than `AGE`. `--fresh` walks
+everything again.
+
+Known differences from GNU du, all rare:
+
+- `du >&-` exits 0: Rust reopens a closed standard output on `/dev/null`
+  before `du` starts, so the write error GNU reports never happens.
+- Hard links to one file in the same directory of more than 10,000 entries
+  can be listed in another order, since GNU sorts those with the C library's
+  unstable `qsort`.
+- Numbers use the C locale's `.` and no digit grouping, and `--time` formats
+  go through chrono rather than the C library's `strftime`: `full-iso`,
+  `long-iso` and `iso` match, but `%Z` prints an offset and `%x` a two-digit
+  year.
+- In a UTF-8 locale, `--exclude` wildcards match bytes rather than
+  characters, and diagnostics do not escape control characters inside
+  `‘...’` quotes.
+
+`--json` prints the same entries as one document, each with its size, its
+kind, why it can be had back, the command that gives the space back (`cargo
+clean`, `pnpm store prune`, …) and when it was last written, plus `as_of`
+and `source` (`walk`, `journal` or `directories`) for the whole answer.
+Behind a `du` symlink the same switches come from the environment:
+`DISKTREE_DU_JSON=1`, `DISKTREE_DU_MAX_AGE=1h`, `DISKTREE_DU_FRESH=1`, and
+`DISKTREE_DU_INDEX=0` to keep no snapshots.
+
 ## On Hyprland
 
 Hyprland tiles new windows, so disktree opens into whatever tile it is given.
@@ -406,6 +485,8 @@ gone while their neighbours are not.
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |
 | `crates/disktree-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
 | `crates/disktree-app/src/tests.rs` | end-to-end tests through a real window |
+| `crates/disktree-core/src/du` | GNU du on a parallel walk and its snapshots |
+| `crates/disktree-app/tests/gnu.rs` | comparison against GNU du |
 | `packaging/`, `assets/`, `Makefile` | the desktop entry, the icon, and install |
 
 The interface follows the
