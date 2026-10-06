@@ -321,7 +321,7 @@ The same program, with Windows' answers to the questions above:
   file table instead of walked, as WizTree does: one pass over the table in
   large reads. On a 4-million-file `C:\` that took about 3.4 s against 11.2
   s for WizTree and about 20 s for the walk. It also sees what the walk is
-  refused, such as System Volume Information. It is used only for a whole
+  denied, such as System Volume Information. It is used only for a whole
   NTFS drive, since a folder would still cost the whole table, and not with
   `-l`, whose links the table does not follow. disktree flushes the volume
   after its own removals so the rescan shows them; changes other programs
