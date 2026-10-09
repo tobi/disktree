@@ -9,6 +9,10 @@ description = "Filesystem scanning and treemap layout for disktree"
 [lints]
 workspace = true
 
+[features]
+# Only terminal builds retain both size bases and hidden-entry identity.
+tui = []
+
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rayon = { workspace = true }

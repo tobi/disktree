@@ -1117,10 +1117,9 @@ impl Table<'_> {
             return Ok(None);
         }
         let name = self.name(entry);
-        if !self.options.include_hidden
-            && (name.starts_with('.')
-                || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0)
-        {
+        let hidden = name.starts_with('.')
+            || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0;
+        if !self.options.include_hidden && hidden {
             return Ok(None);
         }
         let link = info.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -1129,9 +1128,10 @@ impl Table<'_> {
             if info.attributes & EVICTED != 0 || !descend {
                 return Ok(None);
             }
-            return self
-                .directory(entry.child, name.into(), depth + 1)
-                .map(Some);
+            let mut node =
+                self.directory(entry.child, name.into(), depth + 1)?;
+            node.set_hidden(hidden);
+            return Ok(Some(node));
         }
         let size = if self.options.apparent_size {
             info.apparent
@@ -1144,6 +1144,12 @@ impl Table<'_> {
             NodeKind::File
         };
         let mut node = Node::entry(name, kind, size);
+        let alternate = if self.options.apparent_size {
+            info.allocated
+        } else {
+            info.apparent
+        };
+        node.set_projection(hidden, alternate);
         node.modified = info.modified;
         if info.names > 1 {
             node.inode = NonZeroU64::new(u64::from(entry.child))

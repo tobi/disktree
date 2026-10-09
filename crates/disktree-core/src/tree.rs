@@ -67,6 +67,14 @@ pub struct Node {
     /// Subtree total: direct contents plus every descendant. A file's own
     /// size, or nothing for a second name of a file already charged.
     pub bytes: u64,
+    /// The leaf's measured size before hardlink de-duplication. Kept so a
+    /// hidden-file projection can charge a remaining visible hardlink.
+    #[cfg(feature = "tui")]
+    pub measured_bytes: u64,
+    /// The leaf's size under the other measurement basis. A presentation can
+    /// swap bases without reading the filesystem again.
+    #[cfg(feature = "tui")]
+    pub alternate_bytes: u64,
     /// Files at or beneath this node; `1` for a file.
     pub files: u64,
     /// Directories at or beneath this node; `1` for a directory. Four
@@ -77,6 +85,9 @@ pub struct Node {
     pub inode: Option<(u64, NonZeroU64)>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
+    /// Hidden by its name or filesystem attribute when it was listed.
+    #[cfg(feature = "tui")]
+    pub hidden: bool,
     /// Newest write time at or beneath this node, in Unix seconds; `0` when
     /// unknown. Derived for directories by [`aggregate`].
     pub modified: i64,
@@ -100,10 +111,16 @@ impl Node {
             name: name.into(),
             kind: NodeKind::Directory,
             bytes: 0,
+            #[cfg(feature = "tui")]
+            measured_bytes: 0,
+            #[cfg(feature = "tui")]
+            alternate_bytes: 0,
             files: 0,
             dirs: 1,
             inode: None,
             read_error: false,
+            #[cfg(feature = "tui")]
+            hidden: false,
             modified: 0,
             category: Category::Other,
             reclaim: None,
@@ -121,10 +138,16 @@ impl Node {
             name: name.into(),
             kind,
             bytes,
+            #[cfg(feature = "tui")]
+            measured_bytes: bytes,
+            #[cfg(feature = "tui")]
+            alternate_bytes: bytes,
             files: u64::from(kind == NodeKind::File),
             dirs: 0,
             inode: None,
             read_error: false,
+            #[cfg(feature = "tui")]
+            hidden: false,
             modified: 0,
             category: Category::Other,
             reclaim: None,
@@ -134,6 +157,32 @@ impl Node {
 
     pub const fn is_dir(&self) -> bool {
         self.kind.is_dir()
+    }
+
+    #[cfg(feature = "tui")]
+    pub(crate) const fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+    }
+
+    #[cfg(not(feature = "tui"))]
+    pub(crate) const fn set_hidden(&mut self, _hidden: bool) {}
+
+    #[cfg(feature = "tui")]
+    pub(crate) const fn set_projection(
+        &mut self,
+        hidden: bool,
+        alternate: u64,
+    ) {
+        self.hidden = hidden;
+        self.alternate_bytes = alternate;
+    }
+
+    #[cfg(not(feature = "tui"))]
+    pub(crate) const fn set_projection(
+        &mut self,
+        _hidden: bool,
+        _alternate: u64,
+    ) {
     }
 
     /// Bytes of the leaf entries directly in this directory, or this file's
@@ -267,6 +316,35 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     aggregate_at(node, metric, 0, None);
 }
 
+/// Switch between allocated and apparent sizes already recorded on leaves.
+/// The scan records both from the same listing, so this changes the view
+/// without another filesystem walk.
+#[cfg(feature = "tui")]
+pub fn switch_measure(node: &mut Node, metric: Metric, dedup_hardlinks: bool) {
+    fn swap_leaves(node: &mut Node) {
+        if node.is_dir() {
+            for child in &mut node.children {
+                swap_leaves(child);
+            }
+        } else {
+            std::mem::swap(&mut node.measured_bytes, &mut node.alternate_bytes);
+        }
+    }
+    swap_leaves(node);
+    aggregate_view(node, metric, dedup_hardlinks);
+}
+
+/// Rebuild a presentation after filtering or changing the metric. A fresh
+/// identity set lets a visible hardlink take the charge of a hidden sibling.
+#[cfg(feature = "tui")]
+pub fn aggregate_view(node: &mut Node, metric: Metric, dedup_hardlinks: bool) {
+    if dedup_hardlinks {
+        aggregate_deduped(node, metric, &Seen::new());
+    } else {
+        aggregate(node, metric);
+    }
+}
+
 /// [`aggregate`], charging a hardlinked file once: a leaf whose identity
 /// `seen` already holds weighs nothing. Which of a file's names is charged
 /// is whichever a worker reaches first, so two scans of an unchanged tree
@@ -353,9 +431,16 @@ fn aggregate_at(
     seen: Option<&Seen>,
 ) {
     if !node.is_dir() {
+        #[cfg(feature = "tui")]
+        let chargeable = {
+            node.bytes = node.measured_bytes;
+            node.measured_bytes > 0 || node.alternate_bytes > 0
+        };
+        #[cfg(not(feature = "tui"))]
+        let chargeable = node.bytes > 0;
         // Every name of a file has the file's size, so one that weighs
         // nothing need not be remembered to be charged once.
-        if node.bytes > 0
+        if chargeable
             && let Some(seen) = seen
             && let Some(key) = node.identity()
             && !seen.insert(key)
@@ -432,6 +517,11 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn a_node_stays_small() {
+        // The terminal keeps two size bases for instant display toggles;
+        // the desktop build does not pay for those per-node fields.
+        #[cfg(feature = "tui")]
+        assert_eq!(size_of::<Node>(), 112);
+        #[cfg(not(feature = "tui"))]
         assert_eq!(size_of::<Node>(), 88);
     }
 
@@ -469,6 +559,29 @@ mod tests {
         }
         aggregate_deduped(&mut root, Metric::Bytes, &Seen::new());
         assert_eq!(root.bytes, 4096 + 8192);
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn a_visible_hardlink_takes_the_charge_after_hiding_its_sibling() {
+        let mut root = Node::directory("root");
+        for (name, hidden) in [(".hidden", true), ("visible", false)] {
+            let mut file = leaf(name, 4096);
+            file.alternate_bytes = 1000;
+            file.hidden = hidden;
+            file.inode = Some((1, NonZeroU64::new(42).expect("nonzero inode")));
+            root.children.push(file);
+        }
+        aggregate_view(&mut root, Metric::Bytes, true);
+        assert_eq!(root.bytes, 4096);
+        root.children.retain(|child| !child.hidden);
+        aggregate_view(&mut root, Metric::Bytes, true);
+        assert_eq!(root.bytes, 4096);
+        assert_eq!(root.children[0].own_bytes(), 4096);
+        switch_measure(&mut root, Metric::Bytes, true);
+        assert_eq!(root.bytes, 1000);
+        switch_measure(&mut root, Metric::Bytes, true);
+        assert_eq!(root.bytes, 4096);
     }
 
     #[test]
