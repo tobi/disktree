@@ -152,6 +152,29 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
 }
 
 #[gpui_kit::test]
+fn the_titlebar_names_the_version_and_follows_the_directory(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let home = read(&view, cx, |app| app.home.clone());
+    let expected = |path: &Path| {
+        Some(format!(
+            "disktree {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            crate::marks::display_path(path, home.as_deref())
+        ))
+    };
+    assert_eq!(cx.window_title(), expected(temp.path()));
+
+    // Enter descends into .cache, the largest; the title follows it.
+    press(cx, "enter");
+    assert_eq!(cx.window_title(), expected(&temp.path().join(".cache")));
+}
+
+#[gpui_kit::test]
 fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();

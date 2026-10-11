@@ -152,12 +152,9 @@ fn run() -> Result<()> {
                         )),
                         titlebar: Some(gpui_kit::TitlebarOptions {
                             title: Some(
-                                format!(
-                                    "disktree · {}",
-                                    marks::display_path(
-                                        &title_root,
-                                        home.as_deref(),
-                                    )
+                                marks::window_title(
+                                    &title_root,
+                                    home.as_deref(),
                                 )
                                 .into(),
                             ),

@@ -121,6 +121,16 @@ pub fn display_path(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
+/// The window title: the app, its version and the directory on screen, so a
+/// glance tells which build is running.
+pub fn window_title(path: &Path, home: Option<&Path>) -> String {
+    format!(
+        "disktree {} · {}",
+        env!("CARGO_PKG_VERSION"),
+        display_path(path, home)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +157,23 @@ mod tests {
             is_dir: false,
             hidden: false,
         }
+    }
+
+    #[test]
+    fn the_window_title_names_the_version_and_the_directory() {
+        let home = Path::new("/home/tobi");
+        assert_eq!(
+            window_title(&home.join("Downloads"), Some(home)),
+            format!(
+                "disktree {} · ~{}Downloads",
+                env!("CARGO_PKG_VERSION"),
+                std::path::MAIN_SEPARATOR
+            )
+        );
+        assert_eq!(
+            window_title(home, Some(home)),
+            format!("disktree {} · ~", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

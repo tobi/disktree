@@ -3191,12 +3191,9 @@ impl Render for Disktree {
         self.tick_transition(window);
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
-        let title = format!(
-            "disktree · {}",
-            crate::marks::display_path(
-                &self.current_path(),
-                self.home.as_deref()
-            )
+        let title = crate::marks::window_title(
+            &self.current_path(),
+            self.home.as_deref(),
         );
         if title != self.window_title {
             window.set_window_title(&title);
