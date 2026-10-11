@@ -15,7 +15,7 @@ use disktree_core::filter::{Keep, Matches, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
-    detect_trash_backend, plan,
+    detect_trash_backend, plan_with_root_identity,
 };
 use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{
@@ -452,6 +452,10 @@ pub struct Disktree {
     /// Where the scan in flight is rooted. Differs from `root_path` while
     /// widening, when the old tree stays on screen until the wider one lands.
     pub scan_root: PathBuf,
+    /// Identity of the directory that produced the visible tree.
+    pub tree_root_identity: Option<(u64, u64)>,
+    /// Identity captured before the in-flight scan begins.
+    scan_root_identity: Option<(u64, u64)>,
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
@@ -466,6 +470,7 @@ impl Disktree {
     ) -> Self {
         let home = std::env::home_dir();
         let space = space_info(&root_path).ok();
+        let root_identity = disktree_core::removal::path_identity(&root_path);
         let trash_backend = detect_trash_backend();
         let mut tree = Self {
             root_path,
@@ -549,6 +554,8 @@ impl Disktree {
             panel_rems: PANEL_REMS,
             scan_started: None,
             scan_root: PathBuf::new(),
+            tree_root_identity: root_identity,
+            scan_root_identity: root_identity,
             scan_elapsed: None,
             scanned_at: now_seconds(),
         };
@@ -632,6 +639,7 @@ impl Disktree {
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
         self.scan_root.clone_from(&above);
+        self.scan_root_identity = disktree_core::removal::path_identity(&above);
         self.remember();
         let known = Known {
             path: self.root_path.clone(),
@@ -940,6 +948,9 @@ impl Disktree {
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
         self.scan_root.clone_from(&self.root_path);
+        let identity = disktree_core::removal::path_identity(&self.root_path);
+        self.scan_root_identity = identity;
+        self.tree_root_identity = identity;
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
             self.options.clone(),
@@ -986,6 +997,7 @@ impl Disktree {
         };
         match outcome {
             Ok(node) => {
+                self.tree_root_identity = self.scan_root_identity;
                 // A widening scan lands on a new root: move the view up to it,
                 // with the directory it came from selected.
                 let came_from = (self.scan_root != self.root_path)
@@ -1767,7 +1779,11 @@ impl Disktree {
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
-        plan(self.marks.items(), &self.root_path)
+        plan_with_root_identity(
+            self.marks.items(),
+            &self.root_path,
+            self.tree_root_identity,
+        )
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────

@@ -78,6 +78,8 @@ pub struct Plan {
     pub blocked: Vec<Blocked>,
     /// The scanned root the targets were judged against.
     pub root: PathBuf,
+    /// Unix `(device, inode)` captured when the scan started.
+    root_identity: Option<(u64, u64)>,
     /// Bytes the targets free on `root`'s volume; see [`Self::reclaim`].
     reclaim: u64,
     /// Bytes the targets free on other volumes; see [`Self::foreign`].
@@ -122,7 +124,16 @@ impl Plan {
 /// Paths outside `root` are blocked rather than removed: the tree the user was
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
-    plan_against(targets, root, &mount_points())
+    plan_with_root_identity(targets, root, path_identity(root))
+}
+
+/// Build a plan retaining the directory identity observed by the scan.
+pub fn plan_with_root_identity(
+    targets: &[Target],
+    root: &Path,
+    root_identity: Option<(u64, u64)>,
+) -> Plan {
+    plan_against_identity(targets, root, &mount_points(), root_identity)
 }
 
 /// [`plan`] against a given read of the mount table, for testing.
@@ -130,10 +141,21 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
 /// One read answers both what may be removed and which volume each target's
 /// bytes belong to, so the projection cannot be built from a state of the
 /// machine the guards never saw.
+#[cfg(test)]
 fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
+    plan_against_identity(targets, root, mounts, path_identity(root))
+}
+
+fn plan_against_identity(
+    targets: &[Target],
+    root: &Path,
+    mounts: &MountTable,
+    root_identity: Option<(u64, u64)>,
+) -> Plan {
     let root = normalize(root);
     let mut plan = Plan {
         root: root.clone(),
+        root_identity,
         ..Plan::default()
     };
     let mut accepted: Vec<Target> = Vec::new();
@@ -582,6 +604,11 @@ fn identity(path: &Path, _follow: bool) -> Option<(u64, u64)> {
 #[cfg(not(any(unix, windows)))]
 const fn identity(_path: &Path, _follow: bool) -> Option<(u64, u64)> {
     None
+}
+
+/// Filesystem identity of the directory at `path`, following a root link.
+pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    identity(path, true)
 }
 
 /// How long a read of the mount table is used before it is read again. A
@@ -1089,15 +1116,33 @@ fn run(
                     real_root.as_deref(),
                     home.as_ref(),
                 )
+            })
+            .or_else(|| {
+                plan.root_identity
+                    .is_none_or(|identity| {
+                        path_identity(&plan.root) != Some(identity)
+                    })
+                    .then(|| {
+                        String::from(
+                            "the scanned root identity cannot be verified",
+                        )
+                    })
             });
         let outcome = if let Some(reason) = reason {
             Err(io::Error::other(reason))
         } else {
             match mode {
-                RemovalMode::Permanent => {
-                    remove_permanently(&target.path, &plan.root)
-                }
-                RemovalMode::Trash => move_to_trash(&target.path, backend),
+                RemovalMode::Permanent => remove_permanently_with_identity(
+                    &target.path,
+                    &plan.root,
+                    plan.root_identity,
+                ),
+                RemovalMode::Trash => move_to_trash_with_root(
+                    &target.path,
+                    &plan.root,
+                    plan.root_identity,
+                    backend,
+                ),
             }
         };
         if outcome.is_ok() {
@@ -1160,9 +1205,18 @@ fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
 /// see [`open_parent`].
 #[cfg(unix)]
 pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
+    remove_permanently_with_identity(path, root, path_identity(root))
+}
+
+#[cfg(unix)]
+fn remove_permanently_with_identity(
+    path: &Path,
+    root: &Path,
+    root_identity: Option<(u64, u64)>,
+) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, statat, unlinkat};
 
-    let (parent, name) = open_parent(path, root)?;
+    let (parent, name) = open_parent(path, root, root_identity)?;
     let stat = statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         unlinkat(&parent, name, AtFlags::empty())?;
@@ -1190,6 +1244,7 @@ pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
 fn open_parent<'a>(
     path: &'a Path,
     root: &Path,
+    root_identity: Option<(u64, u64)>,
 ) -> io::Result<(std::os::fd::OwnedFd, &'a std::ffi::OsStr)> {
     use rustix::io::Errno;
 
@@ -1211,6 +1266,15 @@ fn open_parent<'a>(
             ))
         })?;
     let mut dir = open_root(root)?;
+    let expected = root_identity.ok_or_else(|| {
+        io::Error::other("the scanned root identity cannot be verified")
+    })?;
+    let actual = rustix::fs::fstat(&dir)?;
+    if stat_identity(&actual) != expected {
+        return Err(io::Error::other(
+            "the scanned root changed since the scan; nothing was removed",
+        ));
+    }
     for component in below.components() {
         match component {
             Component::Normal(part) => {
@@ -1228,6 +1292,18 @@ fn open_parent<'a>(
         }
     }
     Ok((dir, name))
+}
+
+// Match MetadataExt's u64 identity on Unix, including Darwin's signed dev_t.
+#[cfg(unix)]
+#[allow(
+    trivial_numeric_casts,
+    clippy::unnecessary_cast,
+    clippy::cast_sign_loss,
+    reason = "native stat identity widths and signedness differ across Unix"
+)]
+const fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
 }
 
 /// Open the scanned root, following links: see [`open_parent`].
@@ -1279,6 +1355,14 @@ pub fn remove_permanently(path: &Path, _root: &Path) -> io::Result<()> {
     } else {
         fs::remove_file(path)
     }
+}
+#[cfg(not(unix))]
+fn remove_permanently_with_identity(
+    path: &Path,
+    root: &Path,
+    _root_identity: Option<(u64, u64)>,
+) -> io::Result<()> {
+    remove_permanently(path, root)
 }
 
 /// Where a directory lives, as far as crossing into another filesystem goes.
@@ -1407,11 +1491,27 @@ const fn is_dir_link(_meta: &fs::Metadata) -> bool {
 }
 
 /// Move one path to the desktop trash.
+fn move_to_trash_with_root(
+    path: &Path,
+    root: &Path,
+    root_identity: Option<(u64, u64)>,
+    backend: TrashBackend,
+) -> io::Result<()> {
+    if backend == TrashBackend::XdgHome {
+        trash_via_xdg(path, root, root_identity)
+    } else {
+        move_to_trash(path, backend)
+    }
+}
+
 pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
     match backend {
         TrashBackend::TrashPut => run_tool(Path::new("trash-put"), &[], path),
         TrashBackend::Gio => run_tool(Path::new("gio"), &["trash"], path),
-        TrashBackend::XdgHome => trash_via_xdg(path),
+        TrashBackend::XdgHome => {
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            trash_via_xdg(path, root, path_identity(root))
+        }
         TrashBackend::MacOs => trash_via_macos(path),
         TrashBackend::RecycleBin => recycle(path),
         TrashBackend::Unavailable => Err(io::Error::other(
@@ -1494,50 +1594,152 @@ fn run_tool(program: &Path, arguments: &[&str], path: &Path) -> io::Result<()> {
 ///
 /// Only same-volume paths can be trashed this way: the specification forbids
 /// copying a file into a trash directory on another filesystem.
-fn trash_via_xdg(path: &Path) -> io::Result<()> {
+fn trash_via_xdg(
+    path: &Path,
+    root: &Path,
+    root_identity: Option<(u64, u64)>,
+) -> io::Result<()> {
     let trash = home_trash_dir().ok_or_else(|| {
         io::Error::other("neither XDG_DATA_HOME nor HOME is set")
     })?;
-    trash_into(path, &trash)
+    #[cfg(unix)]
+    {
+        trash_into_from_root(path, root, &trash, root_identity)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, root_identity);
+        trash_into(path, &trash)
+    }
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_dir()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+))]
+fn renameat_noreplace(
+    source_dir: &std::os::fd::OwnedFd,
+    source_name: impl rustix::path::Arg,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination_name: impl rustix::path::Arg,
+) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        source_dir,
+        source_name,
+        destination_dir,
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    ))
+))]
+fn renameat_noreplace(
+    _source_dir: &std::os::fd::OwnedFd,
+    _source_name: impl rustix::path::Arg,
+    _destination_dir: &std::os::fd::OwnedFd,
+    _destination_name: impl rustix::path::Arg,
+) -> io::Result<()> {
+    // A check followed by renameat can still overwrite a raced-in recovery copy.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform has no supported atomic no-replace trash rename",
+    ))
 }
 
 /// Move `path` into the trash directory at `trash`.
 #[cfg(unix)]
 pub fn trash_into(path: &Path, trash: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
+    let root = path.parent().ok_or_else(|| {
+        io::Error::other("refusing to trash a path without a parent")
+    })?;
+    trash_into_from_root(path, root, trash, path_identity(root))
+}
+
+#[cfg(unix)]
+fn trash_into_from_root(
+    path: &Path,
+    root: &Path,
+    trash: &Path,
+    root_identity: Option<(u64, u64)>,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, fstat, statat, unlinkat};
+    use std::io::Write as _;
 
     let files = trash.join("files");
     let info = trash.join("info");
-    fs::create_dir_all(&files)?;
-    fs::create_dir_all(&info)?;
+    if let Some(parent) = trash.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    create_private_dir(trash)?;
+    create_private_dir(&files)?;
+    create_private_dir(&info)?;
 
-    let source = fs::symlink_metadata(path)?;
-    let trash_meta = fs::metadata(&files)?;
-    if source.dev() != trash_meta.dev() {
+    let (source_parent, source_name) = open_parent(path, root, root_identity)?;
+    let source =
+        statat(&source_parent, source_name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let files_fd = open_root(&files)?;
+    let info_fd = open_root(&info)?;
+    // Compare the opened destinations, not a pathname checked before opening.
+    if source.st_dev != fstat(&files_fd)?.st_dev {
         return Err(io::Error::other(
             "on a different filesystem than the trash; use permanent deletion",
         ));
     }
 
-    let name = path
-        .file_name()
-        .ok_or_else(|| {
-            io::Error::other("refusing to trash a path without a name")
-        })?
-        .to_string_lossy()
-        .into_owned();
-    let (candidate, trashed_name) = unique_name(&files, &name);
-    fs::rename(path, &candidate)?;
-
-    let info_path = info.join(format!("{trashed_name}.trashinfo"));
+    let name = source_name.to_string_lossy();
+    let (trashed_name, info_name, mut info_file) =
+        unique_name(&files_fd, &info_fd, &name)?;
     let contents = format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\n",
         percent_encode(&path.to_string_lossy()),
         deletion_date()
     );
-    if let Err(error) = fs::write(&info_path, contents) {
-        // Put it back rather than leaving an entry the trash UI cannot restore.
-        let _ = fs::rename(&candidate, path);
+    // Finish metadata before moving: a failed write leaves the source intact.
+    let outcome = info_file.write_all(contents.as_bytes()).and_then(|()| {
+        renameat_noreplace(
+            &source_parent,
+            source_name,
+            &files_fd,
+            trashed_name.as_str(),
+        )
+    });
+    if let Err(error) = outcome {
+        drop(info_file);
+        unlinkat(&info_fd, info_name.as_str(), AtFlags::empty()).map_err(
+            |cleanup| {
+                io::Error::other(format!(
+                    "{error}; could not remove {info_name}: {cleanup}"
+                ))
+            },
+        )?;
         return Err(error);
     }
     Ok(())
@@ -1550,21 +1752,44 @@ pub fn trash_into(_path: &Path, _trash: &Path) -> io::Result<()> {
     ))
 }
 
-/// `name`, or `name.1`, `name.2`, … until the name is free in `dir`.
+/// Reserve matching payload and metadata names without replacing either one.
 #[cfg(unix)]
-fn unique_name(dir: &Path, name: &str) -> (PathBuf, String) {
-    let first = dir.join(name);
-    if !first.exists() {
-        return (first, name.to_string());
-    }
-    for index in 1..10_000 {
-        let candidate = format!("{name}.{index}");
-        let path = dir.join(&candidate);
-        if !path.exists() {
-            return (path, candidate);
+fn unique_name(
+    files: &std::os::fd::OwnedFd,
+    info: &std::os::fd::OwnedFd,
+    name: &str,
+) -> io::Result<(String, String, fs::File)> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, statat};
+    use rustix::io::Errno;
+
+    for index in 0..10_000 {
+        let candidate = if index == 0 {
+            name.to_string()
+        } else {
+            format!("{name}.{index}")
+        };
+        // Dangling symlinks reserve names too; an unreadable lookup fails closed.
+        match statat(files, candidate.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => continue,
+            Err(Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let info_name = format!("{candidate}.trashinfo");
+        match openat(
+            info,
+            info_name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => return Ok((candidate, info_name, fs::File::from(fd))),
+            Err(Errno::EXIST) => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    (dir.join(name), name.to_string())
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "all 10,000 trash names are already in use",
+    ))
 }
 
 /// Percent-encode a path for a `.trashinfo` file: everything outside the
@@ -2194,6 +2419,61 @@ mod tests {
         assert!(keep.path().join("x/precious.bin").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_root_replaced_after_scan_is_not_accepted_for_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let original = TempDir::new().expect("original root");
+        let replacement = TempDir::new().expect("replacement root");
+        let root = temp.path().join("scan-root");
+        let marked = root.join("victim");
+        let replaced = replacement.path().join("victim");
+        fs::write(original.path().join("victim"), b"original").expect("write");
+        fs::write(&replaced, b"replacement").expect("write");
+        link_dir(original.path(), &root);
+
+        let root_identity =
+            path_identity(&root).expect("scanned root identity");
+        let plan = plan_with_root_identity(
+            &[target(&marked, 1)],
+            &root,
+            Some(root_identity),
+        );
+        assert_eq!(plan.targets.len(), 1, "the scan result is markable");
+        fs::remove_file(&root).expect("replace root link");
+        link_dir(replacement.path(), &root);
+        assert_ne!(
+            path_identity(&root),
+            Some(root_identity),
+            "fixture root identity changed",
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        run(
+            &plan,
+            RemovalMode::Permanent,
+            TrashBackend::Unavailable,
+            &AtomicBool::new(false),
+            &sender,
+        );
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RemovalEvent::Item {
+                outcome: Err(_),
+                ..
+            }
+        )));
+        assert_eq!(
+            fs::read(&replaced).expect("replacement survives"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(original.path().join("victim"))
+                .expect("original survives"),
+            b"original"
+        );
+    }
     #[test]
     fn a_target_reached_through_a_link_is_refused() {
         let temp = tree();
@@ -2213,6 +2493,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fallback_trash_does_not_follow_a_replaced_parent() {
+        let root = TempDir::new().expect("scanned root");
+        let trash = TempDir::new().expect("trash");
+        let outside = TempDir::new().expect("outside directory");
+        let parent = root.path().join("parent");
+        let marked = parent.join("victim");
+        let external = outside.path().join("victim");
+        fs::create_dir(&parent).expect("parent");
+        fs::write(&marked, b"scanned entry").expect("write source");
+        fs::write(&external, b"outside entry").expect("write external");
+        let root_identity = path_identity(root.path()).expect("root identity");
+        fs::remove_file(&marked).expect("remove scanned entry");
+        fs::remove_dir(&parent).expect("remove parent");
+        link_dir(outside.path(), &parent);
+
+        let error = trash_into_from_root(
+            &marked,
+            root.path(),
+            trash.path(),
+            Some(root_identity),
+        )
+        .expect_err("changed parent is refused");
+        assert!(error.to_string().contains("changed since"), "{error}");
+        assert_eq!(
+            fs::read(&external).expect("external survives"),
+            b"outside entry"
+        );
+    }
     /// The trash follows links on the way down, so the worker asks again,
     /// whatever the mode.
     #[test]
@@ -2357,19 +2667,238 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn trash_names_avoid_collisions() {
-        let temp = TempDir::new().expect("tempdir");
-        let (first, first_name) = unique_name(temp.path(), "notes");
-        assert_eq!(first_name, "notes");
-        fs::write(&first, b"x").expect("write");
+        let files = TempDir::new().expect("files");
+        let info = TempDir::new().expect("info");
+        let files_fd = open_root(files.path()).expect("open files");
+        let info_fd = open_root(info.path()).expect("open info");
+        let (first, first_info, _first_record) =
+            unique_name(&files_fd, &info_fd, "notes").expect("first name");
+        assert_eq!(first, "notes");
+        assert_eq!(first_info, "notes.trashinfo");
+        fs::write(files.path().join(&first), b"x").expect("write");
 
-        let (second, second_name) = unique_name(temp.path(), "notes");
-        assert_eq!(second_name, "notes.1");
+        let (second, second_info, _second_record) =
+            unique_name(&files_fd, &info_fd, "notes").expect("second name");
+        assert_eq!(second, "notes.1");
+        assert_eq!(second_info, "notes.1.trashinfo");
         assert_ne!(first, second);
     }
 
     #[cfg(unix)]
     #[test]
+    fn exhausted_trash_names_fail_without_overwriting_existing_data() {
+        let temp = TempDir::new().expect("tempdir");
+        let info = TempDir::new().expect("info");
+        let files_fd = open_root(temp.path()).expect("open files");
+        let info_fd = open_root(info.path()).expect("open info");
+        for index in 0..10_000 {
+            let name = if index == 0 {
+                "notes".to_string()
+            } else {
+                format!("notes.{index}")
+            };
+            fs::write(temp.path().join(name), b"preserve")
+                .expect("reserve name");
+        }
+
+        let error = unique_name(&files_fd, &info_fd, "notes")
+            .expect_err("an exhausted namespace must fail");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(temp.path().join("notes")).expect("original"),
+            b"preserve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_named_trash_entries_keep_distinct_metadata() {
+        let trash = TempDir::new().expect("trash");
+        let first = TempDir::new().expect("first source");
+        let second = TempDir::new().expect("second source");
+        let first_path = first.path().join("notes");
+        let second_path = second.path().join("notes");
+        fs::write(&first_path, b"first payload").expect("first payload");
+        fs::write(&second_path, b"second payload").expect("second payload");
+        trash_into(&first_path, trash.path()).expect("first trash");
+
+        // An orphaned record reserves its name even without a payload.
+        let reserved_info = trash.path().join("info/notes.1.trashinfo");
+        fs::write(&reserved_info, b"existing recovery record")
+            .expect("reserve metadata name");
+        trash_into(&second_path, trash.path())
+            .expect("second trash skips both payload and metadata collisions");
+
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        for (name, source, payload) in [
+            ("notes", &first_path, b"first payload".as_slice()),
+            ("notes.2", &second_path, b"second payload".as_slice()),
+        ] {
+            assert_eq!(
+                fs::read(trash.path().join("files").join(name))
+                    .expect("trashed payload"),
+                payload
+            );
+            let record = fs::read_to_string(
+                trash.path().join("info").join(format!("{name}.trashinfo")),
+            )
+            .expect("matching metadata");
+            assert_eq!(
+                record.lines().find_map(|line| line.strip_prefix("Path=")),
+                Some(percent_encode(&source.to_string_lossy()).as_str())
+            );
+        }
+        assert_eq!(
+            fs::read(reserved_info).expect("reserved metadata survives"),
+            b"existing recovery record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_trash_namespace_preserves_source_and_recovery_files() {
+        let trash = TempDir::new().expect("trash");
+        let work = TempDir::new().expect("source");
+        let source = work.path().join("notes");
+        fs::write(&source, b"source payload").expect("source payload");
+        let files = trash.path().join("files");
+        let info = trash.path().join("info");
+        fs::create_dir(&files).expect("files directory");
+        fs::create_dir(&info).expect("info directory");
+        for index in 0..10_000 {
+            let name = if index == 0 {
+                "notes".to_string()
+            } else {
+                format!("notes.{index}")
+            };
+            fs::write(files.join(&name), b"existing payload")
+                .expect("reserve payload");
+            fs::write(
+                info.join(format!("{name}.trashinfo")),
+                b"existing record",
+            )
+            .expect("reserve metadata");
+        }
+
+        let error = trash_into(&source, trash.path())
+            .expect_err("exhausted namespace must refuse the real move");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(source).expect("source survives"),
+            b"source payload"
+        );
+        for index in 0..10_000 {
+            let name = if index == 0 {
+                "notes".to_string()
+            } else {
+                format!("notes.{index}")
+            };
+            assert_eq!(
+                fs::read(files.join(&name)).expect("payload survives"),
+                b"existing payload"
+            );
+            assert_eq!(
+                fs::read(info.join(format!("{name}.trashinfo")))
+                    .expect("record survives"),
+                b"existing record"
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn existing_trash_directory_permissions_are_unchanged() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = TempDir::new().expect("trash parent");
+        let trash = temp.path().join("Trash");
+        for (path, mode) in [
+            (trash.clone(), 0o750),
+            (trash.join("files"), 0o710),
+            (trash.join("info"), 0o750),
+        ] {
+            fs::create_dir(&path).expect("existing directory");
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .expect("existing mode");
+        }
+        let work = TempDir::new().expect("source parent");
+        let source = work.path().join("notes");
+        fs::write(&source, b"source payload").expect("source");
+        trash_into(&source, &trash).expect("trash into existing directories");
+        for (path, mode) in [
+            (trash.clone(), 0o750),
+            (trash.join("files"), 0o710),
+            (trash.join("info"), 0o750),
+        ] {
+            assert_eq!(
+                fs::metadata(path).expect("directory").mode() & 0o777,
+                mode,
+                "do not chmod an existing user directory"
+            );
+        }
+        assert_eq!(
+            fs::metadata(trash.join("info/notes.trashinfo"))
+                .expect("metadata")
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_creation_failure_preserves_the_source() {
+        let trash = TempDir::new().expect("trash");
+        let work = TempDir::new().expect("source parent");
+        // The payload name fits NAME_MAX, but appending .trashinfo does not.
+        let source = work.path().join("n".repeat(250));
+        fs::write(&source, b"source payload").expect("valid payload name");
+        trash_into(&source, trash.path())
+            .expect_err("metadata name is too long");
+        assert_eq!(
+            fs::read(source).expect("source survives"),
+            b"source payload"
+        );
+        for directory in ["files", "info"] {
+            assert_eq!(
+                fs::read_dir(trash.path().join(directory))
+                    .expect("trash directory")
+                    .count(),
+                0,
+                "no orphaned {directory}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_payload_move_discards_reserved_metadata() {
+        let temp = TempDir::new().expect("source parent");
+        let source = temp.path().join("doomed");
+        fs::create_dir(&source).expect("source directory");
+        fs::write(source.join("keep"), b"source witness").expect("witness");
+        let trash = source.join("Trash");
+        // Moving a directory into itself is refused after reserving metadata.
+        trash_into(&source, &trash).expect_err("cannot move into itself");
+        assert_eq!(
+            fs::read(source.join("keep")).expect("source survives"),
+            b"source witness"
+        );
+        for directory in ["files", "info"] {
+            assert_eq!(
+                fs::read_dir(trash.join(directory))
+                    .expect("trash directory")
+                    .count(),
+                0,
+                "no orphaned {directory}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_xdg_trash_moves_a_file_and_records_where_it_came_from() {
+        use std::os::unix::fs::MetadataExt as _;
         // A private trash directory keeps the test out of the real trash can.
         let trash = TempDir::new().expect("tempdir");
         let work = TempDir::new().expect("tempdir");
@@ -2388,6 +2917,27 @@ mod tests {
         assert!(info.starts_with("[Trash Info]\nPath="), "{info}");
         assert!(info.contains("doomed.bin"));
         assert!(info.contains("DeletionDate="));
+        assert_eq!(
+            fs::metadata(trash.path().join("files"))
+                .expect("files directory")
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(trash.path().join("info"))
+                .expect("info directory")
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(trash.path().join("info/doomed.bin.trashinfo"))
+                .expect("info file")
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
