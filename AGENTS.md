@@ -115,6 +115,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
+| the tree as text, for `--cli` | `crates/disktree-core/src/report.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what macOS lists and measures in bulk | `crates/disktree-core/src/macos.rs` — `unsafe` for `getattrlistbulk` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — `unsafe` for Win32 |

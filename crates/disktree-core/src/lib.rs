@@ -15,6 +15,7 @@ mod macos;
 #[cfg(windows)]
 mod mft;
 pub mod removal;
+pub mod report;
 pub mod scan;
 pub mod scan_threads;
 pub mod size;

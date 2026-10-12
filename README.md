@@ -133,6 +133,29 @@ disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
+### In the terminal
+
+`--cli` scans the same way and prints the tree instead of opening a window,
+for an SSH session, a script, or a coding agent that can only read output:
+
+```text
+$ disktree --cli --depth 2 ~/work
+38 GiB  /home/me/work
+├──     21 GiB   55%  builds/
+│   ├──     12 GiB   57%  release/ …
+│   └──    9.0 GiB   43%  debug/ …
+├──    9.4 GiB   25%  node_modules/ …
+└──    7.6 GiB   20%  datasets/ …
+
+38 GiB in 512.0k files, 48.0k directories — 3 unreadable
+```
+
+Largest first, each row with its share of its parent. `--depth` is how many
+levels print; a directory the limit stops at ends in `…`. Past 96 children,
+the number the mosaic keeps, the rest share one `… N more` row. Every scan
+option applies, and `--metric files` ranks and prints file counts. A name
+holding a control character is escaped, so it cannot read as two rows.
+
 ### The screen
 
 - **Top:** the trail from `/`, then what is measured — **Size**, **Files** or

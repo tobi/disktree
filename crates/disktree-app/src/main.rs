@@ -45,6 +45,8 @@ struct Args {
     options: ScanOptions,
     depth: u32,
     power: Option<power::PowerEfficiency>,
+    /// Print the tree to standard output instead of opening a window.
+    cli: bool,
 }
 
 const USAGE: &str = "\
@@ -78,6 +80,8 @@ options:
       --thread-system-cpu-percent N
                         best-effort host CPU budget; 0 disables it (80)
       --metric files    rank by file count instead of bytes
+      --cli             print the tree to standard output, --depth levels
+                        deep, instead of opening a window
   -h, --help            show this help
 ";
 
@@ -101,6 +105,9 @@ fn run() -> Result<()> {
             power::PowerEfficiency::default()
         });
     let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
+    if args.cli {
+        return print_tree(&args);
+    }
 
     // When the app executable is reached through the command-line symlink,
     // cmux sends SIGTERM to its foreground process group as AppKit takes
@@ -203,6 +210,29 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// `--cli`: scan as the window would, and print the tree instead of
+/// drawing it, for a caller that can only read standard output.
+fn print_tree(args: &Args) -> Result<()> {
+    use std::io::Write as _;
+
+    let tree = disktree_core::scan::scan(&args.root, args.options.clone())
+        .with_context(|| format!("cannot scan {}", args.root.display()))?;
+    let text = disktree_core::report::text_tree(
+        &args.root.display().to_string(),
+        &tree,
+        args.options.metric,
+        args.depth,
+    );
+    match std::io::stdout().lock().write_all(text.as_bytes()) {
+        // `disktree --cli | head` closes the pipe once it has its lines;
+        // that is the reader having had enough, not a failure.
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+            Err(error).context("cannot write to standard output")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Read the command line, program name already skipped.
 #[cfg(test)]
 fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
@@ -221,6 +251,7 @@ fn parse_args_with_power(
     let mut power = Some(preset);
     let mut depth = 3_u32;
     let mut disk = false;
+    let mut cli = false;
     // `std::env::args` panics on a name that is not Unicode, and a path is
     // any name: a restart as administrator hands the root back exactly as
     // it was, so the caller passes `args_os`.
@@ -244,6 +275,7 @@ fn parse_args_with_power(
             "-x" | "--one-filesystem" => options.one_filesystem = true,
             "-X" | "--cross-filesystems" => options.one_filesystem = false,
             "-D" | "--disk" => disk = true,
+            "--cli" => cli = true,
             "-d" | "--depth" => {
                 let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
@@ -357,6 +389,7 @@ fn parse_args_with_power(
         options,
         depth: depth.clamp(1, 6),
         power,
+        cli,
     })
 }
 
@@ -429,6 +462,15 @@ mod argument_tests {
                 < f64::EPSILON
         );
         assert_eq!(args.options.threads.system_cpu_limit, None);
+    }
+
+    #[test]
+    fn the_cli_flag_asks_for_text_instead_of_a_window() {
+        assert!(!parse_args(arguments(&[])).expect("window").cli);
+        let args =
+            parse_args(arguments(&["--cli", "--depth", "2"])).expect("text");
+        assert!(args.cli);
+        assert_eq!(args.depth, 2);
     }
 
     #[test]
