@@ -200,6 +200,12 @@ fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        // `protocol.allow=never` above is only the default: a checkout's
+        // own `protocol.ext.allow=always` is more specific and wins, and a
+        // git older than 2.44 does not know `GIT_NO_LAZY_FETCH`. With this
+        // set git asks no configuration at all, only this list, and no
+        // transport is called `none`.
+        .env("GIT_ALLOW_PROTOCOL", "none")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -291,6 +297,57 @@ mod tests {
         assert!(git(&["config", "core.fsmonitor", &hook]));
         assert!(state(dir.path()).is_some());
         assert!(!marker.exists(), "the checkout's fsmonitor ran");
+    }
+
+    /// A partial clone whose promisor remote is a command, allowed by the
+    /// checkout's own configuration, and a branch whose commits are
+    /// missing: fetching them would run it. Whatever git makes of such a
+    /// checkout, the command must not run.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_cannot_make_git_fetch_through_its_own_transport() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !git_installed() || !git(&["init", "-q"]) {
+            return; // no git on this machine
+        }
+        let url = format!("ext::sh -c 'touch \"{}\"'", marker.display());
+        for (key, value) in [
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.url", url.as_str()),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("protocol.ext.allow", "always"),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ] {
+            assert!(git(&["config", key, value]), "{key}");
+        }
+        // Two commits nobody has: the branch, and what it tracks.
+        let store = dir.path().join(".git");
+        for (name, id) in [
+            ("refs/heads/main", "1".repeat(40)),
+            ("refs/remotes/origin/main", "2".repeat(40)),
+        ] {
+            let path = store.join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent"))
+                .expect("mkdir");
+            std::fs::write(path, format!("{id}\n")).expect("write ref");
+        }
+        std::fs::write(store.join("HEAD"), "ref: refs/heads/main\n")
+            .expect("write HEAD");
+
+        let _ = state(dir.path());
+        assert!(!marker.exists(), "the checkout's transport ran");
     }
 
     /// A signed stash and `log.showSignature`: listing stashes the way

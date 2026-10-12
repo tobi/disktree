@@ -15,6 +15,9 @@ use rustc_hash::FxHashSet;
 pub struct Marks {
     items: Vec<Target>,
     index: FxHashSet<PathBuf>,
+    /// Bumped whenever the marks, or the tree they were last read from,
+    /// change: what a cache derived from them is keyed by.
+    generation: u64,
 }
 
 impl Marks {
@@ -34,10 +37,16 @@ impl Marks {
         self.items.is_empty()
     }
 
+    /// See the field: differs whenever the marks may have.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Mark `target`, or unmark it when it is already marked.
     ///
     /// Returns `true` when the path ended up marked.
     pub fn toggle(&mut self, target: Target) -> bool {
+        self.generation += 1;
         if self.index.remove(&target.path) {
             self.items.retain(|item| item.path != target.path);
             false
@@ -49,12 +58,14 @@ impl Marks {
     }
 
     pub fn remove(&mut self, path: &Path) {
+        self.generation += 1;
         if self.index.remove(path) {
             self.items.retain(|item| item.path != path);
         }
     }
 
     pub fn clear(&mut self) {
+        self.generation += 1;
         self.items.clear();
         self.index.clear();
     }
@@ -78,6 +89,7 @@ impl Marks {
             }
         }
         self.items = resolved;
+        self.generation += 1;
     }
 }
 

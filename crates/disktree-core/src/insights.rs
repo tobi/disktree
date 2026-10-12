@@ -111,7 +111,8 @@ fn visit(
             && now - child.modified > STALE_DAYS * DAY;
         if is_stale {
             stale.0 += 1;
-            stale.1 += child.bytes;
+            // Saturating: see `tree::aggregate`.
+            stale.1 = child.bytes.saturating_add(stale.1);
             // A stale experiment is judged whole; its caches go with it.
             continue;
         }

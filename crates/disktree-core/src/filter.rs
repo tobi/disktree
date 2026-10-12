@@ -104,7 +104,9 @@ fn visit(
         if contains_ignoring_case(&child.name, &matches.needle) {
             matches.keep.insert(crumbs.clone(), Keep::Whole);
             matches.count += 1;
-            total.0 += child.bytes;
+            // Saturating, as `tree::aggregate` is: a corrupt volume's
+            // file table can claim any size.
+            total.0 = child.bytes.saturating_add(total.0);
             total.1 += child.files;
         } else if !child.children.is_empty() {
             let (bytes, files) = visit(child, crumbs, matches);
@@ -112,7 +114,7 @@ fn visit(
                 matches
                     .keep
                     .insert(crumbs.clone(), Keep::Partial { bytes, files });
-                total.0 += bytes;
+                total.0 = bytes.saturating_add(total.0);
                 total.1 += files;
             }
         }

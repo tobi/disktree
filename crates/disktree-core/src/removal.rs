@@ -530,8 +530,8 @@ fn misread_by_win32(name: &str) -> bool {
 /// user's own choice of root, so the real path is compared with the real
 /// root. The home directory is looked for again by real path, too.
 ///
-/// Anything that cannot be resolved passes: the removal of a path that is
-/// gone fails on its own.
+/// A path that is gone passes: its removal fails on its own. One that is
+/// still there and cannot be resolved, under a root that can, is refused.
 fn linked(
     path: &Path,
     root: &Path,
@@ -539,7 +539,25 @@ fn linked(
     home: Option<&Home>,
 ) -> Option<String> {
     let (parent, name) = (path.parent()?, path.file_name()?);
-    let real = guard_key(&fs::canonicalize(parent).ok()?.join(name));
+    let real_parent = match fs::canonicalize(parent) {
+        Ok(real_parent) => real_parent,
+        // Gone, or on a volume where nothing resolves, the root included:
+        // there is no real path to compare with.
+        Err(_)
+            if real_root.is_none() || fs::symlink_metadata(parent).is_err() =>
+        {
+            return None;
+        }
+        // The root resolved and this, inside it and still there, did not:
+        // whether a link leads out can no longer be told, so it stays.
+        Err(error) => {
+            return Some(format!(
+                "its real location could not be read ({error}), so a link \
+                 leading out of the scanned root cannot be ruled out"
+            ));
+        }
+    };
+    let real = guard_key(&real_parent.join(name));
     if let (Some(real_root), Ok(rest)) = (real_root, path.strip_prefix(root))
         && real != guard_key(&real_root.join(rest))
     {
@@ -1102,7 +1120,7 @@ fn run(
         };
         if outcome.is_ok() {
             removed += 1;
-            bytes += target.bytes;
+            bytes = bytes.saturating_add(target.bytes);
         } else {
             failed += 1;
         }

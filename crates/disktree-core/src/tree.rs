@@ -1,5 +1,6 @@
 //! The scanned tree.
 
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -233,8 +234,10 @@ impl Node {
         if needle.is_empty() {
             return None;
         }
-        let mut queue = vec![(Vec::new(), self)];
-        while let Some((crumbs, node)) = queue.pop() {
+        // Taken from the front: popping the back would search depth-first,
+        // and find a deep match in a late branch before a shallow one.
+        let mut queue = VecDeque::from([(Vec::new(), self)]);
+        while let Some((crumbs, node)) = queue.pop_front() {
             for (index, child) in node.children.iter().enumerate() {
                 if child.name.to_lowercase().contains(&needle) {
                     let found: Vec<usize> = crumbs
@@ -247,7 +250,7 @@ impl Node {
                 if child.is_dir() && !child.children.is_empty() {
                     let mut next = crumbs.clone();
                     next.push(index);
-                    queue.push((next, child));
+                    queue.push_back((next, child));
                 }
             }
         }

@@ -282,6 +282,18 @@ impl LayoutTransition {
     }
 }
 
+/// The marks as crumbs, for the tree and the marks they were resolved
+/// against.
+struct MarkedCrumbs {
+    /// [`Marks::generation`] when resolved.
+    generation: u64,
+    /// The tree then, by address and only ever compared. A tree re-ranked
+    /// in place keeps its address, and refreshes the marks, which moves
+    /// on `generation`.
+    tree: Option<*const Node>,
+    crumbs: Rc<FxHashSet<Vec<usize>>>,
+}
+
 /// Layout for one (crumbs, area, options) combination.
 struct LayoutCache {
     key: LayoutKey,
@@ -360,6 +372,7 @@ pub struct Disktree {
     pub transition: Option<LayoutTransition>,
     pub layout_options: LayoutOptions,
     cache: Option<LayoutCache>,
+    marked: Option<MarkedCrumbs>,
 
     /// Mouse position in treemap-local pixels, for hit-testing and the tooltip.
     pub pointer: Option<Point<Pixels>>,
@@ -495,6 +508,7 @@ impl Disktree {
                 ..LayoutOptions::default()
             },
             cache: None,
+            marked: None,
             pointer: None,
             treemap_origin: Rc::new(Cell::new(Point::new(px(0.), px(0.)))),
             treemap_size: Rc::new(Cell::new(size(px(0.), px(0.)))),
@@ -1055,11 +1069,24 @@ impl Disktree {
                     })
                     .unwrap_or(Duration::from_millis(1200));
                 cx.background_executor().timer(interval).await;
+                let Ok(path) =
+                    this.update(cx, |this, _| this.root_path.clone())
+                else {
+                    break;
+                };
+                // Asked off the UI thread: a network share or a drive
+                // spinning up can take seconds to answer, and the window,
+                // Escape included, must not wait with it.
+                let asked = path.clone();
+                let fresh = cx
+                    .background_executor()
+                    .spawn(async move { space_info(&asked).ok() })
+                    .await;
                 let ok = this
                     .update(cx, |this, cx| {
-                        let path = this.root_path.clone();
-                        let fresh = space_info(&path).ok();
-                        if fresh != this.space {
+                        // A root chosen while the old one answered has
+                        // been measured already; this is not its number.
+                        if this.root_path == path && fresh != this.space {
                             this.space = fresh;
                             cx.notify();
                         }
@@ -1138,21 +1165,31 @@ impl Disktree {
         let Some(node) = self.node_at(parent) else {
             return (Vec::new(), 0);
         };
-        let mut rows: Vec<Sibling> = node
+        // Ranked as plain numbers, with names copied only for the rows
+        // shown: a directory can hold a million entries, and the menu asks
+        // again on every key.
+        let mut ranked: Vec<(usize, u64)> = node
             .children
             .iter()
             .enumerate()
-            .map(|(index, child)| Sibling {
-                index,
-                name: child.name.to_string(),
-                value: child.value(metric),
-                category: child.category,
-                is_dir: child.is_dir(),
+            .map(|(index, child)| (index, child.value(metric)))
+            .collect();
+        ranked.sort_by_key(|&(_, value)| std::cmp::Reverse(value));
+        let more = ranked.len().saturating_sub(SIBLING_ROWS);
+        ranked.truncate(SIBLING_ROWS);
+        let rows = ranked
+            .into_iter()
+            .map(|(index, value)| {
+                let child = &node.children[index];
+                Sibling {
+                    index,
+                    name: child.name.to_string(),
+                    value,
+                    category: child.category,
+                    is_dir: child.is_dir(),
+                }
             })
             .collect();
-        rows.sort_by_key(|row| std::cmp::Reverse(row.value));
-        let more = rows.len().saturating_sub(SIBLING_ROWS);
-        rows.truncate(SIBLING_ROWS);
         (rows, more)
     }
 
@@ -1783,29 +1820,33 @@ impl Disktree {
         let hovered = self.hovered.clone();
         let selected = self.selected.clone();
 
-        // Marks are paths; the mosaic thinks in crumbs. Resolve once per frame
-        // rather than building a path for every tile.
-        let mut marked: FxHashSet<Vec<usize>> = FxHashSet::default();
-        for item in self.marks.items() {
-            if let Some(crumbs) = self.crumbs_for_path(&item.path) {
-                marked.insert(crumbs);
-            }
-        }
+        // Marks are paths; the mosaic thinks in crumbs.
+        let marked = self.marked_crumbs();
 
-        let Some(tiles) = self.layout().map(<[Tile]>::to_vec) else {
+        // Bring the cache up to date, then take it out for the pass and put
+        // it back after: the tiles are read beside the tree and the marks,
+        // and copying thousands of them, crumbs and all, ran on every
+        // pointer move.
+        let cache = if self.layout().is_some() {
+            self.cache.take()
+        } else {
+            None
+        };
+        let Some(cache) = cache else {
             return Mosaic {
                 view,
                 ..Mosaic::default()
             };
         };
+        let tiles = &cache.tiles;
 
         // Hue comes from the node's kind; lightness from its depth in this
         // view, so the first level always reads as the first level.
         let age = self.color_mode == ColorMode::Age;
         let now = self.scanned_at;
         let mut decorations = Vec::with_capacity(tiles.len());
-        let mut labels = Vec::new();
-        for tile in &tiles {
+        let mut slots: Vec<LabelSlot<'_>> = Vec::new();
+        for tile in tiles {
             let crumbs = tile.crumbs();
             let node = match &tile.kind {
                 TileKind::Node { crumbs } => self.node_at(crumbs),
@@ -1830,8 +1871,9 @@ impl Disktree {
             let is_covered = !marked.is_empty()
                 && (1..crumbs.len())
                     .any(|length| marked.contains(&crumbs[..length]));
+            let rect = self.animated_rect(tile.rect);
             decorations.push(TileDeco {
-                rect: self.animated_rect(tile.rect),
+                rect,
                 depth: tile.depth,
                 category,
                 age_bucket,
@@ -1846,57 +1888,98 @@ impl Disktree {
 
             // Labels are chosen in screen space: zooming in makes room for more
             // of them, which is the point of zooming in.
-            let drawn = self.animated_rect(tile.rect);
-            let screen = view.project(
-                tile.header
-                    .map_or(drawn, |header| self.animated_rect(header)),
-            );
+            let header = tile.header.map(|header| self.animated_rect(header));
+            let screen = view.project(header.unwrap_or(rect));
             if screen.w < LABEL_MIN_W_REMS * self.rem
                 || screen.h < LABEL_MIN_H_REMS * self.rem
             {
                 continue;
             }
-            match &tile.kind {
-                TileKind::Node { crumbs } => {
-                    let Some(node) = self.node_at(crumbs) else {
+            let (others, dim) = match &tile.kind {
+                TileKind::Node { .. } => {
+                    if node.is_none() {
                         continue;
-                    };
-                    labels.push(Label {
-                        text: node.name.to_string(),
-                        rect: self.animated_rect(tile.rect),
-                        header: tile
-                            .header
-                            .map(|header| self.animated_rect(header)),
-                        depth: tile.depth,
-                        dim: filtered == Filtered::Out,
-                        marked: is_marked || is_covered,
-                        size_text: crate::widgets::short_value(node, metric),
-                    });
+                    }
+                    (0, filtered == Filtered::Out)
                 }
-                TileKind::Others { count, .. } => labels.push(Label {
-                    text: format!("+{count} more"),
-                    rect: self.animated_rect(tile.rect),
-                    header: None,
-                    depth: tile.depth,
-                    dim: self.matches.is_some(),
-                    marked: false,
-                    size_text: String::new(),
-                }),
-            }
+                TileKind::Others { count, .. } => {
+                    (*count, self.matches.is_some())
+                }
+            };
+            slots.push(LabelSlot {
+                node,
+                others,
+                rect,
+                header,
+                depth: tile.depth,
+                dim,
+                // The merged tail is never marked: its crumbs are its
+                // parent's, and a mark there is drawn on the parent.
+                marked: node.is_some() && (is_marked || is_covered),
+            });
         }
 
-        labels.sort_by(|left, right| {
+        slots.sort_by(|left, right| {
             let left_area = left.rect.w * left.rect.h;
             let right_area = right.rect.w * right.rect.h;
             right_area.total_cmp(&left_area)
         });
-        labels.truncate(MAX_LABELS);
+        slots.truncate(MAX_LABELS);
+        // Text only for the labels that will be shaped: a deep view has
+        // thousands of tiles big enough for one, and a name and a size
+        // formatted for each was thrown away for all but `MAX_LABELS`.
+        let labels = slots
+            .into_iter()
+            .map(|slot| Label {
+                text: slot.node.map_or_else(
+                    || format!("+{} more", slot.others),
+                    |node| node.name.to_string(),
+                ),
+                rect: slot.rect,
+                header: slot.header,
+                depth: slot.depth,
+                dim: slot.dim,
+                marked: slot.marked,
+                size_text: slot.node.map_or_else(String::new, |node| {
+                    crate::widgets::short_value(node, metric)
+                }),
+            })
+            .collect();
+        self.cache = Some(cache);
 
         Mosaic {
             tiles: decorations,
             labels,
             view,
         }
+    }
+
+    /// The marks as crumbs. Resolved when the marks or the tree change
+    /// rather than on every frame: each mark is a walk down the tree with
+    /// a search through a directory's entries at every level, and a frame
+    /// is drawn for every pointer move.
+    fn marked_crumbs(&mut self) -> Rc<FxHashSet<Vec<usize>>> {
+        let generation = self.marks.generation();
+        let tree = self.tree.as_ref().map(Arc::as_ptr);
+        if let Some(marked) = &self.marked
+            && marked.generation == generation
+            && marked.tree == tree
+        {
+            return Rc::clone(&marked.crumbs);
+        }
+        let crumbs: Rc<FxHashSet<Vec<usize>>> = Rc::new(
+            self.marks
+                .items()
+                .iter()
+                .filter_map(|item| self.crumbs_for_path(&item.path))
+                .collect(),
+        );
+        self.marked = Some(MarkedCrumbs {
+            generation,
+            tree,
+            crumbs: Rc::clone(&crumbs),
+        });
+        crumbs
     }
 
     /// Crumbs for an absolute path, if the tree still contains it.
@@ -2060,16 +2143,19 @@ impl Disktree {
         let directory = self.current_path();
         let selected = self.selected.as_deref().and_then(|c| self.path_at(c));
         self.options.metric = self.options.metric.toggled();
-        if let Some(tree) = &self.tree {
-            let mut tree = (**tree).clone();
-            disktree_core::tree::aggregate(&mut tree, self.options.metric);
-            discard(self.tree.replace(Arc::new(tree)));
-            let metric = self.options.metric;
-            self.marks.refresh(
-                &self.root_path,
-                self.tree.as_ref().unwrap(),
-                metric,
+        if let Some(tree) = &mut self.tree {
+            // Re-ranked in place: copying a disk's millions of nodes took
+            // seconds and held two trees at once. Only a search or a
+            // widening scan still reading the tree makes this a copy, and
+            // then whichever of them finishes last frees the old one.
+            disktree_core::tree::aggregate(
+                Arc::make_mut(tree),
+                self.options.metric,
             );
+        }
+        if let Some(tree) = &self.tree {
+            self.marks
+                .refresh(&self.root_path, tree, self.options.metric);
         }
         self.crumbs = self.crumbs_for_path(&directory).unwrap_or_default();
         self.selected = selected.and_then(|path| self.crumbs_for_path(&path));
@@ -2254,7 +2340,8 @@ impl Disktree {
                 } => {
                     if outcome.is_ok() {
                         self.run_summary.removed += 1;
-                        self.run_summary.bytes += bytes;
+                        self.run_summary.bytes =
+                            self.run_summary.bytes.saturating_add(bytes);
                     } else {
                         self.run_summary.failed += 1;
                     }
@@ -2918,8 +3005,10 @@ impl Disktree {
         }
         if event.modifiers.shift {
             // Pan instead of zoom, for looking around a magnified view.
-            self.view.origin_y =
-                (self.view.origin_y - lines * 40.0 / self.view.scale).max(0.0);
+            // Clamped at both ends, as zooming is: stopping only at the
+            // top let the mosaic be scrolled off the bottom of the view.
+            self.view.origin_y -= lines * 40.0 / self.view.scale;
+            self.view = self.view.clamped(self.treemap_size.get());
             cx.notify();
             return;
         }
@@ -3023,6 +3112,20 @@ pub struct Label {
     pub dim: bool,
     pub marked: bool,
     pub size_text: String,
+}
+
+/// A label a tile has room for, before its text is made: only the
+/// [`MAX_LABELS`] largest get any.
+struct LabelSlot<'a> {
+    /// The tile's node; `None` for the merged tail.
+    node: Option<&'a Node>,
+    /// How many entries a merged tail stands for.
+    others: usize,
+    rect: Rect,
+    header: Option<Rect>,
+    depth: u32,
+    dim: bool,
+    marked: bool,
 }
 
 /// How many labels one frame will shape.
