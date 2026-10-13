@@ -272,7 +272,7 @@ and removes duplicate hardlinks.
 
 Press `v` (or click **Volumes** beside the disk name in the side panel) to
 bring up the volume picker. It lists every candidate volume mounted on the
-system together with its free space, ordered fullest first, filtering out
+system together with its free space, by name, filtering out
 pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
 entry resets the scan root directly to that volume.
 

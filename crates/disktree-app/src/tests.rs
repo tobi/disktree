@@ -1844,3 +1844,19 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[test]
+fn the_volume_picker_lists_volumes_by_name() {
+    let volume = |point: &str| Volume {
+        point: PathBuf::from(point),
+        device: None,
+        space: None,
+    };
+    let mut volumes = vec![volume("E:\\"), volume("c:\\"), volume("D:\\")];
+    crate::state::by_name(&mut volumes);
+    let order: Vec<_> = volumes
+        .iter()
+        .map(|volume| volume.point.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(order, ["c:\\", "D:\\", "E:\\"]);
+}

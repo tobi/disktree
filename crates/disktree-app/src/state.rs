@@ -672,6 +672,7 @@ impl Disktree {
                 });
             }
             volumes.retain(|volume| volume.point != root_path);
+            by_name(&mut volumes);
             volumes
         });
         cx.spawn(async move |this, cx| {
@@ -3145,6 +3146,16 @@ pub fn now_seconds() -> i64 {
         .map_or(0, |since| {
             i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+/// Order the picker's volumes by name, as a file manager lists drives: a
+/// volume is found where its letter or name says, however full it happens
+/// to be. Without regard to case, so `/Volumes/archive` is not sent below
+/// every capital.
+pub fn by_name(volumes: &mut [disktree_core::space::Volume]) {
+    volumes.sort_by_cached_key(|volume| {
+        volume.point.to_string_lossy().to_lowercase()
+    });
 }
 
 /// Let go of a tree off the UI thread: freeing a disk's millions of nodes
