@@ -2499,13 +2499,35 @@ impl Disktree {
 
     /// Show the tile a key acts on in Finder (or the file manager), selected.
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some((path, _)) = self.target_on_disk(cx) {
+            cx.reveal_path(&path);
+        }
+    }
+
+    /// Right-click: open a directory in the file manager, since what is in
+    /// it is what was asked about. A file has nothing to open into, so it
+    /// is shown selected in its directory, as `o` shows either. Only a
+    /// directory is ever opened: opening a file would run it.
+    pub fn open_target(&mut self, cx: &mut Context<'_, Self>) {
+        match self.target_on_disk(cx) {
+            Some((path, true)) => cx.open_with_system(&path),
+            Some((path, false)) => cx.reveal_path(&path),
+            None => {}
+        }
+    }
+
+    /// The path a key acts on and whether it is a directory, or a notice
+    /// that it has gone. A link is not followed: it is shown where it is.
+    fn target_on_disk(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<(PathBuf, bool)> {
         let crumbs =
             self.action_target().unwrap_or_else(|| self.crumbs.clone());
-        let Some(path) = self.path_at(&crumbs) else {
-            return;
-        };
-        // GPUI's reveal cannot report failure, so check what it can't.
-        if std::fs::symlink_metadata(&path).is_err() {
+        let path = self.path_at(&crumbs)?;
+        // GPUI's reveal and open cannot report failure, so check what they
+        // can't.
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             self.notice = Some((
                 format!(
                     "{} is no longer on disk",
@@ -2514,9 +2536,9 @@ impl Disktree {
                 Status::Warning,
             ));
             cx.notify();
-            return;
-        }
-        cx.reveal_path(&path);
+            return None;
+        };
+        Some((path, metadata.is_dir()))
     }
 
     /// Every binding, in reading order of the hint bar, so the keys and the
@@ -2875,12 +2897,12 @@ impl Disktree {
                     self.toggle_mark(&crumbs, cx);
                 }
             }
-            // What `o` does, for the tile under the pointer: select it, then
-            // show it in Finder, File Explorer or the file manager.
+            // Select the tile under the pointer, then open it in Finder,
+            // File Explorer or the file manager; a file is shown there.
             MouseButton::Right => {
                 if let Some(crumbs) = crumbs {
                     self.select(Some(crumbs), cx);
-                    self.reveal_target(cx);
+                    self.open_target(cx);
                 }
             }
             // Buttons 8 and 9. gpui-pre maps them on X11, Wayland and

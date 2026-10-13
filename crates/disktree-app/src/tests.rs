@@ -372,7 +372,7 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
+fn right_click_selects_the_tile_and_opens_it(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
@@ -401,7 +401,7 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
     });
 
     // The test platform cannot open a file manager, so take the path away
-    // first: the reveal then reports it instead of reaching the platform.
+    // first: the click then reports it instead of reaching the platform.
     if path.is_dir() {
         std::fs::remove_dir_all(&path).expect("remove");
     } else {
@@ -429,7 +429,7 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
     assert_eq!(selected, Some(target), "the clicked tile is selected");
     assert!(
         notice.is_some_and(|text| text.contains("no longer on disk")),
-        "the reveal ran for it"
+        "the click reached the file manager step"
     );
 }
 
