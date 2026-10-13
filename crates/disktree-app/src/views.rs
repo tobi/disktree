@@ -1619,15 +1619,20 @@ fn worth_section(
             }),
     );
     if app.insights.is_empty() {
+        let (selector, line) = if app.tree().is_some() {
+            ("insights-none", "Nothing obviously disposable")
+        } else if app.scan.is_some() {
+            ("insights-waiting", "Waiting for the scan")
+        } else {
+            // Cancelled, or failed: there is none to wait for.
+            ("insights-unscanned", "Nothing was scanned")
+        };
         return section.child(
             div()
+                .debug_selector(|| selector.into())
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(if app.tree().is_some() {
-                    "Nothing obviously disposable"
-                } else {
-                    "Waiting for the scan"
-                }),
+                .child(line),
         );
     }
     let selected = app.action_target();
@@ -2291,7 +2296,17 @@ fn scanning_panel(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let progress = &app.progress;
-    let cancelled = app.scan.is_none() && progress.cancelled;
+    // No scan running and no tree: it was cancelled, or it failed. Either
+    // way nothing is being read, so nothing here should spin.
+    let stopped = app.scan.is_none();
+    let cancelled = stopped && progress.cancelled;
+    let (state, title) = if cancelled {
+        ("scan-cancelled", "Stopped reading")
+    } else if stopped {
+        ("scan-failed", "Could not read")
+    } else {
+        ("scan-reading", "Reading")
+    };
     let mut panel = div()
         .flex()
         .flex_col()
@@ -2301,7 +2316,7 @@ fn scanning_panel(
         .justify_center()
         .gap(space::LG)
         .bg(theme.inset)
-        .when(!cancelled, |panel| {
+        .when(!stopped, |panel| {
             panel.child(
                 gpui_omarchy::icon(gpui_omarchy::IconName::Loader)
                     .size(icon::LG)
@@ -2310,14 +2325,11 @@ fn scanning_panel(
         })
         .child(
             div()
+                .debug_selector(|| state.into())
                 .text_size(text::TITLE)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.bright)
-                .child(if cancelled {
-                    format!("Stopped reading {}", widgets::display_root(app))
-                } else {
-                    format!("Reading {}", widgets::display_root(app))
-                }),
+                .child(format!("{title} {}", widgets::display_root(app))),
         )
         .child(
             div()
@@ -2342,9 +2354,10 @@ fn scanning_panel(
                     cx,
                 )),
         )
-        .when(!cancelled, |panel| {
+        .when(!stopped, |panel| {
             panel.child(
                 div()
+                    .debug_selector(|| "scan-meter".into())
                     .w(size::SCANNING_METER)
                     .child(widgets::meter_row(
                         "",
@@ -2359,7 +2372,7 @@ fn scanning_panel(
             div()
                 .text_size(text::BODY)
                 .text_color(theme.secondary)
-                .child(if cancelled {
+                .child(if stopped {
                     "Nothing is shown from a scan that did not finish."
                 } else {
                     "Marking, zooming and the free-space meter all work as soon as it lands."

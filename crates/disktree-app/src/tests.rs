@@ -1582,6 +1582,51 @@ fn escape_cancels_the_first_scan_and_r_starts_it_again(
     assert!(read(&view, cx, |app| app.tree().is_some()));
 }
 
+/// A scan that failed leaves no walk and no tree, so the panel must not go
+/// on spinning as if one were coming, nor call a failure a cancellation.
+#[gpui_kit::test]
+fn a_scan_that_failed_says_so_instead_of_spinning(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    // Nothing is there to read, which is the plainest way a scan fails.
+    let root = temp.path().join("gone");
+    let (view, cx) =
+        cx.add_window_view(move |_, cx| Disktree::new(root, options(), 3, cx));
+    draw(cx);
+    assert!(cx.debug_bounds("scan-reading").is_some());
+    assert!(cx.debug_bounds("scan-meter").is_some());
+    assert!(cx.debug_bounds("insights-waiting").is_some());
+
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    // Six seconds at most, as `finish_scan` allows a scan that lands.
+    for _ in 0..600 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if !update(&view, cx, |app, cx| app.poll_scan_once(epoch, cx)) {
+            break;
+        }
+    }
+    let (scanning, error, cancelled) = read(&view, cx, |app| {
+        (
+            app.scan.is_some(),
+            app.scan_error.is_some(),
+            app.progress.cancelled,
+        )
+    });
+    assert!(!scanning, "the scan never ended");
+    assert!(error, "a root that is not there cannot be read");
+    assert!(!cancelled, "nobody stopped it");
+
+    draw(cx);
+    assert!(cx.debug_bounds("scan-failed").is_some(), "it says so");
+    assert!(cx.debug_bounds("scan-cancelled").is_none());
+    assert!(cx.debug_bounds("scan-reading").is_none());
+    assert!(cx.debug_bounds("scan-meter").is_none(), "nothing to meter");
+    assert!(
+        cx.debug_bounds("insights-unscanned").is_some(),
+        "no scan is left to wait for"
+    );
+}
+
 /// Escape stops a widening scan and keeps the tree it started from.
 #[gpui_kit::test]
 fn escape_cancels_widening_and_keeps_the_tree_on_screen(
