@@ -2208,20 +2208,23 @@ fn review_button(
 
 /// The keys, quietly: outlines and light labels, there when needed. The key
 /// to every other key and the scan's own numbers hold the trailing edge.
-fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
-    // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
-        ("space", "mark"),
-        ("enter", "open"),
-        ("\u{232b}", "up"),
-        ("c", "review"),
-        ("hjkl", "move"),
-        ("/", "filter"),
-        ("[ ]", "depth"),
-        ("t", "mode"),
-        ("0", "reset"),
-        ("v", "volumes"),
-        ("r", "rescan"),
+fn key_bar(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
+    // Most useful first, so a narrow window clips the least useful. Each
+    // is a button for the key it names, for a hand already on the mouse;
+    // the last column is that key as the bindings spell it. Moving between
+    // tiles is four keys and no one click, so it stays a label.
+    let hints: [(&str, &str, Option<&str>); 11] = [
+        ("space", "mark", Some("space")),
+        ("enter", "open", Some("enter")),
+        ("\u{232b}", "up", Some("backspace")),
+        ("c", "review", Some("c")),
+        ("hjkl", "move", None),
+        ("/", "filter", Some("/")),
+        ("[ ]", "depth", Some("[ ]")),
+        ("t", "mode", Some("t")),
+        ("0", "reset", Some("0")),
+        ("v", "volumes", Some("v")),
+        ("r", "rescan", Some("r")),
     ];
     let mut lane = div()
         .flex()
@@ -2231,8 +2234,13 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .flex_1()
         .min_w_0()
         .overflow_hidden();
-    for (keys, label) in hints {
-        lane = lane.child(widgets::hint(keys, label, cx).flex_shrink_0());
+    for (keys, label, key) in hints {
+        lane = lane.child(match key {
+            Some(key) => key_hint(keys, label, key, cx).into_any_element(),
+            None => widgets::hint(keys, label, cx)
+                .flex_shrink_0()
+                .into_any_element(),
+        });
     }
 
     let mut row = div()
@@ -2274,14 +2282,35 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
             widgets::human_count(app.progress.files)
         )
     };
-    row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary.opacity(0.7))
-                .child(scan),
-        )
+    row.child(key_hint("?", "all keys", "?", cx)).child(
+        div()
+            .flex_shrink_0()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary.opacity(0.7))
+            .child(scan),
+    )
+}
+
+/// A key hint that is also a button: a click does what `key` does, and the
+/// keyboard goes back to where that leaves it.
+fn key_hint(
+    keys: &'static str,
+    label: &'static str,
+    key: &'static str,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let id = format!("key-{label}");
+    widgets::hint_button(ElementId::Name(id.clone().into()), keys, label, cx)
+        .debug_selector(move || id)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.press(key, cx);
+            // A dialog the key opened takes the keyboard; anything else
+            // hands it back to the treemap, which a click took it from.
+            if this.focus_request.is_none() {
+                window.focus(&this.focus, cx);
+            }
+            this.apply_focus(window, cx);
+        }))
 }
 
 /// What the viewport shows while the first scan is running.
@@ -2934,7 +2963,11 @@ fn commit_controls(
         )
 }
 
-fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
+fn review_footer(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
     let commit = match app.removal_mode {
         RemovalMode::Trash => "move to trash",
         RemovalMode::Permanent => "delete\u{2026}",
@@ -2948,13 +2981,13 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .py(space::SM)
         .border_t_1()
         .border_color(theme.divider())
-        .child(widgets::hint("enter", commit, cx))
-        .child(widgets::hint("m", "trash", cx))
-        .child(widgets::hint("p", "permanent", cx))
-        .child(widgets::hint("!", "unmark all", cx))
-        .child(widgets::hint("s", "save list", cx))
-        .child(widgets::hint("a", "copy as prompt", cx))
-        .child(widgets::hint("esc", "back", cx))
+        .child(key_hint("enter", commit, "enter", cx))
+        .child(key_hint("m", "trash", "m", cx))
+        .child(key_hint("p", "permanent", "p", cx))
+        .child(key_hint("!", "unmark all", "!", cx))
+        .child(key_hint("s", "save list", "s", cx))
+        .child(key_hint("a", "copy as prompt", "a", cx))
+        .child(key_hint("esc", "back", "escape", cx))
         .child(div().flex_1())
         .child(
             div()

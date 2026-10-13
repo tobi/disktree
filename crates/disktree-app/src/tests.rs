@@ -1844,3 +1844,53 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[gpui_kit::test]
+fn a_click_on_a_key_hint_does_what_the_key_does(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let click = |cx: &mut Window, selector: &'static str| {
+        let hint = cx.debug_bounds(selector).expect("the hint is drawn");
+        cx.simulate_click(hint.center(), gpui_kit::Modifiers::none());
+        draw(cx);
+    };
+
+    // `]` draws one level more; past the deepest the hint starts over.
+    assert_eq!(read(&view, cx, |app| app.layout_options.max_depth), 3);
+    click(cx, "key-depth");
+    assert_eq!(read(&view, cx, |app| app.layout_options.max_depth), 4);
+    update(&view, cx, |app, cx| app.adjust_depth(2, cx));
+    draw(cx);
+    click(cx, "key-depth");
+    assert_eq!(read(&view, cx, |app| app.layout_options.max_depth), 1);
+
+    // `?` opens the key list, and the keyboard still closes it: the click
+    // must not have left the keys with the hint.
+    click(cx, "key-all keys");
+    assert!(read(&view, cx, |app| app.show_help));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_help));
+
+    // `v` opens the picker, which takes the keyboard for itself.
+    click(cx, "key-volumes");
+    assert!(read(&view, cx, |app| app.volumes_open));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+
+    // Moving is four keys and no one click, so that hint stays a label.
+    assert!(cx.debug_bounds("key-move").is_none());
+
+    // `space` marks the selection, as the key does.
+    assert!(read(&view, cx, |app| app.marks.is_empty()));
+    click(cx, "key-mark");
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
+
+    // And on the review screen the footer's hints are buttons too.
+    click(cx, "key-review");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    click(cx, "key-back");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+}

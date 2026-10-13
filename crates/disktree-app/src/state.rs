@@ -312,6 +312,10 @@ pub struct History {
 /// through, and small enough that pruning after a scan costs nothing.
 const HISTORY_DEPTH: usize = 100;
 
+/// The most levels drawn at once. The depth hint's click wraps here, so
+/// it has to be the same number the keys stop at.
+const DEPTH_LIMIT: u32 = 6;
+
 /// Result of the removal run, summarised for the final screen.
 #[derive(Clone, Debug, Default)]
 pub struct RunSummary {
@@ -491,7 +495,7 @@ impl Disktree {
             view: View::default(),
             transition: None,
             layout_options: LayoutOptions {
-                max_depth: depth.clamp(1, 6),
+                max_depth: depth.clamp(1, DEPTH_LIMIT),
                 ..LayoutOptions::default()
             },
             cache: None,
@@ -2048,7 +2052,7 @@ impl Disktree {
     /// a treemap: seeing further in without changing what is on screen.
     pub fn adjust_depth(&mut self, step: i32, cx: &mut Context<'_, Self>) {
         let depth = (self.layout_options.max_depth.cast_signed() + step)
-            .clamp(1, 6) as u32;
+            .clamp(1, DEPTH_LIMIT.cast_signed()) as u32;
         self.layout_options.max_depth = depth;
         self.cache = None;
         cx.notify();
@@ -2631,6 +2635,37 @@ impl Disktree {
                     cx.notify();
                 }
             }
+        }
+    }
+
+    /// A click on a key hint does what the key would.
+    pub fn press(&mut self, key: &str, cx: &mut Context<'_, Self>) {
+        // What owns the keyboard owns it against a click behind it, too.
+        if self.confirm_open || self.volumes_open {
+            return;
+        }
+        if key == "?" {
+            self.show_help = !self.show_help;
+            cx.notify();
+            return;
+        }
+        if self.show_help {
+            return;
+        }
+        match self.screen {
+            // The hint names both keys and a click can only be one: it
+            // draws one level more, and past the deepest starts over.
+            Screen::Explore if key == "[ ]" => {
+                let step = if self.layout_options.max_depth >= DEPTH_LIMIT {
+                    1 - DEPTH_LIMIT.cast_signed()
+                } else {
+                    1
+                };
+                self.adjust_depth(step, cx);
+            }
+            Screen::Explore => self.on_explore_key(key, false, false, cx),
+            Screen::Review => self.on_review_key(key, cx),
+            Screen::Running | Screen::Done => {}
         }
     }
 

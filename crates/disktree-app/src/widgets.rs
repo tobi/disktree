@@ -9,7 +9,8 @@ use disktree_core::tree::{Metric, Node};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Div, ElementId, FontWeight, Hsla, InteractiveElement as _,
-    ParentElement, SharedString, Styled, div, relative,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, div,
+    relative,
 };
 use gpui_omarchy::{ActiveTheme, Status};
 
@@ -246,6 +247,30 @@ pub fn hint(
                 .text_color(theme.secondary)
                 .child(label.into()),
         )
+}
+
+/// A hint that can be clicked: the same pair, with the hover and the
+/// pointer of something that does what its key does.
+pub fn hint_button(
+    id: impl Into<ElementId>,
+    keys: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    cx: &App,
+) -> gpui_kit::Stateful<Div> {
+    let theme = cx.omarchy();
+    hint(keys, label, cx)
+        .id(id)
+        .flex_shrink_0()
+        // Framed and padded evenly, so the key and its word sit in the
+        // middle of something that reads as pressable.
+        .justify_center()
+        .px(space::SM)
+        .py(space::XXS)
+        .border_1()
+        .border_color(theme.control_border())
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.hover_fill()))
+        .active(|style| style.bg(theme.pressed_fill()))
 }
 
 /// A section heading inside a panel.
