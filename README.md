@@ -228,6 +228,7 @@ and shows how much free space was actually gained.
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
+| `T` | the system's theme, light or dark |
 | `o` | show it in Finder, File Explorer or the file manager |
 | right-click | show that tile in Finder, File Explorer or the file manager |
 | `?` | every key |

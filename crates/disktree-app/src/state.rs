@@ -33,6 +33,7 @@ use gpui_kit::{
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::appearance::ThemeChoice;
 use crate::git::GitState;
 
 use crate::marks::{Marks, display_path, is_hidden};
@@ -326,6 +327,8 @@ pub struct Disktree {
     /// The directory the tree was scanned from.
     pub root_path: PathBuf,
     pub home: Option<PathBuf>,
+    /// Whose palette is drawn; for this run only.
+    pub theme_choice: ThemeChoice,
     pub options: ScanOptions,
     pub power_choice: Option<crate::power::PowerEfficiency>,
     pub power_settings_path: Option<PathBuf>,
@@ -470,6 +473,7 @@ impl Disktree {
         let mut tree = Self {
             root_path,
             home,
+            theme_choice: ThemeChoice::default(),
             options,
             power_choice: None,
             power_settings_path: crate::power::settings_path(),
@@ -2380,6 +2384,46 @@ impl Disktree {
     }
 
     // ── input ───────────────────────────────────────────────────────────
+
+    /// `T`, the one key that needs the window: the theme follows its
+    /// appearance. Only where the treemap has the keyboard, so it does not
+    /// fire under a dialog, a menu or the filter.
+    pub fn on_window_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let quiet = self.can_start_over()
+            && !self.find_open
+            && !self.show_help
+            && self.crumb_menu.is_none()
+            && self.power_menu.is_none();
+        let modifiers = &event.keystroke.modifiers;
+        let chord = modifiers.control || modifiers.platform;
+        let shifted = modifiers.shift && !chord && !modifiers.alt;
+        if !(quiet && shifted && event.keystroke.key == "t") {
+            return false;
+        }
+        self.cycle_theme(window, cx);
+        true
+    }
+
+    /// `T`: the system's theme, then light, then dark, and round again.
+    pub fn cycle_theme(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
+        self.theme_choice = self.theme_choice.next();
+        crate::appearance::choose(
+            self.theme_choice,
+            window.appearance(),
+            self.home.as_deref(),
+            cx,
+        );
+        self.notice = Some((
+            format!("{} theme", self.theme_choice.name()),
+            Status::Neutral,
+        ));
+        cx.notify();
+    }
 
     /// Handle a key press.
     pub fn on_key_down(

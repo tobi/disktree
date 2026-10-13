@@ -130,12 +130,16 @@ pub const fn highlight(theme: &Theme) -> Hsla {
     theme.warning
 }
 
-/// Text on a filled highlight.
-pub const fn on_highlight(theme: &Theme) -> Hsla {
-    if dark(theme) {
-        theme.background
+/// Text on a filled highlight: whichever end of the theme stands further
+/// from the fill. A light theme's highlight is a dark amber, and the dark
+/// text that suits its pages was nearly lost on it.
+pub fn on_highlight(theme: &Theme) -> Hsla {
+    let fill = highlight(theme).l;
+    let (ground, ink) = (theme.background, theme.bright);
+    if (ground.l - fill).abs() >= (ink.l - fill).abs() {
+        ground
     } else {
-        theme.bright
+        ink
     }
 }
 
@@ -197,6 +201,17 @@ mod tests {
                     || (left.s - right.s).abs() > 0.1;
                 assert!(apart, "{left:?} and {right:?} read as one colour");
             }
+        }
+    }
+
+    #[test]
+    fn text_on_the_highlight_stands_apart_from_it_in_both_themes() {
+        for appearance in [ThemeAppearance::Dark, ThemeAppearance::Light] {
+            let theme = theme(appearance);
+            let apart = (on_highlight(&theme).l - highlight(&theme).l).abs();
+            // Well short of this, the light theme's button could not be
+            // read: its text and its amber were 0.2 of lightness apart.
+            assert!(apart > 0.35, "{appearance:?}: only {apart} apart");
         }
     }
 

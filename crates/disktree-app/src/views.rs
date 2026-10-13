@@ -93,6 +93,9 @@ pub fn root(
                 cx.notify();
                 return;
             }
+            if this.on_window_key(event, window, cx) {
+                return;
+            }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
         }))
@@ -3532,6 +3535,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
         ("p", "Show or hide the selection line"),
+        ("T", "System, light or dark theme"),
         (
             "o",
             if cfg!(target_os = "macos") {

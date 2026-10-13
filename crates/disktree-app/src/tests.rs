@@ -1844,3 +1844,43 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[gpui_kit::test]
+fn the_theme_steps_from_the_system_to_light_to_dark(cx: &mut TestAppContext) {
+    use crate::appearance::ThemeChoice;
+    use gpui_kit::base::ThemeAppearance;
+    use gpui_omarchy::ActiveTheme as _;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.theme_choice), ThemeChoice::System);
+
+    press(cx, "shift-t");
+    read(&view, cx, |app| {
+        assert_eq!(app.theme_choice, ThemeChoice::Light);
+        let said = app.notice.as_ref().map(|(text, _)| text.as_str());
+        assert_eq!(said, Some("Light theme"));
+    });
+    cx.update(|_, cx| {
+        assert!(matches!(cx.omarchy().appearance, ThemeAppearance::Light));
+    });
+
+    // Round again, and a frame draws in each.
+    press(cx, "shift-t");
+    assert_eq!(read(&view, cx, |app| app.theme_choice), ThemeChoice::Dark);
+    cx.update(|_, cx| {
+        assert!(matches!(cx.omarchy().appearance, ThemeAppearance::Dark));
+    });
+    // `t` alone is still the Size | Files | Age switch.
+    press(cx, "t");
+    read(&view, cx, |app| {
+        assert_eq!(app.theme_choice, ThemeChoice::Dark);
+        assert_eq!(app.mode_index(), 1);
+    });
+    // In the filter a capital T is a letter of the name, not the key.
+    press(cx, "/");
+    press(cx, "shift-t");
+    assert_eq!(read(&view, cx, |app| app.theme_choice), ThemeChoice::Dark);
+}
