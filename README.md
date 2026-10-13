@@ -238,6 +238,11 @@ rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
 window quits); other ⌘ chords are left to the system. On Linux and Windows
 the same work with ctrl, with F5 to rescan too.
 
+The depth, Size / Files / Age, hidden files, apparent size, and the side
+panel's width and whether it is shown are remembered between launches, in
+`disktree/settings` beside the Power Efficiency preset; an option on the
+command line still overrules what was saved.
+
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back. Or hand the list on instead of acting on it: `s`
 saves it as a text file, one path per line, and `a` copies a prompt for a

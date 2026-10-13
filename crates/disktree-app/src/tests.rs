@@ -1844,3 +1844,34 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[gpui_kit::test]
+fn view_choices_are_written_down_as_they_change(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let config = tempfile::TempDir::new().expect("tempdir");
+    let path = config.path().join("disktree").join("settings");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| app.settings_path = Some(path.clone()));
+    draw(cx);
+    assert!(!path.exists(), "nothing changed yet");
+
+    press(cx, "]");
+    press(cx, "t");
+    press(cx, "p");
+    let saved = crate::settings::load(&path).expect("saved");
+    assert_eq!(saved.depth, 4);
+    assert_eq!(saved.mode, 1);
+    assert!(!saved.show_selection);
+
+    // And a window opened with them starts as this one was left.
+    let again = update(&view, cx, |app, _| {
+        app.show_selection = true;
+        app.panel_rems = crate::state::PANEL_MIN_REMS;
+        app.apply_settings(&saved);
+        app.settings()
+    });
+    assert!(!again.show_selection);
+    assert!((again.panel_rems - saved.panel_rems).abs() < f32::EPSILON);
+    assert_eq!(again.mode, 1);
+}

@@ -834,10 +834,7 @@ fn view_settings(
         )
         .tab_stop(false)
         .on_change(move |_, _, window, cx| {
-            let _ = entity.update(cx, |this, cx| {
-                this.options.include_hidden = !this.options.include_hidden;
-                this.start_scan(cx);
-            });
+            let _ = entity.update(cx, Disktree::toggle_hidden);
             window.focus(&focus, cx);
         })
     };
@@ -850,10 +847,7 @@ fn view_settings(
         )
         .tab_stop(false)
         .on_change(move |_, _, window, cx| {
-            let _ = entity.update(cx, |this, cx| {
-                this.options.apparent_size = !this.options.apparent_size;
-                this.start_scan(cx);
-            });
+            let _ = entity.update(cx, Disktree::toggle_apparent_size);
             window.focus(&focus, cx);
         })
     };

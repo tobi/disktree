@@ -36,6 +36,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::git::GitState;
 
 use crate::marks::{Marks, display_path, is_hidden};
+use crate::settings::Settings;
 use crate::treemap_view::{Mosaic, TileDeco};
 
 /// What a tile's colour says.
@@ -455,6 +456,9 @@ pub struct Disktree {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
+    /// Where the view choices are saved. `None` keeps them for this run
+    /// only: no settings directory, or a test that must not write to one.
+    pub settings_path: Option<PathBuf>,
 }
 
 impl Disktree {
@@ -551,7 +555,15 @@ impl Disktree {
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
+            settings_path: None,
         };
+        // The panel's width changes continuously under a drag, so it is
+        // written down once, on the way out, with everything else.
+        cx.on_app_quit(|this, _| {
+            this.save_settings();
+            std::future::ready(())
+        })
+        .detach();
         tree.device = device_for(&tree.root_path);
         tree.full_disk_access = tree
             .home
@@ -592,6 +604,59 @@ impl Disktree {
         app.refresh_insights();
         app.select_largest(cx);
         app
+    }
+
+    // ── saved choices ───────────────────────────────────────────────────
+
+    /// The view choices as they stand, for the settings file.
+    pub const fn settings(&self) -> Settings {
+        Settings {
+            depth: self.layout_options.max_depth,
+            include_hidden: self.options.include_hidden,
+            apparent_size: self.options.apparent_size,
+            mode: self.mode_index(),
+            panel_rems: self.panel_rems,
+            show_selection: self.show_selection,
+        }
+    }
+
+    /// Take the saved choices the command line has no flag for. The depth
+    /// and the scan options arrive through the arguments instead, where a
+    /// flag can overrule them.
+    pub fn apply_settings(&mut self, saved: &Settings) {
+        // Age keeps areas by size, so it only holds while nothing, saved
+        // or flagged, asked for areas by files.
+        if saved.mode == 2 && self.options.metric == Metric::Bytes {
+            self.color_mode = ColorMode::Age;
+        }
+        self.panel_rems = saved.panel_rems;
+        self.show_selection = saved.show_selection;
+    }
+
+    /// Write the view choices down. A failure goes to standard error and
+    /// no further: the choice still holds for this run, and a notice on
+    /// every click would be worse than the loss.
+    pub fn save_settings(&self) {
+        let Some(path) = self.settings_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = crate::settings::save(path, &self.settings()) {
+            eprintln!("Cannot save settings: {error}");
+        }
+    }
+
+    /// `i`: include or skip hidden entries, which changes what is measured.
+    pub fn toggle_hidden(&mut self, cx: &mut Context<'_, Self>) {
+        self.options.include_hidden = !self.options.include_hidden;
+        self.save_settings();
+        self.start_scan(cx);
+    }
+
+    /// `d`: disk usage or apparent size, which changes what is measured.
+    pub fn toggle_apparent_size(&mut self, cx: &mut Context<'_, Self>) {
+        self.options.apparent_size = !self.options.apparent_size;
+        self.save_settings();
+        self.start_scan(cx);
     }
 
     /// Scan a different root from scratch. Marks are kept; a mark outside
@@ -2051,6 +2116,7 @@ impl Disktree {
             .clamp(1, 6) as u32;
         self.layout_options.max_depth = depth;
         self.cache = None;
+        self.save_settings();
         cx.notify();
     }
 
@@ -2094,6 +2160,7 @@ impl Disktree {
         if self.options.metric != metric {
             self.toggle_metric(cx);
         }
+        self.save_settings();
         cx.notify();
     }
 
@@ -2730,16 +2797,11 @@ impl Disktree {
             "r" if !control => self.start_scan(cx),
             "g" if !control => self.go_to_disk(cx),
             "v" if !control && !shift => self.open_volumes(cx),
-            "i" if !control => {
-                self.options.include_hidden = !self.options.include_hidden;
-                self.start_scan(cx);
-            }
-            "d" if !control => {
-                self.options.apparent_size = !self.options.apparent_size;
-                self.start_scan(cx);
-            }
+            "i" if !control => self.toggle_hidden(cx),
+            "d" if !control => self.toggle_apparent_size(cx),
             "p" if !control => {
                 self.show_selection = !self.show_selection;
+                self.save_settings();
                 cx.notify();
             }
             "o" if !control => self.reveal_target(cx),

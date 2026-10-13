@@ -17,6 +17,7 @@ mod git;
 mod marks;
 mod palette;
 mod power;
+mod settings;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -100,7 +101,15 @@ fn run() -> Result<()> {
             eprintln!("Cannot load Power Efficiency: {error}; using Balanced");
             power::PowerEfficiency::default()
         });
-    let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
+    let settings_path = settings::path();
+    let chosen = settings_path
+        .as_deref()
+        .map_or_else(|| Ok(settings::Settings::default()), settings::load)
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot load settings: {error}; using the defaults");
+            settings::Settings::default()
+        });
+    let args = parse_args_with(std::env::args_os().skip(1), saved, &chosen)?;
 
     // When the app executable is reached through the command-line symlink,
     // cmux sends SIGTERM to its foreground process group as AppKit takes
@@ -186,6 +195,8 @@ fn run() -> Result<()> {
                                 cx,
                             );
                             app.power_choice = args.power;
+                            app.settings_path.clone_from(&settings_path);
+                            app.apply_settings(&chosen);
                             app
                         })
                     },
@@ -209,17 +220,34 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
     parse_args_with_power(args, power::PowerEfficiency::default())
 }
 
+#[cfg(test)]
 fn parse_args_with_power(
+    args: impl Iterator<Item = std::ffi::OsString>,
+    preset: power::PowerEfficiency,
+) -> Result<Args> {
+    parse_args_with(args, preset, &settings::Settings::default())
+}
+
+/// Saved choices are where the options start; a flag then overrules one.
+fn parse_args_with(
     mut args: impl Iterator<Item = std::ffi::OsString>,
     preset: power::PowerEfficiency,
+    saved: &settings::Settings,
 ) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions {
         threads: preset.policy(power::cpu_threads()),
+        apparent_size: saved.apparent_size,
+        include_hidden: saved.include_hidden,
+        metric: if saved.mode == 1 {
+            disktree_core::tree::Metric::Files
+        } else {
+            disktree_core::tree::Metric::Bytes
+        },
         ..ScanOptions::default()
     };
     let mut power = Some(preset);
-    let mut depth = 3_u32;
+    let mut depth = saved.depth;
     let mut disk = false;
     // `std::env::args` panics on a name that is not Unicode, and a path is
     // any name: a restart as administrator hands the root back exactly as
@@ -429,6 +457,32 @@ mod argument_tests {
                 < f64::EPSILON
         );
         assert_eq!(args.options.threads.system_cpu_limit, None);
+    }
+
+    #[test]
+    fn saved_view_choices_are_where_the_flags_start() {
+        let saved = settings::Settings {
+            depth: 5,
+            include_hidden: false,
+            apparent_size: true,
+            mode: 1,
+            ..settings::Settings::default()
+        };
+        let preset = power::PowerEfficiency::default();
+        let args =
+            parse_args_with(arguments(&[]), preset, &saved).expect("saved");
+        assert_eq!(args.depth, 5);
+        assert!(!args.options.include_hidden);
+        assert!(args.options.apparent_size);
+        assert_eq!(args.options.metric, disktree_core::tree::Metric::Files);
+        let args = parse_args_with(
+            arguments(&["--depth", "2", "--metric", "bytes"]),
+            preset,
+            &saved,
+        )
+        .expect("flags");
+        assert_eq!(args.depth, 2);
+        assert_eq!(args.options.metric, disktree_core::tree::Metric::Bytes);
     }
 
     #[test]
