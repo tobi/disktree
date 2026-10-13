@@ -136,7 +136,10 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 ### The screen
 
 - **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. Click
+  the empty space beside the trail, or press `ctrl l`, and the trail becomes
+  a text field holding the path: copy it, or type or paste another and press
+  Enter to go there. In the
   tree a crumb goes there, and its ▾ lists its siblings, largest first with
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
@@ -226,6 +229,7 @@ and shows how much free space was actually gained.
 | `esc` while scanning | stop the scan |
 | `v` | scan another mounted volume |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
+| `ctrl l` (`⌘L` on macOS) | type or paste a path to go to; `esc` puts the trail back |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
 | `o` | show it in Finder, File Explorer or the file manager |

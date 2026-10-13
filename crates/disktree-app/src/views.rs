@@ -93,6 +93,9 @@ pub fn root(
                 cx.notify();
                 return;
             }
+            if this.on_window_key(event, window, cx) {
+                return;
+            }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
         }))
@@ -448,7 +451,7 @@ fn top_bar(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    div()
+    let bar = div()
         .flex()
         .flex_row()
         .items_center()
@@ -457,11 +460,48 @@ fn top_bar(
         .py(space::MD)
         .border_b_1()
         .border_color(theme.divider())
-        .child(logo(theme))
+        .child(logo(theme));
+    let bar = match app.path_input.clone().filter(|_| app.path_open) {
+        Some(input) => bar.child(
+            div()
+                .id("path-field")
+                .debug_selector(|| "path-field".into())
+                .flex_1()
+                .min_w_0()
+                // Framed in the accent, so the row plainly became a field
+                // to type in: the input's own border is the bar's colour.
+                .border_1()
+                .border_color(theme.accent)
+                .child(gpui_omarchy::input("path-input", &input, window, cx)),
+        ),
         // Where you are is navigation, and it belongs to the whole window.
-        .child(trail(app, theme, cx))
-        .child(div().flex_1())
-        .child(view_settings(app, window, cx))
+        None => bar.child(trail(app, theme, cx)).child(path_space(cx)),
+    };
+    bar.child(view_settings(app, window, cx))
+}
+
+/// The empty part of the trail's row. A click there turns the trail into a
+/// text field holding the path, as the same spot does in a file manager's
+/// address bar: to copy it, or to type or paste another.
+fn path_space(cx: &Context<'_, Disktree>) -> Stateful<Div> {
+    with_tooltip(
+        div()
+            .id("path-space")
+            .debug_selector(|| "path-space".into())
+            .flex_1()
+            // The row centres its children, and an empty one has no
+            // height of its own to click on.
+            .self_stretch()
+            .cursor_text()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_path_bar(window, cx);
+            })),
+        if cfg!(target_os = "macos") {
+            "Type or paste a path \u{00b7} \u{2318}L"
+        } else {
+            "Type or paste a path \u{00b7} ctrl l"
+        },
+    )
 }
 
 /// The trail, from `/`. Above the scanned root, a crumb widens the scan;
@@ -3494,6 +3534,11 @@ const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
 } else {
     "ctrl-o"
 };
+const MODIFIER_PATH: &str = if cfg!(target_os = "macos") {
+    "\u{2318}L"
+} else {
+    "ctrl-l"
+};
 
 fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
@@ -3528,6 +3573,10 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("esc", "Stop a scan in progress"),
         ("v", "Scan another volume"),
         (MODIFIER_OPEN, "Choose another directory to scan"),
+        (
+            MODIFIER_PATH,
+            "Type or paste a path; a click beside the trail does too",
+        ),
         ("g", "The whole disk; click any directory above to widen"),
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
