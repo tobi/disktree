@@ -553,12 +553,29 @@ fn tree_crumb(
     cx: &Context<'_, Disktree>,
 ) -> gpui_kit::AnyElement {
     let Some((&index, parent)) = path.split_last() else {
-        // The scanned root: no siblings in the tree to offer.
-        return widgets::crumb(id, label, current, cx)
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.go_to(Vec::new(), cx)),
-            )
-            .into_any_element();
+        // The scanned root: no siblings in the tree to offer. Being there
+        // already, the crumb of a whole volume offers the other volumes
+        // instead, as a current crumb in the tree offers its siblings.
+        let volumes = current && app.root_is_a_volume();
+        let crumb = widgets::crumb(id, label, current, cx)
+            .debug_selector(|| "root-crumb".into())
+            .when(volumes, |crumb| {
+                crumb.hover(|style| style.bg(theme.hover_fill()))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if volumes {
+                    this.open_volumes(cx);
+                    this.apply_focus(window, cx);
+                } else {
+                    this.go_to(Vec::new(), cx);
+                }
+            }));
+        return if volumes {
+            with_tooltip(crumb, "Scan another volume \u{00b7} v")
+                .into_any_element()
+        } else {
+            crumb.into_any_element()
+        };
     };
     let parent = parent.to_vec();
     let open = app
@@ -2014,13 +2031,28 @@ fn disk_section(
         .flex_row()
         .items_center()
         .gap(space::SM)
-        .child(widgets::eyebrow("Disk", cx))
-        .child(
+        .child(with_tooltip(
             div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary.opacity(0.6))
-                .child(device),
-        )
+                .id("disk-label")
+                .debug_selector(|| "disk-label".into())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_volumes(cx);
+                    this.apply_focus(window, cx);
+                }))
+                .child(widgets::eyebrow("Disk", cx))
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary.opacity(0.6))
+                        .child(device),
+                ),
+            "Scan another volume \u{00b7} v",
+        ))
         .child(div().flex_1())
         .child(
             button("volumes", "Volumes", ButtonVariant::Secondary, cx)

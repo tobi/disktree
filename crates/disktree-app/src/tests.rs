@@ -1844,3 +1844,39 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[gpui_kit::test]
+fn the_crumb_of_a_whole_volume_offers_the_other_volumes(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    // A directory with a disk above it is not one: its crumb goes to the
+    // top of the scan, as it always did.
+    assert!(!read(&view, cx, Disktree::root_is_a_volume));
+    let crumb = cx.debug_bounds("root-crumb").expect("the root's crumb");
+    cx.simulate_click(crumb.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.volumes_open));
+
+    update(&view, cx, |app, cx| {
+        app.disk_root = Some(app.root_path.clone());
+        cx.notify();
+    });
+    assert!(read(&view, cx, Disktree::root_is_a_volume));
+    draw(cx);
+    let crumb = cx.debug_bounds("root-crumb").expect("the root's crumb");
+    cx.simulate_click(crumb.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.volumes_open));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+
+    // The disk's label in the panel is the same way on.
+    let label = cx.debug_bounds("disk-label").expect("the disk label");
+    cx.simulate_click(label.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.volumes_open));
+}

@@ -751,6 +751,13 @@ impl Disktree {
         }
     }
 
+    /// Whether the scanned root is itself a volume: there is nothing above
+    /// it to widen to, so the only way on from its crumb is another volume.
+    pub fn root_is_a_volume(&self) -> bool {
+        self.root_path.parent().is_none()
+            || self.disk_root.as_deref() == Some(self.root_path.as_path())
+    }
+
     /// Recompute "worth a look" from the tree on screen.
     fn refresh_insights(&mut self) {
         self.scanned_at = now_seconds();

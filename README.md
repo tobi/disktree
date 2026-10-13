@@ -270,11 +270,13 @@ and removes duplicate hardlinks.
 
 ## Switching volumes
 
-Press `v` (or click **Volumes** beside the disk name in the side panel) to
-bring up the volume picker. It lists every candidate volume mounted on the
-system together with its free space, ordered fullest first, filtering out
-pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
-entry resets the scan root directly to that volume.
+Press `v`, or click the disk's name or **Volumes** beside it in the side
+panel, to bring up the volume picker. When the scan is of a whole volume,
+its crumb in the trail (`C:\` or `/`) opens it too. It lists every
+candidate volume mounted on the system together with its free space,
+ordered fullest first, filtering out pseudo-filesystems and duplicate
+btrfs/APFS mount points. Selecting any entry resets the scan root directly
+to that volume.
 
 ## The whole disk
 
