@@ -98,6 +98,10 @@ pub mod size {
     pub const TOOLTIP: Rems = Rems(16.75);
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
+    /// The page of disks: three cards across at the default rem.
+    pub const HOME: Rems = Rems(58.0);
+    /// One disk on that page: wide enough for a label and its letter.
+    pub const DRIVE_CARD: Rems = Rems(16.0);
     /// The key column of the keyboard overlay.
     pub const KEY_LANE: Rems = Rems(7.0);
 }

@@ -518,6 +518,51 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_help_overlay_closes_by_button_and_from_outside_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let drawn =
+        read(&view, cx, |app| (app.crumbs.clone(), app.selected.clone()));
+
+    press(cx, "?");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_help));
+    // A press on the card is the card's own.
+    let card = cx.debug_bounds("help-card").expect("the key list");
+    cx.simulate_click(card.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_help));
+    // One beside it closes the page, and the keys are the treemap's again.
+    let page = cx.debug_bounds("help").expect("the page");
+    let outside = Point::new(page.origin.x + px(4.), page.origin.y + px(4.));
+    cx.simulate_click(outside, gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.show_help));
+    // Neither press reached the screen behind: the same directory is drawn.
+    assert_eq!(
+        read(&view, cx, |app| (app.crumbs.clone(), app.selected.clone())),
+        drawn
+    );
+
+    // The way out is a button as well as a key.
+    press(cx, "?");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_help));
+    let close = cx.debug_bounds("help-close").expect("Close");
+    cx.simulate_click(close.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.show_help));
+    press(cx, "?");
+    assert!(read(&view, cx, |app| app.show_help));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_help));
+}
+
+#[gpui_kit::test]
 fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
@@ -552,6 +597,7 @@ fn enter_in_the_focused_volume_picker_scans_the_selected_root(
             point: target.clone(),
             device: None,
             space: None,
+            label: None,
         }];
         app.volume_highlight = 0;
         app.volumes_open = true;
@@ -586,11 +632,13 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
                     free: 500,
                     available: 400,
                 }),
+                label: None,
             },
             Volume {
                 point: PathBuf::from("/two"),
                 device: None,
                 space: None,
+                label: None,
             },
         ];
         app.volumes_open = true;
@@ -621,6 +669,101 @@ fn the_volume_picker_is_centred_and_still_dismisses_from_outside(
         !read(&view, cx, |app| app.volumes_open),
         "clicking outside the picker closes it"
     );
+}
+
+#[gpui_kit::test]
+fn the_page_of_disks_scans_the_one_clicked(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let target = temp.path().join("junk");
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let home = cx.debug_bounds("home").expect("the home button");
+    cx.simulate_click(home.center(), gpui_kit::Modifiers::none());
+    assert!(read(&view, cx, |app| app.home_open));
+    // Fixed disks, so this is not about the machine running the test.
+    update(&view, cx, |app, cx| {
+        app.volumes = vec![
+            Volume {
+                point: PathBuf::from("/elsewhere"),
+                device: Some("/dev/elsewhere".into()),
+                space: Some(SpaceInfo {
+                    total: 1_000,
+                    free: 50,
+                    available: 40,
+                }),
+                label: Some("Nearly full".into()),
+            },
+            Volume {
+                point: target.clone(),
+                device: None,
+                space: None,
+                label: None,
+            },
+        ];
+        app.volumes_loading = false;
+        cx.notify();
+    });
+    draw(cx);
+    // The treemap's keys are the page's while it is up.
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    press(cx, "down");
+    assert_eq!(read(&view, cx, |app| app.volume_highlight), 1);
+
+    let drive = cx.debug_bounds("drive-1").expect("the second disk");
+    cx.simulate_click(drive.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert!(!app.home_open);
+        assert_eq!(app.root_path, target);
+    });
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
+fn the_page_of_disks_closes_without_moving_the_scan(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let before = read(&view, cx, |app| app.root_path.clone());
+    let open = |cx: &mut VisualTestContext| {
+        let home = cx.debug_bounds("home").expect("the home button");
+        cx.simulate_click(home.center(), gpui_kit::Modifiers::none());
+        draw(cx);
+    };
+
+    // The page lists this machine's disks and draws them without
+    // panicking; nothing behind it may start over while it is up.
+    open(cx);
+    read(&view, cx, |app| {
+        assert!(app.home_open);
+        assert!(!app.can_start_over());
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.home_open));
+
+    // A press on the card is the card's own; one beside it closes the page.
+    open(cx);
+    let card = cx.debug_bounds("home-card").expect("the page's card");
+    cx.simulate_click(card.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.home_open));
+    let page = cx.debug_bounds("home").expect("the page");
+    let outside = Point::new(page.origin.x + px(4.), page.origin.y + px(4.));
+    cx.simulate_click(outside, gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.home_open));
+
+    // The way out is a button as well as a key.
+    open(cx);
+    let close = cx.debug_bounds("home-close").expect("Close");
+    cx.simulate_click(close.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.home_open));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), before);
 }
 
 #[gpui_kit::test]

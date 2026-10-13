@@ -136,7 +136,9 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 ### The screen
 
 - **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. The disk
+  button beside the name opens a page of every disk, with its name, size
+  and room; click one to scan it. In the
   tree a crumb goes there, and its ▾ lists its siblings, largest first with
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
@@ -237,6 +239,9 @@ On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘R to
 rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
 window quits); other ⌘ chords are left to the system. On Linux and Windows
 the same work with ctrl, with F5 to rescan too.
+
+The key list and the page of disks close with `esc`, their Close button,
+or a click outside them.
 
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back. Or hand the list on instead of acting on it: `s`

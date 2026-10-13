@@ -689,6 +689,20 @@ pub const fn foreign_mounts_for(_root: &Path) -> Option<Vec<PathBuf>> {
     Some(Vec::new())
 }
 
+/// The name of the volume `path` is on, where the system keeps one.
+#[cfg(windows)]
+pub fn volume_label(path: &Path) -> Option<String> {
+    crate::windows::volume_root(path)
+        .and_then(|root| crate::windows::volume_label(&root))
+}
+
+/// The name of the volume `path` is on, where the system keeps one: only
+/// Windows is asked, the mount point being the name elsewhere.
+#[cfg(not(windows))]
+pub const fn volume_label(_path: &Path) -> Option<String> {
+    None
+}
+
 /// A mounted volume the picker can switch the scan to: where it is mounted
 /// and how much room it has. Listed by [`volumes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -701,6 +715,9 @@ pub struct Volume {
     pub device: Option<String>,
     /// Free space on the volume now; `None` when it cannot be read.
     pub space: Option<SpaceInfo>,
+    /// The name its owner gave it, such as `Data` for `D:\`; `None` when
+    /// it has none or the system does not say.
+    pub label: Option<String>,
 }
 
 /// Every volume worth offering as a scan root, fullest first.
@@ -742,6 +759,7 @@ pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
     let mut volumes: Vec<Volume> = seen
         .iter()
         .map(|mount| Volume {
+            label: None,
             point: mount.point.clone(),
             device: Some(mount.source.clone()),
             space: space_info(&mount.point).ok(),
@@ -824,6 +842,7 @@ pub fn volumes() -> Vec<Volume> {
     let mut volumes: Vec<Volume> = points
         .iter()
         .map(|point| Volume {
+            label: None,
             point: point.clone(),
             device: device_for(point),
             space: space_info(point).ok(),
@@ -844,6 +863,7 @@ pub fn volumes() -> Vec<Volume> {
         .into_iter()
         .filter_map(|point| {
             space_info(&point).ok().map(|space| Volume {
+                label: crate::windows::volume_label(&point),
                 point,
                 device: None,
                 space: Some(space),
@@ -999,6 +1019,7 @@ portal /run/user/1000/doc fuse.portal rw 0 0
     #[test]
     fn volumes_with_least_space_come_first_and_unknowns_last() {
         let volume = |name: &str, available: Option<u64>| Volume {
+            label: None,
             point: PathBuf::from(name),
             device: None,
             space: available.map(|available| SpaceInfo {

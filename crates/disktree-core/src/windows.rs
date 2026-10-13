@@ -639,6 +639,31 @@ pub fn file_table_readable(root: &Path) -> bool {
     ok != 0 && String::from_utf16_lossy(&name[..end]) == "NTFS"
 }
 
+/// The label of the volume mounted at `root`, as File Explorer shows it
+/// before the drive letter. `None` for an unlabelled or unreadable volume.
+pub fn volume_label(root: &Path) -> Option<String> {
+    let volume = wide(root, true).ok()?;
+    let mut label = [0_u16; MAX_PATH as usize + 1];
+    let length = u32::try_from(label.len()).unwrap_or(u32::MAX);
+    // SAFETY: `volume` is NUL-terminated and outlives the call, `label` is
+    // writable for the length passed, and the other outputs may be null.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            volume.as_ptr(),
+            label.as_mut_ptr(),
+            length,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let end = label.iter().position(|&unit| unit == 0).unwrap_or(0);
+    let label = String::from_utf16_lossy(&label[..end]);
+    (ok != 0 && !label.is_empty()).then_some(label)
+}
+
 /// Start `program` with `args` as an administrator, through the UAC
 /// prompt. Returns once the prompt is answered; declining it is an error
 /// (`ERROR_CANCELLED`).

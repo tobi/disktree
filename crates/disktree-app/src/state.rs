@@ -446,6 +446,9 @@ pub struct Disktree {
     volume_epoch: u64,
     pub volumes: Vec<disktree_core::space::Volume>,
     pub volume_highlight: usize,
+    /// The page of disks is up. It lists `volumes` as the picker does, the
+    /// scanned one among them.
+    pub home_open: bool,
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
     pub scan_started: Option<Instant>,
@@ -545,6 +548,7 @@ impl Disktree {
             volumes_loading: false,
             volume_epoch: 0,
             volumes: Vec::new(),
+            home_open: false,
             volume_highlight: 0,
             panel_rems: PANEL_REMS,
             scan_started: None,
@@ -650,14 +654,37 @@ impl Disktree {
     /// is left alone until a volume is picked; picking calls [`set_root`],
     /// which cancels it.
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
+        self.volumes_open = true;
+        self.focus_request = Some(FocusTarget::Dialog);
+        self.load_volumes(false, cx);
+    }
+
+    /// The home page: every disk with its name, size and room, as a file
+    /// manager's own first page shows them, the one being scanned too.
+    pub fn open_home(&mut self, cx: &mut Context<'_, Self>) {
+        if !self.can_start_over() {
+            return;
+        }
+        self.home_open = true;
+        self.load_volumes(true, cx);
+    }
+
+    /// Leave the page of disks without choosing one.
+    pub fn close_home(&mut self, cx: &mut Context<'_, Self>) {
+        self.home_open = false;
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    /// Read the volumes for the picker, or with `with_current` for the
+    /// page of disks, which shows the scanned one among the others.
+    fn load_volumes(&mut self, with_current: bool, cx: &mut Context<'_, Self>) {
         self.volume_epoch += 1;
         let epoch = self.volume_epoch;
         let root_path = self.root_path.clone();
         self.volumes.clear();
         self.volume_highlight = 0;
         self.volumes_loading = true;
-        self.volumes_open = true;
-        self.focus_request = Some(FocusTarget::Dialog);
         // Removable media and network volumes can take seconds to answer.
         // Keep Escape and the window responsive while probing them.
         let task = cx.background_executor().spawn(async move {
@@ -669,15 +696,19 @@ impl Disktree {
                     point: root.clone(),
                     device: device_for(&root),
                     space: space_info(&root).ok(),
+                    label: disktree_core::space::volume_label(&root),
                 });
             }
-            volumes.retain(|volume| volume.point != root_path);
+            if !with_current {
+                volumes.retain(|volume| volume.point != root_path);
+            }
             volumes
         });
         cx.spawn(async move |this, cx| {
             let volumes = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.volumes_open && this.volume_epoch == epoch {
+                let wanted = this.volumes_open || this.home_open;
+                if wanted && this.volume_epoch == epoch {
                     this.volumes = volumes;
                     this.volumes_loading = false;
                     cx.notify();
@@ -708,10 +739,12 @@ impl Disktree {
             .map(|volume| volume.point.clone())
         else {
             self.volumes_open = false;
+            self.home_open = false;
             cx.notify();
             return;
         };
         self.volumes_open = false;
+        self.home_open = false;
         self.volumes.clear();
         self.set_root(point, cx);
     }
@@ -2397,6 +2430,7 @@ impl Disktree {
         self.screen == Screen::Explore
             && !self.confirm_open
             && !self.volumes_open
+            && !self.home_open
     }
 
     /// Ask for a directory and scan it: an app opened from the Dock has no
@@ -2534,6 +2568,18 @@ impl Disktree {
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
         if self.confirm_open {
+            return;
+        }
+
+        // The page of disks takes the picker's keys.
+        if self.home_open {
+            match key {
+                "escape" => self.close_home(cx),
+                "enter" => self.choose_volume(cx),
+                "up" if !control => self.move_volume_highlight(-1, cx),
+                "down" if !control => self.move_volume_highlight(1, cx),
+                _ => {}
+            }
             return;
         }
 
