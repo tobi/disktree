@@ -518,6 +518,100 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_empty_part_of_the_trail_opens_a_path_field(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let space = cx
+        .debug_bounds("path-space")
+        .expect("room beside the trail");
+    cx.simulate_click(space.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.path_open));
+    assert!(
+        cx.debug_bounds("path-field").is_some(),
+        "the field is drawn"
+    );
+    // It starts on the path on screen, to copy or to type over.
+    let shown = view.read_with(cx, |app, cx| {
+        app.path_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+    });
+    assert_eq!(shown, Some(temp.path().display().to_string()));
+
+    // What is typed there is text: `c` must not open the review screen,
+    // nor `?` the key list.
+    update(&view, cx, Disktree::toggle_mark_selected);
+    press(cx, "c");
+    press(cx, "?");
+    read(&view, cx, |app| {
+        assert_eq!(app.screen, Screen::Explore);
+        assert!(!app.show_help);
+        assert!(app.path_open);
+    });
+
+    // Escape puts the trail back and the keys with the treemap.
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.path_open));
+    assert!(cx.debug_bounds("path-space").is_some());
+
+    // The key opens it as the click does, but not under the key list.
+    press(cx, "ctrl-l");
+    assert!(read(&view, cx, |app| app.path_open));
+    press(cx, "escape");
+    press(cx, "?");
+    assert!(read(&view, cx, |app| app.show_help));
+    press(cx, "ctrl-l");
+    assert!(!read(&view, cx, |app| app.path_open));
+}
+
+#[gpui_kit::test]
+fn a_typed_path_goes_there_or_says_why_not(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    // Canonical, as a root from the command line is.
+    let root = dunce::canonicalize(temp.path()).expect("root");
+    let (view, cx) = view_over(&root, cx);
+    draw(cx);
+
+    // Inside the tree: a step within it, and no new scan.
+    let deeper = root.join("junk").join("deeper");
+    let quoted = format!("  \"{}\"  ", deeper.display());
+    assert!(update(&view, cx, |app, cx| app.go_to_path(&quoted, cx)));
+    read(&view, cx, |app| {
+        assert_eq!(app.current_path(), deeper);
+        assert_eq!(app.root_path, root);
+        assert!(app.scan.is_none(), "nothing was scanned again");
+    });
+
+    // A file names the directory it is in.
+    let file = root.join("keep").join("notes.txt");
+    let typed = file.display().to_string();
+    assert!(update(&view, cx, |app, cx| app.go_to_path(&typed, cx)));
+    assert_eq!(read(&view, cx, Disktree::current_path), root.join("keep"));
+
+    // Nowhere, and a path with nothing to be relative to: said, not done.
+    for typed in [root.join("no-such").display().to_string(), "junk".into()] {
+        assert!(!update(&view, cx, |app, cx| app.go_to_path(&typed, cx)));
+        read(&view, cx, |app| {
+            assert!(app.notice.is_some(), "{typed} is explained");
+            assert_eq!(app.current_path(), root.join("keep"));
+        });
+    }
+
+    // Outside the scanned root: that directory becomes the root.
+    let other = tempfile::TempDir::new().expect("tempdir");
+    let elsewhere = dunce::canonicalize(other.path()).expect("elsewhere");
+    let typed = elsewhere.display().to_string();
+    assert!(update(&view, cx, |app, cx| app.go_to_path(&typed, cx)));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), elsewhere);
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
 fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
@@ -1843,4 +1937,78 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     cx.simulate_click(toggle.center(), Modifiers::none());
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
+}
+
+/// Another machine's tree is on screen to be read. Nothing that would
+/// act on one of its paths as though it were this machine's is offered,
+/// and what is pressed anyway says why not.
+#[gpui_kit::test]
+fn another_machine_is_looked_at_and_never_acted_on(cx: &mut TestAppContext) {
+    use disktree_core::remote::Remote;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    update(&view, cx, Disktree::toggle_mark_selected);
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
+    assert!(cx.debug_bounds("mark-button").is_some());
+    assert!(cx.debug_bounds("key-mark").is_some());
+    assert!(cx.debug_bounds("key-review").is_some());
+
+    // Stand in for a scan of another machine: the tree on screen with a
+    // remote set, as it is once a listing lands. Nothing is connected to.
+    update(&view, cx, |app, cx| {
+        app.remote = Remote::parse("me@box:/srv/data");
+        app.marks.clear();
+        cx.notify();
+    });
+    draw(cx);
+    // Its paths read as its own, whatever this machine joins them with,
+    // and nothing offers to mark one.
+    read(&view, cx, |app| {
+        let inside = app.root_path.join("srv").join("data");
+        assert_eq!(app.shown_path(&inside), {
+            let root = app.root_path.to_string_lossy().replace('\\', "/");
+            format!("{root}/srv/data")
+        });
+        assert_eq!(crate::widgets::display_root(app), "me@box:/srv/data");
+    });
+    assert!(cx.debug_bounds("mark-button").is_none());
+    assert!(cx.debug_bounds("key-mark").is_none());
+    assert!(cx.debug_bounds("key-review").is_none());
+    assert!(cx.debug_bounds("key-open").is_some());
+    // Marking says why not, and marks nothing; so does the file manager.
+    press(cx, "space");
+    read(&view, cx, |app| {
+        assert!(app.marks.is_empty());
+        let (text, _) = app.notice.as_ref().expect("a reason");
+        assert!(text.contains("read-only"), "{text}");
+    });
+    update(&view, cx, |app, cx| {
+        app.notice = None;
+        app.reveal_target(cx);
+        assert!(app.notice.is_some());
+        app.begin_removal(cx);
+        assert_eq!(app.screen, Screen::Explore);
+    });
+    // A path typed now is this machine's. It is scanned as one, and never
+    // looked for in the other machine's tree, though that tree happens
+    // to hold a directory of the same name here.
+    let junk = dunce::canonicalize(temp.path().join("junk")).expect("junk");
+    let typed = junk.display().to_string();
+    assert!(update(&view, cx, |app, cx| app.go_to_path(&typed, cx)));
+    read(&view, cx, |app| {
+        assert!(app.remote.is_none());
+        assert_eq!(app.root_path, junk);
+        assert!(app.scan.is_some(), "a local scan of it, not a step");
+    });
+    finish_scan(&view, cx);
+    // A local root is a local scan again, with everything it allows.
+    let root = temp.path().to_path_buf();
+    update(&view, cx, |app, cx| app.set_root(root, cx));
+    assert!(read(&view, cx, |app| app.remote.is_none()));
+    finish_scan(&view, cx);
+    press(cx, "space");
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
 }

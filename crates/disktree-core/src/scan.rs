@@ -142,7 +142,7 @@ impl ScanProgress {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
 
-    fn record_error(&self, path: &Path, error: &io::Error) {
+    pub(crate) fn record_error(&self, path: &Path, error: &io::Error) {
         self.errors.fetch_add(1, Ordering::Relaxed);
         // A scan without Full Disk Access can refuse thousands of paths;
         // only the ones that will be kept are worth formatting.
@@ -244,6 +244,31 @@ impl ScanHandle {
             progress.finish();
         }
 
+        Self { progress, result }
+    }
+
+    /// Start listing another machine over SSH on a worker thread. The
+    /// handle is the same as a walk's, so whoever waits on one waits on
+    /// either; see [`crate::remote`] for what the tree may be used for.
+    pub fn spawn_remote(
+        remote: crate::remote::Remote,
+        options: ScanOptions,
+    ) -> Self {
+        let progress = Arc::new(ScanProgress::default());
+        let (sender, result) = mpsc::channel();
+        let shared = Arc::clone(&progress);
+        let worker = thread::Builder::new().name("disktree-ssh".into()).spawn(
+            move || {
+                let outcome = crate::remote::scan(&remote, &options, &shared)
+                    .map(|node| finish_tree(node, &options, &WALK_POOL));
+                shared.finish();
+                let _ = sender.send(outcome);
+            },
+        );
+        if let Err(error) = worker {
+            progress.record_error(Path::new("scan worker"), &error);
+            progress.finish();
+        }
         Self { progress, result }
     }
 

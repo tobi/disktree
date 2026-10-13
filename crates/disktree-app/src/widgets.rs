@@ -19,7 +19,12 @@ use crate::state::Disktree;
 
 /// The scanned root, shortened to `~` where it is the home directory.
 pub fn display_root(app: &Disktree) -> String {
-    crate::marks::display_path(&app.root_path, app.home.as_deref())
+    // Another machine's root is named with the machine: `/tmp` alone
+    // would read as this one's.
+    app.remote.as_ref().map_or_else(
+        || crate::marks::display_path(&app.root_path, app.home.as_deref()),
+        ToString::to_string,
+    )
 }
 
 /// File counts, which is what a directory count is too.

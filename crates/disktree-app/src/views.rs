@@ -93,6 +93,9 @@ pub fn root(
                 cx.notify();
                 return;
             }
+            if this.on_window_key(event, window, cx) {
+                return;
+            }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
         }))
@@ -409,6 +412,10 @@ fn explore(
 
 /// The selection, when it is a checkout git can say something about.
 fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
+    // On another machine there is no checkout here to ask git about.
+    if app.remote.is_some() {
+        return None;
+    }
     let target = app.action_target()?;
     let node = app.node_at(&target)?;
     if !node.is_dir() {
@@ -448,7 +455,7 @@ fn top_bar(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    div()
+    let bar = div()
         .flex()
         .flex_row()
         .items_center()
@@ -457,11 +464,48 @@ fn top_bar(
         .py(space::MD)
         .border_b_1()
         .border_color(theme.divider())
-        .child(logo(theme))
+        .child(logo(theme));
+    let bar = match app.path_input.clone().filter(|_| app.path_open) {
+        Some(input) => bar.child(
+            div()
+                .id("path-field")
+                .debug_selector(|| "path-field".into())
+                .flex_1()
+                .min_w_0()
+                // Framed in the accent, so the row plainly became a field
+                // to type in: the input's own border is the bar's colour.
+                .border_1()
+                .border_color(theme.accent)
+                .child(gpui_omarchy::input("path-input", &input, window, cx)),
+        ),
         // Where you are is navigation, and it belongs to the whole window.
-        .child(trail(app, theme, cx))
-        .child(div().flex_1())
-        .child(view_settings(app, window, cx))
+        None => bar.child(trail(app, theme, cx)).child(path_space(cx)),
+    };
+    bar.child(view_settings(app, window, cx))
+}
+
+/// The empty part of the trail's row. A click there turns the trail into a
+/// text field holding the path, as the same spot does in a file manager's
+/// address bar: to copy it, or to type or paste another.
+fn path_space(cx: &Context<'_, Disktree>) -> Stateful<Div> {
+    with_tooltip(
+        div()
+            .id("path-space")
+            .debug_selector(|| "path-space".into())
+            .flex_1()
+            // The row centres its children, and an empty one has no
+            // height of its own to click on.
+            .self_stretch()
+            .cursor_text()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_path_bar(window, cx);
+            })),
+        if cfg!(target_os = "macos") {
+            "Type or paste a path \u{00b7} \u{2318}L"
+        } else {
+            "Type or paste a path \u{00b7} ctrl l"
+        },
+    )
 }
 
 /// The trail, from `/`. Above the scanned root, a crumb widens the scan;
@@ -489,7 +533,7 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
     for (index, (label, step)) in steps.into_iter().enumerate() {
         if hidden.contains(&index) {
             if index == hidden.start {
-                row = row.child(separator_glyph(theme)).child(
+                row = row.child(separator_glyph(app, theme)).child(
                     div()
                         .px(space::XS)
                         .text_color(theme.secondary.opacity(0.6))
@@ -500,7 +544,7 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
         }
         // The root is its own separator: "/" then "home", not "/ / home".
         if index > 1 {
-            row = row.child(separator_glyph(theme));
+            row = row.child(separator_glyph(app, theme));
         }
         let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
         let crumb = match step {
@@ -533,12 +577,17 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
 const TRAIL_STEPS: usize = 7;
 
 /// The platform's path separator, so the trail reads like the paths shown
-/// elsewhere: `/` here, `\` on Windows.
-fn separator_glyph(theme: &Theme) -> Div {
+/// elsewhere: `/` here, `\` on Windows. Another machine's paths are
+/// listed by `find`, and are always `/`.
+fn separator_glyph(app: &Disktree, theme: &Theme) -> Div {
     div()
         .text_color(theme.secondary.opacity(0.5))
         .text_size(text::BODY)
-        .child(std::path::MAIN_SEPARATOR_STR)
+        .child(if app.remote.is_some() {
+            "/"
+        } else {
+            std::path::MAIN_SEPARATOR_STR
+        })
 }
 
 /// A crumb in the tree. Its label goes there (the current one opens the
@@ -636,7 +685,7 @@ fn sibling_menu(
     let largest = rows.first().map_or(1, |row| row.value.max(1));
     let parent_name = app.node_at(parent).map_or_else(String::new, |node| {
         if parent.is_empty() {
-            crate::marks::display_path(&app.root_path, app.home.as_deref())
+            app.shown_path(&app.root_path)
         } else {
             node.name.to_string()
         }
@@ -1419,9 +1468,10 @@ fn selection_section(
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(path.as_deref().map_or_else(String::new, |path| {
-                    crate::marks::display_path(path, app.home.as_deref())
-                })),
+                .child(
+                    path.as_deref()
+                        .map_or_else(String::new, |path| app.shown_path(path)),
+                ),
         );
 
     let (number, unit) = match app.options.metric {
@@ -1557,6 +1607,7 @@ fn selection_section(
             _ => "Mark for removal".to_string(),
         };
         let mark = button("mark", label, ButtonVariant::Primary, cx)
+            .debug_selector(|| "mark-button".into())
             .tab_stop(false)
             .flex_1()
             .justify_center()
@@ -1570,18 +1621,25 @@ fn selection_section(
                 window.focus(&this.focus, cx);
             }));
         let filled = !marked && covered_by.is_none();
-        actions = actions.child(if filled {
-            let on = palette::on_highlight(theme);
-            mark.bg(highlight)
-                .border_color(highlight)
-                .text_color(on)
-                .font_weight(FontWeight::SEMIBOLD)
-                .hover(move |style| {
-                    style.bg(highlight.opacity(0.85)).border_color(highlight)
-                })
-        } else {
-            mark
-        });
+        // Nothing is marked on another machine, so marking is not offered
+        // there; pressed, it could only say no.
+        let offered = app.remote.is_none();
+        actions = actions.children(offered.then(|| {
+            if filled {
+                let on = palette::on_highlight(theme);
+                mark.bg(highlight)
+                    .border_color(highlight)
+                    .text_color(on)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .hover(move |style| {
+                        style
+                            .bg(highlight.opacity(0.85))
+                            .border_color(highlight)
+                    })
+            } else {
+                mark
+            }
+        }));
     }
 
     section
@@ -1625,8 +1683,11 @@ fn worth_section(
                 .text_color(theme.secondary)
                 .child(if app.tree().is_some() {
                     "Nothing obviously disposable"
-                } else {
+                } else if app.scan.is_some() {
                     "Waiting for the scan"
+                } else {
+                    // Cancelled, or failed: there is none to wait for.
+                    "Nothing was scanned"
                 }),
         );
     }
@@ -1768,7 +1829,11 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Space marks the tile you point at"),
+                .child(if app.remote.is_some() {
+                    "Nothing is marked on another machine"
+                } else {
+                    "Space marks the tile you point at"
+                }),
         );
     }
     for (index, item) in app.marks.items().iter().take(MARKED_ROWS).enumerate()
@@ -1886,7 +1951,11 @@ fn privacy_line(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Option<Div> {
-    if app.progress.errors == 0 || app.full_disk_access != Some(false) {
+    // What another machine kept back is not this one's access to grant.
+    if app.remote.is_some()
+        || app.progress.errors == 0
+        || app.full_disk_access != Some(false)
+    {
         return None;
     }
     let color = theme.warning;
@@ -1939,7 +2008,13 @@ fn administrator_line(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Option<Div> {
-    if app.administrator != Some(false) || app.restarting || app.run.is_some() {
+    // Nor would an administrator here read what another machine kept
+    // back, or its disk from a file table.
+    if app.remote.is_some()
+        || app.administrator != Some(false)
+        || app.restarting
+        || app.run.is_some()
+    {
         return None;
     }
     let errors = app.progress.errors;
@@ -2231,8 +2306,18 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .flex_1()
         .min_w_0()
         .overflow_hidden();
-    for (keys, label) in hints {
-        lane = lane.child(widgets::hint(keys, label, cx).flex_shrink_0());
+    // Marking and its review are not offered for another machine, so
+    // their keys are not advertised there.
+    let local = app.remote.is_none();
+    for (keys, label) in hints
+        .into_iter()
+        .filter(|(_, label)| local || !matches!(*label, "mark" | "review"))
+    {
+        lane = lane.child(
+            widgets::hint(keys, label, cx)
+                .flex_shrink_0()
+                .debug_selector(move || format!("key-{label}")),
+        );
     }
 
     let mut row = div()
@@ -2291,7 +2376,11 @@ fn scanning_panel(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let progress = &app.progress;
-    let cancelled = app.scan.is_none() && progress.cancelled;
+    // No scan running and no tree: it was cancelled, or it failed, as a
+    // connection to another machine does when the host is not found.
+    // Either way nothing is being read, so nothing here should spin.
+    let stopped = app.scan.is_none();
+    let cancelled = stopped && progress.cancelled;
     let mut panel = div()
         .flex()
         .flex_col()
@@ -2301,7 +2390,7 @@ fn scanning_panel(
         .justify_center()
         .gap(space::LG)
         .bg(theme.inset)
-        .when(!cancelled, |panel| {
+        .when(!stopped, |panel| {
             panel.child(
                 gpui_omarchy::icon(gpui_omarchy::IconName::Loader)
                     .size(icon::LG)
@@ -2315,6 +2404,8 @@ fn scanning_panel(
                 .text_color(theme.bright)
                 .child(if cancelled {
                     format!("Stopped reading {}", widgets::display_root(app))
+                } else if stopped {
+                    format!("Could not read {}", widgets::display_root(app))
                 } else {
                     format!("Reading {}", widgets::display_root(app))
                 }),
@@ -2342,7 +2433,7 @@ fn scanning_panel(
                     cx,
                 )),
         )
-        .when(!cancelled, |panel| {
+        .when(!stopped, |panel| {
             panel.child(
                 div()
                     .w(size::SCANNING_METER)
@@ -2359,8 +2450,11 @@ fn scanning_panel(
             div()
                 .text_size(text::BODY)
                 .text_color(theme.secondary)
-                .child(if cancelled {
+                .child(if stopped {
                     "Nothing is shown from a scan that did not finish."
+                } else if app.remote.is_some() {
+                    "Another machine's files can be looked at as soon as it \
+                     lands, and nothing else: a remote scan is read-only."
                 } else {
                     "Marking, zooming and the free-space meter all work as soon as it lands."
                 }),
@@ -3349,10 +3443,12 @@ fn history_card(app: &Disktree, back: bool, cx: &gpui_kit::App) -> Div {
 pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
     let crumbs = app.hovered.as_deref()?;
     let is_dir = app.node_at(crumbs)?.is_dir();
-    let keys = if is_dir {
-        "space mark · enter open"
-    } else {
-        "space mark"
+    // Marking is not offered for another machine, so it is not named.
+    let keys = match (app.remote.is_some(), is_dir) {
+        (false, true) => "space mark · enter open",
+        (false, false) => "space mark",
+        (true, true) => "enter open",
+        (true, false) => "read-only",
     };
     node_card(app, crumbs, keys, cx)
 }
@@ -3405,9 +3501,10 @@ fn node_card(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(path.as_deref().map_or_else(String::new, |path| {
-                    crate::marks::display_path(path, app.home.as_deref())
-                })),
+                .child(
+                    path.as_deref()
+                        .map_or_else(String::new, |path| app.shown_path(path)),
+                ),
         )
         .child(
             div()
@@ -3494,6 +3591,11 @@ const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
 } else {
     "ctrl-o"
 };
+const MODIFIER_PATH: &str = if cfg!(target_os = "macos") {
+    "\u{2318}L"
+} else {
+    "ctrl-l"
+};
 
 fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
@@ -3528,6 +3630,10 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("esc", "Stop a scan in progress"),
         ("v", "Scan another volume"),
         (MODIFIER_OPEN, "Choose another directory to scan"),
+        (
+            MODIFIER_PATH,
+            "Type or paste a path; a click beside the trail does too",
+        ),
         ("g", "The whole disk; click any directory above to widen"),
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
