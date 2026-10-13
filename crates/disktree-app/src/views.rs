@@ -402,7 +402,7 @@ fn explore(
                                 .child(viewport),
                         ),
                 )
-                .children(panel.then(|| side_panel(app, &theme, cx))),
+                .children(panel.then(|| side_panel(app, &theme, window, cx))),
         )
         .child(key_bar(app, &theme, cx))
 }
@@ -1296,6 +1296,7 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
 fn side_panel(
     app: &Disktree,
     theme: &Theme,
+    window: &Window,
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let rule = || div().h(px(1.)).bg(theme.divider());
@@ -1337,17 +1338,38 @@ fn side_panel(
         // so the two numbers that matter never leave the screen.
         .child(
             div()
-                .id("panel-lists")
+                .relative()
                 .flex()
                 .flex_col()
-                .gap(space::LG)
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .child(worth_section(app, theme, cx))
-                .child(rule())
-                .child(marked_section(app, theme, cx)),
+                .child(
+                    div()
+                        .id("panel-lists")
+                        .debug_selector(|| "panel-lists".into())
+                        .flex()
+                        .flex_col()
+                        .gap(space::LG)
+                        .flex_1()
+                        .min_h_0()
+                        // Room for the bar, which is drawn over this edge.
+                        .pr(space::MD)
+                        .overflow_y_scroll()
+                        .track_scroll(&app.panel_scroll)
+                        .child(worth_section(app, theme, cx))
+                        .child(rule())
+                        .child(marked_section(app, theme, cx)),
+                )
+                .child(gpui_omarchy::scrollbar(
+                    "panel-scroll",
+                    gpui_kit::base::ScrollbarAxis::Vertical,
+                    &app.panel_scroll,
+                    window,
+                    cx,
+                )),
         )
+        // Pinned under the lists, so it is there however long they are.
+        .children(insights_toggle(app, theme, cx))
         .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
@@ -1703,6 +1725,60 @@ fn worth_section(
         );
     }
     section
+}
+
+/// "Show more" under Worth a look, and "Show fewer" to put the short list
+/// back. Offered once the short list is full, since there may then be
+/// more, and while the long one is shown.
+///
+/// It sits under the lists, not at the end of them: the long list is
+/// thirty rows, and a button at its foot is a scroll away from whoever
+/// wants the short one back.
+fn insights_toggle(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    let offered =
+        app.insights_all || app.insights.len() >= crate::state::INSIGHT_LIMIT;
+    offered.then(|| {
+        div()
+            .debug_selector(|| "insights-more".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .flex_shrink_0()
+            .child(
+                button(
+                    "insights-more",
+                    if app.insights_all {
+                        "Show fewer"
+                    } else {
+                        "Show more"
+                    },
+                    ButtonVariant::Outline,
+                    cx,
+                )
+                .tab_stop(false)
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.toggle_insights(cx);
+                        window.focus(&this.focus, cx);
+                    },
+                )),
+            )
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(if app.insights_all {
+                        format!("{} worth a look", app.insights.len())
+                    } else {
+                        "of what is worth a look".to_owned()
+                    }),
+            )
+    })
 }
 
 /// A finding's title, as the last two parts of its path, and why it is on

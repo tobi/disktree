@@ -28,7 +28,7 @@ use disktree_core::treemap::{
 use gpui_kit::{
     Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, NavigationDirection, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Size, Window, px, size,
+    ScrollHandle, ScrollWheelEvent, Size, Window, px, size,
 };
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -99,8 +99,10 @@ pub fn panel_width(pointer_x: f32, viewport: f32, rem: f32) -> f32 {
     width.clamp(PANEL_MIN_REMS, max)
 }
 
-/// How many "worth a look" findings the panel lists.
-const INSIGHT_LIMIT: usize = 6;
+/// How many "worth a look" findings the panel lists, and how many once
+/// "Show more" is asked for: the rest of what the scan found plausible.
+pub const INSIGHT_LIMIT: usize = 6;
+const INSIGHT_MORE: usize = 30;
 
 /// Which screen the app is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -417,6 +419,10 @@ pub struct Disktree {
     pub color_mode: ColorMode,
     /// The largest things worth clearing, recomputed when a scan lands.
     pub insights: Vec<Candidate>,
+    /// "Worth a look" lists [`INSIGHT_MORE`] findings instead of the few.
+    pub insights_all: bool,
+    /// Where the side panel's lists are scrolled to, for their scrollbar.
+    pub panel_scroll: ScrollHandle,
     /// What git knows about each checkout that has been selected; `None`
     /// once asked and found not to be one.
     pub git: FxHashMap<PathBuf, Option<GitState>>,
@@ -533,6 +539,8 @@ impl Disktree {
             crumb_menu: None,
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
+            insights_all: false,
+            panel_scroll: ScrollHandle::new(),
             git: FxHashMap::default(),
             git_pending: FxHashSet::default(),
             device: None,
@@ -755,8 +763,20 @@ impl Disktree {
     fn refresh_insights(&mut self) {
         self.scanned_at = now_seconds();
         self.insights = self.tree.as_deref().map_or_else(Vec::new, |tree| {
-            worth_a_look(tree, self.scanned_at, INSIGHT_LIMIT)
+            let limit = if self.insights_all {
+                INSIGHT_MORE
+            } else {
+                INSIGHT_LIMIT
+            };
+            worth_a_look(tree, self.scanned_at, limit)
         });
+    }
+
+    /// "Show more" under Worth a look, and "Show fewer" to put it back.
+    pub fn toggle_insights(&mut self, cx: &mut Context<'_, Self>) {
+        self.insights_all = !self.insights_all;
+        self.refresh_insights();
+        cx.notify();
     }
 
     /// Ask git about `path` once, off the UI thread, if it is a checkout.
