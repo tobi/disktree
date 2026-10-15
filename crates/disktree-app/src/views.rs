@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, ViewMode, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -105,7 +105,12 @@ pub fn root(
         .font_family(theme.font)
         .text_size(text::BODY)
         .child(body);
-    if let Some(tip) = cursor_tooltip(app, window, cx) {
+    // The tooltip is positioned from the pointer in treemap-local pixels, which
+    // only the mosaic records. A list row carries its own figures, so there is
+    // nothing for it to add there.
+    if app.view_mode == ViewMode::Mosaic
+        && let Some(tip) = cursor_tooltip(app, window, cx)
+    {
         root = root.child(tip);
     }
     if app.show_help {
@@ -355,6 +360,10 @@ fn explore(
         // The first walk of a home directory takes long enough that an
         // empty viewport would look broken; count the work instead.
         scanning_panel(app, &theme, cx).into_any_element()
+    } else if app.view_mode == ViewMode::List {
+        // The mosaic is prepared either way: entering a directory from the
+        // list animates from the tile the child would have had.
+        crate::list_view::list(app, window, cx).into_any_element()
     } else {
         treemap_view::mosaic(mosaic, app, window, cx).into_any_element()
     };
@@ -485,6 +494,7 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
         .justify_end()
         .gap(space::XXS)
         .min_w_0()
+        .debug_selector(|| "trail".into())
         .overflow_hidden();
     for (index, (label, step)) in steps.into_iter().enumerate() {
         if hidden.contains(&index) {
@@ -937,18 +947,33 @@ fn view_settings(
             cx,
         ));
 
-    let depth = app.layout_options.max_depth;
+    // Whatever the view on screen counts as its depth, so the control means the
+    // same thing in both and never reads the mosaic's number over a list.
+    let depth = app.depth_drawn();
+    // Wrapped so each button's bounds can be measured: the stepper is the one
+    // control that has to work over both views, so a test clicks it rather
+    // than only the keys.
     let stepper = |id: &'static str,
                    label: &'static str,
                    step: i32,
                    cx: &mut Context<'_, Disktree>| {
-        button(id, label, ButtonVariant::Secondary, cx)
-            .tab_stop(false)
-            .disabled(if step < 0 { depth <= 1 } else { depth >= 6 })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.adjust_depth(step, cx);
-                window.focus(&this.focus, cx);
-            }))
+        div()
+            .id(ElementId::Name(id.into()))
+            .debug_selector(move || id.into())
+            .flex_shrink_0()
+            .child(
+                button(id, label, ButtonVariant::Secondary, cx)
+                    .tab_stop(false)
+                    .disabled(if step < 0 {
+                        depth <= 1
+                    } else {
+                        depth >= Disktree::MAX_DEPTH
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.adjust_depth(step, cx);
+                        window.focus(&this.focus, cx);
+                    })),
+            )
     };
     let depth_control = with_tooltip(
         div()
@@ -2209,8 +2234,15 @@ fn review_button(
 /// The keys, quietly: outlines and light labels, there when needed. The key
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
-    // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
+    // Most useful first, so a narrow window clips the least useful. `w` sits
+    // beside `t` because they are the two halves of one question — what shape,
+    // measured how — and names the view it switches to.
+    let other = if app.view_mode == ViewMode::List {
+        "treemap"
+    } else {
+        "list"
+    };
+    let hints: [(&str, &str); 12] = [
         ("space", "mark"),
         ("enter", "open"),
         ("\u{232b}", "up"),
@@ -2219,6 +2251,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         ("/", "filter"),
         ("[ ]", "depth"),
         ("t", "mode"),
+        ("w", other),
         ("0", "reset"),
         ("v", "volumes"),
         ("r", "rescan"),
@@ -3524,6 +3557,18 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ),
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
+        (
+            "w",
+            "Treemap or list: the same tree as squares, or as ranked rows",
+        ),
+        (
+            "\u{2192} / \u{2190}",
+            "In the list, open or close a row; open twice to go in",
+        ),
+        (
+            "[ / ]",
+            "In the list, close everything or open one more level",
+        ),
         ("r", "Scan again from the same root"),
         ("esc", "Stop a scan in progress"),
         ("v", "Scan another volume"),
