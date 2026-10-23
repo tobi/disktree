@@ -287,7 +287,8 @@ tool-owned data. The remote helper itself has no delete operation.
 ### The screen
 
 - **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+  **Age**, **Hidden files**, **Apparent size**, and the depth drawn; at the
+  end, the way to GitHub. In the
   tree a crumb goes there, and its ▾ lists its siblings, largest first with
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to

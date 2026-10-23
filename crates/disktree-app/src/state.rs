@@ -100,6 +100,10 @@ pub fn panel_width(pointer_x: f32, viewport: f32, rem: f32) -> f32 {
     width.clamp(PANEL_MIN_REMS, max)
 }
 
+/// Where the source and the issue tracker are, for the button that goes
+/// there.
+pub const REPOSITORY: &str = "https://github.com/tobi/disktree";
+
 /// How many "worth a look" findings the panel lists.
 const INSIGHT_LIMIT: usize = 6;
 
@@ -2547,6 +2551,11 @@ impl Disktree {
             (ColorMode::Kind, Metric::Files) => 1,
             (ColorMode::Kind, Metric::Bytes) => 0,
         }
+    }
+
+    /// Open the project's page in the browser.
+    pub fn open_repository(cx: &Context<'_, Self>) {
+        cx.open_url(REPOSITORY);
     }
 
     // ── removal ─────────────────────────────────────────────────────────

@@ -2357,3 +2357,32 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[gpui_kit::test]
+fn the_bar_ends_with_the_way_to_the_repository(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    // Wider than the 900 the other tests use: with the harness's fonts the
+    // controls before this one already run 4px past the bar's padding
+    // there, so at that width the last of them is the one pushed out.
+    let width = px(1000.);
+    cx.simulate_resize(gpui_kit::size(width, px(600.)));
+    draw(cx);
+
+    // Drawn, and only drawn: clicking it would open a browser on whatever
+    // runs the tests, so where it goes is checked as text instead.
+    let button = cx.debug_bounds("repository").expect("the button is drawn");
+    let power = cx.debug_bounds("power-efficiency").expect("control");
+    assert!(
+        button.left() >= power.right(),
+        "{button:?} before {power:?}"
+    );
+    assert!(button.right() <= width, "{button:?} is cut off");
+    assert!(button.size.width > px(0.) && button.size.height > px(0.));
+    assert!(
+        crate::state::REPOSITORY.starts_with("https://github.com/"),
+        "{} is not a page on GitHub",
+        crate::state::REPOSITORY
+    );
+}

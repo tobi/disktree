@@ -1118,6 +1118,38 @@ fn view_settings(
         .child(apparent)
         .child(depth_control)
         .child(power_efficiency(app, cx))
+        .child(repository_button(&theme, cx))
+}
+
+/// A glyph on the bar that does one thing when clicked.
+fn bar_icon(
+    id: &'static str,
+    name: gpui_omarchy::IconName,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .p(space::XS)
+        .text_color(theme.secondary)
+        .hover(|style| style.bg(theme.hover_fill()).text_color(theme.bright))
+        .child(gpui_omarchy::icon(name).size(icon::MD))
+}
+
+/// The way to the source, the releases and the issue tracker.
+fn repository_button(
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    with_tooltip(
+        bar_icon("repository", gpui_omarchy::IconName::Github, theme).on_click(
+            cx.listener(|this, _, window, cx| {
+                Disktree::open_repository(cx);
+                window.focus(&this.focus, cx);
+            }),
+        ),
+        "disktree on GitHub",
+    )
 }
 
 /// What the tooltip says the choice will do, where the gauge alone cannot.
