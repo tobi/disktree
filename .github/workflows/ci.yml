@@ -117,6 +117,18 @@ jobs:
             throw "disktree.exe has no embedded icon"
           }
 
+      # Here rather than only at release time, so a broken installer script
+      # fails the pull request instead of a release half-way through.
+      - name: Installer
+        shell: pwsh
+        run: |
+          packaging/windows/install-inno.ps1 -Dir "$env:RUNNER_TEMP\inno"
+          & "$env:RUNNER_TEMP\inno\ISCC.exe" /Q /DAppVersion=0.0.0 `
+            /DArch=x86_64 packaging/windows/disktree.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          packaging/windows/check-setup.ps1 `
+            -Setup target/bundle/disktree-0.0.0-x86_64-windows-setup.exe
+
   # The other half of each release: the same tests on the architectures
   # the release builds for but the jobs above do not run on.
   other-architectures:
@@ -152,3 +164,16 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+      # The Arm64 setup, which no other job builds before a release does.
+      - name: Installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p disktree-app
+          packaging/windows/install-inno.ps1 -Dir "$env:RUNNER_TEMP\inno"
+          & "$env:RUNNER_TEMP\inno\ISCC.exe" /Q /DAppVersion=0.0.0 `
+            /DArch=aarch64 packaging/windows/disktree.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          packaging/windows/check-setup.ps1 `
+            -Setup target/bundle/disktree-0.0.0-aarch64-windows-setup.exe

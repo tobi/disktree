@@ -122,9 +122,17 @@ NOTARY_PROFILE=<profile> cargo xtask bundle \
 
 ### Windows
 
-On Windows 10 or 11, download `disktree-*-x86_64-windows.zip`
-(`aarch64-windows` on ARM) from the same release, unpack it anywhere and run
-`disktree.exe`. Or build it with Rust 1.97 or newer, from
+On Windows 10 or 11, download `disktree-*-x86_64-windows-setup.exe`
+(`aarch64-windows` on ARM, Windows 11) from the same release and run it. It
+installs for you alone, with no administrator prompt, unless you choose all
+users on its first page; it adds disktree to the Start menu and the desktop,
+and to **Settings > Apps** to uninstall. A newer setup upgrades in place.
+
+The setup is not signed, so SmartScreen says "Windows protected your PC";
+choose **More info**, then **Run anyway**.
+
+To skip installing, download `disktree-*-x86_64-windows.zip` instead, unpack
+it anywhere and run `disktree.exe`. Or build it with Rust 1.97 or newer, from
 [rustup](https://rustup.rs), and the MSVC toolchain (Visual Studio Build
 Tools, C++ workload):
 
