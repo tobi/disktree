@@ -2357,3 +2357,373 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+#[gpui_kit::test]
+fn the_filter_menu_narrows_by_size_and_kind(cx: &mut TestAppContext) {
+    use disktree_core::classify::Category;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let click = |cx: &mut Window, selector: &'static str| {
+        let at = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(at.center(), gpui_kit::Modifiers::none());
+        draw(cx);
+    };
+
+    click(cx, "filter-control");
+    assert!(read(&view, cx, |app| app.filter_menu));
+    assert!(
+        cx.debug_bounds("filter-menu").is_some(),
+        "the menu is drawn"
+    );
+
+    // Kinds are ticked, any number of them, and the menu stays for more.
+    click(cx, "filter-kind-media");
+    click(cx, "filter-kind-cache");
+    read(&view, cx, |app| {
+        assert_eq!(app.filter_kinds, [Category::Media, Category::Cache]);
+        assert!(app.filter_menu);
+        // The name field is not where these are kept.
+        assert!(app.find.is_empty());
+    });
+    click(cx, "filter-kind-media");
+    click(cx, "filter-kind-cache");
+    assert!(read(&view, cx, |app| app.filter_kinds.is_empty()));
+
+    // A least and a most, typed, in the unit picked: 150 to 250 KiB is
+    // the one 200 KiB blob, not the 300 KiB one or the 100 KiB one.
+    let (least, most) =
+        read(&view, cx, |app| app.size_inputs.clone()).expect("the fields");
+    cx.update(|window, cx| {
+        least.update(cx, |field, cx| field.set_value("150", window, cx));
+        most.update(cx, |field, cx| field.set_value("250", window, cx));
+    });
+    update(&view, cx, |app, cx| app.set_size_unit(0, 0, cx));
+    update(&view, cx, |app, cx| app.set_size_unit(1, 0, cx));
+    cx.run_until_parked();
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.filter_least, Some(150 << 10));
+        assert_eq!(app.filter_most, Some(250 << 10));
+        // Read back as a sentence, and counted for the button.
+        assert_eq!(
+            app.filter_sentence(),
+            "Showing files of from 150 KiB to 250 KiB"
+        );
+        assert_eq!(app.filter_count(), 2);
+        let matches = app.matches.as_ref().expect("a filter");
+        assert_eq!((matches.count, matches.bytes), (1, 200_000));
+        assert!(app.filter_applied);
+    });
+
+    // Not a number, or the wrong way round: said, and nothing changes.
+    cx.update(|window, cx| {
+        least.update(cx, |field, cx| field.set_value("lots", window, cx));
+    });
+    update(&view, cx, Disktree::apply_sizes);
+    draw(cx);
+    read(&view, cx, |app| {
+        // Said for the field it is in, with the way out of it.
+        let (side, why) = app.size_error.clone().expect("an error");
+        assert_eq!(side, 0);
+        assert!(why.starts_with("Min is not a number"), "{why}");
+        assert_eq!(app.filter_least, Some(150 << 10));
+    });
+    assert!(
+        cx.debug_bounds("filter-size-error").is_some(),
+        "the error is drawn beside its field"
+    );
+    cx.update(|window, cx| {
+        least.update(cx, |field, cx| field.set_value("300", window, cx));
+    });
+    update(&view, cx, Disktree::apply_sizes);
+    read(&view, cx, |app| {
+        let (side, why) = app.size_error.clone().expect("an error");
+        assert_eq!(side, 1);
+        assert!(why.starts_with("Max is below Min"), "{why}");
+    });
+    // Apply puts the keyboard in the field that is wrong: Max, here.
+    click(cx, "filter-apply");
+    let in_max = cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        most.read(cx).focus_handle(cx).is_focused(window)
+    });
+    assert!(in_max, "the Max field has the keyboard");
+    // Put right, the error goes; nothing is left greyed out meanwhile.
+    cx.update(|window, cx| {
+        least.update(cx, |field, cx| field.set_value("150", window, cx));
+    });
+    click(cx, "filter-apply");
+    read(&view, cx, |app| {
+        assert!(app.size_error.is_none());
+        assert_eq!(app.filter_least, Some(150 << 10));
+    });
+    assert!(cx.debug_bounds("filter-size-error").is_none());
+
+    // Escape closes the menu and leaves the filter; Clear lifts it.
+    press(cx, "escape");
+    read(&view, cx, |app| {
+        assert!(!app.filter_menu);
+        assert!(app.filter_chosen());
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| app.clear_chosen_filter(window, cx));
+    });
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert!(!app.filter_chosen());
+        assert!(app.matches.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn the_name_filter_has_a_button_of_its_own(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let name = cx.debug_bounds("filter-name").expect("the Name button");
+    cx.simulate_click(name.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert!(app.find_open);
+        assert!(!app.filter_menu);
+    });
+    // What is typed is the name, and only the name.
+    press(cx, "b l o b");
+    read(&view, cx, |app| {
+        assert_eq!(app.find, "blob");
+        assert!(!app.filter_chosen());
+    });
+}
+
+#[gpui_kit::test]
+fn each_size_has_its_own_unit(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| app.toggle_filter_menu(window, cx));
+    });
+    draw(cx);
+    let (least, most) =
+        read(&view, cx, |app| app.size_inputs.clone()).expect("the fields");
+    cx.update(|window, cx| {
+        least.update(cx, |field, cx| field.set_value("150", window, cx));
+        most.update(cx, |field, cx| field.set_value("1", window, cx));
+    });
+    // 150 KiB to 1 MiB: the min in one unit, the max in another.
+    update(&view, cx, |app, cx| app.set_size_unit(0, 0, cx));
+    update(&view, cx, |app, cx| app.set_size_unit(1, 1, cx));
+    cx.run_until_parked();
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.size_unit, [0, 1]);
+        assert_eq!(app.filter_least, Some(150 << 10));
+        assert_eq!(app.filter_most, Some(1 << 20));
+        assert_eq!(app.matches.as_ref().map(|found| found.count), Some(2));
+    });
+    assert!(cx.debug_bounds("filter-size-summary").is_some());
+    assert!(cx.debug_bounds("filter-summary").is_some());
+    read(&view, cx, |app| {
+        assert_eq!(
+            app.filter_sentence(),
+            "Showing files of from 150 KiB to 1.0 MiB"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_size_has_a_dropdown_for_its_unit_and_a_cross_to_empty_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| app.toggle_filter_menu(window, cx));
+    });
+    draw(cx);
+    // Min and Max share a line: the Max field is beside the Min one.
+    let least = cx.debug_bounds("filter-least").expect("Min");
+    let most = cx.debug_bounds("filter-most").expect("Max");
+    assert_eq!(least.origin.y, most.origin.y);
+    assert!(most.origin.x > least.origin.x);
+    // An empty field has nothing to clear.
+    assert!(cx.debug_bounds("filter-least-clear").is_none());
+
+    press(cx, "1 5 0 enter");
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.filter_least), Some(150 << 20));
+
+    // The unit is picked from a dropdown, and what is picked is read at
+    // once: the 150 typed now means KiB.
+    let selects =
+        read(&view, cx, |app| app.unit_selects.clone()).expect("dropdowns");
+    let unit = cx.debug_bounds("filter-unit-0").expect("the Min unit");
+    cx.simulate_click(unit.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(cx.update(|_, cx| selects[0].read(cx).is_open()));
+    assert!(cx.debug_bounds("omarchy-choice-popup").is_some());
+    // Escape there closes the dropdown, not the menu under it.
+    press(cx, "escape");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.filter_menu));
+    cx.update(|_, cx| {
+        selects[0].update(cx, |select, cx| select.set_selected(Some(0), cx));
+    });
+    cx.run_until_parked();
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.size_unit, [0, 1]);
+        assert_eq!(app.filter_least, Some(150 << 10));
+    });
+
+    // The largest unit on offer is the terabyte.
+    let (_, most) =
+        read(&view, cx, |app| app.size_inputs.clone()).expect("the fields");
+    cx.update(|window, cx| {
+        most.update(cx, |field, cx| field.set_value("1.5", window, cx));
+        selects[1].update(cx, |select, cx| select.set_selected(Some(3), cx));
+    });
+    cx.run_until_parked();
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(crate::state::size_units()[3], "TiB");
+        assert_eq!(app.filter_most, Some(3 << 39));
+    });
+
+    // The cross in the field empties it and lifts that limit.
+    let clear = cx.debug_bounds("filter-least-clear").expect("the cross");
+    cx.simulate_click(clear.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.filter_least, None);
+        assert!(app.filter_menu);
+    });
+    assert!(cx.debug_bounds("filter-least-clear").is_none());
+}
+
+#[gpui_kit::test]
+fn the_name_and_the_menu_are_cleared_apart_and_a_miss_is_said(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::classify::Category;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| app.toggle_filter_menu(window, cx));
+    });
+    draw(cx);
+    // A size typed with more digits than it is shown with.
+    let (least, _) =
+        read(&view, cx, |app| app.size_inputs.clone()).expect("the fields");
+    cx.update(|window, cx| {
+        least.update(cx, |field, cx| field.set_value("0.1234", window, cx));
+    });
+    update(&view, cx, Disktree::apply_sizes);
+    let typed = read(&view, cx, |app| app.filter_least);
+    press(cx, "escape");
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| app.toggle_filter_menu(window, cx));
+    });
+    draw(cx);
+    // Reopened, it reads as it was typed, and Apply moves nothing.
+    assert_eq!(
+        cx.update(|_, cx| least.read(cx).value().to_string()),
+        "0.1234"
+    );
+    update(&view, cx, Disktree::apply_sizes);
+    assert_eq!(read(&view, cx, |app| app.filter_least), typed);
+    press(cx, "escape");
+
+    // Escape in the name field drops the name and leaves the menu's.
+    press(cx, "/");
+    press(cx, "b l o b");
+    press(cx, "escape");
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert!(app.find.is_empty());
+        assert!(!app.find_open);
+        assert_eq!(app.filter_least, typed);
+    });
+
+    // A kind nothing here is: said, since nothing is then hidden.
+    update(&view, cx, |app, cx| {
+        app.filter_least = None;
+        app.toggle_filter_kind(Category::Git, cx);
+    });
+    cx.run_until_parked();
+    read(&view, cx, |app| {
+        assert_eq!(app.matches.as_ref().map(|found| found.count), Some(0));
+        assert_eq!(
+            app.filter_sentence(),
+            "Nothing here matches, so everything is shown"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_filter_menu_is_walked_and_worked_by_keyboard(cx: &mut TestAppContext) {
+    use disktree_core::classify::Category;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |app, cx| app.toggle_filter_menu(window, cx));
+    });
+    draw(cx);
+    // Nothing to clear, so no Clear button rather than a greyed one.
+    assert!(cx.debug_bounds("filter-clear").is_none());
+    assert_eq!(
+        read(&view, cx, Disktree::filter_sentence),
+        "Showing everything"
+    );
+
+    // The keyboard starts in the Min field: digits are text there, and
+    // Enter applies.
+    press(cx, "2 0 0 enter");
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.filter_least, Some(200 << 20));
+        assert!(app.filter_menu);
+    });
+    assert!(cx.debug_bounds("filter-clear").is_some());
+
+    // Shift+Tab walks back out of the field to the kinds above it, the
+    // last of them first, and Space ticks the one in focus.
+    press(cx, "shift-tab");
+    draw(cx);
+    // A control answers the key coming up, as a native button does.
+    let space = gpui_kit::Keystroke::parse("space").expect("a key");
+    cx.simulate_event(gpui_kit::KeyDownEvent {
+        keystroke: space.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(gpui_kit::KeyUpEvent { keystroke: space });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(
+            app.filter_kinds,
+            [*Category::LEGEND.last().expect("a kind")]
+        );
+        assert_eq!(app.filter_count(), 2);
+        assert!(app.filter_menu, "the menu stays for more");
+    });
+
+    // The way out is a button as well as a key.
+    let close = cx.debug_bounds("filter-done").expect("Close");
+    cx.simulate_click(close.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.filter_menu));
+}

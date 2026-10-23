@@ -511,7 +511,7 @@ fn explore(
                         .flex_1()
                         .min_w_0()
                         .min_h_0()
-                        .child(trail_and_legend(app, &theme, cx))
+                        .child(trail_and_legend(app, &theme, window, cx))
                         .child(
                             div()
                                 .flex()
@@ -1326,7 +1326,8 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
 fn trail_and_legend(
     app: &Disktree,
     theme: &Theme,
-    cx: &Context<'_, Disktree>,
+    window: &mut Window,
+    cx: &mut Context<'_, Disktree>,
 ) -> Div {
     let mut row = div()
         .flex()
@@ -1335,11 +1336,447 @@ fn trail_and_legend(
         .gap(space::LG)
         .px(space::LG)
         .py(space::SM)
-        .child(scan_totals(app, theme));
+        .child(scan_totals(app, theme))
+        .child(filter_control(app, theme, window, cx));
     if app.find_open || !app.find.is_empty() {
         row = row.child(find_field(app, theme));
     }
     row.child(div().flex_1()).child(legend(app, theme, cx))
+}
+
+/// How many things the Filter menu asks for, in words: read in its
+/// heading, and on its button while the menu is shut.
+fn filter_status(app: &Disktree) -> String {
+    match app.filter_count() {
+        0 => "No filter on".into(),
+        1 => "1 filter on".into(),
+        many => format!("{many} filters on"),
+    }
+}
+
+/// A section of the Filter menu: what it is, then what it does, in words
+/// at reading size rather than as a small capital label.
+fn menu_heading(title: &'static str, hint: &'static str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::XXS)
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.bright)
+                .child(title),
+        )
+        .child(
+            div()
+                .text_size(text::BODY)
+                .text_color(theme.secondary)
+                .child(hint),
+        )
+}
+
+/// Two ways to narrow the mosaic, each its own button. **Filter** is what
+/// can be picked: kinds of data, any number of them, and a least and a
+/// most size for files. **Name** is what has to be typed, and opens the
+/// field `/` opens. They combine, and neither shows the other's words.
+///
+/// The menu is laid out to the four POUR principles. Perceivable: nothing
+/// is smaller than body text, and a state is never colour alone — a tick,
+/// a weight, an icon or a word goes with it. Operable: every control is a
+/// tab stop at least [`size::TARGET`] tall, and Tab walks them. To be
+/// understood: each field is labelled above, an empty one says "No limit",
+/// the filter is read back as a sentence, and an error sits by its field
+/// and says the way out. Robust: the controls are the toolkit's own, so
+/// each carries a role, a name and a state.
+fn filter_control(
+    app: &Disktree,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut Context<'_, Disktree>,
+) -> Div {
+    use gpui_omarchy::{IconName, Status};
+
+    let highlight = palette::highlight(theme);
+    let chosen = app.filter_chosen();
+    let toggle =
+        button("filter-button", "Filter", ButtonVariant::Secondary, cx)
+            .tab_stop(false)
+            .when(chosen, |toggle| {
+                // The count is there to read with the menu shut.
+                toggle.border_color(highlight).child(
+                    div()
+                        .debug_selector(|| "filter-summary".into())
+                        .px(space::XS)
+                        .bg(highlight.opacity(0.2))
+                        .text_color(theme.bright)
+                        .font_weight(FontWeight::BOLD)
+                        .child(format!("{} on", app.filter_count())),
+                )
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_filter_menu(window, cx);
+                this.apply_focus(window, cx);
+            }));
+    let name = button("filter-name", "Name", ButtonVariant::Secondary, cx)
+        .tab_stop(false)
+        .when(!app.find.is_empty(), |name| name.border_color(highlight))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.filter_menu = false;
+            this.find_open = true;
+            cx.notify();
+            window.focus(&this.focus, cx);
+        }));
+    let holder = div()
+        .id("filter-control")
+        .debug_selector(|| "filter-control".into())
+        .relative()
+        .flex_shrink_0()
+        .child(toggle);
+    let buttons = |holder: Stateful<Div>| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .flex_shrink_0()
+            .child(holder)
+            .child(
+                div()
+                    .id("filter-name-holder")
+                    .debug_selector(|| "filter-name".into())
+                    .child(name),
+            )
+    };
+    let Some((least, most)) =
+        app.size_inputs.clone().filter(|_| app.filter_menu)
+    else {
+        return buttons(holder);
+    };
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(space::XXS)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child("Filter"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "filter-status".into())
+                        .text_size(text::BODY)
+                        .text_color(theme.secondary)
+                        .child(filter_status(app)),
+                ),
+        )
+        .child(
+            gpui_omarchy::icon_button(
+                "filter-done",
+                IconName::Close,
+                "Close the Filter menu",
+                ButtonVariant::Outline,
+                cx,
+            )
+            .debug_selector(|| "filter-done".into())
+            .size(size::TARGET)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_filter_menu(cx);
+                this.apply_focus(window, cx);
+            })),
+        );
+
+    let entity = cx.entity().downgrade();
+    let mut kinds = div().flex().flex_col().child(
+        menu_heading("Kind", "Show files of any ticked kind", theme)
+            .pb(space::XS),
+    );
+    for category in Category::LEGEND {
+        let on = app.filter_kinds.contains(&category);
+        let id = format!(
+            "filter-kind-{}",
+            disktree_core::filter::kind_key(category)
+        );
+        let entity = entity.clone();
+        kinds = kinds.child(
+            div()
+                .debug_selector({
+                    let id = id.clone();
+                    move || id
+                })
+                .child(
+                    // The toolkit's tick box: a checkbox by role, named
+                    // for its kind, focusable, and ticked with Space. The
+                    // whole row is the target, not the box alone.
+                    checkbox(
+                        ElementId::Name(id.into()),
+                        "",
+                        if on {
+                            CheckboxState::Checked
+                        } else {
+                            CheckboxState::Unchecked
+                        },
+                        cx,
+                    )
+                    .accessibility_label(category.label())
+                    .w_full()
+                    .min_h(size::TARGET)
+                    .text_size(text::TITLE)
+                    // Ticked is said by the tick and by weight; the
+                    // swatch only echoes the legend.
+                    .when(on, |row| {
+                        row.font_weight(FontWeight::BOLD)
+                            .text_color(theme.bright)
+                    })
+                    .child(widgets::swatch(palette::category_accent(
+                        theme, category,
+                    )))
+                    .child(category.label())
+                    .on_change(move |_, _, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.toggle_filter_kind(category, cx);
+                        });
+                    }),
+                ),
+        );
+    }
+
+    let warning = widgets::alert_color(Status::Warning, cx);
+    // Min and Max on one line, read left to right as the range is said:
+    // "from 500 MiB to 4 GiB". Each is named above its field, and has its
+    // unit in a dropdown beside it and a cross in it that empties it.
+    let mut sides = div().flex().flex_row().items_start().gap(space::MD);
+    for (side, (label, hint, id, input)) in [
+        ("Min size", "at least", "filter-least", &least),
+        ("Max size", "at most", "filter-most", &most),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let wrong = app.size_error.as_ref().is_some_and(|(at, _)| *at == side);
+        let mut editor = gpui_omarchy::input(
+            ElementId::Name(format!("{id}-input").into()),
+            input,
+            window,
+            cx,
+        )
+        // A set height, so the cross turning up does not move the row.
+        .h(size::TARGET)
+        .py(space::NONE);
+        if !input.read(cx).value().is_empty() {
+            editor = editor.suffix(
+                gpui_omarchy::icon_button(
+                    ElementId::Name(format!("{id}-clear").into()),
+                    IconName::Close,
+                    format!("Clear the {}", label.to_lowercase()),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .debug_selector(move || format!("{id}-clear"))
+                .p(space::XS)
+                .on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.clear_size(side, window, cx);
+                    },
+                )),
+            );
+        }
+        let field = div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .flex_1()
+            .min_w_0()
+            // Always a border, so one that turns up for an error moves
+            // nothing.
+            .border_1()
+            .border_color(if wrong {
+                warning
+            } else {
+                theme.foreground.opacity(0.)
+            })
+            .child(editor);
+        let unit = app.unit_selects.as_ref().map(|selects| {
+            div()
+                .debug_selector(move || format!("filter-unit-{side}"))
+                .w(size::UNIT_SELECT)
+                .flex_shrink_0()
+                .child(gpui_omarchy::select(
+                    ElementId::Name(
+                        format!("filter-unit-{side}-select").into(),
+                    ),
+                    &selects[side],
+                    window,
+                    cx,
+                ))
+        });
+        sides = sides.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(space::XS)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::SM)
+                        .child(
+                            div()
+                                .text_size(text::TITLE)
+                                .text_color(theme.bright)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_size(text::BODY)
+                                .text_color(theme.secondary)
+                                .child(hint),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::XS)
+                        .child(field)
+                        .children(unit),
+                ),
+        );
+    }
+    // Under both, since the row is shared: the sentence names the field.
+    // An icon and words, not a red edge alone.
+    let sizes = div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .child(sides)
+        .children(app.size_error.as_ref().map(|(_, why)| {
+            div()
+                .debug_selector(|| "filter-size-error".into())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::XS)
+                .text_size(text::BODY)
+                .text_color(warning)
+                .child(
+                    gpui_omarchy::icon(IconName::TriangleAlert)
+                        .size(icon::SM)
+                        .text_color(warning),
+                )
+                .child(why.clone())
+        }));
+
+    let summary = div()
+        .debug_selector(|| "filter-size-summary".into())
+        .px(space::SM)
+        .py(space::XS)
+        .bg(theme.hover_fill())
+        .text_size(text::BODY)
+        .text_color(theme.foreground)
+        .child(if app.size_error.is_some() {
+            "Not applied yet: put the size right first".to_owned()
+        } else {
+            app.filter_sentence()
+        });
+    let actions = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        // Only when there is something to clear, rather than greyed out.
+        .children(chosen.then(|| {
+            button("filter-clear", "Clear all", ButtonVariant::Outline, cx)
+                .debug_selector(|| "filter-clear".into())
+                .min_h(size::TARGET)
+                .text_size(text::TITLE)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.clear_chosen_filter(window, cx);
+                }))
+        }))
+        .child(div().flex_1())
+        .child(
+            div()
+                .text_size(text::BODY)
+                .text_color(theme.secondary)
+                .child("Esc closes"),
+        )
+        .child(
+            // Never disabled: a bad size is answered beside its field,
+            // and the keyboard is put there.
+            button("filter-apply", "Apply", ButtonVariant::Primary, cx)
+                .debug_selector(|| "filter-apply".into())
+                .min_h(size::TARGET)
+                .text_size(text::TITLE)
+                .font_weight(FontWeight::BOLD)
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .font_weight(FontWeight::NORMAL)
+                        .child("Enter"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.press_apply(window, cx);
+                })),
+        );
+
+    // A focus scope, so Tab and Shift+Tab walk the menu's controls.
+    let menu = gpui_omarchy::focus_scope("filter-menu")
+        .debug_selector(|| "filter-menu".into())
+        .occlude()
+        .child(
+            card_surface(cx)
+                .w(size::FILTER_MENU)
+                .p(space::MD)
+                .gap(space::MD)
+                // Solid, where a tooltip is not: the mosaic's labels
+                // showing through would sit behind words to be read.
+                .bg(theme.background)
+                .child(header)
+                .child(kinds)
+                .child(separator(cx))
+                .child(menu_heading(
+                    "File size",
+                    "Sizes apply to files, not folders",
+                    theme,
+                ))
+                .child(sizes)
+                .child(summary)
+                .child(actions)
+                .children(app.notice.as_ref().map(|(text, status)| {
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(widgets::alert_color(*status, cx))
+                        .child(text.clone())
+                })),
+        );
+    // Hung below the button and deferred, so it paints over the mosaic.
+    buttons(
+        holder.child(
+            div().absolute().top_full().left_0().child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.))
+                        .offset(gpui_kit::point(px(0.), px(4.)))
+                        .child(menu),
+                )
+                .with_priority(2),
+            ),
+        ),
+    )
 }
 
 /// What the whole scan found, as one quiet line; unreadable paths are

@@ -21,6 +21,8 @@ use gpui_kit::Rems;
 pub mod space {
     use super::Rems;
 
+    /// None at all: a control whose height is set, not padded out.
+    pub const NONE: Rems = Rems(0.0);
     /// Optical correction: an icon baseline, a compact separator.
     pub const XXS: Rems = Rems(0.125);
     /// Parts of one control: icon and label, title and its description.
@@ -103,6 +105,13 @@ pub mod size {
     pub const SOURCE_VIEWPORT_FRACTION: f32 = 0.92;
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
+    /// The Filter menu: Min and Max side by side, each a field and a unit.
+    pub const FILTER_MENU: Rems = Rems(28.0);
+    /// A size's unit, as a dropdown: `MiB` and the arrow that opens it.
+    pub const UNIT_SELECT: Rems = Rems(5.0);
+    /// The least height of something to press in that menu: 32 px at the
+    /// default rem, over the 24 px WCAG 2.2 asks of a pointer target.
+    pub const TARGET: Rems = Rems(2.0);
     /// The key column of the keyboard overlay.
     pub const KEY_LANE: Rems = Rems(7.0);
 }

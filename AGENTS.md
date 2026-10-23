@@ -134,6 +134,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — `unsafe` for Win32 |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
+| what a filter matches: name, kind, size | `crates/disktree-core/src/filter.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |

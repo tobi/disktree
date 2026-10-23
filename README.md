@@ -292,7 +292,14 @@ tool-owned data. The remote helper itself has no delete operation.
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
   there (see below).
-- **Under it:** the scan totals, the filter when one is typed, and the legend.
+- **Under it:** the scan totals, **Filter** and **Name**, and the legend.
+  Filter narrows the mosaic to the kinds of data that are ticked, any number
+  of them, and to files between a **Min** and a **Max** size, each typed
+  with its own unit, up to the terabyte, and emptied by the cross in its
+  field. The button counts what is in force and the menu reads it back as
+  a sentence. The menu works from the keyboard: Tab and Shift+Tab walk it,
+  Space ticks, Enter applies, Esc closes. Name is the filter `/` opens,
+  and Esc there drops the name alone. The two combine.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches — at one muted
   level, lighter with depth. A diagonal hatch is space that can be had back

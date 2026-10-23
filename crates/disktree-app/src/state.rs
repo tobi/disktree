@@ -103,6 +103,13 @@ pub fn panel_width(pointer_x: f32, viewport: f32, rem: f32) -> f32 {
 /// How many "worth a look" findings the panel lists.
 const INSIGHT_LIMIT: usize = 6;
 
+/// The units a size can be typed in, in the Filter menu: each 1024 of
+/// the one before, as sizes are shown. Up to the terabyte: a disk image
+/// or a backup set is a file that big.
+pub const fn size_units() -> [&'static str; 4] {
+    ["KiB", "MiB", "GiB", "TiB"]
+}
+
 /// Which screen the app is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Screen {
@@ -471,6 +478,27 @@ pub struct Disktree {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
+    /// The Filter button's menu is open.
+    pub filter_menu: bool,
+    /// The kinds of data the Filter menu has ticked: any of them is shown.
+    /// Kept apart from the name typed after `/`, which the field shows.
+    pub filter_kinds: Vec<disktree_core::classify::Category>,
+    /// The least and the most a file may hold, in bytes, from the menu.
+    pub filter_least: Option<u64>,
+    pub filter_most: Option<u64>,
+    /// Which unit each of the menu's two size fields is read in, the
+    /// least then the most: an index into [`size_units`]. Each has its
+    /// own, so "from 500 MiB to 4 GiB" is typed as it is said.
+    pub size_unit: [usize; 2],
+    /// The dropdowns those units are picked from, built each time the
+    /// menu opens so each starts on the unit then in force.
+    pub unit_selects: Option<[Entity<gpui_omarchy::ChoiceState>; 2]>,
+    /// What is wrong with a typed size and which field it is in, the
+    /// least (`0`) or the most (`1`): said beside that field, in words,
+    /// until it is put right.
+    pub size_error: Option<(usize, String)>,
+    /// The menu's least and most fields, built the first time it opens.
+    pub size_inputs: Option<(Entity<InputState>, Entity<InputState>)>,
 }
 
 impl Disktree {
@@ -622,6 +650,15 @@ impl Disktree {
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
+            filter_menu: false,
+            filter_kinds: Vec::new(),
+            filter_least: None,
+            filter_most: None,
+            // Megabytes: the unit most "large files" are counted in.
+            size_unit: [1, 1],
+            unit_selects: None,
+            size_error: None,
+            size_inputs: None,
         };
         if local && start {
             tree.device = device_for(&tree.root_path);
@@ -2739,7 +2776,7 @@ impl Disktree {
     pub fn refresh_matches(&mut self, cx: &Context<'_, Self>) {
         self.find_epoch += 1;
         let epoch = self.find_epoch;
-        let needle = self.find.clone();
+        let needle = self.needle();
         let Some(tree) =
             self.tree.clone().filter(|_| !needle.trim().is_empty())
         else {
@@ -2785,10 +2822,14 @@ impl Disktree {
             return;
         };
         if matches.count == 0 {
-            self.notice = Some((
-                format!("nothing here matches {}", matches.needle),
-                Status::Warning,
-            ));
+            // The menu's choices travel as words no one typed, so they
+            // are not read back; a name alone is.
+            let what = if self.filter_chosen() {
+                "nothing here matches the filter".to_owned()
+            } else {
+                format!("nothing here matches {}", matches.needle)
+            };
+            self.notice = Some((what, Status::Warning));
             cx.notify();
             return;
         }
@@ -2819,10 +2860,337 @@ impl Disktree {
         self.finding = false;
         self.apply_pending = false;
         self.find.clear();
+        self.filter_kinds.clear();
+        self.filter_least = None;
+        self.filter_most = None;
         self.find_open = false;
         self.matches = None;
         self.filter_applied = false;
         self.filter_epoch += 1;
+    }
+
+    // ── filtering by kind and size ──────────────────────────────────────
+
+    /// Everything the filter asks, as the one needle the search reads: the
+    /// name typed after `/`, then the kinds and sizes chosen in the Filter
+    /// menu. They are held apart so the field shows only what was typed.
+    pub fn needle(&self) -> String {
+        use disktree_core::filter::{
+            KIND_PREFIX, LEAST_PREFIX, MOST_PREFIX, kind_key,
+        };
+        let mut words: Vec<String> = Vec::new();
+        let name = self.find.trim();
+        if !name.is_empty() {
+            words.push(name.to_owned());
+        }
+        for kind in &self.filter_kinds {
+            words.push(format!("{KIND_PREFIX}{}", kind_key(*kind)));
+        }
+        if let Some(least) = self.filter_least {
+            words.push(format!("{LEAST_PREFIX}{least}"));
+        }
+        if let Some(most) = self.filter_most {
+            words.push(format!("{MOST_PREFIX}{most}"));
+        }
+        words.join(" ")
+    }
+
+    /// How many things the Filter menu asks for: each ticked kind, and
+    /// each size that is set.
+    pub fn filter_count(&self) -> usize {
+        self.filter_kinds.len()
+            + usize::from(self.filter_least.is_some())
+            + usize::from(self.filter_most.is_some())
+    }
+
+    /// The menu's choices read back as a sentence, so what is in force is
+    /// said in words and not only shown by ticks.
+    pub fn filter_sentence(&self) -> String {
+        use disktree_core::size::human_bytes;
+        // Nothing is hidden when nothing matched: see `apply_filter`.
+        let none = self.matches.as_ref().is_some_and(|found| found.count == 0);
+        if self.filter_chosen() && none && !self.finding {
+            return "Nothing here matches, so everything is shown".into();
+        }
+        let kinds = self
+            .filter_kinds
+            .iter()
+            .map(|kind| kind.label())
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let sizes = match (self.filter_least, self.filter_most) {
+            (Some(least), Some(most)) => {
+                format!("from {} to {}", human_bytes(least), human_bytes(most))
+            }
+            (Some(least), None) => format!("{} or more", human_bytes(least)),
+            (None, Some(most)) => format!("{} or less", human_bytes(most)),
+            (None, None) => String::new(),
+        };
+        match (kinds.is_empty(), sizes.is_empty()) {
+            (true, true) => "Showing everything".into(),
+            (false, true) => format!("Showing {kinds}"),
+            (true, false) => format!("Showing files of {sizes}"),
+            (false, false) => format!("Showing {kinds}, {sizes}"),
+        }
+    }
+
+    /// Whether the Filter menu asks for anything, whatever the name does.
+    pub const fn filter_chosen(&self) -> bool {
+        !self.filter_kinds.is_empty()
+            || self.filter_least.is_some()
+            || self.filter_most.is_some()
+    }
+
+    /// Open the Filter menu, its size fields showing the sizes in force,
+    /// or close it.
+    pub fn toggle_filter_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.filter_menu {
+            self.close_filter_menu(cx);
+            return;
+        }
+        let (least, most) = if let Some(inputs) = self.size_inputs.clone() {
+            inputs
+        } else {
+            // An empty field says what empty means, rather than nothing.
+            let field = |window: &mut Window, cx: &mut Context<'_, Self>| {
+                cx.new(|cx| InputState::new(window, cx).placeholder("No limit"))
+            };
+            let least = field(window, cx);
+            let most = field(window, cx);
+            for input in [&least, &most] {
+                cx.subscribe_in(input, window, Self::on_size_event).detach();
+            }
+            self.size_inputs = Some((least.clone(), most.clone()));
+            (least, most)
+        };
+        let units = self.size_unit;
+        self.unit_selects = Some([0, 1].map(|side| {
+            let select = cx.new(|cx| {
+                gpui_omarchy::ChoiceState::new(
+                    size_units()
+                        .into_iter()
+                        .map(|unit| gpui_omarchy::ChoiceItem::new(unit, unit))
+                        .collect(),
+                    window,
+                    cx,
+                )
+                .label(if side == 0 {
+                    "Unit of the min size"
+                } else {
+                    "Unit of the max size"
+                })
+                .default_selected(units[side])
+            });
+            cx.observe(&select, move |this, select, cx| {
+                let picked = select.read(cx).selected().and_then(|item| {
+                    size_units()
+                        .into_iter()
+                        .position(|unit| unit == item.value.as_ref())
+                });
+                if let Some(unit) = picked
+                    && unit != this.size_unit[side]
+                {
+                    this.set_size_unit(side, unit, cx);
+                }
+            })
+            .detach();
+            select
+        }));
+        for (input, bytes, unit) in [
+            (&least, self.filter_least, units[0]),
+            (&most, self.filter_most, units[1]),
+        ] {
+            // What was typed stays as typed while it still means the
+            // size in force: written back from the bytes it would be
+            // rounded, and the next Apply would move the limit.
+            if size_typed(&input.read(cx).value(), unit) == Ok(bytes) {
+                continue;
+            }
+            let shown =
+                bytes.map_or_else(String::new, |bytes| size_shown(bytes, unit));
+            input.update(cx, |state, cx| state.set_value(shown, window, cx));
+        }
+        // The keyboard starts inside the menu, so Tab and Shift+Tab walk
+        // its controls; from the treemap they would not reach it.
+        least.update(cx, |state, cx| state.focus(window, cx));
+        self.size_error = None;
+        self.filter_menu = true;
+        self.crumb_menu = None;
+        self.power_menu = None;
+        cx.notify();
+    }
+
+    /// Put the Filter menu away and return the keyboard to the treemap.
+    pub fn close_filter_menu(&mut self, cx: &mut Context<'_, Self>) {
+        self.filter_menu = false;
+        self.focus_request = Some(FocusTarget::Root);
+        cx.notify();
+    }
+
+    /// Tick or untick one kind of data. Any ticked kind is shown, so the
+    /// menu stays open for the next.
+    pub fn toggle_filter_kind(
+        &mut self,
+        kind: disktree_core::classify::Category,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(at) = self.filter_kinds.iter().position(|on| *on == kind) {
+            self.filter_kinds.remove(at);
+        } else {
+            self.filter_kinds.push(kind);
+        }
+        self.rerun_filter(cx);
+    }
+
+    /// Read one size field, the least (`0`) or the most (`1`), in another
+    /// unit: the number stays as it was typed and means something else,
+    /// as changing a unit does.
+    pub fn set_size_unit(
+        &mut self,
+        side: usize,
+        unit: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let side = side.min(1);
+        let unit = unit.min(size_units().len() - 1);
+        self.size_unit[side] = unit;
+        // The dropdown shows it too, when this did not come from there.
+        if let Some(selects) = &self.unit_selects {
+            let select = selects[side].clone();
+            let shown = select
+                .read(cx)
+                .selected()
+                .is_some_and(|item| item.value.as_ref() == size_units()[unit]);
+            if !shown {
+                select.update(cx, |state, cx| {
+                    state.set_selected(Some(unit), cx);
+                });
+            }
+        }
+        self.apply_sizes(cx);
+    }
+
+    /// Empty one size field, the least (`0`) or the most (`1`), and lift
+    /// that limit at once: the cross in a field is an action, not an
+    /// edit waiting for Apply.
+    pub fn clear_size(
+        &mut self,
+        side: usize,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((least, most)) = self.size_inputs.clone() else {
+            return;
+        };
+        let input = if side == 0 { least } else { most };
+        input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.apply_sizes(cx);
+    }
+
+    /// Take the least and most sizes from the menu's fields. An empty
+    /// field is no limit on that side.
+    pub fn apply_sizes(&mut self, cx: &mut Context<'_, Self>) {
+        let Some((least, most)) = self.size_inputs.clone() else {
+            return;
+        };
+        let typed = |input: &Entity<InputState>, unit: usize| {
+            size_typed(&input.read(cx).value(), unit)
+        };
+        let units = self.size_unit;
+        // Each failure names its field and the way out of it, and is
+        // shown beside that field: see `views::filter_control`.
+        let not_a_number = |side: &str| {
+            format!("{side} is not a number. Type one such as 1.5.")
+        };
+        match (typed(&least, units[0]), typed(&most, units[1])) {
+            (Err(()), _) => {
+                self.size_error = Some((0, not_a_number("Min")));
+            }
+            (_, Err(())) => {
+                self.size_error = Some((1, not_a_number("Max")));
+            }
+            (Ok(Some(least)), Ok(Some(most))) if least > most => {
+                self.size_error = Some((
+                    1,
+                    format!(
+                        "Max is below Min. Raise Max above {}.",
+                        disktree_core::size::human_bytes(least)
+                    ),
+                ));
+            }
+            (Ok(least), Ok(most)) => {
+                self.filter_least = least;
+                self.filter_most = most;
+                self.size_error = None;
+                self.rerun_filter(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Untick every kind and lift both sizes; a name being searched for
+    /// stays, since it was not asked for here.
+    pub fn clear_chosen_filter(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.filter_kinds.clear();
+        self.filter_least = None;
+        self.filter_most = None;
+        if let Some((least, most)) = self.size_inputs.clone() {
+            least.update(cx, |state, cx| state.set_value("", window, cx));
+            most.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.size_error = None;
+        self.rerun_filter(cx);
+    }
+
+    /// Search again with the filter as it now stands, and show only what
+    /// matches, as Enter in the name field does.
+    fn rerun_filter(&mut self, cx: &mut Context<'_, Self>) {
+        if self.needle().is_empty() {
+            self.clear_filter();
+        } else {
+            self.refresh_matches(cx);
+            self.apply_filter(cx);
+        }
+        cx.notify();
+    }
+
+    /// Apply, from the button or Enter: the sizes are taken, and when one
+    /// is wrong the keyboard is put in its field, where the fix is typed.
+    pub fn press_apply(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.apply_sizes(cx);
+        if let Some((side, _)) = &self.size_error
+            && let Some((least, most)) = self.size_inputs.clone()
+        {
+            let input = if *side == 0 { least } else { most };
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
+    fn on_size_event(
+        &mut self,
+        _: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if matches!(event, InputEvent::PressEnter { .. }) && self.filter_menu {
+            self.press_apply(window, cx);
+        }
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -3053,6 +3421,19 @@ impl Disktree {
             return;
         }
 
+        // The Filter menu has fields to type sizes in, so keys are text
+        // there.
+        if self.filter_menu {
+            // An open dropdown takes Escape for itself first.
+            let picking = self.unit_selects.as_ref().is_some_and(|selects| {
+                selects.iter().any(|select| select.read(cx).is_open())
+            });
+            if key == "escape" && !picking {
+                self.close_filter_menu(cx);
+            }
+            return;
+        }
+
         // The volume picker owns its keys while open: arrows move, Enter
         // picks, Escape closes, and nothing behind it acts.
         if self.volumes_open {
@@ -3098,6 +3479,13 @@ impl Disktree {
         // tree, and Escape always means "give the keyboard back".
         if self.screen == Screen::Explore && self.find_open {
             match key {
+                // The name alone: what the Filter menu holds was not
+                // typed here, and its own Clear leaves the name in turn.
+                "escape" if self.filter_chosen() => {
+                    self.find.clear();
+                    self.find_open = false;
+                    self.rerun_filter(cx);
+                }
                 "escape" => self.clear_filter(),
                 "enter" => self.apply_filter(cx),
                 "backspace" => {
@@ -3662,6 +4050,39 @@ pub fn restart_args(
     args.push(depth.to_string().into());
     args.push(root.as_os_str().to_owned());
     args
+}
+
+/// A size typed in the Filter menu, in bytes: `None` for an empty field,
+/// which asks nothing, and an error for anything that is not a size.
+fn size_typed(text: &str, unit: usize) -> Result<Option<u64>, ()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let number: f64 = text.parse().map_err(|_| ())?;
+    let bytes = number * UNIT_STEP.powi(unit_power(unit));
+    // `inf` and `nan` parse as numbers; neither is a size.
+    if !(bytes.is_finite() && (0.0..1e18).contains(&bytes)) {
+        return Err(());
+    }
+    Ok(Some(bytes as u64))
+}
+
+/// `bytes` as the number to show in a size field read in `unit`, without
+/// the zeros a whole number does not need.
+fn size_shown(bytes: u64, unit: usize) -> String {
+    let number = bytes as f64 / UNIT_STEP.powi(unit_power(unit));
+    let text = format!("{number:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// What one of [`size_units`] is of the one before: binary, as sizes are
+/// shown.
+const UNIT_STEP: f64 = 1024.0;
+
+/// How many steps above a byte a unit of [`size_units`] is.
+fn unit_power(unit: usize) -> i32 {
+    i32::try_from(unit.min(size_units().len() - 1)).unwrap_or(0) + 1
 }
 
 /// Now, in Unix seconds.
