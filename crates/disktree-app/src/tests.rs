@@ -987,6 +987,51 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_help_overlay_closes_by_button_and_from_outside_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let drawn =
+        read(&view, cx, |app| (app.crumbs.clone(), app.selected.clone()));
+
+    press(cx, "?");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_help));
+    // A press on the card is the card's own.
+    let card = cx.debug_bounds("help-card").expect("the key list");
+    cx.simulate_click(card.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_help));
+    // One beside it closes the page, and the keys are the treemap's again.
+    let page = cx.debug_bounds("help").expect("the page");
+    let outside = Point::new(page.origin.x + px(4.), page.origin.y + px(4.));
+    cx.simulate_click(outside, gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.show_help));
+    // Neither press reached the screen behind: the same directory is drawn.
+    assert_eq!(
+        read(&view, cx, |app| (app.crumbs.clone(), app.selected.clone())),
+        drawn
+    );
+
+    // The way out is a button as well as a key.
+    press(cx, "?");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_help));
+    let close = cx.debug_bounds("help-close").expect("Close");
+    cx.simulate_click(close.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.show_help));
+    press(cx, "?");
+    assert!(read(&view, cx, |app| app.show_help));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_help));
+}
+
+#[gpui_kit::test]
 fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();

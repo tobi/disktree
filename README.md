@@ -389,6 +389,8 @@ rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
 window quits); other ⌘ chords are left to the system. On Linux and Windows
 the same work with ctrl, with F5 to rescan too.
 
+The key list closes with `esc`, its Close button, or a click outside it.
+
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back. Or hand the list on instead of acting on it: `s`
 saves it as a text file, one path per line, and `a` copies a prompt for a

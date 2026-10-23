@@ -330,6 +330,84 @@ fn centred_popup(
         )
 }
 
+/// A page over the dimmed window: the keys, for one. A press outside the
+/// card closes it, as Escape does; one on the card is the card's own, and
+/// nothing reaches the screen behind either way.
+fn modal(
+    id: &'static str,
+    theme: &Theme,
+    card: impl IntoElement,
+    close: fn(&mut Disktree, &mut Context<'_, Disktree>),
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.background.opacity(0.86))
+        .on_any_mouse_down(cx.listener(
+            move |this, _: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                close(this, cx);
+                window.focus(&this.focus, cx);
+            },
+        ))
+        .child(
+            div()
+                .id(ElementId::Name(format!("{id}-card").into()))
+                .debug_selector(move || format!("{id}-card"))
+                .on_any_mouse_down(
+                    |_: &MouseDownEvent, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                    },
+                )
+                .child(card),
+        )
+}
+
+/// A page's heading with the way out of it at the far end, for a hand on
+/// the mouse; Escape and a press outside do the same.
+fn page_header(
+    id: &'static str,
+    glyph: gpui_omarchy::IconName,
+    title: &'static str,
+    close: fn(&mut Disktree, &mut Context<'_, Disktree>),
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let theme = cx.omarchy();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .child(
+            gpui_omarchy::icon(glyph)
+                .size(icon::MD)
+                .text_color(theme.accent),
+        )
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.bright)
+                .child(title),
+        )
+        .child(div().flex_1())
+        .child(
+            button(id, "Close", ButtonVariant::Secondary, cx)
+                .debug_selector(move || id.into())
+                .tab_stop(false)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    close(this, cx);
+                    window.focus(&this.focus, cx);
+                })),
+        )
+}
+
 /// The one question disktree asks: a permanent deletion cannot be undone, so
 /// it is an alert dialog that names what goes and what comes back. The trash is
 /// reversible and needs no dialog.
@@ -3775,8 +3853,12 @@ const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
     "ctrl-o"
 };
 
-fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
-    let theme = cx.omarchy();
+fn help_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let close: fn(&mut Disktree, &mut Context<'_, Disktree>) = |this, cx| {
+        this.show_help = false;
+        cx.notify();
+    };
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
     let rows = [
@@ -3860,54 +3942,32 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         );
     }
 
-    div()
-        .absolute()
-        .inset_0()
+    let card = div()
         .flex()
-        .items_center()
-        .justify_center()
-        .bg(theme.background.opacity(0.86))
+        .flex_col()
+        .gap(space::MD)
+        .w(size::HELP)
+        .p(space::XL)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .child(page_header(
+            "help-close",
+            gpui_omarchy::IconName::Keyboard,
+            "Keyboard and mouse",
+            close,
+            cx,
+        ))
+        .child(keys)
         .child(
             div()
-                .flex()
-                .flex_col()
-                .gap(space::MD)
-                .w(size::HELP)
-                .p(space::XL)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.surface)
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(space::SM)
-                        .child(
-                            gpui_omarchy::icon(
-                                gpui_omarchy::IconName::Keyboard,
-                            )
-                            .size(icon::MD)
-                            .text_color(theme.accent),
-                        )
-                        .child(
-                            div()
-                                .text_size(text::TITLE)
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme.bright)
-                                .child("Keyboard and mouse"),
-                        ),
-                )
-                .child(keys)
-                .child(
-                    div()
-                        .text_size(text::CAPTION)
-                        .text_color(theme.secondary)
-                        .child(format!(
-                            "? or esc closes \u{00b7} {} \u{00b7} {}",
-                            app.root_path.display(),
-                            app.options.metric.label()
-                        )),
-                ),
-        )
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!(
+                    "?, esc or a click outside closes \u{00b7} {} \u{00b7} {}",
+                    app.root_path.display(),
+                    app.options.metric.label()
+                )),
+        );
+    modal("help", &theme, card, close, cx)
 }
