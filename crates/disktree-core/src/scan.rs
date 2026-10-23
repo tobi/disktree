@@ -1673,7 +1673,14 @@ mod tests {
                 state.to_le_bytes()[0]
             })
             .collect();
-        fs::write(temp.path().join("data.bin"), noise).expect("write");
+        // Flush and sync before scanning: on CoW filesystems with delayed
+        // allocation (such as OpenZFS), asynchronous writes remain buffered
+        // in transaction groups and report st_blocks = 1 until synced.
+        let mut file =
+            fs::File::create(temp.path().join("data.bin")).expect("create");
+        std::io::Write::write_all(&mut file, &noise).expect("write");
+        file.sync_all().expect("sync");
+        drop(file);
         let tree = scan_dir(temp.path(), &ScanOptions::default());
         assert!(tree.bytes >= 100_000, "{}", tree.bytes);
         assert_eq!(tree.bytes % 512, 0, "{}", tree.bytes);
