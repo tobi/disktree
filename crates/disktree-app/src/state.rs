@@ -31,7 +31,7 @@ use gpui_kit::{
     MouseDownEvent, MouseMoveEvent, NavigationDirection, Pixels, Point, Render,
     ScrollDelta, ScrollWheelEvent, Size, Window, px, size,
 };
-use gpui_omarchy::Status;
+use gpui_omarchy::{ActiveTheme as _, Status};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::git::GitState;
@@ -387,8 +387,21 @@ pub struct Disktree {
     /// Focus to move on the next occasion a window is in hand. Key handling
     /// has no window, and opening or closing the dialog must move focus.
     pub focus_request: Option<FocusTarget>,
-    /// What the titlebar says, so it is only set when it changes.
+    /// What the titlebar says, so it is only set when it changes. The strip
+    /// paints no title, but the Window menu, Mission Control, the taskbar
+    /// and Waybar still read it.
     window_title: String,
+    /// The left button went down on the title strip and has not moved yet:
+    /// the first motion starts a window move.
+    pub strip_drag: bool,
+    /// A window frame to draw instead of asking the platform. The
+    /// window-harness tests pin one per layout: their window has no
+    /// compositor to ask.
+    pub chrome_pin: Option<crate::chrome::Frame>,
+    /// How far the content sits inside the window, from this frame's
+    /// [`crate::chrome::Frame`]: what turns a pointer position into one in
+    /// the root's coordinates.
+    pub content_edges: gpui_kit::Edges<Pixels>,
     /// The window's `rem` in pixels, read each frame. The mosaic is laid out
     /// in pixels, so its header band and label thresholds are scaled by this
     /// to follow interface zoom like the rest of the interface.
@@ -575,6 +588,9 @@ impl Disktree {
             confirm_focus: cx.focus_handle(),
             focus_request: None,
             window_title: String::new(),
+            strip_drag: false,
+            chrome_pin: None,
+            content_edges: gpui_kit::Edges::default(),
             rem: crate::ui::BASE_REM,
             run: None,
             run_epoch: 0,
@@ -948,7 +964,12 @@ impl Disktree {
             cx.notify();
             return;
         }
-        if !path.is_absolute() {
+        let absolute = if self.volumes_source.is_some() {
+            disktree_core::remote::is_posix_absolute_path(&path)
+        } else {
+            path.is_absolute()
+        };
+        if !absolute {
             self.picker_error =
                 Some("Enter an absolute directory path.".into());
             cx.notify();
@@ -3735,7 +3756,14 @@ impl Render for Disktree {
             window.set_window_title(&title);
             self.window_title = title;
         }
-        crate::views::root(self, window, cx)
+        let frame = self
+            .chrome_pin
+            .clone()
+            .unwrap_or_else(|| crate::chrome::Frame::detect(window, cx));
+        self.content_edges = frame.content_edges();
+        let root = crate::views::root(self, &frame, window, cx);
+        let theme = cx.omarchy().clone();
+        crate::chrome::client_frame(&frame, root, window, &theme)
     }
 }
 

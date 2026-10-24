@@ -25,6 +25,7 @@ use gpui_omarchy::{
 
 use gpui_kit::prelude::FluentBuilder as _;
 
+use crate::chrome::{self, Frame};
 use crate::palette;
 use crate::state::{
     ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
@@ -40,6 +41,7 @@ const LIST_LIMIT: usize = 1200;
 /// The whole window.
 pub fn root(
     app: &mut Disktree,
+    frame: &Frame,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Stateful<Div> {
@@ -48,6 +50,7 @@ pub fn root(
     }
     app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
+    let strip = title_strip(app, frame, window, cx);
     let body = match app.screen {
         Screen::Explore => explore(app, window, cx),
         Screen::Review => review(app, window, cx),
@@ -113,6 +116,7 @@ pub fn root(
         .text_color(theme.foreground)
         .font_family(theme.font)
         .text_size(text::BODY)
+        .child(strip)
         .child(body);
     if let Some(tip) = cursor_tooltip(app, window, cx) {
         root = root.child(tip);
@@ -418,8 +422,8 @@ fn delete_dialog(
 
 fn explore(
     app: &mut Disktree,
-    window: &mut Window,
-    cx: &mut Context<'_, Disktree>,
+    window: &Window,
+    cx: &Context<'_, Disktree>,
 ) -> Div {
     let theme = cx.omarchy().clone();
     if app.awaiting_root {
@@ -484,7 +488,6 @@ fn explore(
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(top_bar(app, &theme, window, cx))
         .child(
             div()
                 .id("explore-body")
@@ -496,9 +499,16 @@ fn explore(
                 // pointer from here, wherever it goes in the window.
                 .on_drag_move(cx.listener(
                     |this, event: &DragMoveEvent<PanelDrag>, window, cx| {
+                        // The pointer is in window coordinates; the
+                        // panel's right edge is the content's, inset by a
+                        // client-side frame.
+                        let inset = &this.content_edges;
                         this.panel_rems = panel_width(
-                            event.event.position.x.as_f32(),
-                            window.viewport_size().width.as_f32(),
+                            (event.event.position.x - inset.left).as_f32(),
+                            (window.viewport_size().width
+                                - inset.left
+                                - inset.right)
+                                .as_f32(),
                             this.rem,
                         );
                         cx.notify();
@@ -567,37 +577,52 @@ impl gpui_kit::Render for NoGhost {
     }
 }
 
-// ── top bar ─────────────────────────────────────────────────────────────
+// ── title strip ─────────────────────────────────────────────────────────
 
-/// The app, what the whole scan found, and the controls that decide what
-/// is measured, on the edge they own.
-fn top_bar(
+/// Width, in rem, below which the wordmark gives the trail its room: the
+/// settings do not shrink, and at the minimum window the stoplights' zone
+/// would otherwise squeeze the trail to nothing. The mark stays.
+const WORDMARK_SHOWN_REMS: f32 = 70.0;
+
+/// The window's title strip. On explore it carries what the whole window
+/// is about — where you are and how it is measured — after the brand; the
+/// other screens have a heading of their own, so it is only the brand there.
+fn title_strip(
     app: &Disktree,
-    theme: &Theme,
+    frame: &Frame,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
-) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::LG)
-        .px(space::LG)
-        .py(space::MD)
-        .border_b_1()
-        .border_color(theme.divider())
-        .child(with_tooltip(
-            logo(theme).id("choose-source").cursor_pointer()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_volumes(cx);
-                    this.apply_focus(window, cx);
-                })),
-            "Choose local or SSH source · v",
-        ))
-        // Where you are is navigation, and it belongs to the whole window.
-        .child(trail(app, theme, cx))
-        .child(div().flex_1())
-        .child(view_settings(app, window, cx))
+) -> Stateful<Div> {
+    let theme = cx.omarchy().clone();
+    let explore = app.screen == Screen::Explore;
+    let width_rems = window.viewport_size().width.as_f32() / app.rem;
+    let wordmark = !explore || width_rems >= WORDMARK_SHOWN_REMS;
+    let content = if explore {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            // Where you are is navigation, and it belongs to the whole window.
+            .child(trail(app, &theme, cx))
+            // The space between the trail and the settings is all title
+            // bar: a gap there would look like it and not move the window.
+            .child(
+                chrome::drag_area(frame, "strip-drag", cx)
+                    .flex_1()
+                    .min_w(space::XXL)
+                    .self_stretch(),
+            )
+            .child(view_settings(app, window, cx))
+    } else {
+        div()
+            .flex()
+            .flex_1()
+            .self_stretch()
+            .child(chrome::drag_area(frame, "strip-drag", cx).flex_1())
+    };
+    chrome::strip(frame, wordmark, content, window, cx)
 }
 
 /// The trail, from `/`. Above the scanned root, a crumb widens the scan;
@@ -875,44 +900,6 @@ fn sibling_menu(
         );
     }
     panel
-}
-
-/// Four tiles in category colours, and the name.
-fn logo(theme: &Theme) -> Div {
-    let tile = |category| {
-        div()
-            .size(space::SM)
-            .bg(palette::category_accent(theme, category))
-    };
-    let column = |top, bottom| {
-        div()
-            .flex()
-            .flex_col()
-            .gap(space::XXS)
-            .child(tile(top))
-            .child(tile(bottom))
-    };
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::SM)
-        .flex_shrink_0()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap(space::XXS)
-                .child(column(Category::Code, Category::Synced))
-                .child(column(Category::AgentScratch, Category::Toolchain)),
-        )
-        .child(
-            div()
-                .text_size(text::HEADING)
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.bright)
-                .child("disktree"),
-        )
 }
 
 /// How the mosaic is measured and drawn, as real controls with visible state.
@@ -3559,16 +3546,22 @@ pub fn cursor_tooltip(
     let content = hover_tooltip(app, cx)?;
     let origin = app.treemap_origin.get();
     let window_size = window.bounds().size;
+    // The tooltip is placed in the root's coordinates, which a client-side
+    // frame insets from the window's by its resize ring and border.
+    let inset = &app.content_edges;
+    let content_width = (window_size.width - inset.left - inset.right).as_f32();
+    let content_height =
+        (window_size.height - inset.top - inset.bottom).as_f32();
 
     // Flip to the other side of the pointer rather than overflow the window.
-    let anchor_x = origin.x.as_f32() + pointer.x.as_f32();
-    let anchor_y = origin.y.as_f32() + pointer.y.as_f32();
-    let x = if anchor_x + gap + width > window_size.width.as_f32() {
+    let anchor_x = (origin.x + pointer.x - inset.left).as_f32();
+    let anchor_y = (origin.y + pointer.y - inset.top).as_f32();
+    let x = if anchor_x + gap + width > content_width {
         (anchor_x - gap - width).max(edge)
     } else {
         anchor_x + gap
     };
-    let y = if anchor_y + gap + height > window_size.height.as_f32() {
+    let y = if anchor_y + gap + height > content_height {
         (anchor_y - gap - height).max(edge)
     } else {
         anchor_y + gap
@@ -3576,6 +3569,7 @@ pub fn cursor_tooltip(
 
     Some(
         card_surface(cx)
+            .debug_selector(|| "cursor-tooltip".into())
             .absolute()
             .left(px(x))
             .top(px(y))

@@ -237,6 +237,19 @@ fn startup_chooser_never_scans_before_explicit_acceptance(
 }
 
 #[gpui_kit::test]
+fn title_brand_opens_source_picker(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let brand = cx.debug_bounds("strip-brand").expect("title brand");
+    cx.simulate_click(brand.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.volumes_open));
+    assert!(cx.debug_bounds("source-picker").is_some());
+}
+
+#[gpui_kit::test]
 fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let selected = fixture();
@@ -2356,4 +2369,276 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     cx.simulate_click(toggle.center(), Modifiers::none());
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
+}
+
+/// Every frame the title strip can be drawn in, as the platforms report
+/// them: the window harness has no compositor to ask, so each is pinned.
+fn window_frames() -> Vec<(&'static str, crate::chrome::Frame)> {
+    use crate::chrome::{Frame, Platform};
+    use gpui_kit::{
+        Decorations, Tiling, WindowButton, WindowButtonLayout, WindowControls,
+    };
+
+    let frame = |platform, decorations, layout, fullscreen| {
+        Frame::new(
+            platform,
+            decorations,
+            layout,
+            WindowControls::default(),
+            fullscreen,
+        )
+    };
+    let floating = Decorations::Client {
+        tiling: Tiling::default(),
+    };
+    // Close, minimize, maximize on the left: the layout that puts the
+    // controls where macOS has its stoplights.
+    let on_the_left = WindowButtonLayout {
+        left: [
+            Some(WindowButton::Close),
+            Some(WindowButton::Minimize),
+            Some(WindowButton::Maximize),
+        ],
+        right: [None; 3],
+    };
+    vec![
+        (
+            "macOS",
+            frame(Platform::MacOs, Decorations::Server, None, false),
+        ),
+        (
+            "macOS full screen",
+            frame(Platform::MacOs, Decorations::Server, None, true),
+        ),
+        (
+            "Windows",
+            frame(Platform::Windows, Decorations::Server, None, false),
+        ),
+        (
+            "Hyprland or KDE",
+            frame(Platform::Linux, Decorations::Server, None, false),
+        ),
+        (
+            "GNOME, controls right",
+            frame(Platform::Linux, floating, None, false),
+        ),
+        (
+            "GNOME, controls left",
+            frame(Platform::Linux, floating, Some(on_the_left), false),
+        ),
+        (
+            "GNOME, maximized",
+            frame(
+                Platform::Linux,
+                Decorations::Client {
+                    tiling: Tiling::tiled(),
+                },
+                None,
+                false,
+            ),
+        ),
+    ]
+}
+
+#[gpui_kit::test]
+fn the_title_strip_draws_on_every_window_frame(cx: &mut TestAppContext) {
+    use crate::chrome::Controls;
+    use crate::ui::chrome;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    for (name, frame) in window_frames() {
+        for screen in [Screen::Explore, Screen::Review, Screen::Done] {
+            update(&view, cx, |app, cx| {
+                app.chrome_pin = Some(frame.clone());
+                app.screen = screen;
+                cx.notify();
+            });
+            draw(cx);
+
+            let strip = cx.debug_bounds("title-strip").expect(name);
+            // The band the stoplights centre in, then the divider below it.
+            assert_eq!(
+                strip.size.height,
+                chrome::STRIP + px(1.),
+                "{name}, {screen:?}"
+            );
+            let brand = cx.debug_bounds("strip-brand").expect(name);
+            assert!(brand.size.width > px(0.), "{name}: the brand is drawn");
+
+            // The brand stays clear of the controls at either end.
+            match &frame.leading {
+                // The brand's area runs to the edge, padding and all.
+                Controls::None => assert_eq!(brand.left(), strip.left()),
+                Controls::Stoplights => assert!(
+                    brand.left() - strip.left() >= chrome::STOPLIGHT_ZONE,
+                    "{name}: brand at {:?}",
+                    brand.left() - strip.left()
+                ),
+                Controls::Buttons(_) => {
+                    let controls =
+                        cx.debug_bounds("window-controls-leading").expect(name);
+                    assert!(controls.left() >= strip.left());
+                    assert!(brand.left() >= controls.right(), "{name}");
+                }
+            }
+            if let Controls::Buttons(_) = &frame.trailing {
+                let controls =
+                    cx.debug_bounds("window-controls-trailing").expect(name);
+                assert!(
+                    (strip.right() - controls.right()).abs() <= px(1.),
+                    "{name}: the controls sit at the right edge"
+                );
+                assert!(brand.right() < controls.left(), "{name}");
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_client_side_frame_keeps_a_resize_ring_until_it_is_tiled(
+    cx: &mut TestAppContext,
+) {
+    use crate::ui::chrome;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let frames = window_frames();
+    let pin = |name: &str| {
+        frames
+            .iter()
+            .find(|(each, _)| *each == name)
+            .map(|(_, frame)| frame.clone())
+    };
+
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = pin("GNOME, controls right");
+        cx.notify();
+    });
+    draw(cx);
+    let root = cx.debug_bounds("disktree-root").expect("root");
+    let frame = cx.debug_bounds("client-frame").expect("client frame");
+    // The ring, then the window's hairline border.
+    let inset = chrome::RESIZE_RING + px(1.);
+    assert_eq!(root.left() - frame.left(), inset);
+    assert_eq!(root.top() - frame.top(), inset);
+    for grip in ["grip-top", "grip-bottom-right", "grip-left"] {
+        assert!(cx.debug_bounds(grip).is_some(), "{grip}");
+    }
+
+    // Maximized or tiled, the compositor owns the edges: no ring, no grips.
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = pin("GNOME, maximized");
+        cx.notify();
+    });
+    draw(cx);
+    let root = cx.debug_bounds("disktree-root").expect("root");
+    let frame = cx.debug_bounds("client-frame").expect("client frame");
+    assert_eq!(root.left() - frame.left(), px(1.));
+    assert_eq!(root.top() - frame.top(), px(1.));
+    assert!(cx.debug_bounds("grip-top").is_none());
+
+    // Where the compositor draws the frame, the content is the window.
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = pin("Hyprland or KDE");
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("client-frame").is_none());
+}
+
+#[gpui_kit::test]
+fn the_wordmark_gives_way_in_a_narrow_window(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = window_frames().first().map(|(_, f)| f.clone());
+        cx.notify();
+    });
+    let brand_width = |cx: &mut Window| {
+        draw(cx);
+        cx.debug_bounds("strip-brand").expect("brand").size.width
+    };
+
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    let wide = brand_width(cx);
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    let narrow = brand_width(cx);
+    assert!(
+        narrow < wide / 2.,
+        "only the mark is left at 900 pt: {narrow:?} of {wide:?}"
+    );
+    // The trail keeps the crumb you are in.
+    assert!(cx.debug_bounds("title-strip").is_some());
+}
+
+#[gpui_kit::test]
+fn a_press_on_the_strip_arms_a_move_and_a_click_disarms_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = window_frames().first().map(|(_, f)| f.clone());
+        cx.notify();
+    });
+    draw(cx);
+    let empty = cx.debug_bounds("strip-drag").expect("empty strip");
+    let at = empty.center();
+    let none = gpui_kit::Modifiers::none();
+    let left = gpui_kit::MouseButton::Left;
+
+    // A press arms the move. The move itself, on the first motion with
+    // the button down, cannot run here: the test platform leaves
+    // `start_window_move` unimplemented.
+    cx.simulate_mouse_down(at, left, none);
+    assert!(read(&view, cx, |app| app.strip_drag));
+
+    // Released without moving, it was a click, and leaves nothing armed
+    // for the next time the pointer passes over with a button held.
+    cx.simulate_mouse_up(at, left, none);
+    assert!(!read(&view, cx, |app| app.strip_drag));
+
+    // The keyboard still belongs to the treemap.
+    let focused = cx.update(|window, cx| {
+        let focus = view.read(cx).focus.clone();
+        focus.is_focused(window)
+    });
+    assert!(focused, "a press on the strip leaves the treemap focused");
+}
+
+#[gpui_kit::test]
+fn the_tooltip_follows_the_pointer_inside_a_client_side_frame(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Floating under GNOME: the content sits inside the resize ring.
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = window_frames()
+            .into_iter()
+            .find(|(name, _)| *name == "GNOME, controls right")
+            .map(|(_, frame)| frame);
+        cx.notify();
+    });
+    draw(cx);
+    let origin = read(&view, cx, |app| app.treemap_origin.get());
+    let at = origin + Point::new(px(40.), px(40.));
+    cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::default());
+    draw(cx);
+
+    let tip = cx.debug_bounds("cursor-tooltip").expect("a tooltip");
+    // Beside the pointer by the tooltip's gap, wherever the root starts.
+    let gap = crate::ui::space::MD.0 * crate::ui::BASE_REM;
+    assert_eq!(
+        tip.left(),
+        at.x + px(gap),
+        "{tip:?} for a pointer at {at:?}"
+    );
+    assert_eq!(tip.top(), at.y + px(gap));
 }

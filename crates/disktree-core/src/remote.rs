@@ -5,7 +5,7 @@
 //! and stream without making a second serialized copy of the whole tree.
 
 use std::io::{self, BufRead, BufReader, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -22,6 +22,17 @@ use std::time::Instant;
 const VERSION: u32 = 1;
 const MAX_LINE: u64 = 1 << 20;
 const MAX_DIAGNOSTICS: usize = 16 << 10;
+
+/// The helper runs on Linux, even when the desktop runs on Windows.
+pub fn is_posix_absolute_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|path| path.starts_with('/'))
+}
+
+// Local protocol fixtures use native paths; a Windows desktop must also
+// accept slash-rooted paths returned by the Linux helper.
+fn is_absolute_path(path: &Path) -> bool {
+    path.is_absolute() || is_posix_absolute_path(path)
+}
 
 // Non-interactive shells often omit ~/.local/bin. Do not require users to
 // edit the server's startup files after the documented user-local install.
@@ -84,8 +95,11 @@ pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
         || roots
             .volumes
             .iter()
-            .any(|volume| !volume.point.is_absolute())
-        || roots.home.as_ref().is_some_and(|home| !home.is_absolute())
+            .any(|volume| !is_absolute_path(&volume.point))
+        || roots
+            .home
+            .as_ref()
+            .is_some_and(|home| !is_absolute_path(home))
     {
         return Err(io::Error::other("incompatible remote root discovery"));
     }
@@ -312,7 +326,7 @@ fn read_snapshot_with_progress(
     shared: &Shared,
 ) -> io::Result<Snapshot> {
     let header: Header = receive(input)?;
-    if header.version != VERSION || !header.root.is_absolute() {
+    if header.version != VERSION || !is_absolute_path(&header.root) {
         return Err(io::Error::other("incompatible remote helper protocol"));
     }
     let mut progress = Progress {
@@ -577,7 +591,7 @@ impl RemoteScan {
         Self::spawn_with_archive(command, host, request, archive)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn spawn_command(
         command: Command,
         host: &str,
@@ -736,6 +750,13 @@ impl<T> Drop for RemoteJob<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_absolute_paths_use_the_servers_syntax() {
+        assert!(is_posix_absolute_path(Path::new("/var/log")));
+        assert!(!is_posix_absolute_path(Path::new("var/log")));
+        assert!(!is_posix_absolute_path(Path::new(r"C:\Windows")));
+    }
+
     fn request() -> Request {
         Request {
             root: None,
@@ -744,6 +765,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait<T: Send + 'static>(scan: &RemoteJob<T>) -> io::Result<T> {
         wait_for(scan, std::time::Duration::from_secs(10))
     }
@@ -1209,18 +1231,23 @@ mod tests {
                     .unwrap();
             assert_eq!(snapshot.tree.bytes, if dedup { 10 } else { 15 });
             assert_eq!(snapshot.tree.files, 3);
-            let preview = shared.lock().unwrap().preview.clone().unwrap();
-            let nested = preview
-                .entries
-                .iter()
-                .find(|entry| entry.name == "nested")
-                .unwrap();
-            assert_eq!(nested.bytes, 5);
-            assert_eq!(nested.files, 1);
-            assert_eq!(
-                preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
-                snapshot.tree.bytes
-            );
+            // The non-Unix fallback sends a complete tree without live
+            // preview records; the Unix scanner streams the preview.
+            #[cfg(unix)]
+            {
+                let preview = shared.lock().unwrap().preview.clone().unwrap();
+                let nested = preview
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == "nested")
+                    .unwrap();
+                assert_eq!(nested.bytes, 5);
+                assert_eq!(nested.files, 1);
+                assert_eq!(
+                    preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
+                    snapshot.tree.bytes
+                );
+            }
         }
     }
 

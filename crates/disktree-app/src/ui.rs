@@ -107,6 +107,46 @@ pub mod size {
     pub const KEY_LANE: Rems = Rems(7.0);
 }
 
+/// The title strip across the top of the window.
+///
+/// Pixels, not rems: these line up with what the system draws or measures —
+/// the macOS stoplights, Windows' caption buttons, a compositor's resize
+/// grip — and none of those follow interface zoom. The strip's own contents
+/// (the trail, the settings) stay in rems and scale as they always have.
+pub mod chrome {
+    use gpui_kit::{Pixels, px};
+
+    /// The band's height. Even, so a 14 pt stoplight centres on a whole
+    /// point; the divider below it is drawn under the band, not inside it.
+    pub const STRIP: Pixels = px(40.);
+    /// Where macOS puts the close button, from the window's top-left:
+    /// 16 in, and `(40 - 14) / 2` down, so the stoplights centre on y=20.
+    pub const STOPLIGHTS: (f32, f32) = (16., 13.);
+    /// Room left for the stoplights: they end at x=76, and the brand keeps
+    /// 20 clear of them.
+    pub const STOPLIGHT_ZONE: Pixels = px(96.);
+    /// A Windows caption button: the system's own 46 wide, the strip tall.
+    pub const CAPTION_BUTTON: Pixels = px(46.);
+    /// A painted Linux window button, square like the rest of the app.
+    pub const WINDOW_BUTTON: Pixels = px(24.);
+    /// The glyph inside either kind of button.
+    pub const GLYPH: Pixels = px(10.);
+    /// Each of the two windows in the restore glyph.
+    pub const GLYPH_BEHIND: Pixels = px(8.);
+    /// The close cross, a little larger: its strokes are diagonal, so at
+    /// the same box it reads smaller than the square beside it.
+    pub const CLOSE_GLYPH: Pixels = px(12.);
+    /// The app icon beside the wordmark.
+    pub const MARK: Pixels = px(20.);
+    /// The wordmark, bold, and as tall as its line so it centres by cap
+    /// height rather than by the font's ascent.
+    pub const WORDMARK: Pixels = px(17.);
+    /// The mark and the wordmark.
+    pub const LOCKUP_GAP: Pixels = px(8.);
+    /// The ring a client-side window keeps for its shadow and resize grip.
+    pub const RESIZE_RING: Pixels = px(10.);
+}
+
 /// Interface zoom steps, as a factor of the 16 px default rem.
 pub const ZOOM_STEPS: [f32; 7] = [0.75, 0.875, 1.0, 1.125, 1.25, 1.5, 1.75];
 

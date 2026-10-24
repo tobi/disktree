@@ -149,6 +149,16 @@ pub fn hatch(theme: &Theme) -> Hsla {
     }
 }
 
+/// A window button disktree paints where a Linux compositor leaves the
+/// frame to it, at rest and under the pointer: a quiet square that reads as
+/// a control on any theme without competing with the trail beside it.
+pub fn window_button(theme: &Theme) -> (Hsla, Hsla) {
+    (
+        theme.foreground.opacity(0.08),
+        theme.foreground.opacity(0.16),
+    )
+}
+
 /// Linear interpolation between two colours, in RGB: interpolating hue
 /// would drag a colour around the wheel on its way to a grey.
 pub fn mix(from: Hsla, to: Hsla, t: f32) -> Hsla {

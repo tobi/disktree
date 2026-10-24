@@ -138,6 +138,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
+| the title strip, window controls, the client-side frame | `crates/disktree-app/src/chrome.rs` |
 
 ## Verification expectations
 
