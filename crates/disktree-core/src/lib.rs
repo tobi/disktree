@@ -17,6 +17,7 @@ mod macos;
 #[cfg(windows)]
 mod mft;
 pub mod payload;
+pub mod query;
 pub mod remote;
 pub mod remote_progress;
 #[cfg(unix)]

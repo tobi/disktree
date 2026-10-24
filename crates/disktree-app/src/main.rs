@@ -11,6 +11,7 @@
 // reach one. Ignored elsewhere.
 #![windows_subsystem = "windows"]
 
+mod agent;
 mod app_menu;
 mod appearance;
 mod git;
@@ -57,6 +58,7 @@ disktree — a treemap of what is using your disk
 usage: disktree [OPTIONS] [PATH]
        disktree ssh HOST [OPTIONS] [PATH]
        disktree extract-scanner ARCH OUTPUT
+       disktree mcp
 
 Linux packaged builds deploy an embedded static scanner over SSH on demand.
 Unbundled development builds need disktree-scan on the remote PATH or in
@@ -67,6 +69,8 @@ Use --check with ssh to deploy and scan without opening a window.
 
 arguments:
   PATH              explicit directory to scan; omitted opens root selection
+  mcp               serve an AI agent over stdio instead of opening a
+                    window: `claude mcp add disktree -- disktree mcp`
 
 Without PATH, choose this computer or SSH, then a mount or directory.
 No scan starts before explicit acceptance. Nested mounts are excluded.
@@ -106,6 +110,12 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
+    // `disktree mcp` is the agent's disktree: it scans and marks over stdin
+    // and stdout and opens no window of its own, though it may open one for
+    // the review screen.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
+        return disktree_mcp::serve();
+    }
     if extract_scanner()? {
         return Ok(());
     }
@@ -258,6 +268,23 @@ fn run() -> Result<()> {
                 let focus = this.focus.clone();
                 window.focus(&focus, cx);
             });
+
+            // Listen for an agent. Another window already linked, or a
+            // system without the socket, leaves this one on its own; the
+            // agent then works headless and says so.
+            match disktree_link::Listener::bind() {
+                Ok(listener) => {
+                    let _ = window.update(cx, |this, _, cx| {
+                        this.attach_agent(listener, cx);
+                    });
+                }
+                Err(error)
+                    if error.kind() != std::io::ErrorKind::Unsupported =>
+                {
+                    eprintln!("agent link not available: {error}");
+                }
+                Err(_) => {}
+            }
             cx.activate(true);
         });
     Ok(())

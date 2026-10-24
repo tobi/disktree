@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/disktree-app", "crates/disktree-core", "crates/disktree-scan", "xtask"]
+members = [
+    "crates/disktree-app",
+    "crates/disktree-core",
+    "crates/disktree-link",
+    "crates/disktree-mcp",
+    "crates/disktree-scan",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.11.0"
@@ -11,6 +18,8 @@ repository = "https://github.com/tobi/disktree"
 
 [workspace.dependencies]
 disktree-core = { path = "crates/disktree-core" }
+disktree-link = { path = "crates/disktree-link" }
+disktree-mcp = { path = "crates/disktree-mcp" }
 anyhow = "1"
 rayon = "1"
 rustc-hash = "2"

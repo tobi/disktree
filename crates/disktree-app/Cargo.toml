@@ -17,6 +17,8 @@ workspace = true
 gpui-kit = { version = "=0.6.6", default-features = false, features = ["assets"] }
 gpui-omarchy = "0.1.3"
 disktree-core = { workspace = true }
+disktree-link = { workspace = true }
+disktree-mcp = { workspace = true }
 anyhow = { workspace = true }
 dunce = "1.0.5"
 rustc-hash = { workspace = true }

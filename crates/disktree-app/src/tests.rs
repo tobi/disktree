@@ -2357,3 +2357,295 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+/// Drive the window as `disktree mcp` does, over the real socket: say
+/// hello, mark, show, open the review, unmark, hang up. The marks land in
+/// the window, the screen follows, and the header names the agent while it
+/// is there.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
+    use disktree_link::{Link, MarkRequest, Request, Response};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = temp.path().to_path_buf();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let socket = temp.path().join("link.sock");
+    let listener =
+        disktree_link::Listener::bind_at(&socket).expect("bind the link");
+    update(&view, cx, |app, cx| app.attach_agent(listener, cx));
+
+    // The client blocks on each answer, so it runs on its own thread while
+    // the test pumps the window's side, as the timer task would.
+    let mut link = Some(Link::connect_at(&socket).expect("connect"));
+    let mut ask = |cx: &mut Window, request: Request| -> Response {
+        let mut taken = link.take().expect("the link is at hand");
+        let worker = std::thread::spawn(move || {
+            let response = taken.call(&request).expect("an answer");
+            (taken, response)
+        });
+        for _ in 0..400 {
+            update(&view, cx, |app, cx| {
+                app.poll_agent_once(cx);
+            });
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (returned, response) = worker.join().expect("client thread");
+        link = Some(returned);
+        draw(cx);
+        response
+    };
+
+    let hello = ask(
+        cx,
+        Request::Hello {
+            client: "Claude Code".into(),
+            version: disktree_link::VERSION,
+        },
+    );
+    let Response::State(state) = hello else {
+        panic!("hello answers with the state: {hello:?}");
+    };
+    assert_eq!(state.root, root);
+    assert!(state.scanned && !state.scanning);
+    assert!(state.marks.is_empty());
+    assert_eq!(
+        read(&view, cx, |app| app
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.presence.clone())
+            .map(|presence| presence.client)),
+        Some("Claude Code".to_string())
+    );
+    assert!(
+        cx.debug_bounds("agent-pill").is_some(),
+        "the header names the connected agent"
+    );
+
+    // Marking lands in the window's marks; the agent's own number is only
+    // a stand-in, and a wrong one is corrected from the tree.
+    let marked = ask(
+        cx,
+        Request::Mark {
+            root: root.clone(),
+            targets: vec![MarkRequest {
+                path: root.join("junk"),
+                bytes: 7,
+                is_dir: false,
+            }],
+        },
+    );
+    let Response::Marked { state, refused } = marked else {
+        panic!("mark answers with the state: {marked:?}");
+    };
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(state.marks.len(), 1);
+    // The window measured the mark from its own tree, not from the
+    // agent's number.
+    let measured = read(&view, cx, |app| {
+        app.crumbs_for_path(&root.join("junk"))
+            .and_then(|crumbs| app.node_at(&crumbs).map(|node| node.bytes))
+    })
+    .expect("junk is in the tree");
+    assert_eq!(state.marks[0].bytes, measured);
+    assert!(state.marks[0].is_dir);
+    assert_ne!(measured, 7);
+    assert_eq!(read(&view, cx, |app| app.plan().bytes()), measured);
+    assert!(state.tree.is_some_and(|tree| tree.files > 0));
+
+    // A path the tree does not have is refused, not guessed at.
+    let missing = ask(
+        cx,
+        Request::Mark {
+            root: root.clone(),
+            targets: vec![MarkRequest {
+                path: root.join("nowhere"),
+                bytes: 1,
+                is_dir: false,
+            }],
+        },
+    );
+    let Response::Marked { refused, .. } = missing else {
+        panic!("{missing:?}");
+    };
+    assert_eq!(refused.len(), 1);
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
+
+    // The agent reads the window's tree: a listing and a search.
+    let listed = ask(
+        cx,
+        Request::Ls {
+            path: root.clone(),
+            limit: 10,
+        },
+    );
+    let Response::Listing(listing) = listed else {
+        panic!("{listed:?}");
+    };
+    assert!(listing.children.iter().any(|child| child.name == "junk"));
+    assert_eq!(listing.root_bytes, listing.entry.bytes);
+    let outside = ask(
+        cx,
+        Request::Ls {
+            path: PathBuf::from("/definitely/elsewhere"),
+            limit: 10,
+        },
+    );
+    assert!(
+        matches!(outside, Response::Error { ref message } if message.contains("outside")),
+        "{outside:?}"
+    );
+    let found = ask(
+        cx,
+        Request::Find(disktree_link::FindRequest {
+            kind: "file".into(),
+            name: Some("blob".into()),
+            limit: 5,
+            ..disktree_link::FindRequest::default()
+        }),
+    );
+    let Response::Found(found) = found else {
+        panic!("{found:?}");
+    };
+    // Two blobs, the larger first.
+    assert_eq!(found.count, 2);
+    assert_eq!(found.matches[0].path, root.join(".cache/blob.bin"));
+    assert_eq!(found.matches[1].path, root.join("junk/blob.bin"));
+
+    // A scan the agent asks for runs in the window; the state says when it
+    // has landed, and the marks survive it.
+    let rescanned = ask(
+        cx,
+        Request::Scan {
+            root: root.clone(),
+            options: disktree_link::ScanOptionsRequest::default(),
+        },
+    );
+    assert!(
+        matches!(rescanned, Response::State(ref s) if s.scanning),
+        "{rescanned:?}"
+    );
+    finish_scan(&view, cx);
+    let after = ask(cx, Request::State);
+    let Response::State(after) = after else {
+        panic!("{after:?}");
+    };
+    assert!(!after.scanning && after.scanned);
+    assert_eq!(after.marks.len(), 1);
+
+    // A path inside the mark is left alone, not toggled off or added.
+    ask(
+        cx,
+        Request::Mark {
+            root: root.clone(),
+            targets: vec![MarkRequest {
+                path: root.join("junk/deeper"),
+                bytes: 100_000,
+                is_dir: true,
+            }],
+        },
+    );
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
+
+    // Showing a directory opens it; the view follows the agent.
+    let shown = ask(
+        cx,
+        Request::Show {
+            root: root.clone(),
+            path: root.join("junk/deeper"),
+        },
+    );
+    assert_eq!(shown, Response::Ok);
+    let (crumbs, expected) = read(&view, cx, |app| {
+        (
+            app.crumbs.clone(),
+            app.crumbs_for_path(&root.join("junk/deeper")),
+        )
+    });
+    assert_eq!(Some(crumbs), expected);
+
+    // Review opens the review screen over the marks.
+    assert_eq!(ask(cx, Request::Review), Response::Ok);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    assert!(
+        temp.path().join("junk/blob.bin").exists(),
+        "nothing removed"
+    );
+
+    // Unmarking everything empties the list and leaves the review screen.
+    let cleared = ask(cx, Request::Unmark { paths: vec![] });
+    assert!(matches!(cleared, Response::State(ref s) if s.marks.is_empty()));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+    assert_eq!(
+        ask(cx, Request::Review),
+        Response::error("nothing is marked")
+    );
+
+    // Hanging up takes the name out of the header.
+    drop(link);
+    for _ in 0..400 {
+        let gone = update(&view, cx, |app, cx| {
+            app.poll_agent_once(cx);
+            app.agent
+                .as_ref()
+                .is_some_and(|agent| agent.presence.is_none())
+        });
+        if gone {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    draw(cx);
+    assert!(cx.debug_bounds("agent-pill").is_none(), "pill gone");
+}
+
+/// The agent overlay opens from the panel line, lists a command for each
+/// client with the binary's own path, and closes on Escape.
+#[gpui_kit::test]
+fn the_agent_overlay_opens_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    assert!(cx.debug_bounds("agent-line").is_some());
+    assert!(cx.debug_bounds("agent-overlay").is_none());
+
+    update(&view, cx, |app, cx| {
+        app.show_agent = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("agent-overlay").is_some());
+
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_agent));
+    assert!(cx.debug_bounds("agent-overlay").is_none());
+
+    // The Help menu opens the same overlay.
+    cx.dispatch_action(crate::app_menu::ConnectAgent);
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_agent));
+    assert!(cx.debug_bounds("agent-overlay").is_some());
+    press(cx, "escape");
+
+    let commands =
+        crate::agent::connect_commands(Path::new("/opt/disktree/disktree"));
+    assert_eq!(commands.len(), 3);
+    assert!(
+        commands[0]
+            .1
+            .starts_with("claude mcp add --scope user disktree")
+    );
+    assert!(
+        commands
+            .iter()
+            .all(|(_, command)| command.contains("/opt/disktree/disktree"))
+    );
+    assert!(commands[2].1.contains("\"args\": [\"mcp\"]"));
+}

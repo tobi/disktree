@@ -11,6 +11,12 @@ phases after choosing a local/SSH source and root: explore (treemap,
 breadcrumbs, selection and status) and review (the marked list,
 the removal mode, the confirmation). Marking is never destructive.
 
+`disktree mcp` is the same thing for an AI agent: an MCP server over stdio
+that scans with `disktree-core`, marks, and opens the review screen in a
+window over a per-user socket (`disktree-link`). The agent marks; the
+person removes. There is no tool that deletes, and the link has no request
+that deletes.
+
 ## Commands
 
 ```sh
@@ -107,6 +113,19 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    the tree, which `-X` and the media exception allow, is reported and never
    added to this volume's free space; see `space::attribution`. The final number
    comes from `statvfs` before and after.
+10. **An agent marks; a person removes.** `disktree mcp` has no tool that
+    deletes, and the window link has no request that does. `review` only
+    opens the review screen. When a window is linked it is the agent's
+    source of truth: `ls`, `find` and `scan` are answered from its tree,
+    a mark is measured from it, and its marks are the marks — every link
+    answer carries them, and the MCP session replaces its own with what
+    the window says. The session's own scans are read only while no
+    window is open. The listing and search logic is `core::query`, shared
+    by both sides, so they answer alike.
+11. **The link is a same-user socket, nothing more.** `disktree-link`
+    binds `0600` in a per-user directory and has no token, because the
+    agent already runs as the user and `disktree mcp` scans on its own.
+    Do not add a port.
 
 10. **Discovery is not a scan.** No implicit home walk at startup. List
     mounts in the selected machine's namespace without probing them; scans
@@ -138,6 +157,10 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
+| what an agent can ask of the window, and the answer | `crates/disktree-link/src/lib.rs` (messages), `crates/disktree-app/src/agent.rs` (handling) |
+| a tool, its parameters or its wording | `crates/disktree-mcp/src/server.rs` (the MCP surface), `crates/disktree-mcp/src/session.rs` (what it does) |
+| how a listing or a plan reads to an agent | `crates/disktree-mcp/src/report.rs` |
+| the procedure an agent follows | `skills/disktree-free-space/SKILL.md` |
 
 ## Verification expectations
 
@@ -146,6 +169,10 @@ and `cargo build --release` directly; CI runs the gate on both systems.
   against real temporary trees.
 * The screens are covered by window-harness tests that draw frames and press
   keys, including one that marks a directory, confirms the removal and checks
-  the files are gone while unmarked neighbours are untouched.
+  the files are gone while unmarked neighbours are untouched, and one that
+  drives the window over the real socket as `disktree mcp` does.
+* `disktree-mcp` tests every tool as a function against a temporary tree,
+  with a stand-in window on the socket for the linked cases;
+  `disktree-link` tests the socket itself.
 * Rendering was verified by those tests and by running the app against a real
   home directory; it has not been eyeballed in every theme and font size.

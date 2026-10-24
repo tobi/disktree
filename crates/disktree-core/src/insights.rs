@@ -28,6 +28,25 @@ pub enum Finding {
     StaleExperiments { count: usize },
 }
 
+impl Finding {
+    /// The finding in a few words, as a list reads it after the size.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Reclaimable(reclaim) => {
+                format!("reclaimable: {}", reclaim.label())
+            }
+            Self::Worktrees { count, oldest_days } => format!(
+                "{count} agent worktree{}, the oldest {oldest_days} d old",
+                if *count == 1 { "" } else { "s" }
+            ),
+            Self::StaleExperiments { count } => format!(
+                "{count} experiment{} untouched for a month or more",
+                if *count == 1 { "" } else { "s" }
+            ),
+        }
+    }
+}
+
 /// One line of the list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {

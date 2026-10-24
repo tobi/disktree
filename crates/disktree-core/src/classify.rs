@@ -54,6 +54,30 @@ impl Category {
         Self::Cache,
     ];
 
+    /// The label lowercased, as an agent reads and writes it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::AgentScratch => "agent scratch",
+            Self::Toolchain => "toolchain",
+            Self::Synced => "synced",
+            Self::Git => "git",
+            Self::Media => "media",
+            Self::Documents => "documents",
+            Self::Cache => "cache",
+            Self::Other => "other",
+        }
+    }
+
+    /// The category with this [`Self::name`], if any.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::LEGEND
+            .iter()
+            .copied()
+            .chain(std::iter::once(Self::Other))
+            .find(|category| category.name() == name)
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Code => "Code",

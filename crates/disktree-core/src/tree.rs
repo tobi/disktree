@@ -191,6 +191,24 @@ impl Node {
         self.children.get(index)
     }
 
+    /// The node at `relative`, a path below this one, with the crumbs that
+    /// lead there. Components are compared one at a time, so a name holding
+    /// a separator cannot stand for two.
+    pub fn descend(&self, relative: &Path) -> Option<(Vec<usize>, &Self)> {
+        let mut node = self;
+        let mut crumbs = Vec::new();
+        for component in relative.components() {
+            let name = component.as_os_str().to_string_lossy();
+            let index = node
+                .children
+                .iter()
+                .position(|child| child.name.as_ref() == name)?;
+            node = &node.children[index];
+            crumbs.push(index);
+        }
+        Some((crumbs, node))
+    }
+
     /// Follow `crumbs` from this node. Crumbs are child indices, so they stay
     /// valid across re-sorting only for the tree they were produced from.
     pub fn resolve(&self, crumbs: &[usize]) -> Option<&Self> {

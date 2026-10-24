@@ -39,6 +39,8 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
+            /// Show how to connect an AI agent over MCP.
+            ConnectAgent,
         ]
     );
 }
@@ -112,5 +114,11 @@ pub fn install(cx: &mut App) {
             MenuItem::action("Back", GoBack),
             MenuItem::action("Forward", GoForward),
         ]),
+        // Help is where a person looks for "how do I hook this up"; the
+        // same overlay opens from the line under the disk meter.
+        Menu::new("Help").items([MenuItem::action(
+            "Work with an AI Agent\u{2026}",
+            ConnectAgent,
+        )]),
     ]);
 }

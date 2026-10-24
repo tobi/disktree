@@ -418,6 +418,8 @@ pub struct Disktree {
     /// Enter was pressed before the search finished: apply on arrival.
     apply_pending: bool,
     pub show_help: bool,
+    /// The "work with an AI agent" overlay is open.
+    pub show_agent: bool,
     pub show_selection: bool,
     pub focus: FocusHandle,
     /// A trail crumb's sibling menu, when open.
@@ -471,6 +473,8 @@ pub struct Disktree {
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
+    /// The agent link, once a listener is attached; see [`crate::agent`].
+    pub agent: Option<crate::agent::AgentLink>,
 }
 
 impl Disktree {
@@ -592,6 +596,7 @@ impl Disktree {
             finding: false,
             apply_pending: false,
             show_help: false,
+            show_agent: false,
             show_selection: true,
             focus: cx.focus_handle(),
             crumb_menu: None,
@@ -622,6 +627,7 @@ impl Disktree {
             scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
+            agent: None,
         };
         if local && start {
             tree.device = device_for(&tree.root_path);
@@ -1430,6 +1436,7 @@ impl Disktree {
                 self.keep_selection_valid();
                 self.prune_history();
                 self.select_largest(cx);
+                self.finish_pending_show(cx);
             }
             Err(error) => self.scan_error = Some(error.to_string()),
         }
@@ -2720,6 +2727,7 @@ impl Disktree {
         }
         if finished {
             self.run = None;
+            self.record_removal();
             self.marks.clear();
             self.screen = Screen::Done;
             // The tree on screen is now wrong; start over rather than leaving
@@ -3088,6 +3096,13 @@ impl Disktree {
         if self.show_help {
             if matches!(key, "escape" | "?" | "/" | "q") {
                 self.show_help = false;
+                cx.notify();
+            }
+            return;
+        }
+        if self.show_agent {
+            if matches!(key, "escape" | "q") {
+                self.show_agent = false;
                 cx.notify();
             }
             return;

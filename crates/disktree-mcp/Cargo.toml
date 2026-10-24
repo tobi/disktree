@@ -1,0 +1,23 @@
+[package]
+name = "disktree-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "disktree as an MCP server: scan, explore and mark over stdio"
+
+[lints]
+workspace = true
+
+[dependencies]
+disktree-core = { workspace = true }
+disktree-link = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

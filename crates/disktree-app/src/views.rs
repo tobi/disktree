@@ -92,6 +92,13 @@ pub fn root(
                 }
             },
         ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::ConnectAgent, window, cx| {
+                this.show_agent = true;
+                window.focus(&this.focus, cx);
+                cx.notify();
+            },
+        ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if this.zoom_interface(event, window) {
                 cx.notify();
@@ -119,6 +126,9 @@ pub fn root(
     }
     if app.show_help {
         root = root.child(help_overlay(app, cx));
+    }
+    if app.show_agent {
+        root = root.child(agent_overlay(app, cx));
     }
     if app.volumes_open {
         root = root.child(volumes_dialog(app, window, cx));
@@ -597,6 +607,7 @@ fn top_bar(
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
         .child(div().flex_1())
+        .children(agent_pill(app, theme, cx))
         .child(view_settings(app, window, cx))
 }
 
@@ -1496,6 +1507,7 @@ fn side_panel(
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
         .child(disk_section(app, theme, cx))
+        .child(agent_line(app, theme, cx))
 }
 
 /// What the keys act on: its name and place, its size set large with its
@@ -3908,6 +3920,255 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                             app.root_path.display(),
                             app.options.metric.label()
                         )),
+                ),
+        )
+}
+
+/// Who is driving the window, in the top bar: the agent's name and what it
+/// last did. Only while an agent is connected; a click opens the overlay.
+fn agent_pill(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Stateful<Div>> {
+    let presence = app.agent.as_ref()?.presence.as_ref()?;
+    Some(
+        div()
+            .id("agent-pill")
+            .debug_selector(|| "agent-pill".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::XS)
+            .px(space::SM)
+            .py(space::XXS)
+            .border_1()
+            .border_color(theme.success.opacity(0.5))
+            .text_size(text::CAPTION)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.success.opacity(0.1)))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_agent = true;
+                window.focus(&this.focus, cx);
+                cx.notify();
+            }))
+            .child(div().text_color(theme.success).child("\u{25cf}"))
+            .child(
+                div()
+                    .text_color(theme.foreground)
+                    .whitespace_nowrap()
+                    .child(presence.client.clone()),
+            )
+            .child(
+                div()
+                    .text_color(theme.secondary)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .max_w(size::TOOLTIP)
+                    .child(format!("\u{00b7} {}", presence.action)),
+            ),
+    )
+}
+
+/// The way to an agent, under the disk: who is connected, or how to
+/// connect one. Quiet, since most sessions never need it.
+fn agent_line(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let presence = app.agent.as_ref().and_then(|agent| agent.presence.clone());
+    let mut line = div()
+        .id("agent-line")
+        .debug_selector(|| "agent-line".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::XS)
+        .text_size(text::CAPTION)
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.show_agent = true;
+            window.focus(&this.focus, cx);
+            cx.notify();
+        }));
+    match presence {
+        Some(presence) => {
+            line = line
+                .child(div().text_color(theme.success).child("\u{25cf}"))
+                .child(
+                    div()
+                        .text_color(theme.foreground)
+                        .child(format!("{} is connected", presence.client)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_color(theme.secondary)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(presence.action),
+                );
+        }
+        None => {
+            line = line
+                .text_color(theme.secondary)
+                .hover(|style| style.text_color(theme.foreground))
+                .child("Work with an AI agent \u{203a}");
+        }
+    }
+    line
+}
+
+/// How to connect an agent, and what it may do once it is: look, mark,
+/// and open the review screen. Removing stays with the person.
+fn agent_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+    let theme = cx.omarchy().clone();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("disktree"));
+    let mut body = div().flex().flex_col().gap(space::MD);
+    body = body.child(
+        div()
+            .text_size(text::BODY)
+            .text_color(theme.foreground)
+            .child(
+                "An agent such as Claude Code or Codex can run disktree as \
+                 an MCP server: it scans, walks the tree and marks what \
+                 can go, and this window follows along. Removing stays \
+                 yours: the agent opens the review screen, and you press \
+                 Enter.",
+            ),
+    );
+    for (index, (label, command)) in
+        crate::agent::connect_commands(&exe).into_iter().enumerate()
+    {
+        let what = format!("the {label} command");
+        let text = command.clone();
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XS)
+                .child(widgets::eyebrow(label, cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(space::SM)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px(space::SM)
+                                .py(space::XS)
+                                .bg(theme.inset)
+                                .border_1()
+                                .border_color(theme.divider())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.foreground)
+                                .child(command),
+                        )
+                        .child(
+                            button(
+                                ElementId::Name(
+                                    format!("copy-connect-{index}").into(),
+                                ),
+                                "Copy",
+                                ButtonVariant::Outline,
+                                cx,
+                            )
+                            .tab_stop(false)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.copy_connect_text(
+                                        text.clone(),
+                                        &what,
+                                        cx,
+                                    );
+                                    window.focus(&this.focus, cx);
+                                },
+                            )),
+                        ),
+                ),
+        );
+    }
+    body = body.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(format!(
+                        "Then ask it: \u{201c}{}\u{201d}",
+                        crate::agent::FIRST_PROMPT
+                    )),
+            )
+            .child(
+                button("copy-prompt", "Copy", ButtonVariant::Outline, cx)
+                    .tab_stop(false)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.copy_connect_text(
+                            crate::agent::FIRST_PROMPT.to_string(),
+                            "the prompt",
+                            cx,
+                        );
+                        window.focus(&this.focus, cx);
+                    })),
+            ),
+    );
+    let status = match &app.agent {
+        Some(agent) => match &agent.presence {
+            Some(presence) => format!(
+                "{} is connected \u{00b7} {}",
+                presence.client, presence.action
+            ),
+            None => "No agent is connected to this window yet.".to_string(),
+        },
+        None => "This window cannot be driven here; an agent still scans \
+                 and marks on its own."
+            .to_string(),
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.background.opacity(0.86))
+        .child(
+            div()
+                .id("agent-overlay")
+                .debug_selector(|| "agent-overlay".into())
+                .flex()
+                .flex_col()
+                .gap(space::LG)
+                .w(size::HELP)
+                .p(space::XL)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child("Work with an AI agent"),
+                )
+                .child(body)
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(format!("{status} \u{00b7} esc closes")),
                 ),
         )
 }
