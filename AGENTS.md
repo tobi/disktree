@@ -112,7 +112,9 @@ and `cargo build --release` directly; CI runs the gate on both systems.
     mounts in the selected machine's namespace without probing them; scans
     stop at nested mounts, including bind mounts and same-device subvolumes.
     Switching machines clears marks and identity. The Unix SSH helper streams
-    records and never retains the tree.
+    records and never retains the tree. SSH hosts are Unix, so remote paths
+    are POSIX on every client: join, split and compare them through
+    `PathStyle`, never `std::path`, which uses `\` on Windows.
 
 11. **A live overview is not an actionable tree.** Keep provisional,
     bounded display summaries separate from `Disktree::tree` and all path,
@@ -125,6 +127,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | --- | --- |
 | bounded Unix SSH traversal | `crates/disktree-core/src/remote_walk.rs` |
 | SSH protocol, discovery and transport | `crates/disktree-core/src/remote.rs` |
+| joining, splitting or comparing a scanned path | `crates/disktree-core/src/path_style.rs` |
 | measurement, filtering, parallelism | `crates/disktree-core/src/scan.rs` |
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |

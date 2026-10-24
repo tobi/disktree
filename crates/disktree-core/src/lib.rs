@@ -16,6 +16,7 @@ pub mod insights;
 mod macos;
 #[cfg(windows)]
 mod mft;
+pub mod path_style;
 pub mod payload;
 pub mod remote;
 pub mod remote_progress;

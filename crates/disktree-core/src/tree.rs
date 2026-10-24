@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::classify::{Category, Reclaim};
+use crate::path_style::PathStyle;
 
 /// What a node represents on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,14 +413,20 @@ fn aggregate_at(
     });
 }
 
-/// Absolute path of the node at `crumbs` beneath a scanned root.
-pub fn path_of(root_path: &Path, root: &Node, crumbs: &[usize]) -> PathBuf {
+/// Absolute path of the node at `crumbs` beneath a scanned root, joined by
+/// the rules of the machine that was scanned.
+pub fn path_of(
+    root_path: &Path,
+    root: &Node,
+    crumbs: &[usize],
+    style: PathStyle,
+) -> PathBuf {
     let mut path = root_path.to_path_buf();
     let mut node = root;
     for &index in crumbs {
         match node.children.get(index) {
             Some(child) => {
-                path.push(&*child.name);
+                style.push(&mut path, &child.name);
                 node = child;
             }
             None => break,
@@ -552,8 +559,13 @@ mod tests {
         nested.children.push(leaf("deep", 1));
         root.children.push(nested);
 
-        let path = path_of(Path::new("/home/tobi"), &root, &[0, 0]);
+        let path =
+            path_of(Path::new("/home/tobi"), &root, &[0, 0], PathStyle::Native);
         assert_eq!(path, PathBuf::from("/home/tobi/child/deep"));
+        // A Unix host's path is joined with `/` on every client.
+        let path =
+            path_of(Path::new("/home/tobi"), &root, &[0, 0], PathStyle::Posix);
+        assert_eq!(path.to_str(), Some("/home/tobi/child/deep"));
     }
 
     #[test]

@@ -177,6 +177,8 @@ fn run() -> Result<()> {
     let root = args.root.clone();
     let depth = args.depth;
     let title_root = root.clone();
+    let title_style =
+        disktree_core::path_style::PathStyle::of(args.remote.is_some());
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -206,6 +208,7 @@ fn run() -> Result<()> {
                                     marks::display_path(
                                         &title_root,
                                         home.as_deref(),
+                                        title_style,
                                     )
                                 )
                                 .into(),
@@ -438,6 +441,14 @@ fn parse_args_with_power(
     );
     let choose_root = root.is_none() && !disk && !check;
     if remote.is_some() {
+        // SSH hosts are Unix: a root such as `C:\x` names nothing there, and
+        // a relative one would be resolved against an unknown directory.
+        if let Some(root) = &root {
+            anyhow::ensure!(
+                disktree_core::remote::is_remote_absolute(root),
+                "an SSH path must start with /, as on the Unix host"
+            );
+        }
         return Ok(Args {
             root: root.unwrap_or_default(),
             remote,
@@ -593,6 +604,17 @@ mod argument_tests {
         assert_eq!(args.options.threads.max_threads, 4);
         assert_eq!(args.root, PathBuf::from("/only-on-the-remote-machine"));
         assert!(args.power.is_none());
+        for root in ["relative", r"C:\Users", r"\srv"] {
+            assert!(
+                parse_args(
+                    ["ssh", "dev", root]
+                        .into_iter()
+                        .map(std::ffi::OsString::from),
+                )
+                .is_err(),
+                "{root} is not a path on a Unix host"
+            );
+        }
 
         let args = parse_args(
             ["ssh", "dev", "--disk"]

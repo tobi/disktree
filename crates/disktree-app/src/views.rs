@@ -6,6 +6,7 @@
 
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
+use disktree_core::path_style::PathStyle;
 use disktree_core::removal::{Plan, RemovalMode, Target};
 use disktree_core::size::human_bytes;
 use disktree_core::tree::Metric;
@@ -341,7 +342,7 @@ fn delete_dialog(
     let title = match plan.targets.as_slice() {
         [only] => format!(
             "Delete \u{201c}{}\u{201d} permanently?",
-            short_name(&only.path)
+            short_name(&only.path, app.path_style())
         ),
         targets => format!("Delete {} items permanently?", targets.len()),
     };
@@ -625,18 +626,19 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
     for (index, (label, step)) in steps.into_iter().enumerate() {
         if hidden.contains(&index) {
             if index == hidden.start {
-                row = row.child(separator_glyph(theme)).child(
-                    div()
-                        .px(space::XS)
-                        .text_color(theme.secondary.opacity(0.6))
-                        .child("…"),
-                );
+                row =
+                    row.child(separator_glyph(theme, app.path_style())).child(
+                        div()
+                            .px(space::XS)
+                            .text_color(theme.secondary.opacity(0.6))
+                            .child("…"),
+                    );
             }
             continue;
         }
         // The root is its own separator: "/" then "home", not "/ / home".
         if index > 1 {
-            row = row.child(separator_glyph(theme));
+            row = row.child(separator_glyph(theme, app.path_style()));
         }
         let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
         let crumb = match step {
@@ -668,13 +670,13 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
 /// Steps a trail shows before it folds its middle into an ellipsis.
 const TRAIL_STEPS: usize = 7;
 
-/// The platform's path separator, so the trail reads like the paths shown
-/// elsewhere: `/` here, `\` on Windows.
-fn separator_glyph(theme: &Theme) -> Div {
+/// The scanned machine's path separator, so the trail reads like the paths
+/// shown elsewhere: `/` here and on SSH hosts, `\` on Windows.
+fn separator_glyph(theme: &Theme, style: PathStyle) -> Div {
     div()
         .text_color(theme.secondary.opacity(0.5))
         .text_size(text::BODY)
-        .child(std::path::MAIN_SEPARATOR_STR)
+        .child(style.separator().to_string())
 }
 
 /// A crumb in the tree. Its label goes there (the current one opens the
@@ -772,7 +774,7 @@ fn sibling_menu(
     let largest = rows.first().map_or(1, |row| row.value.max(1));
     let parent_name = app.node_at(parent).map_or_else(String::new, |node| {
         if parent.is_empty() {
-            crate::marks::display_path(&app.root_path, app.home.as_deref())
+            app.display_path(&app.root_path)
         } else {
             node.name.to_string()
         }
@@ -1526,47 +1528,48 @@ fn selection_section(
     let is_current_root = target == app.crumbs;
     let highlight = palette::highlight(theme);
 
-    let identity = div()
-        .flex()
-        .flex_col()
-        .gap(space::XS)
-        .min_w_0()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(space::SM)
-                .min_w_0()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .w(space::XS)
-                        .h(text::HEADING)
-                        .bg(palette::category_accent(theme, node.category)),
-                )
-                .child(
-                    div()
-                        .text_size(text::HEADING)
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.bright)
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(node.name.to_string()),
-                ),
-        )
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(path.as_deref().map_or_else(String::new, |path| {
-                    crate::marks::display_path(path, app.home.as_deref())
-                })),
-        );
+    let identity =
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::XS)
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::SM)
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(space::XS)
+                            .h(text::HEADING)
+                            .bg(palette::category_accent(theme, node.category)),
+                    )
+                    .child(
+                        div()
+                            .text_size(text::HEADING)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.bright)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(node.name.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(path.as_deref().map_or_else(String::new, |path| {
+                        app.display_path(path)
+                    })),
+            );
 
     let (number, unit) = match app.options.metric {
         Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
@@ -1696,7 +1699,7 @@ fn selection_section(
         let crumbs = target;
         let label = match &ancestor {
             Some(ancestor) if !marked => {
-                format!("Unmark {}", short_name(ancestor))
+                format!("Unmark {}", short_name(ancestor, app.path_style()))
             }
             _ if marked => "Unmark".to_string(),
             _ => "Mark for removal".to_string(),
@@ -1945,10 +1948,7 @@ fn marked_section(
                         .whitespace_nowrap()
                         .overflow_hidden()
                         .text_ellipsis()
-                        .child(crate::marks::display_path(
-                            &item.path,
-                            app.home.as_deref(),
-                        )),
+                        .child(app.display_path(&item.path)),
                 )
                 .child(
                     div()
@@ -2557,18 +2557,11 @@ fn indexing_progress(
         || "Directory not reported yet".into(),
         |path| path.display().to_string(),
     );
-    let mut parts = path
-        .map(|path| {
-            path.components()
-                .rev()
-                .take(3)
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    parts.reverse();
-    let short_path = if path.is_some_and(|path| path.components().count() > 3) {
-        format!("…/{}", parts.join("/"))
+    // Split by the scanned machine's rules: a Unix host's `a\b` is one name.
+    let names = path.map(|path| app.path_style().names(path));
+    let names = names.as_deref().unwrap_or_default();
+    let short_path = if names.len() > 3 {
+        format!("…/{}", names[names.len() - 3..].join("/"))
     } else {
         full_path.clone()
     };
@@ -2724,8 +2717,8 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         )
 }
 
-fn short_name(path: &std::path::Path) -> String {
-    path.file_name().map_or_else(
+fn short_name(path: &std::path::Path, style: PathStyle) -> String {
+    style.file_name(path).map_or_else(
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
@@ -2740,8 +2733,8 @@ fn marks_ancestor(
     app.marks
         .items()
         .iter()
-        .filter(|item| item.path != path && path.starts_with(&item.path))
-        .map(|item| short_name(&item.path))
+        .filter(|item| app.path_style().is_below(path, &item.path))
+        .map(|item| short_name(&item.path, app.path_style()))
         .next()
 }
 
@@ -2851,7 +2844,7 @@ fn mark_row(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let root_value = app.tree().map_or(0, |tree| tree.bytes);
-    let path_text = crate::marks::display_path(&item.path, app.home.as_deref());
+    let path_text = app.display_path(&item.path);
     let color = if blocked.is_some() || covered {
         theme.secondary
     } else {
@@ -2887,7 +2880,7 @@ fn mark_row(
                     div()
                         .min_w_0()
                         .text_color(color)
-                        .child(short_name(&item.path)),
+                        .child(short_name(&item.path, app.path_style())),
                 )
                 .child(
                     div()
@@ -3069,7 +3062,7 @@ fn review_summary(
                     .text_color(theme.warning)
                     .child(format!(
                         "{}: {}",
-                        short_name(&item.path),
+                        short_name(&item.path, app.path_style()),
                         item.reason
                     )),
             );
@@ -3305,7 +3298,7 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                         } else {
                             theme.danger
                         })
-                        .child(short_name(path)),
+                        .child(short_name(path, app.path_style())),
                 )
                 .children(outcome.as_ref().err().map(|error| {
                     div()
@@ -3397,7 +3390,11 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .flex_row()
                 .gap(space::SM)
                 .text_size(text::CAPTION)
-                .child(div().text_color(theme.danger).child(short_name(path)))
+                .child(
+                    div()
+                        .text_color(theme.danger)
+                        .child(short_name(path, app.path_style())),
+                )
                 .child(div().text_color(theme.secondary).child(
                     outcome.as_ref().err().cloned().unwrap_or_default(),
                 )),
@@ -3654,82 +3651,83 @@ fn node_card(
     let hidden = node.name.starts_with('.');
     let covered = marks_ancestor(app, path.as_deref());
 
-    let mut tip = div()
-        .flex()
-        .flex_col()
-        .gap(space::XS)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(space::XS)
-                .child(
-                    gpui_omarchy::icon(if node.is_dir() {
-                        gpui_omarchy::IconName::FolderOpen
-                    } else {
-                        gpui_omarchy::IconName::File
-                    })
-                    .size(icon::SM)
-                    .text_color(theme.secondary),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.bright)
-                        .child(node.name.to_string()),
-                ),
-        )
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(path.as_deref().map_or_else(String::new, |path| {
-                    crate::marks::display_path(path, app.home.as_deref())
-                })),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(space::SM)
-                .child(
-                    div()
-                        .text_size(text::TITLE)
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme.bright)
-                        .child(human_bytes(node.bytes)),
-                )
-                .child(widgets::glyph_bar(
-                    node.bytes,
-                    parent_value.max(1),
-                    10,
-                    theme.secondary,
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(text::CAPTION)
-                        .text_color(theme.secondary)
-                        .child(widgets::percent(node.bytes, parent_value)),
-                ),
-        )
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(format!(
-                    "{} files · {} dirs · {} direct",
-                    widgets::human_count(node.files),
-                    widgets::human_count(
-                        u64::from(node.dirs)
-                            .saturating_sub(u64::from(node.is_dir()))
+    let mut tip =
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::XS)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::XS)
+                    .child(
+                        gpui_omarchy::icon(if node.is_dir() {
+                            gpui_omarchy::IconName::FolderOpen
+                        } else {
+                            gpui_omarchy::IconName::File
+                        })
+                        .size(icon::SM)
+                        .text_color(theme.secondary),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.bright)
+                            .child(node.name.to_string()),
                     ),
-                    human_bytes(node.own_bytes())
-                )),
-        );
+            )
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(path.as_deref().map_or_else(String::new, |path| {
+                        app.display_path(path)
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::SM)
+                    .child(
+                        div()
+                            .text_size(text::TITLE)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.bright)
+                            .child(human_bytes(node.bytes)),
+                    )
+                    .child(widgets::glyph_bar(
+                        node.bytes,
+                        parent_value.max(1),
+                        10,
+                        theme.secondary,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(widgets::percent(node.bytes, parent_value)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(format!(
+                        "{} files · {} dirs · {} direct",
+                        widgets::human_count(node.files),
+                        widgets::human_count(
+                            u64::from(node.dirs)
+                                .saturating_sub(u64::from(node.is_dir()))
+                        ),
+                        human_bytes(node.own_bytes())
+                    )),
+            );
 
     let mut badges = div().flex().flex_row().gap(space::XS).flex_wrap();
     if hidden {
