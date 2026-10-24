@@ -13,8 +13,13 @@
 	<string>disktree</string>
 	<key>CFBundleExecutable</key>
 	<string>disktree</string>
+	<!-- AppIcon.icns, for macOS 15 and earlier. The marker becomes
+	     CFBundleIconName when the bundle also carries Assets.car, the Icon
+	     Composer icon macOS 26 draws instead; without Xcode 26's actool to
+	     compile it the marker is dropped. -->
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	@ICON_CATALOG@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>

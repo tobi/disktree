@@ -1427,7 +1427,11 @@ dependencies = [
  "dunce",
  "gpui-kit",
  "gpui-omarchy",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "rustc-hash 2.1.3",
+ "rustix",
  "tempfile",
  "windows-sys 0.61.2",
 ]

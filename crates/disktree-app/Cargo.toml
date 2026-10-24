@@ -22,6 +22,27 @@ dunce = "1.0.5"
 rustc-hash = { workspace = true }
 tempfile = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# AppKit for the Dock icon of a run outside the app bundle (dock_icon.rs):
+# the crates and versions GPUI already builds, with only the classes used.
+objc2 = "0.6"
+# The kernel release, which says which macOS this is whatever SDK linked it.
+rustix = { version = "1.1", features = ["system"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSData",
+    "NSGeometry",
+    "NSProcessInfo",
+    "NSString",
+] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 

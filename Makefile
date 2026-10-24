@@ -47,7 +47,7 @@ define check_install_path
 	fi
 endef
 
-.PHONY: help build run install install-scan uninstall bundle lint test test-ssh ci fmt clean
+.PHONY: help build run install install-scan uninstall bundle dock-icons lint test test-ssh ci fmt clean
 
 help:
 	@echo "disktree"
@@ -58,6 +58,7 @@ help:
 	@echo "  make install     install to $(PREFIX): binary, desktop entry, icon"
 	@echo "                   (macOS: disktree.app into $(APPS))"
 	@echo "  make bundle      macOS: build target/bundle/disktree.app and its zip"
+	@echo "  make dock-icons  macOS 26: redraw the Dock icon of an unbundled run"
 	@echo "  make uninstall   remove what install put there"
 	@echo "  make lint        rustfmt --check and clippy -D warnings"
 	@echo "  make test        core and window-harness tests"
@@ -152,6 +153,12 @@ endif
 
 bundle:
 	$(CARGO) xtask bundle
+
+# The Dock icon a run outside the bundle shows, in the flat look of macOS 15
+# and the Liquid Glass of macOS 26, which only that macOS can draw: needs
+# macOS 26 and Xcode 26. Run after either SVG in packaging/macos changes.
+dock-icons:
+	swift packaging/macos/render-dock-icons.swift
 
 clean:
 	$(CARGO) clean

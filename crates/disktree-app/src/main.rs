@@ -13,6 +13,8 @@
 
 mod app_menu;
 mod appearance;
+#[cfg(target_os = "macos")]
+mod dock_icon;
 mod git;
 mod marks;
 mod palette;
@@ -183,6 +185,8 @@ fn run() -> Result<()> {
         .run(move |cx| {
             gpui_omarchy::init(cx);
             app_menu::install(cx);
+            #[cfg(target_os = "macos")]
+            dock_icon::install();
             let home = std::env::home_dir();
             let native_look = appearance::follows_system(home.as_deref());
             if native_look {

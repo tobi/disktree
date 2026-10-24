@@ -126,8 +126,10 @@ jobs:
       matrix:
         include:
           # `xtask bundle` names the zip after the machine it runs on, so
-          # each architecture builds on its own.
-          - { runner: macos-15, arch: aarch64 }
+          # each architecture builds on its own. macOS 26's Xcode compiles
+          # the Icon Composer icon into the bundle; there is no macOS 26
+          # Intel runner, so that build ships the legacy icon alone.
+          - { runner: macos-26, arch: aarch64 }
           - { runner: macos-15-intel, arch: x86_64 }
     runs-on: ${{ matrix.runner }}
     env:

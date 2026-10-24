@@ -1,0 +1,35 @@
+{
+  "fill" : {
+    "solid" : "srgb:0.10196,0.10588,0.14902,1.00000"
+  },
+  "groups" : [
+    {
+      "name" : "Mark",
+      "layers" : [
+        {
+          "name" : "glyph",
+          "image-name" : "glyph.png",
+          "fill" : "automatic",
+          "glass" : false,
+          "hidden" : false,
+          "blend-mode" : "normal"
+        }
+      ],
+      "lighting" : "individual",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

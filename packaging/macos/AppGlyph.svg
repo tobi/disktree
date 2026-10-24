@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- disktree's mark (assets/disktree.svg) without its background, on the
+     full 1024 pt Icon Composer canvas: the layer of AppIcon.icon. The tile
+     behind it is the package's fill, so macOS 26 can give the icon its own
+     shape, glass edge, and Dark, Clear and Tinted looks. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- The mark's panel, 54 of its 64 units, is 700 pt: 68% of the canvas,
+       162 pt in from each edge, about the weight of Slack's glyph or
+       1Password's ring beside it in the Dock. Its corners are rounded so
+       it reads as a squircle inside the squircle, as Finder's face does.
+       At the full 1024 the panel's square corners sat 80 pt in and macOS
+       26's mask clipped them; on the 824 pt keyline they cleared the mask
+       but the mark still crowded the edge next to other icons. -->
+  <defs>
+    <clipPath id="panel">
+      <rect x="162" y="162" width="700" height="700" rx="100" ry="100"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#panel)">
+    <!-- 54 units become 700 pt, so one unit is 700 / 54 pt. -->
+    <g transform="translate(162 162) scale(12.962963) translate(-5 -5)">
+      <rect x="5" y="5" width="54" height="54" fill="#3a4152"/>
+      <rect x="5" y="5" width="54" height="9" fill="#7aa2f7"/>
+      <rect x="8" y="17" width="30" height="39" fill="#2a653b"/>
+      <rect x="8" y="17" width="30" height="7" fill="#9ece6a"/>
+      <rect x="41" y="17" width="15" height="24" fill="#362f5e"/>
+      <rect x="41" y="17" width="15" height="6" fill="#bb9af7"/>
+      <rect x="41" y="44" width="15" height="12" fill="#e0af68"/>
+    </g>
+  </g>
+</svg>

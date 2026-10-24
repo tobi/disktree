@@ -20,6 +20,7 @@ make install                    # ~/.local: binary, desktop entry, icon
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
 make bundle                     # macOS: target/bundle/disktree.app and its zip
+make dock-icons                 # macOS 26: redraw the Dock icon of an unbundled run
 make lint                       # rustfmt --check, then clippy --all-targets -D warnings
 make test                       # core and window-harness tests
 make ci                         # lint, then test
@@ -36,6 +37,21 @@ On macOS `make install` installs `target/bundle/disktree.app` into
 `~/Applications` instead, built by `cargo xtask bundle` from
 `packaging/macos/` (the `Info.plist` template and the icon's SVG). The bundle
 identifier there keys every macOS permission grant; do not change it lightly.
+
+The macOS icon has two sources in `packaging/macos/`, and each macOS reads
+the one made for it. `AppIcon.svg` is the mark on Apple's legacy 824-in-1024
+tile; the bundle draws `AppIcon.icns` from it, which macOS 15 and earlier
+draw literally. `AppIcon.icon` with `AppGlyph.svg` is the Icon Composer
+package: when Xcode 26's actool is at hand `cargo xtask bundle` compiles it
+into `Assets.car` and names it with `CFBundleIconName`, and macOS 26 draws
+that with its own shape, glass edge and Dark, Clear and Tinted looks. Handed
+only the `.icns`, macOS 26 normalizes it instead, and 26.6.2 has drawn such a
+padded icns on a light plate, so a bundle without the catalog says so. A run
+outside the bundle (`make run`, `cargo run`) has no icon for macOS to draw,
+so `dock_icon.rs` paints one: `DockIcon.png`, or on macOS 26
+`DockIcon-glass.png`, the shipped icon as that macOS itself draws it, since
+Liquid Glass is never applied to an image set at run time. `make dock-icons`
+redraws both on a macOS 26 with Xcode 26; run it after either SVG changes.
 
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.
@@ -138,6 +154,7 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
+| the macOS icon, in any of its looks | `packaging/macos/` — the SVGs and `AppIcon.icon`, then `make dock-icons` |
 
 ## Verification expectations
 

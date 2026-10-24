@@ -71,9 +71,34 @@ jobs:
         run: cargo xtask test
 
       # The app bundle, signed ad hoc: catches a broken Info.plist, icon or
-      # signature before a release does.
+      # signature before a release does. This runner's Xcode has no actool
+      # 26, so this is the bundle without the Icon Composer icon.
       - name: Bundle
         run: cargo xtask bundle
+
+  bundle-macos-26:
+    name: Bundle (macOS 26)
+    # The bundle with the Icon Composer icon: Xcode 26's actool compiles it
+    # into Assets.car, and the plist names it, which the job checks.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bundle
+        run: cargo xtask bundle
+
+      - name: Icon catalog
+        run: |
+          app=target/bundle/disktree.app
+          test -f "$app/Contents/Resources/Assets.car"
+          test -f "$app/Contents/Resources/AppIcon.icns"
+          test "$(plutil -extract CFBundleIconName raw "$app/Contents/Info.plist")" = Icon
 
   windows:
     name: Lint and test (Windows)

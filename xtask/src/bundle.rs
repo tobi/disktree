@@ -1,7 +1,8 @@
 //! `cargo xtask bundle`: the macOS app, from a release build.
 //!
 //! Plain Apple tools and nothing to install: `sips` and `iconutil` draw the
-//! icon from its SVG, `codesign` signs, `ditto` zips the way Finder does
+//! icon from its SVG, `actool` compiles its Icon Composer package when
+//! Xcode 26's is there, `codesign` signs, `ditto` zips the way Finder does
 //! (keeping the signature's extended attributes), and `notarytool` and
 //! `stapler` notarize. Everything lands in `target/bundle/`.
 //!
@@ -112,22 +113,26 @@ pub fn bundle(args: &[String]) -> Result<(), String> {
     // Local symbols only: the backtrace of a panic still names functions.
     tool(Command::new("strip").arg("-x").arg(&binary))?;
 
+    icon(
+        &root.join("packaging/macos/AppIcon.svg"),
+        &out,
+        &resources.join("AppIcon.icns"),
+    )?;
+    let catalog = icon_catalog(&root, &out, &resources)?;
+
     let plist = fs::read_to_string(root.join("packaging/macos/Info.plist.in"))
         .map_err(|err| format!("cannot read the Info.plist template: {err}"))?;
     write(
         &contents.join("Info.plist"),
-        &plist.replace("@VERSION@", version),
+        &plist.replace("@VERSION@", version).replace(
+            ICON_CATALOG_MARKER,
+            if catalog { ICON_CATALOG_KEYS } else { "" },
+        ),
     )?;
     tool(
         Command::new("plutil")
             .arg("-lint")
             .arg(contents.join("Info.plist")),
-    )?;
-
-    icon(
-        &root.join("packaging/macos/AppIcon.svg"),
-        &out,
-        &resources.join("AppIcon.icns"),
     )?;
 
     sign(&app, options.identity.as_deref())?;
@@ -184,6 +189,114 @@ fn icon(svg: &Path, scratch: &Path, icns: &Path) -> Result<(), String> {
             .arg("-o")
             .arg(icns),
     )
+}
+
+/// The token in the plist template that the catalog's keys replace. Left
+/// empty without a catalog, its line keeps only its indent.
+const ICON_CATALOG_MARKER: &str = "@ICON_CATALOG@";
+/// What macOS 26 reads the icon by: the name actool gave it in `Assets.car`.
+const ICON_CATALOG_KEYS: &str =
+    "<key>CFBundleIconName</key>\n\t<string>Icon</string>";
+
+/// `Assets.car` from the Icon Composer package, when Xcode 26's actool is at
+/// hand; whether it was made.
+///
+/// macOS 26 draws an app's icon from this catalog: its own shape, the glass
+/// edge, and the Dark, Clear and Tinted looks. Handed only a legacy `.icns`
+/// it normalizes that instead, and 26.6.2 has drawn a padded one on a light
+/// plate. macOS 15 and earlier never open the catalog and keep reading
+/// `AppIcon.icns`, which has every size they draw; actool derives an icns
+/// too, but with four sizes, so it is left where it was compiled. Without
+/// that actool the bundle ships the icns alone, and says so: a Mac with the
+/// Command Line Tools, or an older Xcode, still builds.
+fn icon_catalog(
+    root: &Path,
+    scratch: &Path,
+    resources: &Path,
+) -> Result<bool, String> {
+    match actool_version() {
+        Some(major) if major >= 26 => {}
+        found => {
+            let found = found.map_or_else(
+                || "no actool".to_owned(),
+                |major| format!("actool {major}"),
+            );
+            println!(
+                "note: {found}; macOS 26 will draw AppIcon.icns without \
+                 Liquid Glass. Xcode 26 compiles packaging/macos/AppIcon.icon."
+            );
+            return Ok(false);
+        }
+    }
+
+    // actool resolves `--app-icon Icon` by the package's basename: under any
+    // other name it exits 0 and writes no icon at all. So the package is
+    // copied under that name, and gets its layer drawn from the SVG there.
+    let package = scratch.join("Icon.icon");
+    let compiled = scratch.join("AppIcon.catalog");
+    for dir in [&package, &compiled] {
+        if dir.exists() {
+            fs::remove_dir_all(dir).map_err(|err| {
+                format!("cannot clear {}: {err}", dir.display())
+            })?;
+        }
+    }
+    let assets = package.join("Assets");
+    for dir in [&assets, &compiled] {
+        fs::create_dir_all(dir)
+            .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    }
+    copy(
+        &root.join("packaging/macos/AppIcon.icon/icon.json"),
+        &package.join("icon.json"),
+    )?;
+    tool(
+        Command::new("sips")
+            .args(["-s", "format", "png", "-z", "1024", "1024"])
+            .arg(root.join("packaging/macos/AppGlyph.svg"))
+            .arg("--out")
+            .arg(assets.join("glyph.png"))
+            .stdout(Stdio::null()),
+    )?;
+    // The invocation electron-builder settled on for the same package, so
+    // the catalog is the one other apps on the Mac ship.
+    tool(
+        Command::new("xcrun")
+            .arg("actool")
+            .arg(&package)
+            .arg("--compile")
+            .arg(&compiled)
+            .args(["--output-format", "human-readable-text"])
+            .args(["--notices", "--warnings"])
+            .arg("--output-partial-info-plist")
+            .arg(compiled.join("Info.plist"))
+            .args(["--app-icon", "Icon", "--include-all-app-icons"])
+            .args(["--enable-on-demand-resources", "NO"])
+            .args(["--development-region", "en"])
+            .args(["--target-device", "mac"])
+            .args(["--minimum-deployment-target", DEPLOYMENT_TARGET])
+            .args(["--platform", "macosx"]),
+    )?;
+    copy(&compiled.join("Assets.car"), &resources.join("Assets.car"))?;
+    Ok(true)
+}
+
+/// The major version of the actool `xcrun` finds, if it finds one.
+fn actool_version() -> Option<u32> {
+    let output = Command::new("xcrun")
+        .args(["actool", "--version"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // A plist, with the version under `short-bundle-version`.
+    let text = String::from_utf8_lossy(&output.stdout);
+    let after = text.split("<key>short-bundle-version</key>").nth(1)?;
+    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+    value.split('.').next()?.parse().ok()
 }
 
 /// Sign the bundle, then check the signature holds.
@@ -335,5 +448,29 @@ mod tests {
         assert!(
             plist.contains(&format!("<string>{DEPLOYMENT_TARGET}</string>"))
         );
+    }
+
+    /// The catalog's keys go in only when the catalog does: a bundle that
+    /// names an icon it does not carry shows none on macOS 26.
+    #[test]
+    fn the_plist_template_takes_the_catalog_keys_from_the_bundle() {
+        let plist = include_str!("../../packaging/macos/Info.plist.in");
+        assert!(plist.contains(ICON_CATALOG_MARKER));
+        assert!(!plist.contains("<key>CFBundleIconName</key>"));
+        let without = plist.replace(ICON_CATALOG_MARKER, "");
+        assert!(!without.contains(ICON_CATALOG_MARKER));
+        let with = plist.replace(ICON_CATALOG_MARKER, ICON_CATALOG_KEYS);
+        assert!(with.contains("<key>CFBundleIconName</key>\n\t<string>Icon"));
+    }
+
+    /// The package names the layer the bundle draws from the SVG, and fills
+    /// the tile with the mark's own background.
+    #[test]
+    fn the_icon_package_is_the_glyph_on_the_marks_background() {
+        let manifest =
+            include_str!("../../packaging/macos/AppIcon.icon/icon.json");
+        assert!(manifest.contains(r#""image-name" : "glyph.png""#));
+        // #1a1b26, as assets/disktree.svg paints it.
+        assert!(manifest.contains("srgb:0.10196,0.10588,0.14902,1.00000"));
     }
 }
