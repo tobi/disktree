@@ -948,7 +948,13 @@ impl Disktree {
             cx.notify();
             return;
         }
-        if !path.is_absolute() {
+        // SSH roots use the Unix server's namespace, even on Windows.
+        let absolute = if self.volumes_source.is_some() {
+            path.to_str().is_some_and(|path| path.starts_with('/'))
+        } else {
+            path.is_absolute()
+        };
+        if !absolute {
             self.picker_error =
                 Some("Enter an absolute directory path.".into());
             cx.notify();

@@ -658,21 +658,33 @@ pub const MACOS_DATA_VOLUME: &str = "/System/Volumes/Data";
 /// Directories under `root` a scan must never enter, whatever the volume
 /// rules say, given where `root` really is (`canonical`).
 ///
-/// On macOS: the Data volume's second mount, which is every firmlinked
-/// directory again under another name, so walking it counts the disk twice;
-/// and `/Network`, an automount point that would reach for a server. The
+/// On macOS: `/Network`, an automount point that would reach for a server.
+/// The Data volume is restricted separately to its private service stores,
+/// so firmlinked directories are not visited again. The
 /// paths are returned in `root`'s own spelling, because that is how the walk
 /// names what it finds.
 pub fn never_scanned(root: &Path, canonical: &Path) -> Vec<PathBuf> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
-    [MACOS_DATA_VOLUME, "/Network"]
-        .iter()
+    std::iter::once("/Network")
         .filter_map(|skip| Path::new(skip).strip_prefix(canonical).ok())
         .filter(|below| !below.as_os_str().is_empty())
         .map(|below| root.join(below))
         .collect()
+}
+
+/// A Data mount below the root must expose only private service stores.
+/// Scanning Data directly still walks the entire volume once.
+pub fn data_services_only(root: &Path, canonical: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    Path::new(MACOS_DATA_VOLUME)
+        .strip_prefix(canonical)
+        .ok()
+        .filter(|below| !below.as_os_str().is_empty())
+        .map(|below| root.join(below))
 }
 
 /// The top of the disk `path` lives on: its mount point, from `statfs`.
@@ -1371,7 +1383,7 @@ map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
     }
 
     #[test]
-    fn only_macos_skips_the_data_volume_and_in_the_roots_spelling() {
+    fn macos_restricts_data_aliases_but_direct_data_scans_are_unrestricted() {
         let skipped = never_scanned(Path::new("/"), Path::new("/"));
         let below_system =
             never_scanned(Path::new("/System/"), Path::new("/System"));
@@ -1382,19 +1394,34 @@ map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
             Path::new(MACOS_DATA_VOLUME),
         );
         if cfg!(target_os = "macos") {
+            assert_eq!(skipped, vec![PathBuf::from("/Network")]);
+            assert!(below_system.is_empty());
             assert_eq!(
-                skipped,
-                vec![PathBuf::from(MACOS_DATA_VOLUME), "/Network".into()]
-            );
-            assert_eq!(
-                below_system,
-                vec![PathBuf::from("/System/Volumes/Data")]
+                data_services_only(
+                    Path::new("/spelling"),
+                    Path::new("/System")
+                ),
+                Some(PathBuf::from("/spelling/Volumes/Data"))
             );
         } else {
             assert!(skipped.is_empty() && below_system.is_empty());
         }
         assert!(inside.is_empty());
         assert!(itself.is_empty(), "asking for it by name scans it");
+        assert_eq!(
+            data_services_only(
+                Path::new(MACOS_DATA_VOLUME),
+                Path::new(MACOS_DATA_VOLUME)
+            ),
+            None
+        );
+        assert_eq!(
+            data_services_only(
+                Path::new("/Users/tobi"),
+                Path::new("/Users/tobi")
+            ),
+            None
+        );
     }
 
     #[test]

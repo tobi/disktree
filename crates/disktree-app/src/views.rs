@@ -1490,7 +1490,8 @@ fn side_panel(
                 .overflow_y_scroll()
                 .child(worth_section(app, theme, cx))
                 .child(rule())
-                .child(marked_section(app, theme, cx)),
+                .child(marked_section(app, theme, cx))
+                .children(macos_services_section(app, theme, cx)),
         )
         .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
@@ -1568,10 +1569,26 @@ fn selection_section(
                 })),
         );
 
-    let (number, unit) = match app.options.metric {
+    let (mut number, mut unit) = match app.options.metric {
         Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
         Metric::Files => (widgets::human_count(node.files), "files".into()),
     };
+    if disktree_core::macos_services::is_service_name(&node.name)
+        && let (Some(tree), Some(path)) = (app.tree(), path.as_deref())
+    {
+        use disktree_core::macos_services::{Usage, usage};
+        match usage(&app.root_path, tree, &app.options, path) {
+            Usage::Unavailable | Usage::OutsideScan => {
+                number = "Unavailable".into();
+                unit.clear();
+            }
+            Usage::Incomplete(_) => {
+                number = format!("≥ {number}");
+                unit.push_str(" measured");
+            }
+            Usage::Measured(_) => {}
+        }
+    }
     let share = node.bytes as f32 / root_value.max(1) as f32;
     let measure = div()
         .flex()
@@ -1735,6 +1752,140 @@ fn selection_section(
         .child(grid)
         .children(badges)
         .child(actions)
+        .children(match node.category {
+            Category::FilesystemEvents => Some(service_guidance(
+                disktree_core::macos_services::Service::Fsevents,
+                theme,
+                cx,
+            )),
+            Category::Spotlight => Some(service_guidance(
+                disktree_core::macos_services::Service::Spotlight,
+                theme,
+                cx,
+            )),
+            _ => None,
+        })
+}
+
+fn service_guidance(
+    service: disktree_core::macos_services::Service,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .text_size(text::CAPTION)
+        .text_color(theme.secondary)
+        .child(service.guidance())
+        .child(
+            button(
+                ElementId::Name(
+                    format!("service-docs-{}", service.name()).into(),
+                ),
+                "Apple's guidance",
+                ButtonVariant::Outline,
+                cx,
+            )
+            .tab_stop(false)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.open_url(service.documentation());
+                window.focus(&this.focus, cx);
+            })),
+        )
+}
+
+/// Private stores remain visible here even when unknown sizes have no tile.
+fn macos_services_section(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<impl IntoElement> {
+    use disktree_core::macos_services::{Service, Usage, stores_volume, usage};
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let volume = stores_volume(&app.root_path)?;
+    let tree = app.tree()?;
+    let rule = || div().h(px(1.)).bg(theme.divider());
+    let mut section = div()
+        .id("macos-services")
+        .debug_selector(|| "macos-services".into())
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .child(rule())
+        .child(widgets::eyebrow("macOS service stores", cx));
+    let mut incomplete = false;
+    for service in Service::ALL {
+        let path = volume.join(service.name());
+        let state = usage(&app.root_path, tree, &app.options, &path);
+        let measured = match state {
+            Usage::Measured(bytes) => human_bytes(bytes),
+            Usage::Incomplete(bytes) => {
+                incomplete = true;
+                format!("{} measured · incomplete", human_bytes(bytes))
+            }
+            Usage::Unavailable => {
+                incomplete = true;
+                "Unavailable".into()
+            }
+            Usage::OutsideScan => {
+                incomplete = true;
+                "Outside scan".into()
+            }
+        };
+        section = section.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XS)
+                .child(widgets::figure(
+                    service.label(),
+                    measured,
+                    theme.bright,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(path.display().to_string()),
+                )
+                .child(service_guidance(service, theme, cx)),
+        );
+    }
+    if incomplete {
+        section = section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.warning)
+                .child(
+                    "Unknown contents are not zero. Include hidden entries \
+                     and remove any scan depth limit. Full Disk Access can \
+                     resolve privacy restrictions; filesystem permissions \
+                     may still require administrator read access. Scan the \
+                     listed folder with the directory chooser, or rescan \
+                     after read access is available. disktree does not \
+                     request elevation.",
+                ),
+        );
+    }
+    Some(
+        section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(if app.options.apparent_size {
+                    "Apparent file sizes, already included in the scan. Switch \
+                 to disk usage for allocated bytes."
+                } else {
+                    "Allocated file bytes, already included in the scan. APFS \
+                 shared blocks and snapshots can change actual space freed."
+                }),
+        ),
+    )
 }
 
 /// The biggest things that could plausibly go, with their total.
@@ -2050,7 +2201,8 @@ fn privacy_line(
             .child(div().text_color(color).child(format!(
                 "macOS kept {} {noun} unreadable. Give disktree Full Disk \
                  Access, or your terminal if you started it there, then \
-                 reopen it.",
+                 reopen it. Filesystem permissions can still restrict \
+                 administrator-owned service stores.",
                 widgets::human_count(errors)
             )))
             .child(

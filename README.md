@@ -93,12 +93,20 @@ make install     # ~/Applications/disktree.app, and ~/.local/bin/disktree
 make uninstall
 ```
 
-To see everything, give disktree **Full Disk Access** in System Settings ›
-Privacy & Security (the panel offers a button when it is missing), then
+To see privacy-protected files, give disktree **Full Disk Access** in System
+Settings › Privacy & Security (the panel offers a button when it is missing), then
 reopen it. Without it macOS hides Mail, Messages, Safari, other apps' data
 and the Trash, and disktree counts them as unreadable. Started from a
 terminal, it is the terminal that needs the access. macOS also asks once
 each for Desktop, Documents and Downloads.
+
+Full Disk Access does not override filesystem ownership and permissions.
+Administrator-owned service stores can still be unreadable. Their sizes are
+**Unavailable**, or **measured · incomplete** when only part was readable;
+neither means zero bytes or that the service is absent. Include hidden entries,
+scan without a depth limit, and use the directory chooser to scan a listed
+store directly, or rescan after read access has been made available outside
+disktree. The app does not request elevation or install a privileged helper.
 
 What is different from Linux:
 
@@ -111,6 +119,51 @@ What is different from Linux:
   are part of the gap between the scan and the disk's used space.
 - **Cloud-only folders** (iCloud Drive, Dropbox and the like, evicted to the
   server) are not opened, so a scan never downloads them.
+
+#### FSEvents history and Spotlight indexes
+
+Whole-disk scans show **FSEvents history** (`.fseventsd`) and **Spotlight index**
+(`.Spotlight-V100`) in the treemap and in **macOS service stores** in the panel,
+including an availability label when there is no measurable tile. On a startup
+disk these private stores live in `/System/Volumes/Data`; external volumes
+have their own stores. A home-directory scan does not measure them.
+
+The figures are allocated file bytes (`st_blocks × 512`), unless apparent size
+is selected, and are already part of the scan total. They are not additional
+APFS volume, container or snapshot figures. Hardlinks are counted once across
+the tree; shared APFS clone blocks and snapshots mean measured bytes are not
+a promise of space freed. The rest of the second Data mount stays excluded,
+so firmlinked user files are not counted again.
+
+FSEvents stores persistent filesystem change history that backup and sync
+apps can use. At an administrator's explicit discretion, Apple's supported,
+root-only [`FSEventsPurgeEventsForDeviceUpToEventId` API](https://developer.apple.com/documentation/coreservices/1447985-fseventspurgeeventsfordeviceupto)
+can shorten old history. It destroys history for **every consumer on that
+volume**, and those consumers may need a full rescan. Apple's
+[FSEvents guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
+advises against routine purging and requires an explicit administrator request
+and confirmation. disktree only explains this option; it does not call it or
+suggest raw deletion of `.fseventsd`.
+
+An administrator implementing a chosen retention cutoff would resolve the
+volume's current `st_dev`, obtain an event ID with
+`FSEventsGetLastEventIdForDeviceBeforeTime`, and only then use the purge API.
+The installed macOS SDK's `FSEvents.h` documents this function's time argument
+as **seconds since January 1, 1970**, despite its `CFAbsoluteTime` type. The
+archived guide describes the usual 2001 epoch instead; check the target SDK
+contract rather than applying that conversion. No retention cutoff or space
+saving is guaranteed by disktree.
+
+Spotlight's index supports file and content search. Keep indexing for that
+functionality, exclude selected folders through
+[Spotlight Search Privacy](https://support.apple.com/guide/mac-help/prevent-spotlight-searches-in-files-mchlp2811/mac),
+or have an administrator choose whether a volume should be indexed. The
+installed `mdutil(1)` manual describes `-s` as a read-only status query,
+`-i on|off` as the indexing choice, and `-X` as removing the index directory:
+**`-X` does not itself disable indexing**. An erased index may be rebuilt when
+indexing is enabled, consuming space and work again; disabling indexing reduces
+search coverage. A failed status query is unknown, not evidence of disabled
+indexing. disktree does not run these commands or alter indexing settings.
 
 To sign and notarize a build for others, with a Developer ID certificate in
 the keychain and credentials saved by `xcrun notarytool store-credentials`:
@@ -451,8 +504,9 @@ Click `/` (or any directory above the scanned root) in the trail, press
 `g`, run `disktree --disk`, or use the launcher's *Scan the whole disk*
 action. `g` and `--disk` scan the disk your home directory lives on — `/`
 on Omarchy and on macOS. On macOS the Data volume's second mount,
-`/System/Volumes/Data`, is skipped: it is `/Users`, `/Applications` and the
-rest again under other names.
+`/System/Volumes/Data`, exposes only its private `.fseventsd` and
+`.Spotlight-V100` stores: `/Users`, `/Applications` and the rest would be
+the same files again under other names.
 
 Widening is memoized: the tree already measured is handed to the wider walk
 and reused where it is reached, so going from `~` to `/` reads only what is

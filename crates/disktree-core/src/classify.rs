@@ -36,6 +36,10 @@ pub enum Category {
     Documents,
     /// Caches and other regenerable state.
     Cache,
+    /// macOS's persistent record of filesystem changes.
+    FilesystemEvents,
+    /// macOS's on-volume search database.
+    Spotlight,
     /// Nothing recognisable.
     #[default]
     Other,
@@ -43,7 +47,7 @@ pub enum Category {
 
 impl Category {
     /// The categories the legend lists, in its order.
-    pub const LEGEND: [Self; 8] = [
+    pub const LEGEND: [Self; 10] = [
         Self::Code,
         Self::AgentScratch,
         Self::Toolchain,
@@ -52,6 +56,8 @@ impl Category {
         Self::Media,
         Self::Documents,
         Self::Cache,
+        Self::FilesystemEvents,
+        Self::Spotlight,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -64,6 +70,8 @@ impl Category {
             Self::Media => "Media",
             Self::Documents => "Documents",
             Self::Cache => "Cache",
+            Self::FilesystemEvents => "FSEvents history",
+            Self::Spotlight => "Spotlight index",
             Self::Other => "Other",
         }
     }
@@ -161,6 +169,8 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         // Windows: iCloud for Windows.
         | "iclouddrive" => Category::Synced,
         ".git" => Category::Git,
+        ".fseventsd" => Category::FilesystemEvents,
+        ".spotlight-v100" => Category::Spotlight,
         "pictures" | "photos" | "music" | "videos" | "movies" | "steam"
         | "steamlibrary" | "steamapps" | "emulation"
         | "models" | ".ollama" | ".lmstudio" | "games" | "wineprefix" => {
@@ -227,6 +237,12 @@ pub fn reclaim_of(
 /// Top-down: a node's own name wins, otherwise it inherits. Reclaimable
 /// space is inherited too, so everything under a cache is hatched.
 pub fn classify(root: &mut Node) {
+    if let Some(category) = category_of_name(&root.name)
+        && matches!(category, Category::FilesystemEvents | Category::Spotlight)
+    {
+        classify_below(root, category, None, 0);
+        return;
+    }
     root.category = Category::Other;
     root.reclaim = None;
     for index in 0..root.children.len() {
@@ -300,7 +316,11 @@ fn kind_of(
     reclaim: Option<Reclaim>,
 ) -> (Category, Option<Reclaim>) {
     let child = &siblings[index];
-    if !child.is_dir() {
+    // These stores belong to macOS even when an internal folder is named
+    // `cache` or `tmp`; raw deletion is not an appropriate cleanup method.
+    if !child.is_dir()
+        || matches!(category, Category::FilesystemEvents | Category::Spotlight)
+    {
         return (category, reclaim);
     }
     let has_sibling =
@@ -308,8 +328,14 @@ fn kind_of(
     let child_category = category_of_name(&child.name)
         .or_else(|| is_git_store(child).then_some(Category::Git))
         .unwrap_or(category);
-    let child_reclaim =
-        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling));
+    let child_reclaim = if matches!(
+        child_category,
+        Category::FilesystemEvents | Category::Spotlight
+    ) {
+        None
+    } else {
+        reclaim.or_else(|| reclaim_of(&child.name, category, has_sibling))
+    };
     (child_category, child_reclaim)
 }
 
@@ -324,6 +350,12 @@ fn dominant_child_category(node: &Node) -> Option<Category> {
             .filter(|child| child.is_dir())
             .find_map(|child| {
                 category_of_name(&child.name)
+                    .filter(|category| {
+                        !matches!(
+                            category,
+                            Category::FilesystemEvents | Category::Spotlight
+                        )
+                    })
                     .or_else(|| is_git_store(child).then_some(Category::Git))
             })
         {
@@ -605,6 +637,30 @@ mod tests {
         }
         assert_eq!(category_of_name(".nuget"), Some(Category::Toolchain));
         assert_eq!(category_of_name("OneDriveSetup"), None);
+    }
+
+    #[test]
+    fn macos_stores_are_named_without_suggesting_raw_deletion() {
+        for (name, category) in [
+            (".fseventsd", Category::FilesystemEvents),
+            (".Spotlight-V100", Category::Spotlight),
+        ] {
+            let mut store =
+                dir(name, vec![dir("cache", vec![file("blob", 123)])]);
+            aggregate(&mut store, Metric::Bytes);
+            classify(&mut store);
+            assert_eq!(store.category, category);
+            assert_eq!(store.children[0].category, category);
+            assert_eq!(store.children[0].children[0].category, category);
+            assert_eq!(store.children[0].reclaim, None);
+            assert_eq!(store.bytes, 123);
+            let mut volume =
+                dir("volume", vec![store, dir("ordinary", vec![])]);
+            classify(&mut volume);
+            assert_eq!(volume.children[0].category, category);
+            assert_eq!(volume.children[1].category, Category::Other);
+            assert_eq!(volume.children[0].reclaim, None);
+        }
     }
 
     #[test]

@@ -426,6 +426,16 @@ fn refuse(
     if key == root_key {
         return Some("the scanned root cannot be removed".into());
     }
+    if path.components().any(|part| {
+        crate::macos_services::is_service_name(
+            &part.as_os_str().to_string_lossy(),
+        )
+    }) {
+        return Some(
+            "macOS manages this history or index; use Apple's service tools"
+                .into(),
+        );
+    }
     if cfg!(windows)
         && let Some(name) = path.components().find_map(|part| match part {
             Component::Normal(name) => {
@@ -1875,6 +1885,24 @@ mod tests {
             None,
             "a sibling of home is not above it"
         );
+    }
+
+    #[test]
+    fn macos_service_stores_and_their_contents_are_never_raw_deleted() {
+        for volume in ["/", "/System/Volumes/Data", "/Volumes/External"] {
+            for store in [".fseventsd", ".Spotlight-V100", ".SPOTLIGHT-V100"] {
+                let path = Path::new(volume).join(store);
+                for path in [path.clone(), path.join("index/blob")] {
+                    let reason =
+                        refuse(&path, Path::new(volume), None, &[], &[])
+                            .expect("service-owned contents must be kept");
+                    assert!(
+                        reason.contains("Apple's service tools"),
+                        "{reason}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
