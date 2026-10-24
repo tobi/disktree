@@ -1014,7 +1014,10 @@ fn enter_in_the_focused_volume_picker_scans_the_selected_root(
 ) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let target = temp.path().join("junk");
+    // Accepting a local root canonicalizes it, and the temporary directory
+    // is behind a link on macOS (/var -> /private/var) and a short 8.3 name
+    // on Windows runners, so compare against the resolved path.
+    let target = dunce::canonicalize(temp.path().join("junk")).unwrap();
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, _| {
         app.volumes = vec![disktree_core::space::Volume {

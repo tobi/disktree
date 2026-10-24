@@ -5,7 +5,7 @@
 //! and stream without making a second serialized copy of the whole tree.
 
 use std::io::{self, BufRead, BufReader, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -22,6 +22,19 @@ use std::time::Instant;
 const VERSION: u32 = 1;
 const MAX_LINE: u64 = 1 << 20;
 const MAX_DIAGNOSTICS: usize = 16 << 10;
+
+/// Whether `path` names a directory from the remote host's root.
+///
+/// `serve` runs on Windows as well as Unix, so a remote path is either
+/// `/`-rooted or absolute the Windows way. On Windows
+/// `Path::is_absolute` wants a drive letter, which rejects every Unix path,
+/// and `Path::has_root` also accepts `\x`, which is neither. On Unix this
+/// agrees with `is_absolute`.
+#[must_use]
+pub fn is_remote_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        || path.as_os_str().as_encoded_bytes().first() == Some(&b'/')
+}
 
 // Non-interactive shells often omit ~/.local/bin. Do not require users to
 // edit the server's startup files after the documented user-local install.
@@ -84,8 +97,11 @@ pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
         || roots
             .volumes
             .iter()
-            .any(|volume| !volume.point.is_absolute())
-        || roots.home.as_ref().is_some_and(|home| !home.is_absolute())
+            .any(|volume| !is_remote_absolute(&volume.point))
+        || roots
+            .home
+            .as_ref()
+            .is_some_and(|home| !is_remote_absolute(home))
     {
         return Err(io::Error::other("incompatible remote root discovery"));
     }
@@ -312,7 +328,7 @@ fn read_snapshot_with_progress(
     shared: &Shared,
 ) -> io::Result<Snapshot> {
     let header: Header = receive(input)?;
-    if header.version != VERSION || !header.root.is_absolute() {
+    if header.version != VERSION || !is_remote_absolute(&header.root) {
         return Err(io::Error::other("incompatible remote helper protocol"));
     }
     let mut progress = Progress {
@@ -577,7 +593,8 @@ impl RemoteScan {
         Self::spawn_with_archive(command, host, request, archive)
     }
 
-    #[cfg(test)]
+    // Only the Unix tests run a fake ssh, so Windows has no caller.
+    #[cfg(all(test, unix))]
     fn spawn_command(
         command: Command,
         host: &str,
@@ -744,6 +761,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait<T: Send + 'static>(scan: &RemoteJob<T>) -> io::Result<T> {
         wait_for(scan, std::time::Duration::from_secs(10))
     }
@@ -1086,6 +1104,19 @@ mod tests {
         );
     }
 
+    /// A Windows client must accept a Unix host's paths without a drive
+    /// letter, and every client accepts its own platform's absolute paths.
+    #[test]
+    fn remote_paths_are_absolute_without_a_drive_letter() {
+        assert!(is_remote_absolute(Path::new("/")));
+        assert!(is_remote_absolute(Path::new("/home/someone")));
+        assert!(!is_remote_absolute(Path::new("home/someone")));
+        assert!(!is_remote_absolute(Path::new("")));
+        // Rooted without a drive is absolute nowhere.
+        assert!(!is_remote_absolute(Path::new(r"\home\someone")));
+        assert_eq!(is_remote_absolute(Path::new(r"C:\Users")), cfg!(windows));
+    }
+
     #[test]
     fn rejects_ssh_options_and_shell_syntax() {
         for host in ["-oProxyCommand=oops", "dev; touch x", "dev\nother", ""] {
@@ -1174,6 +1205,9 @@ mod tests {
         assert_eq!(shared.lock().unwrap().stage, Stage::Finalizing);
     }
 
+    // The live preview this checks comes from the Unix helper's streaming
+    // walk; on other systems `serve` sends a finished tree with no preview.
+    #[cfg(unix)]
     #[test]
     fn desktop_dedup_counts_links_once_without_requiring_external_names() {
         let dir = tempfile::tempdir().unwrap();

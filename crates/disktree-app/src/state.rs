@@ -948,7 +948,12 @@ impl Disktree {
             cx.notify();
             return;
         }
-        if !path.is_absolute() {
+        let absolute = if self.volumes_source.is_some() {
+            disktree_core::remote::is_remote_absolute(&path)
+        } else {
+            path.is_absolute()
+        };
+        if !absolute {
             self.picker_error =
                 Some("Enter an absolute directory path.".into());
             cx.notify();
