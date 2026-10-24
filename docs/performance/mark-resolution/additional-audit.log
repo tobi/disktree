@@ -1,0 +1,50 @@
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 6.09s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 1 test
+test tests::additional_render_complexity_audit ... audit bulk-mark M=128 ancestor-visits=8128 inside-visits=8256 wall=3.146875ms
+audit absorb-parent M=128 retain-visits=8384 wall=294.333µs
+audit blocked-review M=128 row-checks=66048 renders=8 per-render=8256 wall=119.267584ms
+audit covered-review children=128 row-checks=67072 renders=8 per-render=8384 wall=135.083208ms
+audit bulk-mark M=1024 ancestor-visits=523776 inside-visits=524800 wall=199.863084ms
+audit absorb-parent M=1024 retain-visits=525824 wall=14.79025ms
+audit blocked-review M=1024 row-checks=4198400 renders=8 per-render=524800 wall=1.101053583s
+audit covered-review children=1024 row-checks=4206592 renders=8 per-render=525824 wall=1.23678775s
+audit deep-breadcrumbs D=128 prefix-walks=65024 renders=8 per-render=8128 wall=12.958166ms
+audit deep-breadcrumbs D=1024 prefix-walks=4190208 renders=8 per-render=523776 wall=33.87925ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 3.29s
+
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-9300e5ba20d6b25f)
+
+running 4 tests
+test classify::tests::additional_classification_case_variant_audit ... audit case-variant-classify F=128 sibling-checks=16384 wall=84.834µs
+audit case-variant-classify F=1024 sibling-checks=1048576 wall=2.682292ms
+ok
+test scan::tests::additional_scan_complexity_audit ... audit real-scan nested=false F=128 listed=128 aggregate-visits=129 wall=574.375µs
+audit real-scan nested=false F=1024 listed=1024 aggregate-visits=1025 wall=2.407709ms
+audit real-scan nested=true F=128 listed=256 aggregate-visits=257 wall=2.721ms
+audit real-scan nested=true F=1024 listed=2048 aggregate-visits=2049 wall=18.88725ms
+ok
+test space::tests::additional_mount_complexity_audit ... audit mount-startup K=128 pairs=8128 wall=83.875µs
+audit mount-startup K=1024 pairs=523776 wall=2.992958ms
+ok
+test treemap::tests::additional_layout_complexity_audit ... audit uncapped-squarify F=128 ratio-visits=682 wall=4.5µs
+audit capped-layout F=128 ratio-visits=482 wall=44.834µs
+audit uncapped-squarify F=1024 ratio-visits=12525 wall=24.375µs
+audit capped-layout F=1024 ratio-visits=319 wall=21.125µs
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 152 filtered out; finished in 0.47s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-0dc2df263f51d89e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

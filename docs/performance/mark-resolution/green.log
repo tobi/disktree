@@ -1,0 +1,40 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 5 tests
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+dimensions folders=128 M=8 D=2 R=1 work=160 wall=30.334µs
+refresh M=128 N=256 R=4 work=2560 wall=241.75µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=46.917µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=71.5µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=45µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=88.459µs
+test marks::tests::refresh_dimension_budget ... ok
+refresh M=1024 N=2048 R=4 work=20480 wall=1.580625ms
+test marks::tests::refresh_resolution_budget ... ok
+warm window M=128 prepares=8 resolution=216 tiles=1544 wall=61.302208ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=61.50175ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=354.14925ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=341.058584ms
+test tests::marked_window_resolution_budget ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.87s
+
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-9300e5ba20d6b25f)
+
+running 1 test
+plan M=128 work=1314 wall=2.802916ms
+plan M=1024 work=15298 wall=21.911541ms
+test removal::tests::removal_nesting_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-0dc2df263f51d89e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

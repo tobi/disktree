@@ -1,0 +1,54 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.25s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 1 test
+test tests::queue_construction_budget ... queue-construction M=128 work=1152 wall=572.625µs
+queue-construction M=1024 work=9216 wall=6.670083ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.13s
+
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 1 test
+test tests::parent_absorption_budget ... parent-absorption M=128 work=266 compactions=130 wall=58.625µs
+parent-absorption M=1024 work=2058 compactions=1026 wall=459.125µs
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.07s
+
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.27s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 13 tests
+test marks::tests::display_path_shortens_the_home_prefix ... ok
+test marks::tests::ordered_marks_keep_exact_non_utf8_paths ... ok
+test marks::tests::ordered_marks_preserve_components_case_and_outermost_ancestor ... ok
+test marks::tests::marking_the_same_path_twice_keeps_one_entry ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=23.041µs
+ok
+test marks::tests::resolver_preserves_lossy_non_utf8_components ... ok
+test marks::tests::toggling_marks_and_unmarks ... ok
+test marks::tests::find_matches_whole_components_only ... ok
+test marks::tests::resolver_preserves_scan_name_semantics ... ok
+test marks::tests::refresh_re_reads_sizes_from_a_new_tree ... ok
+test marks::tests::absorption_invalidates_cached_crumbs_and_keeps_missing_paths_indexed ... ok
+test marks::tests::cached_crumbs_follow_every_invalidation_boundary ... ok
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=50.417µs
+refresh M=128 N=256 R=4 work=2560 wall=232.083µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=58.625µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=27.083µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=60.416µs
+test marks::tests::refresh_dimension_budget ... ok
+refresh M=1024 N=2048 R=4 work=20480 wall=1.545542ms
+test marks::tests::refresh_resolution_budget ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.01s
+

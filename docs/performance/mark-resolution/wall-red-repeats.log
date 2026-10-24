@@ -1,0 +1,174 @@
+
+REPEAT 1: disktree-app baseline 5a3c92e
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4.81s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 4 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=34048 wall=457.125µs
+refresh M=1024 N=2048 R=4 work=2107392 wall=11.105667ms
+
+thread 'marks::tests::refresh_resolution_budget' (403559694) panicked at crates/disktree-app/src/marks.rs:208:9:
+8x marks/folders: 34048 -> 2107392
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test tests::marked_window_resolution_budget ... window M=128 N=256 draws=4 prepares=8 work=68312 wall=159.687834ms
+window M=1024 N=2048 draws=4 prepares=8 work=4215000 wall=6.601997625s
+
+thread 'tests::marked_window_resolution_budget' (403559695) panicked at crates/disktree-app/src/tests.rs:1904:5:
+8x marks/folders per frame: 68312/8 -> 4215000/8
+FAILED
+
+failures:
+
+failures:
+    marks::tests::refresh_resolution_budget
+    tests::marked_window_resolution_budget
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 69 filtered out; finished in 6.83s
+
+error: test failed, to rerun pass `-p disktree-app --bin disktree`
+EXIT 101
+
+REPEAT 1: disktree-core baseline 5a3c92e
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.68s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=9187 wall=11.07275ms
+plan M=1024 work=537027 wall=398.130709ms
+
+thread 'removal::tests::removal_nesting_budget' (403560362) panicked at crates/disktree-core/src/removal.rs:1789:9:
+8x marks: 9187 -> 537027
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    removal::tests::removal_nesting_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.41s
+
+error: test failed, to rerun pass `-p disktree-core --lib`
+EXIT 101
+
+REPEAT 2: disktree-app baseline 5a3c92e
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.28s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 4 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=34048 wall=278.333µs
+refresh M=1024 N=2048 R=4 work=2107392 wall=9.065291ms
+
+thread 'marks::tests::refresh_resolution_budget' (403560424) panicked at crates/disktree-app/src/marks.rs:208:9:
+8x marks/folders: 34048 -> 2107392
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test tests::marked_window_resolution_budget ... window M=128 N=256 draws=4 prepares=8 work=68312 wall=161.706417ms
+window M=1024 N=2048 draws=4 prepares=8 work=4215000 wall=6.607910459s
+
+thread 'tests::marked_window_resolution_budget' (403560426) panicked at crates/disktree-app/src/tests.rs:1904:5:
+8x marks/folders per frame: 68312/8 -> 4215000/8
+FAILED
+
+failures:
+
+failures:
+    marks::tests::refresh_resolution_budget
+    tests::marked_window_resolution_budget
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 69 filtered out; finished in 6.83s
+
+error: test failed, to rerun pass `-p disktree-app --bin disktree`
+EXIT 101
+
+REPEAT 2: disktree-core baseline 5a3c92e
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=9187 wall=8.688291ms
+plan M=1024 work=537027 wall=399.84275ms
+
+thread 'removal::tests::removal_nesting_budget' (403560664) panicked at crates/disktree-core/src/removal.rs:1789:9:
+8x marks: 9187 -> 537027
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    removal::tests::removal_nesting_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.41s
+
+error: test failed, to rerun pass `-p disktree-core --lib`
+EXIT 101
+
+REPEAT 3: disktree-app baseline 5a3c92e
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 4 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=34048 wall=263.917µs
+refresh M=1024 N=2048 R=4 work=2107392 wall=7.863542ms
+
+thread 'marks::tests::refresh_resolution_budget' (403560714) panicked at crates/disktree-app/src/marks.rs:208:9:
+8x marks/folders: 34048 -> 2107392
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test tests::marked_window_resolution_budget ... window M=128 N=256 draws=4 prepares=8 work=68312 wall=155.442209ms
+window M=1024 N=2048 draws=4 prepares=8 work=4215000 wall=6.564761291s
+
+thread 'tests::marked_window_resolution_budget' (403560715) panicked at crates/disktree-app/src/tests.rs:1904:5:
+8x marks/folders per frame: 68312/8 -> 4215000/8
+FAILED
+
+failures:
+
+failures:
+    marks::tests::refresh_resolution_budget
+    tests::marked_window_resolution_budget
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 69 filtered out; finished in 6.77s
+
+error: test failed, to rerun pass `-p disktree-app --bin disktree`
+EXIT 101
+
+REPEAT 3: disktree-core baseline 5a3c92e
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=9187 wall=8.564791ms
+plan M=1024 work=537027 wall=393.824917ms
+
+thread 'removal::tests::removal_nesting_budget' (403560958) panicked at crates/disktree-core/src/removal.rs:1789:9:
+8x marks: 9187 -> 537027
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    removal::tests::removal_nesting_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.40s
+
+error: test failed, to rerun pass `-p disktree-core --lib`
+EXIT 101

@@ -1,0 +1,17 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5.10s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 1 test
+dimensions folders=128 M=8 D=2 R=1 work=1012 wall=61.958µs
+dimensions folders=1024 M=8 D=2 R=1 work=8180 wall=34.958µs
+dimensions folders=1024 M=64 D=2 R=1 work=63648 wall=284.042µs
+dimensions folders=128 M=8 D=16 R=1 work=1124 wall=10.666µs
+dimensions folders=128 M=8 D=2 R=8 work=8096 wall=46.792µs
+test marks::tests::refresh_dimension_budget ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.00s
+

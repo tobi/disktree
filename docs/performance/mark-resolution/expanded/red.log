@@ -1,0 +1,61 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.61s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 9 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=62.75µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=45µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=58.083µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=28.875µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=62.834µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=205.458µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.533583ms
+ok
+test tests::blocked_review_status_budget ... review-status covered=false M=128 work=66048 renders=8 rows=128 per-render=8256 wall=113.90025ms
+review-status covered=false M=1024 work=4198400 renders=8 rows=1024 per-render=524800 wall=1.038960833s
+
+thread 'tests::blocked_review_status_budget' (404491031) panicked at crates/disktree-app/src/tests.rs:2298:5:
+8x status rows: 66048/8 -> 4198400/8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test tests::covered_review_status_budget ... review-status covered=true M=128 work=67072 renders=8 rows=129 per-render=8384 wall=135.896292ms
+review-status covered=true M=1024 work=4206592 renders=8 rows=1025 per-render=525824 wall=1.29864975s
+
+thread 'tests::covered_review_status_budget' (404491108) panicked at crates/disktree-app/src/tests.rs:2298:5:
+8x status rows: 67072/8 -> 4206592/8
+FAILED
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=63.308583ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=64.349292ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=342.802833ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=360.040792ms
+ok
+test tests::parent_absorption_budget ... parent-absorption M=128 work=8771 compactions=8512 wall=347.334µs
+parent-absorption M=1024 work=528899 compactions=526848 wall=15.802708ms
+
+thread 'tests::parent_absorption_budget' (404491437) panicked at crates/disktree-app/src/tests.rs:2223:5:
+8x descendants: 8771 -> 528899
+FAILED
+test tests::queue_construction_budget ... queue-construction M=128 work=16384 wall=2.851667ms
+queue-construction M=1024 work=1048576 wall=183.52175ms
+
+thread 'tests::queue_construction_budget' (404491448) panicked at crates/disktree-app/src/tests.rs:2181:5:
+8x marks: 16384 -> 1048576
+FAILED
+
+failures:
+
+failures:
+    tests::blocked_review_status_budget
+    tests::covered_review_status_budget
+    tests::parent_absorption_budget
+    tests::queue_construction_budget
+
+test result: FAILED. 5 passed; 4 failed; 0 ignored; 0 measured; 74 filtered out; finished in 4.00s
+
+error: test failed, to rerun pass `-p disktree-app --bin disktree`

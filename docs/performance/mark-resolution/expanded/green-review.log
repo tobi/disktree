@@ -1,0 +1,29 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4.06s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 2 tests
+test tests::blocked_review_status_budget ... review-status covered=false M=128 work=3072 renders=8 rows=128 per-render=384 wall=117.141208ms
+review-status covered=false M=1024 work=24576 renders=8 rows=1024 per-render=3072 wall=918.023375ms
+review-status covered=false M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=1.251237917s
+ok
+test tests::covered_review_status_budget ... review-status covered=true M=128 work=3088 renders=8 rows=129 per-render=386 wall=124.676334ms
+review-status covered=true M=1024 work=24592 renders=8 rows=1025 per-render=3074 wall=1.058290834s
+review-status covered=true M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=2.1404995s
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 5.87s
+
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 2 tests
+test views::tests::review_status_preserves_exact_paths_and_first_blocked_reason ... ok
+test views::tests::review_status_keeps_non_utf8_paths_distinct ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 0.00s
+

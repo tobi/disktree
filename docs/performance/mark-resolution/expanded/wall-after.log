@@ -1,0 +1,127 @@
+REPEAT 1: sources at combined fix b71718f
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4.24s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 9 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=144.833µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=62.791µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=74.667µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=38.75µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=87.5µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=295.792µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.906625ms
+ok
+test tests::blocked_review_status_budget ... review-status covered=false M=128 work=3072 renders=8 rows=128 per-render=384 wall=107.559125ms
+review-status covered=false M=1024 work=24576 renders=8 rows=1024 per-render=3072 wall=883.20225ms
+review-status covered=false M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=1.196734875s
+ok
+test tests::covered_review_status_budget ... review-status covered=true M=128 work=3088 renders=8 rows=129 per-render=386 wall=122.079458ms
+review-status covered=true M=1024 work=24592 renders=8 rows=1025 per-render=3074 wall=997.160667ms
+review-status covered=true M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=2.106200625s
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=59.356875ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=60.529083ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=331.029917ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=335.875875ms
+ok
+test tests::parent_absorption_budget ... parent-absorption M=128 work=266 compactions=130 wall=58.125µs
+parent-absorption M=1024 work=2058 compactions=1026 wall=467.083µs
+ok
+test tests::queue_construction_budget ... queue-construction M=128 work=1152 wall=542µs
+queue-construction M=1024 work=9216 wall=6.311584ms
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 6.71s
+
+
+EXIT 0
+REPEAT 2: sources at combined fix b71718f
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.27s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 9 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=25.25µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=42.666µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=51.75µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=24.5µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=56.75µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=198.292µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.479125ms
+ok
+test tests::blocked_review_status_budget ... review-status covered=false M=128 work=3072 renders=8 rows=128 per-render=384 wall=105.373709ms
+review-status covered=false M=1024 work=24576 renders=8 rows=1024 per-render=3072 wall=883.687ms
+review-status covered=false M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=1.188244s
+ok
+test tests::covered_review_status_budget ... review-status covered=true M=128 work=3088 renders=8 rows=129 per-render=386 wall=122.092208ms
+review-status covered=true M=1024 work=24592 renders=8 rows=1025 per-render=3074 wall=1.010354417s
+review-status covered=true M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=2.112680083s
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=61.657666ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=61.290042ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=335.296459ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=333.089792ms
+ok
+test tests::parent_absorption_budget ... parent-absorption M=128 work=266 compactions=130 wall=57.125µs
+parent-absorption M=1024 work=2058 compactions=1026 wall=481.292µs
+ok
+test tests::queue_construction_budget ... queue-construction M=128 work=1152 wall=547.333µs
+queue-construction M=1024 work=9216 wall=6.518083ms
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 6.70s
+
+
+EXIT 0
+REPEAT 3: sources at combined fix b71718f
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 9 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=25.583µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=42.583µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=51.292µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=26.042µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=59.083µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=214µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.552917ms
+ok
+test tests::blocked_review_status_budget ... review-status covered=false M=128 work=3072 renders=8 rows=128 per-render=384 wall=108.225542ms
+review-status covered=false M=1024 work=24576 renders=8 rows=1024 per-render=3072 wall=886.057917ms
+review-status covered=false M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=1.19339425s
+ok
+test tests::covered_review_status_budget ... review-status covered=true M=128 work=3088 renders=8 rows=129 per-render=386 wall=122.399375ms
+review-status covered=true M=1024 work=24592 renders=8 rows=1025 per-render=3074 wall=1.009629625s
+review-status covered=true M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=2.127712375s
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=61.806167ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=61.474458ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=351.863667ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=336.533542ms
+ok
+test tests::parent_absorption_budget ... parent-absorption M=128 work=266 compactions=130 wall=57.75µs
+parent-absorption M=1024 work=2058 compactions=1026 wall=459.042µs
+ok
+test tests::queue_construction_budget ... queue-construction M=128 work=1152 wall=547.75µs
+queue-construction M=1024 work=9216 wall=6.406375ms
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 6.76s
+
+
+EXIT 0

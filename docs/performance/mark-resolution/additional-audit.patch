@@ -1,0 +1,561 @@
+diff --git a/crates/disktree-app/src/marks.rs b/crates/disktree-app/src/marks.rs
+index 3a86060..8d9578a 100644
+--- a/crates/disktree-app/src/marks.rs
++++ b/crates/disktree-app/src/marks.rs
+@@ -18,6 +18,11 @@ pub mod work {
+     thread_local! {
+         pub static RESOLUTION: Cell<usize> = const { Cell::new(0) };
+         pub static FRAMES: Cell<usize> = const { Cell::new(0) };
++        pub static AUDIT_ROWS: Cell<usize> = const { Cell::new(0) };
++        pub static AUDIT_RETAIN: Cell<usize> = const { Cell::new(0) };
++        pub static AUDIT_ANCESTORS: Cell<usize> = const { Cell::new(0) };
++        pub static AUDIT_INSIDE: Cell<usize> = const { Cell::new(0) };
++        pub static AUDIT_CRUMBS: Cell<usize> = const { Cell::new(0) };
+         pub static RENDERS: Cell<usize> = const { Cell::new(0) };
+         pub static PLANS: Cell<usize> = const { Cell::new(0) };
+         pub static REFRESHES: Cell<usize> = const { Cell::new(0) };
+@@ -31,6 +36,11 @@ pub mod work {
+     pub fn reset() {
+         RESOLUTION.set(0);
+         FRAMES.set(0);
++        AUDIT_ROWS.set(0);
++        AUDIT_RETAIN.set(0);
++        AUDIT_ANCESTORS.set(0);
++        AUDIT_INSIDE.set(0);
++        AUDIT_CRUMBS.set(0);
+         RENDERS.set(0);
+         PLANS.set(0);
+         REFRESHES.set(0);
+@@ -91,7 +101,11 @@ impl Marks {
+     pub fn remove(&mut self, path: &Path) {
+         if self.index.remove(path) {
+             self.resolved = None;
+-            self.items.retain(|item| item.path != path);
++            self.items.retain(|item| {
++                #[cfg(test)]
++                work::AUDIT_RETAIN.set(work::AUDIT_RETAIN.get() + 1);
++                item.path != path
++            });
+         }
+     }
+ 
+diff --git a/crates/disktree-app/src/state.rs b/crates/disktree-app/src/state.rs
+index 9713e0c..ce234ec 100644
+--- a/crates/disktree-app/src/state.rs
++++ b/crates/disktree-app/src/state.rs
+@@ -1120,6 +1120,9 @@ impl Disktree {
+         };
+         let mut crumbs: Vec<usize> = Vec::new();
+         for &index in &self.crumbs {
++            #[cfg(test)]
++            crate::marks::work::AUDIT_CRUMBS
++                .set(crate::marks::work::AUDIT_CRUMBS.get() + crumbs.len());
+             let Some(node) =
+                 tree.resolve(&crumbs).and_then(|node| node.child(index))
+             else {
+@@ -1711,6 +1714,9 @@ impl Disktree {
+                 .items()
+                 .iter()
+                 .filter(|item| {
++                    #[cfg(test)]
++                    crate::marks::work::AUDIT_INSIDE
++                        .set(crate::marks::work::AUDIT_INSIDE.get() + 1);
+                     item.path != path && item.path.starts_with(&path)
+                 })
+                 .map(|item| item.path.clone())
+@@ -1738,7 +1744,12 @@ impl Disktree {
+         self.marks
+             .items()
+             .iter()
+-            .filter(|item| item.path != path && path.starts_with(&item.path))
++            .filter(|item| {
++                #[cfg(test)]
++                crate::marks::work::AUDIT_ANCESTORS
++                    .set(crate::marks::work::AUDIT_ANCESTORS.get() + 1);
++                item.path != path && path.starts_with(&item.path)
++            })
+             .map(|item| item.path.clone())
+             .min_by_key(|ancestor| ancestor.as_os_str().len())
+     }
+diff --git a/crates/disktree-app/src/tests.rs b/crates/disktree-app/src/tests.rs
+index 04bcc6f..3d08a34 100644
+--- a/crates/disktree-app/src/tests.rs
++++ b/crates/disktree-app/src/tests.rs
+@@ -2118,3 +2118,141 @@ fn marked_interaction_timings(cx: &mut TestAppContext) {
+         window.update(|window, _| window.remove_window());
+     }
+ }
++
++#[gpui_kit::test]
++#[ignore = "manual additional complexity audit on synthetic state/windows"]
++fn additional_render_complexity_audit(cx: &mut TestAppContext) {
++    use crate::marks::work;
++    use disktree_core::removal::Target;
++    use disktree_core::tree::{Node, NodeKind};
++
++    cx.update(gpui_omarchy::init);
++    let temp = tempfile::tempdir().expect("tempdir");
++    let scan_root = temp.path().join("scan");
++    std::fs::create_dir(&scan_root).expect("mkdir");
++    for count in [128, 1024] {
++        let root_path = scan_root.clone();
++        let mut tree = Node::directory("root");
++        let mut parent = Node::directory("container");
++        for index in 0..count {
++            parent.children.push(Node::entry(
++                format!("file-{index}"),
++                NodeKind::File,
++                1,
++            ));
++        }
++        tree.children.push(parent);
++        let (view, window) = cx.add_window_view(move |_, cx| {
++            Disktree::with_tree(root_path.clone(), tree, options(), 3, cx)
++        });
++        update(&view, window, |app, cx| {
++            work::reset();
++            let start = std::time::Instant::now();
++            for index in 0..count {
++                app.toggle_mark(&[0, index], cx);
++            }
++            assert_eq!(app.marks.len(), count);
++            eprintln!(
++                "audit bulk-mark M={count} ancestor-visits={} inside-visits={} wall={:?}",
++                work::AUDIT_ANCESTORS.get(),
++                work::AUDIT_INSIDE.get(),
++                start.elapsed()
++            );
++            work::reset();
++            let start = std::time::Instant::now();
++            app.toggle_mark(&[0], cx);
++            assert_eq!(app.marks.len(), 1);
++            assert!(app.marks.contains(&scan_root.join("container")));
++            eprintln!(
++                "audit absorb-parent M={count} retain-visits={} wall={:?}",
++                work::AUDIT_RETAIN.get(),
++                start.elapsed()
++            );
++            app.marks.clear();
++            for index in 0..count {
++                app.marks.toggle(Target {
++                    path: temp.path().join(format!("outside-{index}")),
++                    bytes: 1,
++                    is_dir: false,
++                    hidden: false,
++                });
++            }
++            app.screen = Screen::Review;
++        });
++        work::reset();
++        let start = std::time::Instant::now();
++        for _ in 0..4 {
++            update(&view, window, |_, cx| cx.notify());
++            draw(window);
++        }
++        let frames = work::RENDERS.get();
++        assert!(frames >= 4);
++        eprintln!(
++            "audit blocked-review M={count} row-checks={} renders={frames} per-render={} wall={:?}",
++            work::AUDIT_ROWS.get(),
++            work::AUDIT_ROWS.get() / frames,
++            start.elapsed()
++        );
++        update(&view, window, |app, cx| {
++            // Manual marking absorbs these; raw/programmatic queues can
++            // still present overlapping targets to the review renderer.
++            app.marks.clear();
++            let parent = app.target_at(&[0]).expect("parent");
++            app.marks.toggle(parent);
++            for index in 0..count {
++                let child = app.target_at(&[0, index]).expect("child");
++                app.marks.toggle(child);
++            }
++            cx.notify();
++        });
++        work::reset();
++        let start = std::time::Instant::now();
++        for _ in 0..4 {
++            update(&view, window, |_, cx| cx.notify());
++            draw(window);
++        }
++        let frames = work::RENDERS.get();
++        assert!(frames >= 4);
++        eprintln!(
++            "audit covered-review children={count} row-checks={} renders={frames} per-render={} wall={:?}",
++            work::AUDIT_ROWS.get(),
++            work::AUDIT_ROWS.get() / frames,
++            start.elapsed()
++        );
++        window.update(|window, _| window.remove_window());
++    }
++    for depth in [128, 1024] {
++        let root_path = scan_root.clone();
++        let mut tree = Node::directory("x");
++        tree.children
++            .push(Node::entry("payload", NodeKind::File, 1));
++        for _ in 0..depth {
++            let mut parent = Node::directory("x");
++            parent.children.push(tree);
++            tree = parent;
++        }
++        let (view, window) = cx.add_window_view(move |_, cx| {
++            Disktree::with_tree(root_path.clone(), tree, options(), 3, cx)
++        });
++        update(&view, window, |app, cx| {
++            app.crumbs = vec![0; depth];
++            app.selected = None;
++            cx.notify();
++        });
++        work::reset();
++        let start = std::time::Instant::now();
++        for _ in 0..4 {
++            update(&view, window, |_, cx| cx.notify());
++            draw(window);
++        }
++        let frames = work::RENDERS.get();
++        assert!(frames >= 4);
++        eprintln!(
++            "audit deep-breadcrumbs D={depth} prefix-walks={} renders={frames} per-render={} wall={:?}",
++            work::AUDIT_CRUMBS.get(),
++            work::AUDIT_CRUMBS.get() / frames,
++            start.elapsed()
++        );
++        window.update(|window, _| window.remove_window());
++    }
++}
+diff --git a/crates/disktree-app/src/views.rs b/crates/disktree-app/src/views.rs
+index c23e91b..ff3acad 100644
+--- a/crates/disktree-app/src/views.rs
++++ b/crates/disktree-app/src/views.rs
+@@ -2544,11 +2544,20 @@ fn review(
+     }
+ 
+     for (index, item) in items.iter().take(LIST_LIMIT).enumerate() {
+-        let is_covered =
+-            covered.iter().any(|covered| covered.path == item.path);
++        let is_covered = covered.iter().any(|covered| {
++            #[cfg(test)]
++            crate::marks::work::AUDIT_ROWS
++                .set(crate::marks::work::AUDIT_ROWS.get() + 1);
++            covered.path == item.path
++        });
+         let blocked_reason = blocked
+             .iter()
+-            .find(|blocked| blocked.path == item.path)
++            .find(|blocked| {
++                #[cfg(test)]
++                crate::marks::work::AUDIT_ROWS
++                    .set(crate::marks::work::AUDIT_ROWS.get() + 1);
++                blocked.path == item.path
++            })
+             .map(|blocked| blocked.reason.clone());
+         list = list.child(mark_row(
+             index,
+diff --git a/crates/disktree-core/src/classify.rs b/crates/disktree-core/src/classify.rs
+index bfe24a7..82ffd9e 100644
+--- a/crates/disktree-core/src/classify.rs
++++ b/crates/disktree-core/src/classify.rs
+@@ -17,6 +17,10 @@ use rayon::prelude::*;
+ 
+ use crate::tree::Node;
+ 
++#[cfg(test)]
++static AUDIT_SIBLINGS: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
+ /// A kind of data, for colour.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+ pub enum Category {
+@@ -231,8 +235,14 @@ pub fn classify(root: &mut Node) {
+     root.reclaim = None;
+     for index in 0..root.children.len() {
+         let siblings = &root.children;
+-        let has_sibling =
+-            |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
++        let has_sibling = |wanted: &str| {
++            siblings.iter().any(|name| {
++                #[cfg(test)]
++                AUDIT_SIBLINGS
++                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                &*name.name == wanted
++            })
++        };
+         let child = &siblings[index];
+         // A top-level directory with an unknown name takes the kind of its
+         // largest recognisable child: `~/world` is mostly `.git`.
+@@ -303,8 +313,13 @@ fn kind_of(
+     if !child.is_dir() {
+         return (category, reclaim);
+     }
+-    let has_sibling =
+-        |wanted: &str| siblings.iter().any(|name| &*name.name == wanted);
++    let has_sibling = |wanted: &str| {
++        siblings.iter().any(|name| {
++            #[cfg(test)]
++            AUDIT_SIBLINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            &*name.name == wanted
++        })
++    };
+     let child_category = category_of_name(&child.name)
+         .or_else(|| is_git_store(child).then_some(Category::Git))
+         .unwrap_or(category);
+@@ -616,4 +631,39 @@ mod tests {
+             assert!(!category.label().is_empty());
+         }
+     }
++    #[test]
++    #[ignore = "manual case-sensitive sibling classification edge-case audit"]
++    fn additional_classification_case_variant_audit() {
++        for count in [128, 1024] {
++            let mut root = Node::directory("root");
++            for index in 0..count {
++                let mut mask = 1;
++                let name: String = "node_modules"
++                    .chars()
++                    .map(|letter| {
++                        if letter == '_' {
++                            return letter;
++                        }
++                        let upper = index & mask != 0;
++                        mask <<= 1;
++                        if upper {
++                            letter.to_ascii_uppercase()
++                        } else {
++                            letter
++                        }
++                    })
++                    .collect();
++                root.children.push(Node::directory(name));
++            }
++            AUDIT_SIBLINGS.store(0, std::sync::atomic::Ordering::Relaxed);
++            let start = std::time::Instant::now();
++            classify(&mut root);
++            assert!(root.children.iter().all(|child| child.reclaim.is_none()));
++            eprintln!(
++                "audit case-variant-classify F={count} sibling-checks={} wall={:?}",
++                AUDIT_SIBLINGS.load(std::sync::atomic::Ordering::Relaxed),
++                start.elapsed()
++            );
++        }
++    }
+ }
+diff --git a/crates/disktree-core/src/scan.rs b/crates/disktree-core/src/scan.rs
+index 693253a..ab27ea7 100644
+--- a/crates/disktree-core/src/scan.rs
++++ b/crates/disktree-core/src/scan.rs
+@@ -283,6 +283,9 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
+     Ok(node)
+ }
+ 
++#[cfg(test)]
++static AUDIT_CLASSIFIED: AtomicUsize = AtomicUsize::new(0);
++
+ struct WalkContext {
+     /// A subtree to reuse rather than walk.
+     known: Option<Known>,
+@@ -328,6 +331,8 @@ impl WalkContext {
+     /// files, and a disk has millions of them. The name is moved out of
+     /// the entry last, so nothing copies it.
+     fn classify(&self, dir: &Path, entry: &mut impl Listed) -> Classified {
++        #[cfg(test)]
++        AUDIT_CLASSIFIED.fetch_add(1, Ordering::Relaxed);
+         let listing = match entry.listing() {
+             Ok(listing) => listing,
+             Err(error) => {
+@@ -1855,4 +1860,49 @@ mod tests {
+             );
+         }
+     }
++    #[test]
++    #[ignore = "manual normal-scan complexity audit on real temporary fixtures"]
++    fn additional_scan_complexity_audit() {
++        for nested in [false, true] {
++            for count in [128, 1024] {
++                let temp = tempfile::tempdir().expect("tempdir");
++                for index in 0..count {
++                    let name = format!("entry-{index:05}");
++                    let file = if nested {
++                        let folder = temp.path().join(name);
++                        fs::create_dir(&folder).expect("mkdir");
++                        folder.join("payload")
++                    } else {
++                        temp.path().join(name)
++                    };
++                    fs::write(file, [b'x'; 64]).expect("write");
++                }
++                AUDIT_CLASSIFIED.store(0, Ordering::Relaxed);
++                crate::tree::AUDIT_AGGREGATE.store(0, Ordering::Relaxed);
++                let start = std::time::Instant::now();
++                let result = scan(
++                    temp.path(),
++                    ScanOptions {
++                        apparent_size: true,
++                        threads: crate::scan_threads::ScanThreads {
++                            max_threads: 1,
++                            ..crate::scan_threads::ScanThreads::default()
++                        },
++                        ..ScanOptions::default()
++                    },
++                )
++                .expect("scan");
++                assert_eq!(result.files, count as u64);
++                let entries = AUDIT_CLASSIFIED.load(Ordering::Relaxed);
++                let aggregated =
++                    crate::tree::AUDIT_AGGREGATE.load(Ordering::Relaxed);
++                assert_eq!(entries, count * if nested { 2 } else { 1 });
++                assert_eq!(aggregated, entries + 1);
++                eprintln!(
++                    "audit real-scan nested={nested} F={count} listed={entries} aggregate-visits={aggregated} wall={:?}",
++                    start.elapsed()
++                );
++            }
++        }
++    }
+ }
+diff --git a/crates/disktree-core/src/space.rs b/crates/disktree-core/src/space.rs
+index 8a2bc4e..5e2f8af 100644
+--- a/crates/disktree-core/src/space.rs
++++ b/crates/disktree-core/src/space.rs
+@@ -7,6 +7,11 @@
+ use std::io;
+ use std::path::{Path, PathBuf};
+ 
++#[cfg(test)]
++thread_local! {
++    static AUDIT_MOUNT_PAIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
+ /// A volume's capacity in bytes.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub struct SpaceInfo {
+@@ -515,6 +520,8 @@ fn repeated_mounts_excluding(
+     let mut repeated: Vec<PathBuf> = Vec::new();
+     for mount in visible {
+         let elsewhere = kept.iter().find_map(|wider| {
++            #[cfg(test)]
++            AUDIT_MOUNT_PAIRS.set(AUDIT_MOUNT_PAIRS.get() + 1);
+             if !same_filesystem(wider, mount) {
+                 return None;
+             }
+@@ -1327,4 +1334,28 @@ map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+         let space = SpaceInfo::default();
+         assert!((space.used_fraction() - 0.0).abs() < f32::EPSILON);
+     }
++    #[test]
++    #[ignore = "manual complexity audit on synthetic mount metadata"]
++    fn additional_mount_complexity_audit() {
++        for count in [128, 1024] {
++            let mounts: Vec<_> = (0..count)
++                .map(|index| MountView {
++                    device: format!("8:{index}"),
++                    source: format!("/dev/audit-{index}"),
++                    fstype: "ext4".into(),
++                    point: PathBuf::from(format!("/audit/mount-{index:05}")),
++                    fs_root: PathBuf::from("/"),
++                })
++                .collect();
++            AUDIT_MOUNT_PAIRS.set(0);
++            let start = std::time::Instant::now();
++            let duplicates = repeated_mounts(&mounts, Path::new("/"));
++            assert!(duplicates.is_empty());
++            eprintln!(
++                "audit mount-startup K={count} pairs={} wall={:?}",
++                AUDIT_MOUNT_PAIRS.get(),
++                start.elapsed()
++            );
++        }
++    }
+ }
+diff --git a/crates/disktree-core/src/tree.rs b/crates/disktree-core/src/tree.rs
+index 6991a86..8724560 100644
+--- a/crates/disktree-core/src/tree.rs
++++ b/crates/disktree-core/src/tree.rs
+@@ -10,6 +10,10 @@ use rustc_hash::FxHashSet;
+ 
+ use crate::classify::{Category, Reclaim};
+ 
++#[cfg(test)]
++pub(crate) static AUDIT_AGGREGATE: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
++
+ /// What a node represents on disk.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum NodeKind {
+@@ -352,6 +356,8 @@ fn aggregate_at(
+     depth: usize,
+     seen: Option<&Seen>,
+ ) {
++    #[cfg(test)]
++    AUDIT_AGGREGATE.fetch_add(1, Ordering::Relaxed);
+     if !node.is_dir() {
+         // Every name of a file has the file's size, so one that weighs
+         // nothing need not be remembered to be charged once.
+diff --git a/crates/disktree-core/src/treemap.rs b/crates/disktree-core/src/treemap.rs
+index 598b559..ce2fc50 100644
+--- a/crates/disktree-core/src/treemap.rs
++++ b/crates/disktree-core/src/treemap.rs
+@@ -13,6 +13,11 @@
+ use crate::filter::{Keep, Matches};
+ use crate::tree::{Metric, Node};
+ 
++#[cfg(test)]
++thread_local! {
++    static AUDIT_RATIO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
+ /// An axis-aligned rectangle in viewport pixels.
+ #[derive(Clone, Copy, Debug, Default, PartialEq)]
+ pub struct Rect {
+@@ -401,6 +406,8 @@ fn worst_ratio(areas: &[f64], row_sum: f64, side: f64) -> f64 {
+     }
+     let thickness = row_sum / side;
+     areas.iter().fold(0.0_f64, |worst, area| {
++        #[cfg(test)]
++        AUDIT_RATIO.set(AUDIT_RATIO.get() + 1);
+         if *area <= 0.0 || thickness <= 0.0 {
+             return worst;
+         }
+@@ -722,4 +729,43 @@ mod tests {
+         let ratio = area_of("src") / area_of("unit_test.txt");
+         assert!((ratio - 3.0).abs() < 0.05, "ratio {ratio}");
+     }
++    #[test]
++    #[ignore = "manual row-complexity audit on synthetic layout"]
++    fn additional_layout_complexity_audit() {
++        for count in [128, 1024] {
++            let values = vec![1.; count];
++            AUDIT_RATIO.set(0);
++            let start = std::time::Instant::now();
++            let rects = squarify(&values, Rect::new(0., 0., 1024., 1024.));
++            assert_eq!(rects.len(), count);
++            eprintln!(
++                "audit uncapped-squarify F={count} ratio-visits={} wall={:?}",
++                AUDIT_RATIO.get(),
++                start.elapsed()
++            );
++            let mut root = Node::directory("root");
++            for index in 0..count {
++                root.children.push(Node::entry(
++                    format!("file-{index}"),
++                    crate::tree::NodeKind::File,
++                    1,
++                ));
++            }
++            AUDIT_RATIO.set(0);
++            let start = std::time::Instant::now();
++            let tiles = layout(
++                &root,
++                &[],
++                Rect::new(0., 0., 1024., 1024.),
++                Metric::Bytes,
++                &LayoutOptions::default(),
++            );
++            assert!(!tiles.is_empty());
++            eprintln!(
++                "audit capped-layout F={count} ratio-visits={} wall={:?}",
++                AUDIT_RATIO.get(),
++                start.elapsed()
++            );
++        }
++    }
+ }

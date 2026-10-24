@@ -1,0 +1,23 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 4.21s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 1 test
+test tests::folder_queue_construction_budget ... folder-queue M=128 work=16384 wall=2.888959ms
+folder-queue M=1024 work=1048576 wall=177.786542ms
+
+thread 'tests::folder_queue_construction_budget' (404519213) panicked at crates/disktree-app/src/tests.rs:2365:5:
+8x folders: 16384 -> 1048576
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    tests::folder_queue_construction_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.32s
+
+error: test failed, to rerun pass `-p disktree-app --bin disktree`

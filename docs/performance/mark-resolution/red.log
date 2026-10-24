@@ -1,0 +1,32 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5.18s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 4 tests
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+refresh M=128 N=256 R=4 work=34048 wall=364µs
+refresh M=1024 N=2048 R=4 work=2107392 wall=8.818542ms
+
+thread 'marks::tests::refresh_resolution_budget' (403532227) panicked at crates/disktree-app/src/marks.rs:208:9:
+8x marks/folders: 34048 -> 2107392
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test marks::tests::refresh_resolution_budget ... FAILED
+window M=128 N=256 draws=4 prepares=8 work=68312 wall=171.271792ms
+window M=1024 N=2048 draws=4 prepares=8 work=4215000 wall=6.734163791s
+
+thread 'tests::marked_window_resolution_budget' (403532228) panicked at crates/disktree-app/src/tests.rs:1904:5:
+8x marks/folders per frame: 68312/8 -> 4215000/8
+test tests::marked_window_resolution_budget ... FAILED
+
+failures:
+
+failures:
+    marks::tests::refresh_resolution_budget
+    tests::marked_window_resolution_budget
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 69 filtered out; finished in 6.96s
+
+error: test failed, to rerun pass `-p disktree-app --bin disktree`

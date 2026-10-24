@@ -1,0 +1,275 @@
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.11s
+     Running `target/debug/xtask test`
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 89 tests
+test appearance::tests::a_linux_desktop_is_followed_only_if_it_states_a_preference ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::display_path_shortens_the_home_prefix ... ok
+test git::tests::summaries_say_what_would_be_lost ... ok
+test marks::tests::marking_the_same_path_twice_keeps_one_entry ... ok
+test marks::tests::ordered_marks_keep_exact_non_utf8_paths ... ok
+test marks::tests::ordered_marks_preserve_components_case_and_outermost_ancestor ... ok
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test marks::tests::resolver_preserves_lossy_non_utf8_components ... ok
+test marks::tests::toggling_marks_and_unmarks ... ok
+test marks::tests::find_matches_whole_components_only ... ok
+test marks::tests::refresh_re_reads_sizes_from_a_new_tree ... ok
+test marks::tests::absorption_invalidates_cached_crumbs_and_keeps_missing_paths_indexed ... ok
+test marks::tests::cached_crumbs_follow_every_invalidation_boundary ... ok
+test marks::tests::resolver_preserves_scan_name_semantics ... ok
+test palette::tests::age_buckets_cover_every_age_in_order ... ok
+test palette::tests::colourful_categories_share_one_level ... ok
+test palette::tests::deeper_tiles_lift_away_from_the_background ... ok
+test palette::tests::every_legend_category_has_its_own_hue ... ok
+test palette::tests::mix_clamps_its_parameter ... ok
+test palette::tests::mixing_toward_a_grey_keeps_the_hue ... ok
+test palette::tests::the_highlight_is_not_a_category_colour ... ok
+test power::tests::presets_are_fixed_and_show_the_effective_cpu_limit ... ok
+test power::tests::presets_that_add_no_workers_are_not_offered ... ok
+test state::tests::a_transition_grows_a_tile_that_is_being_entered ... ok
+test state::tests::a_transition_starts_where_the_region_was_and_ends_where_it_is ... ok
+test state::tests::clamping_never_leaves_a_margin ... ok
+test state::tests::directions_only_see_gaps_on_their_own_side ... ok
+test argument_tests::saved_power_is_loaded_before_cli_overrides ... ok
+test state::tests::projecting_and_unprojecting_are_inverses ... ok
+test state::tests::zooming_keeps_the_point_under_the_cursor_still ... ok
+test marks::tests::refresh_dimension_budget ... ok
+test power::tests::saved_choice_survives_replacement_and_bad_data_is_reported ... ok
+test marks::tests::refresh_resolution_budget ... ok
+test git::tests::reads_a_real_checkout ... ok
+test git::tests::a_checkout_cannot_make_git_run_its_programs ... ok
+test git::tests::a_checkout_cannot_make_git_verify_a_signature_with_its_program ... ok
+test git::tests::a_checkouts_own_filter_is_never_run ... ok
+test tests::escape_cancels_widening_and_keeps_the_tree_on_screen ... ok
+test tests::escape_in_the_delete_dialog_cancels ... ok
+test tests::command_chords_are_not_read_as_plain_letters ... ok
+test tests::enter_before_the_search_lands_applies_it_when_it_does ... ok
+test tests::marked_interaction_timings ... ignored, manual interaction timing on synthetic temporary files
+test tests::a_view_without_flags_or_marks_still_draws ... ok
+test tests::a_parents_name_gets_its_own_band_above_its_children ... ok
+test tests::a_permanent_deletion_asks_in_an_alert_dialog_then_removes ... ok
+test tests::a_crumb_lists_its_siblings_and_jumps_sideways ... ok
+test tests::enter_in_the_focused_volume_picker_scans_the_selected_root ... ok
+test tests::folder_queue_construction_budget ... ok
+test tests::enter_opens_the_selected_directory_at_any_depth ... ok
+test tests::restart_arguments_parse_back_to_the_same_scan ... ok
+test tests::after_descending_every_tile_is_inside_the_directory_drawn ... ok
+test tests::both_appearances_draw ... ok
+test tests::back_and_forward_retrace_where_you_have_been ... ok
+test tests::dragging_the_panel_edge_resizes_it_within_its_limits ... ok
+test tests::escape_cancels_the_first_scan_and_r_starts_it_again ... ok
+test tests::hovering_reports_the_tile_under_the_pointer ... ok
+test tests::interface_zoom_scales_the_rem_and_the_header_band ... ok
+test tests::marked_tiles_follow_metric_rescan_and_mark_changes ... ok
+test tests::marking_a_directory_marks_everything_inside_it ... ok
+test tests::power_efficiency_menu_saves_without_discarding_the_tree ... ok
+test tests::showing_a_tile_that_is_gone_says_so_instead ... ok
+test tests::keys_walk_the_tree_and_mark_what_is_selected ... ok
+test tests::switching_the_metric_keeps_the_directory_and_the_selection ... ok
+test tests::mouse_side_buttons_go_back_and_forward ... ok
+test tests::parent_absorption_budget ... ok
+test tests::right_click_selects_the_tile_and_reveals_it ... ok
+test tests::the_first_scan_shows_what_it_is_doing_then_the_treemap ... ok
+test views::tests::review_status_keeps_non_utf8_paths_distinct ... ok
+test views::tests::review_status_preserves_exact_paths_and_first_blocked_reason ... ok
+test widgets::tests::ages_read_in_the_unit_a_person_would_use ... ok
+test widgets::tests::sizes_split_into_number_and_unit ... ok
+test tests::the_help_overlay_opens_and_closes ... ok
+test tests::the_mark_key_follows_the_pointer_until_the_keyboard_moves ... ok
+test tests::queue_construction_budget ... ok
+test tests::the_power_menu_offers_only_what_the_cpus_can_tell_apart ... ok
+test tests::the_review_screen_copies_the_list_as_an_agent_prompt ... ok
+test tests::the_review_screen_switches_removal_mode ... ok
+test tests::the_trash_is_the_default_when_there_is_one ... ok
+test tests::the_volume_picker_is_centred_and_still_dismisses_from_outside ... ok
+test tests::marked_window_resolution_budget ... ok
+test tests::the_wheel_goes_into_the_directory_it_zoomed_into ... ok
+test tests::the_treemap_zooms_with_the_wheel_and_resets ... ok
+test tests::the_volume_picker_opens_moves_and_closes ... ok
+test tests::typing_filters_live_and_enter_shows_only_the_matches ... ok
+test tests::widening_reuses_the_tree_it_has_and_reads_only_the_rest ... ok
+test tests::the_window_draws_a_treemap_with_tiles ... ok
+test tests::blocked_review_status_budget ... ok
+test tests::covered_review_status_budget ... ok
+
+test result: ok. 88 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.87s
+
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-9300e5ba20d6b25f)
+
+running 152 tests
+test classify::tests::macos_developer_leftovers_are_reclaimable_and_its_risks_are_not ... ok
+test export::tests::the_list_is_one_path_per_line ... ok
+test classify::tests::steam_libraries_and_emulation_are_media_not_disposable_caches ... ok
+test filter::tests::case_is_ignored_without_allocating ... ok
+test classify::tests::the_legend_lists_every_named_category_once ... ok
+test classify::tests::windows_caches_and_sync_folders_are_recognized ... ok
+test export::tests::a_name_with_a_newline_cannot_smuggle_in_a_path ... ok
+test export::tests::a_name_that_is_not_unicode_is_flagged_not_listed ... ok
+test export::tests::the_prompt_lists_every_path_with_its_size_and_the_rules ... ok
+test filter::tests::an_empty_needle_filters_nothing ... ok
+test filter::tests::a_search_below_the_root_leaves_the_rest_alone ... ok
+test filter::tests::matches_are_kept_whole_and_their_ancestors_by_what_matched ... ok
+test access::tests::only_macos_has_an_answer_and_a_missing_database_is_not_a_refusal ... ok
+test classify::tests::a_steam_library_on_another_drive_is_media_not_its_temp_folder ... ok
+test classify::tests::sandbox_layers_and_snapshots_are_reclaimable_only_in_sandbox_state ... ok
+test insights::tests::the_limit_keeps_the_largest ... ok
+test insights::tests::ranks_findings_largest_first_and_skips_the_tiny ... ok
+test insights::tests::documents_are_never_suggested ... ok
+test insights::tests::crumbs_address_the_finding_from_the_root ... ok
+test classify::tests::names_announce_their_kind_and_children_inherit_it ... ok
+test classify::tests::target_is_build_output_only_beside_a_cargo_manifest ... ok
+test classify::tests::an_unknown_top_level_directory_takes_its_largest_known_child ... ok
+test classify::tests::caches_are_reclaimable_all_the_way_down ... ok
+test removal::tests::a_directory_holding_a_system_tree_is_refused ... ok
+test removal::tests::a_directory_holding_the_home_directory_is_refused ... ok
+test macos::tests::a_missing_directory_is_an_error ... ok
+test removal::tests::macos_always_uses_the_system_trash ... ok
+test removal::tests::macos_guard_keys_fold_the_data_volume_and_case ... ok
+test removal::tests::macos_guards_see_through_other_spellings ... ok
+test removal::tests::macos_system_trees_are_refused_but_apps_are_not ... ok
+test removal::tests::a_name_that_is_not_utf8_is_refused_before_the_trash_sees_it ... ok
+test removal::tests::names_win32_would_misread_are_recognized ... ok
+test macos::tests::a_listing_has_names_kinds_lengths_and_no_dot_entries ... ok
+test removal::tests::nesting_keeps_component_boundaries_duplicates_and_output_order ... ok
+test removal::tests::normalize_resolves_dots_without_the_filesystem ... ok
+test macos::tests::names_are_text_and_open ... ok
+test removal::tests::nesting_uses_guard_case_order_even_when_the_child_sorts_first ... ok
+test macos::tests::every_leaf_reads_as_lstat_reads_it ... ok
+test removal::tests::a_mount_below_a_target_is_caught_again_at_removal_time ... ok
+test removal::tests::a_volume_is_judged_by_its_mount_where_the_kernel_names_one ... ok
+test removal::tests::percent_encoding_escapes_what_the_spec_requires ... ok
+test removal::tests::a_missing_target_reports_not_found ... ok
+test removal::tests::a_plan_keeps_only_the_outermost_targets ... ok
+test removal::tests::a_target_with_a_mount_inside_is_refused ... ok
+test removal::tests::mount_points_are_recognized ... ok
+test removal::tests::a_trash_info_path_is_restorable ... ok
+test removal::tests::a_target_reached_through_a_link_is_refused ... ok
+test removal::tests::paths_outside_the_root_are_refused ... ok
+test removal::tests::permanent_removal_takes_directories_and_leaves_siblings ... ok
+test removal::tests::a_removal_run_reports_every_item_and_a_total ... ok
+test removal::tests::the_macos_trash_takes_a_file_and_leaves_a_linked_target ... ignored, puts a file in this Mac's real Trash
+test removal::tests::home_is_found_by_its_real_path_too ... ok
+test removal::tests::permanent_removal_follows_links_above_the_root ... ok
+test removal::tests::permanent_removal_does_not_follow_a_link_put_on_the_way_down ... ok
+test removal::tests::permanent_removal_unlinks_nested_symlinks_without_following_them ... ok
+test removal::tests::permanent_removal_takes_nested_trees_and_hidden_files ... ok
+test removal::tests::permanent_removal_unlinks_a_symlink_instead_of_following_it ... ok
+test removal::tests::nothing_is_mounted_below_a_temp_dir ... ok
+test removal::tests::read_only_files_are_removed_too ... ok
+test removal::tests::sibling_prefixes_are_not_treated_as_containment ... ok
+test removal::tests::a_link_put_on_the_way_down_after_planning_stops_the_worker ... ok
+test removal::tests::the_mount_table_is_read_off_the_calling_thread_and_then_kept ... ok
+test removal::tests::trash_names_avoid_collisions ... ok
+test removal::tests::the_root_and_home_are_refused ... ok
+test removal::tests::the_xdg_trash_moves_a_file_and_records_where_it_came_from ... ok
+test scan::tests::a_file_root_is_rejected ... ok
+test scan::tests::fixed_worker_pools_change_size_without_reinitializing_rayon ... ok
+test removal::tests::this_macs_mount_table_is_read_without_proc ... ok
+test scan::tests::disk_usage_is_whole_allocation_units ... ok
+test scan::tests::followed_symlink_loops_do_not_hang_the_scan ... ok
+test scan::tests::hardlinks_are_charged_once_by_default ... ok
+test scan::tests::an_unreadable_directory_is_recorded_not_fatal ... ok
+test scan::tests::a_spawned_scan_reports_progress_and_a_result ... ok
+test scan::tests::a_directory_reports_its_own_bytes_separately ... ok
+test scan::tests::whole_disk_smoke ... ignored, walks the whole disk
+test scan::tests::children_are_ranked_largest_first ... ok
+test scan_threads::tests::governor_waits_for_retirement_and_recovers_without_exceeding_target ... ok
+test scan_threads::tests::inconclusive_windows_cannot_accept_a_reduction ... ok
+test scan_threads::tests::increased_limit_is_not_supplied_until_jobs_are_dispatched ... ok
+test scan_threads::tests::long_directory_never_becomes_a_fully_supplied_window ... ok
+test scan_threads::tests::search_refines_one_reference_without_compounding_loss ... ok
+test size::tests::a_value_that_rounds_up_to_the_next_unit_is_shown_in_it ... ok
+test size::tests::bytes_use_binary_units_with_one_decimal_below_ten ... ok
+test size::tests::counts_switch_to_metric_suffixes ... ok
+test size::tests::share_bar_is_always_the_requested_width ... ok
+test scan_threads::tests::real_pool_retires_at_job_boundaries_and_drains_queued_descendants ... ok
+test size::tests::share_survives_a_zero_total ... ok
+test size::tests::short_form_drops_the_space ... ok
+test space::tests::a_bind_mount_inside_the_scan_is_left_out ... ok
+test space::tests::a_home_scan_has_no_foreign_mounts_here ... ok
+test space::tests::a_missing_path_reports_the_io_error ... ok
+test space::tests::a_real_volume_reports_plausible_numbers ... ok
+test space::tests::a_root_booted_from_a_snapshot_keeps_its_subvolumes ... ok
+test space::tests::a_table_that_does_not_place_a_path_claims_nothing ... ok
+test space::tests::a_volume_includes_its_subvolumes_and_nothing_else ... ok
+test space::tests::a_volume_keeps_its_subvolumes_and_loses_everything_else ... ok
+test space::tests::btrfs_subvolume_devices_can_differ ... ok
+test space::tests::excluded_views_cannot_replace_visible_files ... ok
+test space::tests::hidden_original_and_nested_mounts_are_preserved ... ok
+test space::tests::macos_mount_points_keep_spaces_and_brackets ... ok
+test space::tests::mountinfo_escapes_are_decoded_once ... ok
+test space::tests::only_macos_skips_the_data_volume_and_in_the_roots_spelling ... ok
+test space::tests::projecting_removal_cannot_exceed_the_volume ... ok
+test space::tests::separate_home_disk_is_its_own_volume ... ok
+test space::tests::subvolumes_are_not_repeats_but_a_second_mount_of_a_disk_is ... ok
+test space::tests::the_device_is_the_longest_matching_mount ... ok
+test scan::tests::file_count_metric_ranks_by_entries ... ok
+test space::tests::the_home_disk_on_macos_is_the_root_and_has_a_device ... ok
+test space::tests::the_top_of_a_btrfs_disk_beside_its_subvolumes_is_counted_once ... ok
+test space::tests::the_whole_disk_is_the_top_of_the_home_volume ... ok
+test space::tests::unrelated_tmpfs_mounts_are_not_duplicates ... ok
+test space::tests::used_fraction_handles_an_empty_volume_report ... ok
+test space::tests::volume_candidates_are_real_disks_not_pseudo_filesystems ... ok
+test space::tests::volumes_with_least_space_come_first_and_unknowns_last ... ok
+test tree::tests::a_node_stays_small ... ok
+test tree::tests::aggregate_derives_totals_and_orders_children ... ok
+test scan::tests::a_wider_scan_reuses_the_subtree_it_already_knows ... ok
+test tree::tests::depth_counts_edges ... ok
+test tree::tests::find_reports_crumbs_and_is_case_insensitive ... ok
+test tree::tests::aggregate_can_rank_by_file_count ... ok
+test tree::tests::identities_that_differ_only_in_their_top_bits_are_two_files ... ok
+test tree::tests::largest_child_is_the_first_child_because_children_are_sorted ... ok
+test tree::tests::path_of_joins_names_beneath_the_root ... ok
+test tree::tests::resolve_walks_child_indices ... ok
+test treemap::tests::a_leaf_never_claims_a_header ... ok
+test treemap::tests::a_filtered_layout_shows_only_the_matches_at_their_size ... ok
+test treemap::tests::a_subdivided_directory_keeps_a_header_for_its_own_name ... ok
+test treemap::tests::a_tile_without_room_for_a_header_stays_whole ... ok
+test treemap::tests::hit_returns_the_deepest_tile ... ok
+test treemap::tests::layout_depth_one_stops_at_direct_children ... ok
+test tree::tests::seen_charges_an_identity_once_in_either_store ... ok
+test treemap::tests::layout_merges_the_child_tail_into_one_tile ... ok
+test treemap::tests::squarify_fills_the_area ... ok
+test treemap::tests::layout_nests_children_inside_their_parent ... ok
+test space::tests::without_a_table_the_same_place_is_one_volume ... ok
+test scan::tests::hidden_entries_are_included_by_default_and_excluded_on_request ... ok
+test treemap::tests::squarify_keeps_aspect_ratios_reasonable ... ok
+test treemap::tests::squarify_survives_degenerate_input ... ok
+test treemap::tests::tile_crumbs_address_the_scanned_tree_not_the_drawn_node ... ok
+test scan::tests::max_depth_stops_descending_but_keeps_direct_files ... ok
+test scan::tests::symlinks_are_not_followed_by_default ... ok
+test scan::tests::totals_are_summed_bottom_up ... ok
+test removal::tests::system_trees_are_refused_in_a_whole_disk_scan ... ok
+test removal::tests::the_directories_above_home_are_refused ... ok
+test removal::tests::removal_nesting_budget ... ok
+test scan::tests::cancelled_queued_jobs_release_parent_completion_tokens ... ok
+test scan::tests::fixed_worker_pools_preserve_a_wide_deep_tree ... ok
+test removal::tests::only_the_scanned_volumes_marks_are_projected ... ok
+test removal::tests::a_failing_trash_tool_reports_its_stderr ... ok
+test scan_threads::tests::controller_retires_recovers_after_search_and_cancels ... ok
+test macos::tests::a_directory_larger_than_the_buffer_is_listed_whole ... ok
+test removal::tests::a_trash_tool_is_called_with_the_path_after_a_separator ... ok
+
+test result: ok. 150 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-0dc2df263f51d89e)
+
+running 3 tests
+test bundle::tests::signing_is_ad_hoc_unless_an_identity_is_given ... ok
+test bundle::tests::the_plist_template_names_the_executable_and_takes_the_version ... ok
+test bundle::tests::notarizing_needs_a_real_signature ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests disktree_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

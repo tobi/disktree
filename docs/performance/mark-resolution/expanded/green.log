@@ -1,0 +1,57 @@
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.35s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 10 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=24.375µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=48.083µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=52.167µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=26.25µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=92.083µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=203.5µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.533958ms
+ok
+test tests::blocked_review_status_budget ... review-status covered=false M=128 work=3072 renders=8 rows=128 per-render=384 wall=107.112541ms
+review-status covered=false M=1024 work=24576 renders=8 rows=1024 per-render=3072 wall=896.730708ms
+review-status covered=false M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=1.196129834s
+ok
+test tests::covered_review_status_budget ... review-status covered=true M=128 work=3088 renders=8 rows=129 per-render=386 wall=122.642875ms
+review-status covered=true M=1024 work=24592 renders=8 rows=1025 per-render=3074 wall=1.006027084s
+review-status covered=true M=8192 work=84736 renders=8 rows=1200 per-render=10592 wall=2.109495042s
+ok
+test tests::folder_queue_construction_budget ... folder-queue M=128 work=1152 wall=542µs
+folder-queue M=1024 work=9216 wall=6.55425ms
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=60.956167ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=61.972375ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=332.587667ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=333.501ms
+ok
+test tests::parent_absorption_budget ... parent-absorption M=128 work=266 compactions=130 wall=57.667µs
+parent-absorption M=1024 work=2058 compactions=1026 wall=472.542µs
+ok
+test tests::queue_construction_budget ... queue-construction M=128 work=1152 wall=554.417µs
+queue-construction M=1024 work=9216 wall=6.531ms
+ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 79 filtered out; finished in 6.89s
+
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-9300e5ba20d6b25f)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=1314 wall=2.843041ms
+plan M=1024 work=15298 wall=22.107625ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-0dc2df263f51d89e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

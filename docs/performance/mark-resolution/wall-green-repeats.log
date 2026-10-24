@@ -1,0 +1,126 @@
+
+REPEAT 1: disktree-app fixed
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5.26s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 5 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=92.541µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=47.167µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=50.167µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=28.084µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=57.541µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=204.417µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.528584ms
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=64.363667ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=66.748208ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=347.242958ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=358.680958ms
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.91s
+
+EXIT 0
+
+REPEAT 1: disktree-core fixed
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.68s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=1314 wall=3.372625ms
+plan M=1024 work=15298 wall=23.837875ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.03s
+
+EXIT 0
+
+REPEAT 2: disktree-app fixed
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.29s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 5 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=23.458µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=44.542µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=56.5µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=26µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=55.125µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=208.667µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.52875ms
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=65.17375ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=67.732166ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=350.850083ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=356.051625ms
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.89s
+
+EXIT 0
+
+REPEAT 2: disktree-core fixed
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=1314 wall=2.852625ms
+plan M=1024 work=15298 wall=21.89725ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.03s
+
+EXIT 0
+
+REPEAT 3: disktree-app fixed
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.30s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 5 tests
+test argument_tests::adaptive_budget_and_fixed_override_are_explicit ... ok
+test argument_tests::invalid_worker_budgets_are_rejected ... ok
+test marks::tests::refresh_dimension_budget ... dimensions folders=128 M=8 D=2 R=1 work=160 wall=23µs
+dimensions folders=1024 M=8 D=2 R=1 work=1056 wall=51.5µs
+dimensions folders=1024 M=64 D=2 R=1 work=1280 wall=59µs
+dimensions folders=128 M=8 D=16 R=1 work=384 wall=33.667µs
+dimensions folders=128 M=8 D=2 R=8 work=1280 wall=60.167µs
+ok
+test marks::tests::refresh_resolution_budget ... refresh M=128 N=256 R=4 work=2560 wall=198.958µs
+refresh M=1024 N=2048 R=4 work=20480 wall=1.648333ms
+ok
+test tests::marked_window_resolution_budget ... warm window M=128 prepares=8 resolution=216 tiles=1544 wall=65.083791ms
+window M=128 N=256 draws=4 prepares=8 work=856 wall=66.946292ms
+warm window M=1024 prepares=8 resolution=216 tiles=776 wall=340.564ms
+window M=1024 N=2048 draws=4 prepares=8 work=5336 wall=359.560417ms
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.89s
+
+EXIT 0
+
+REPEAT 3: disktree-core fixed
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+test removal::tests::removal_nesting_budget ... plan M=128 work=1314 wall=3.403792ms
+plan M=1024 work=15298 wall=23.242542ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.03s
+
+EXIT 0

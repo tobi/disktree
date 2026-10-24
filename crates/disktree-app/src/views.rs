@@ -4,6 +4,8 @@
 //! always exactly what the state says — there is no second copy of anything to
 //! keep in sync.
 
+use std::path::Path;
+
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{Plan, RemovalMode, Target};
@@ -24,6 +26,7 @@ use gpui_omarchy::{
 };
 
 use gpui_kit::prelude::FluentBuilder as _;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::palette;
 use crate::state::{
@@ -36,6 +39,54 @@ use crate::widgets;
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
 const LIST_LIMIT: usize = 1200;
+
+/// Row decoration borrows this render's freshly evaluated plan. It must
+/// not cache removal authorization, and each displayed row needs constant
+/// expected hash lookups rather than scans of all blocked/covered targets.
+#[derive(Debug)]
+struct ReviewStatus<'a> {
+    covered: FxHashSet<&'a Path>,
+    blocked: FxHashMap<&'a Path, &'a str>,
+}
+
+impl<'a> ReviewStatus<'a> {
+    fn new(plan: &'a Plan) -> Self {
+        let mut status = Self {
+            covered: FxHashSet::default(),
+            blocked: FxHashMap::default(),
+        };
+        for target in &plan.covered {
+            #[cfg(test)]
+            crate::marks::work::REVIEW
+                .set(crate::marks::work::REVIEW.get() + 1);
+            status.covered.insert(target.path.as_path());
+        }
+        for target in &plan.blocked {
+            #[cfg(test)]
+            crate::marks::work::REVIEW
+                .set(crate::marks::work::REVIEW.get() + 1);
+            // A raw queue may repeat a path. Keep the first explanation,
+            // matching the original linear find's behavior.
+            status
+                .blocked
+                .entry(target.path.as_path())
+                .or_insert(target.reason.as_str());
+        }
+        status
+    }
+
+    fn covered(&self, path: &Path) -> bool {
+        #[cfg(test)]
+        crate::marks::work::REVIEW.set(crate::marks::work::REVIEW.get() + 1);
+        self.covered.contains(path)
+    }
+
+    fn blocked(&self, path: &Path) -> Option<&str> {
+        #[cfg(test)]
+        crate::marks::work::REVIEW.set(crate::marks::work::REVIEW.get() + 1);
+        self.blocked.get(path).copied()
+    }
+}
 
 /// The whole window.
 pub fn root(
@@ -2754,9 +2805,8 @@ fn review(
 ) -> Div {
     let theme = cx.omarchy().clone();
     let plan = app.plan();
-    let items: Vec<Target> = app.marks.items().to_vec();
-    let covered: Vec<Target> = plan.covered.clone();
-    let blocked = plan.blocked.clone();
+    let items = app.marks.items();
+    let status = ReviewStatus::new(&plan);
 
     let mut list = div()
         .id("marked-list")
@@ -2779,12 +2829,19 @@ fn review(
     }
 
     for (index, item) in items.iter().take(LIST_LIMIT).enumerate() {
-        let is_covered =
-            covered.iter().any(|covered| covered.path == item.path);
-        let blocked_reason = blocked
-            .iter()
-            .find(|blocked| blocked.path == item.path)
-            .map(|blocked| blocked.reason.clone());
+        let is_covered = status.covered(&item.path);
+        let blocked_reason = status.blocked(&item.path).map(str::to_owned);
+        #[cfg(test)]
+        {
+            use crate::marks::work;
+            work::REVIEW_ROWS.set(work::REVIEW_ROWS.get() + 1);
+            work::COVERED_ROWS
+                .set(work::COVERED_ROWS.get() + usize::from(is_covered));
+            work::BLOCKED_ROWS.set(
+                work::BLOCKED_ROWS.get()
+                    + usize::from(blocked_reason.is_some()),
+            );
+        }
         list = list.child(mark_row(
             index,
             item,
@@ -3910,4 +3967,65 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                         )),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disktree_core::removal::Blocked;
+    use std::path::PathBuf;
+
+    #[test]
+    fn review_status_preserves_exact_paths_and_first_blocked_reason() {
+        let path = PathBuf::from("/synthetic/a/child");
+        let mut plan = Plan::default();
+        plan.covered.push(Target {
+            path: path.clone(),
+            bytes: 1,
+            is_dir: false,
+            hidden: false,
+        });
+        plan.blocked.push(Blocked {
+            path: path.clone(),
+            reason: "first".into(),
+        });
+        plan.blocked.push(Blocked {
+            path: path.clone(),
+            reason: "second".into(),
+        });
+        let status = ReviewStatus::new(&plan);
+        assert!(status.covered(&path));
+        assert!(!status.covered(Path::new("/synthetic/a/childish")));
+        assert!(!status.covered(Path::new("/synthetic/A/child")));
+        assert_eq!(status.blocked(&path), Some("first"));
+        assert_eq!(
+            status.blocked(Path::new("/synthetic/a/./child")),
+            Some("first")
+        );
+        assert_eq!(status.blocked(Path::new("/synthetic/A/child")), None);
+        plan.blocked.clear();
+        plan.covered.clear();
+        let refreshed = ReviewStatus::new(&plan);
+        assert_eq!(refreshed.blocked(&path), None);
+        assert!(!refreshed.covered(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_status_keeps_non_utf8_paths_distinct() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = Path::new("/synthetic")
+            .join(std::ffi::OsStr::from_bytes(b"not-\xff"));
+        let mut plan = Plan::default();
+        plan.blocked.push(Blocked {
+            path: path.clone(),
+            reason: "blocked".into(),
+        });
+        let status = ReviewStatus::new(&plan);
+        assert_eq!(status.blocked(&path), Some("blocked"));
+        assert_eq!(
+            status.blocked(Path::new(&path.to_string_lossy().into_owned())),
+            None
+        );
+    }
 }

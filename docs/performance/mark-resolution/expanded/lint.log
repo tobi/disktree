@@ -1,0 +1,7 @@
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.18s
+     Running `target/debug/xtask lint`
+    Checking disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 2.21s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

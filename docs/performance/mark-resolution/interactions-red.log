@@ -1,0 +1,66 @@
+   Compiling disktree-app v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-app)
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3.91s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/disktree-be72e126ba0d25ca)
+
+running 1 test
+test tests::marked_interaction_timings ... interaction action=mark-space repeat=1 marks=0->1 renders=3 prepares=3 plans=6 refreshes=0 wall=3.866334ms
+interaction action=hover repeat=1 marks=1->1 renders=2 prepares=2 plans=4 refreshes=0 wall=2.832708ms
+interaction action=review-c repeat=1 marks=1->1 renders=3 prepares=1 plans=4 refreshes=0 wall=2.252292ms
+interaction action=mark-space repeat=2 marks=0->1 renders=2 prepares=2 plans=4 refreshes=0 wall=2.443ms
+interaction action=hover repeat=2 marks=1->1 renders=2 prepares=2 plans=4 refreshes=0 wall=2.800667ms
+interaction action=review-c repeat=2 marks=1->1 renders=3 prepares=1 plans=4 refreshes=0 wall=2.211042ms
+interaction action=mark-space repeat=3 marks=0->1 renders=2 prepares=2 plans=4 refreshes=0 wall=2.408125ms
+interaction action=hover repeat=3 marks=1->1 renders=2 prepares=2 plans=4 refreshes=0 wall=2.487209ms
+interaction action=review-c repeat=3 marks=1->1 renders=3 prepares=1 plans=4 refreshes=0 wall=2.212542ms
+interaction action=mark-space repeat=1 marks=1->2 renders=3 prepares=3 plans=6 refreshes=0 wall=3.834833ms
+interaction action=hover repeat=1 marks=2->2 renders=2 prepares=2 plans=4 refreshes=0 wall=2.865791ms
+interaction action=review-c repeat=1 marks=2->2 renders=3 prepares=1 plans=4 refreshes=0 wall=2.445292ms
+interaction action=mark-space repeat=2 marks=1->2 renders=2 prepares=2 plans=4 refreshes=0 wall=2.74825ms
+interaction action=hover repeat=2 marks=2->2 renders=2 prepares=2 plans=4 refreshes=0 wall=2.735875ms
+interaction action=review-c repeat=2 marks=2->2 renders=3 prepares=1 plans=4 refreshes=0 wall=2.421667ms
+interaction action=mark-space repeat=3 marks=1->2 renders=2 prepares=2 plans=4 refreshes=0 wall=3.28325ms
+interaction action=hover repeat=3 marks=2->2 renders=2 prepares=2 plans=4 refreshes=0 wall=2.782625ms
+interaction action=review-c repeat=3 marks=2->2 renders=3 prepares=1 plans=4 refreshes=0 wall=2.733167ms
+interaction action=mark-space repeat=1 marks=8->9 renders=3 prepares=3 plans=6 refreshes=0 wall=5.291709ms
+interaction action=hover repeat=1 marks=9->9 renders=2 prepares=2 plans=4 refreshes=0 wall=4.145167ms
+interaction action=review-c repeat=1 marks=9->9 renders=3 prepares=1 plans=4 refreshes=0 wall=4.556709ms
+interaction action=mark-space repeat=2 marks=8->9 renders=2 prepares=2 plans=4 refreshes=0 wall=3.612542ms
+interaction action=hover repeat=2 marks=9->9 renders=2 prepares=2 plans=4 refreshes=0 wall=3.624666ms
+interaction action=review-c repeat=2 marks=9->9 renders=3 prepares=1 plans=4 refreshes=0 wall=4.150625ms
+interaction action=mark-space repeat=3 marks=8->9 renders=2 prepares=2 plans=4 refreshes=0 wall=3.549459ms
+interaction action=hover repeat=3 marks=9->9 renders=2 prepares=2 plans=4 refreshes=0 wall=3.6055ms
+interaction action=review-c repeat=3 marks=9->9 renders=3 prepares=1 plans=4 refreshes=0 wall=4.159167ms
+interaction action=mark-space repeat=1 marks=32->33 renders=3 prepares=3 plans=6 refreshes=0 wall=9.137625ms
+interaction action=hover repeat=1 marks=33->33 renders=2 prepares=2 plans=4 refreshes=0 wall=6.42875ms
+interaction action=review-c repeat=1 marks=33->33 renders=3 prepares=1 plans=4 refreshes=0 wall=9.801417ms
+interaction action=mark-space repeat=2 marks=32->33 renders=2 prepares=2 plans=4 refreshes=0 wall=6.260209ms
+interaction action=hover repeat=2 marks=33->33 renders=2 prepares=2 plans=4 refreshes=0 wall=6.274417ms
+interaction action=review-c repeat=2 marks=33->33 renders=3 prepares=1 plans=4 refreshes=0 wall=9.739625ms
+interaction action=mark-space repeat=3 marks=32->33 renders=2 prepares=2 plans=4 refreshes=0 wall=6.120542ms
+interaction action=hover repeat=3 marks=33->33 renders=2 prepares=2 plans=4 refreshes=0 wall=6.348584ms
+interaction action=review-c repeat=3 marks=33->33 renders=3 prepares=1 plans=4 refreshes=0 wall=9.569958ms
+interaction action=mark-space repeat=1 marks=128->129 renders=3 prepares=3 plans=6 refreshes=0 wall=41.574ms
+interaction action=hover repeat=1 marks=129->129 renders=2 prepares=2 plans=4 refreshes=0 wall=29.242583ms
+interaction action=review-c repeat=1 marks=129->129 renders=3 prepares=1 plans=4 refreshes=0 wall=44.395917ms
+interaction action=mark-space repeat=2 marks=128->129 renders=2 prepares=2 plans=4 refreshes=0 wall=27.956334ms
+interaction action=hover repeat=2 marks=129->129 renders=2 prepares=2 plans=4 refreshes=0 wall=27.605834ms
+interaction action=review-c repeat=2 marks=129->129 renders=3 prepares=1 plans=4 refreshes=0 wall=44.052416ms
+interaction action=mark-space repeat=3 marks=128->129 renders=2 prepares=2 plans=4 refreshes=0 wall=29.216375ms
+interaction action=hover repeat=3 marks=129->129 renders=2 prepares=2 plans=4 refreshes=0 wall=27.679958ms
+interaction action=review-c repeat=3 marks=129->129 renders=3 prepares=1 plans=4 refreshes=0 wall=44.189917ms
+interaction action=mark-space repeat=1 marks=1024->1025 renders=3 prepares=3 plans=6 refreshes=0 wall=1.726271166s
+interaction action=hover repeat=1 marks=1025->1025 renders=2 prepares=2 plans=4 refreshes=0 wall=1.09936375s
+interaction action=review-c repeat=1 marks=1025->1025 renders=3 prepares=1 plans=4 refreshes=0 wall=1.237629458s
+interaction action=mark-space repeat=2 marks=1024->1025 renders=2 prepares=2 plans=4 refreshes=0 wall=1.154407584s
+interaction action=hover repeat=2 marks=1025->1025 renders=2 prepares=2 plans=4 refreshes=0 wall=1.109142875s
+interaction action=review-c repeat=2 marks=1025->1025 renders=3 prepares=1 plans=4 refreshes=0 wall=1.229517333s
+interaction action=mark-space repeat=3 marks=1024->1025 renders=2 prepares=2 plans=4 refreshes=0 wall=1.064909416s
+interaction action=hover repeat=3 marks=1025->1025 renders=2 prepares=2 plans=4 refreshes=0 wall=1.068550917s
+interaction action=review-c repeat=3 marks=1025->1025 renders=3 prepares=1 plans=4 refreshes=0 wall=1.224605875s
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 26.34s
+

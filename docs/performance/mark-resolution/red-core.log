@@ -1,0 +1,33 @@
+   Compiling fastrand v2.5.0
+   Compiling either v1.18.0
+   Compiling log v0.4.34
+   Compiling num-traits v0.2.19
+   Compiling rustix v1.1.4
+   Compiling once_cell v1.21.4
+   Compiling errno v0.3.14
+   Compiling objc2-foundation v0.3.2
+   Compiling rayon v1.12.0
+   Compiling trash v5.2.9
+   Compiling chrono v0.4.45
+   Compiling tempfile v3.27.0
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mv8epstr/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3.82s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-c3cb863045931ea5)
+
+running 1 test
+plan M=128 work=9187 wall=9.931833ms
+plan M=1024 work=537027 wall=390.640459ms
+
+thread 'removal::tests::removal_nesting_budget' (403531013) panicked at crates/disktree-core/src/removal.rs:1789:9:
+8x marks: 9187 -> 537027
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test removal::tests::removal_nesting_budget ... FAILED
+
+failures:
+
+failures:
+    removal::tests::removal_nesting_budget
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.40s
+
+error: test failed, to rerun pass `-p disktree-core --lib`
