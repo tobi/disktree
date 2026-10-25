@@ -18,7 +18,10 @@ use rayon::prelude::*;
 use crate::tree::Node;
 
 /// A kind of data, for colour.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Category {
     /// Source code and checkouts.
     Code,
@@ -70,7 +73,8 @@ impl Category {
 }
 
 /// Why a directory's space can be had back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Reclaim {
     /// A cache: whatever wrote it will write it again.
     Regenerable,

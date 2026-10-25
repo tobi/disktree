@@ -146,6 +146,61 @@ disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
+### In a terminal
+
+`disktree report` scans without opening a window and prints what fills the
+tree: the largest entries, the scan by kind of data, what can be had back,
+and the *Worth a look* list, from the same classification the window draws.
+Like any explicit scan it needs a PATH or `--disk`, and it never removes
+anything.
+
+```text
+$ disktree report ~/src --depth 2
+~/src  36 GiB · 99 files · 79 dirs
+/dev/nvme0n1p2  412 GiB free of 931 GiB · 56% used
+
+    size  share    files
+  21 GiB    56%       65  disktree/  (git)
+  19 GiB    52%        2    target/  (build output)
+ 1.5 GiB     4%        2    .git/
+ 2.3 MiB    <1%       61    … 2 others
+ 8.9 GiB    24%       32  webapp/  (cache)
+ 5.9 GiB    16%       30    node_modules/  (reinstallable)
+ 3.0 GiB     8%        1    public/  (documents)
+   700 B    <1%        1    … 1 other
+ 7.0 GiB    19%        2  datasets/
+ 7.0 GiB    19%        1    imagenet-mini.tar
+  88 KiB    <1%        1    … 1 other
+
+By kind
+  21 GiB    56%  Git
+ 7.0 GiB    19%  Other
+ 5.9 GiB    16%  Cache
+ 3.0 GiB     8%  Media
+ 2.3 MiB    <1%  Code
+
+Can be had back: 25 GiB, 68% of the scan (hatched in the window)
+  19 GiB  build output
+ 5.9 GiB  reinstallable
+
+Worth a look
+  19 GiB  build output   ~/src/disktree/target
+ 5.9 GiB  reinstallable  ~/src/webapp/node_modules
+```
+
+Every scan option applies: `-a`, `-H`, `-X`, `--metric files`, and the
+power and thread flags. `--depth` sets how many levels are listed, with no
+six-level cap. `--top N` (10) and `--min SIZE` (`500M`, `2G`, or a share
+such as the default `1%`) decide what each directory lists; what they leave
+out is summed on an `… N others` row, so no total loses anything.
+`--findings N` (20) sets how long *Worth a look* is.
+
+`--json` prints one document instead, for scripts and coding agents: the
+totals, the volume's space, the unreadable paths, `kinds`, `reclaimable` by
+reason, `findings`, and the listed `tree`, every entry with its absolute
+path, its kind of data and any reason it can be had back. Progress goes to
+stderr, and only when that is a terminal.
+
 ### Servers over SSH (read-only)
 
 ```sh

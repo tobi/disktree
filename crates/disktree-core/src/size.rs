@@ -66,6 +66,30 @@ pub fn human_count(count: u64) -> String {
     }
 }
 
+/// A size as typed on a command line: `512M`, `2G`, `1.5GiB`, `800k`.
+///
+/// A plain number is bytes. Units are binary however they are spelled,
+/// because every size here is printed in them: `1G` is what `1.0 GiB` means.
+pub fn parse_bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|char: char| !(char.is_ascii_digit() || char == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let power = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 1,
+        "m" | "mb" | "mib" => 2,
+        "g" | "gb" | "gib" => 3,
+        "t" | "tb" | "tib" => 4,
+        "p" | "pb" | "pib" => 5,
+        _ => return None,
+    };
+    let bytes = number * 1024_f64.powi(power);
+    (bytes < u64::MAX as f64).then(|| bytes.round() as u64)
+}
+
 /// Share of `total` as a whole percentage, saturating instead of dividing by
 /// zero.
 pub fn share(part: u64, total: u64) -> f64 {
@@ -133,6 +157,19 @@ mod tests {
         assert_eq!(human_count(999_949), "999.9k");
         assert_eq!(human_count(999_999), "1.0M");
         assert_eq!(human_count(999_999_999), "1.0G");
+    }
+
+    #[test]
+    fn typed_sizes_are_binary_whatever_the_spelling() {
+        assert_eq!(parse_bytes("4096"), Some(4096));
+        assert_eq!(parse_bytes("1k"), Some(1024));
+        assert_eq!(parse_bytes("512M"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_bytes("512 MiB"), parse_bytes("512mb"));
+        assert_eq!(parse_bytes("1.5G"), Some(3 * 512 * 1024 * 1024));
+        assert_eq!(parse_bytes("2TB"), Some(2 << 40));
+        for bad in ["", "G", "1.2.3G", "-1G", "1 lots", "1e3", "99999999P"] {
+            assert_eq!(parse_bytes(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

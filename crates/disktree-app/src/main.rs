@@ -17,6 +17,7 @@ mod git;
 mod marks;
 mod palette;
 mod power;
+mod report;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -49,12 +50,15 @@ struct Args {
     options: ScanOptions,
     depth: u32,
     power: Option<power::PowerEfficiency>,
+    /// `disktree report`: print the scan instead of opening a window.
+    report: Option<report::Settings>,
 }
 
 const USAGE: &str = "\
 disktree — a treemap of what is using your disk
 
 usage: disktree [OPTIONS] [PATH]
+       disktree report [OPTIONS] PATH
        disktree ssh HOST [OPTIONS] [PATH]
        disktree extract-scanner ARCH OUTPUT
 
@@ -72,6 +76,11 @@ Without PATH, choose this computer or SSH, then a mount or directory.
 No scan starts before explicit acceptance. Nested mounts are excluded.
 With PATH the window scans it directly, largest first. Space marks the
 selected tile, Enter opens it, c reviews the marked list, ? lists every key.
+
+report scans PATH (or --disk) without a window and prints the largest
+entries as a tree, the scan by kind of data, what can be had back, and what
+is worth a look, then exits. It never removes anything. Progress goes to
+stderr when it is a terminal; the report goes to stdout.
 
 options:
   -a, --apparent-size   measure apparent length instead of allocated blocks
@@ -94,6 +103,15 @@ options:
                         best-effort host CPU budget; 0 disables it (80)
       --metric files    rank by file count instead of bytes
   -h, --help            show this help
+
+report options:
+  -d, --depth N         levels of the tree to list (default 3, no limit)
+      --top N           entries listed per directory (default 10)
+      --min SIZE        fold entries smaller than SIZE into a remainder
+                        line: 500M, 2G, or a share of the scan such as 1%
+                        (default 1%)
+      --findings N      \"worth a look\" findings to list (default 20)
+      --json            one JSON document instead of text
 ";
 
 fn main() -> Result<()> {
@@ -119,6 +137,10 @@ fn run() -> Result<()> {
             power::PowerEfficiency::default()
         });
     let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
+
+    if let Some(settings) = args.report {
+        return report::run(&args.root, args.options, settings);
+    }
 
     if args.check {
         let host = args
@@ -322,15 +344,22 @@ fn parse_args_with_power(
     };
     let mut check = false;
     let mut args = args.peekable();
-    let remote = if args.peek().is_some_and(|arg| arg == "ssh") {
+    let mut report = if args.peek().is_some_and(|arg| arg == "report") {
         args.next();
-        let host =
-            text(args.next(), "ssh needs a host, e.g. disktree ssh dev")?;
-        disktree_core::remote::validate_host(&host)?;
-        Some(host)
+        Some(report::Settings::default())
     } else {
         None
     };
+    let remote =
+        if report.is_none() && args.peek().is_some_and(|arg| arg == "ssh") {
+            args.next();
+            let host =
+                text(args.next(), "ssh needs a host, e.g. disktree ssh dev")?;
+            disktree_core::remote::validate_host(&host)?;
+            Some(host)
+        } else {
+            None
+        };
 
     while let Some(arg) = args.next() {
         match arg.to_str().unwrap_or_default() {
@@ -350,11 +379,41 @@ fn parse_args_with_power(
             "-d" | "--depth" => {
                 let value = text(args.next(), "--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
-                anyhow::ensure!(
-                    (1..=6).contains(&depth),
-                    "--depth must be 1 to 6"
-                );
+                // Six levels is what a window can draw legibly; printed
+                // text has no such ceiling.
+                if report.is_some() {
+                    anyhow::ensure!(depth >= 1, "--depth must be at least 1");
+                } else {
+                    anyhow::ensure!(
+                        (1..=6).contains(&depth),
+                        "--depth must be 1 to 6"
+                    );
+                }
             }
+            "--top" => {
+                let settings = report_option(&mut report, "--top")?;
+                let value = text(args.next(), "--top needs a number")?;
+                let top: usize =
+                    value.parse().context("--top needs a positive integer")?;
+                anyhow::ensure!(top > 0, "--top must be positive");
+                settings.limits.top = top;
+            }
+            "--min" => {
+                let settings = report_option(&mut report, "--min")?;
+                let value = text(args.next(), "--min needs a size")?;
+                settings.limits.min =
+                    disktree_core::report::Threshold::parse(&value)
+                        .with_context(|| {
+                            format!("--min {value}: try 500M, 2G or 1%")
+                        })?;
+            }
+            "--findings" => {
+                let settings = report_option(&mut report, "--findings")?;
+                let value = text(args.next(), "--findings needs a number")?;
+                settings.limits.findings =
+                    value.parse().context("--findings needs a number")?;
+            }
+            "--json" => report_option(&mut report, "--json")?.json = true,
             "--power-efficiency" => {
                 let value =
                     text(args.next(), "--power-efficiency needs a preset")?;
@@ -436,7 +495,17 @@ fn parse_args_with_power(
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let choose_root = root.is_none() && !disk && !check;
+    if let Some(report) = &mut report {
+        // A report is asked for on purpose, so it scans nothing implicitly
+        // either: no PATH is not taken to mean the home directory.
+        anyhow::ensure!(
+            root.is_some() || disk,
+            "disktree report needs a PATH or --disk, e.g. disktree report ~"
+        );
+        anyhow::ensure!(!check, "--check only applies to disktree ssh HOST");
+        report.limits.depth = depth as usize;
+    }
+    let choose_root = root.is_none() && !disk && !check && report.is_none();
     if remote.is_some() {
         return Ok(Args {
             root: root.unwrap_or_default(),
@@ -447,6 +516,7 @@ fn parse_args_with_power(
             power,
             options,
             depth,
+            report: None,
         });
     }
     let home = std::env::home_dir();
@@ -486,7 +556,18 @@ fn parse_args_with_power(
         options,
         depth: depth.clamp(1, 6),
         power,
+        report,
     })
+}
+
+/// The settings an option only `report` takes; anywhere else it is a typo.
+fn report_option<'a>(
+    report: &'a mut Option<report::Settings>,
+    option: &str,
+) -> Result<&'a mut report::Settings> {
+    report
+        .as_mut()
+        .with_context(|| format!("{option} only applies to disktree report"))
 }
 
 /// The console of the terminal disktree was started from, if any: a
@@ -661,6 +742,39 @@ mod argument_tests {
         .expect("native path");
         assert_eq!(args.root, dunce::canonicalize(root).expect("root"));
         assert_eq!(args.options.threads.max_threads, 4);
+    }
+
+    #[test]
+    fn report_needs_an_explicit_root_and_keeps_its_own_options() {
+        let parse = |args: &[&str]| {
+            parse_args(args.iter().map(std::ffi::OsString::from))
+        };
+        let args = parse(&[
+            "report", "--depth", "9", "--top", "4", "--min", "2G", "--json",
+            "-H", ".",
+        ])
+        .expect("report");
+        let report = args.report.expect("report settings");
+        assert_eq!(report.limits.depth, 9, "no window, no six-level cap");
+        assert_eq!(report.limits.top, 4);
+        assert_eq!(
+            report.limits.min,
+            disktree_core::report::Threshold::Bytes(2 << 30)
+        );
+        assert!(report.json);
+        assert!(!args.options.include_hidden, "scan options still apply");
+        assert!(!args.choose_root);
+        assert!(parse(&["report", "--disk"]).expect("disk").report.is_some());
+
+        assert!(parse(&["report"]).is_err(), "no implicit home scan");
+        assert!(parse(&["report", "--top", "0", "."]).is_err());
+        assert!(parse(&["report", "--min", "lots", "."]).is_err());
+        assert!(parse(&["report", "--check", "."]).is_err());
+        for option in ["--json", "--top", "--min", "--findings"] {
+            assert!(parse(&[option, "1", "."]).is_err(), "{option} alone");
+        }
+        assert!(parse(&["--depth", "9", "."]).is_err(), "the window caps");
+        assert!(parse(&["."]).expect("window").report.is_none());
     }
 
     #[test]
