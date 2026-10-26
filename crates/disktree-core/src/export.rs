@@ -331,6 +331,7 @@ mod tests {
         Target {
             path: PathBuf::from(path),
             bytes,
+            unshared: bytes,
             is_dir,
             hidden: false,
         }
@@ -514,6 +515,7 @@ mod tests {
         let targets = [Target {
             path: PathBuf::from("/tmp").join(name),
             bytes: 1,
+            unshared: 1,
             is_dir: false,
             hidden: false,
         }];

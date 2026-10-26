@@ -76,6 +76,13 @@ pub struct Node {
     /// Subtree total: direct contents plus every descendant. A file's own
     /// size, or nothing for a second name of a file already charged.
     pub bytes: u64,
+    /// The part of `bytes` no other file shares: what removing this node is
+    /// sure to give back, and all a projection may count. A directory's is
+    /// derived. A leaf's is all of its `bytes` unless its file system says
+    /// it shares blocks: an APFS clone holds nothing of its own, so marking
+    /// one copy of three projects nothing, which is what deleting it frees;
+    /// see [`crate::macos`] for a copy edited away from its family.
+    pub unshared: u64,
     /// Files at or beneath this node; `1` for a file.
     pub files: u64,
     /// Directories at or beneath this node; `1` for a directory. Four
@@ -109,6 +116,7 @@ impl Node {
             name: name.into(),
             kind: NodeKind::Directory,
             bytes: 0,
+            unshared: 0,
             files: 0,
             dirs: 1,
             inode: None,
@@ -130,6 +138,7 @@ impl Node {
             name: name.into(),
             kind,
             bytes,
+            unshared: bytes,
             files: u64::from(kind == NodeKind::File),
             dirs: 0,
             inode: None,
@@ -264,20 +273,21 @@ impl Node {
     }
 }
 
-/// Recompute `bytes`, `files` and `dirs` bottom-up, then order children by
-/// `metric`, largest first.
+/// Recompute `bytes`, `unshared`, `files` and `dirs` bottom-up, then order
+/// children by `metric`, largest first.
 ///
-/// A leaf's `bytes` is its measured size and the only input; every total is
-/// derived from the leaves, as are the direct figures [`Node::own_bytes`]
-/// and [`Node::own_files`]. Deriving them is what keeps them consistent:
-/// hardlink de-duplication rewrites a leaf's weight, and every total above
-/// it follows without a second pass.
+/// A leaf's `bytes` and `unshared` are its measured sizes and the only
+/// inputs; every total is derived from the leaves, as are the direct
+/// figures [`Node::own_bytes`] and [`Node::own_files`]. Deriving them is
+/// what keeps them consistent: hardlink de-duplication rewrites a leaf's
+/// weight, and every total above it follows without a second pass.
 pub fn aggregate(node: &mut Node, metric: Metric) {
     aggregate_at(node, metric, 0, None);
 }
 
 /// [`aggregate`], charging a hardlinked file once: a leaf whose identity
-/// `seen` already holds weighs nothing. Which of a file's names is charged
+/// `seen` already holds weighs nothing. On APFS a clone's identity is its
+/// family's, so the family is charged once too. Which of a file's names is charged
 /// is whichever a worker reaches first, so two scans of an unchanged tree
 /// can split it differently between folders; the totals are the same.
 pub(crate) fn aggregate_deduped(node: &mut Node, metric: Metric, seen: &Seen) {
@@ -369,12 +379,17 @@ fn aggregate_at(
             && let Some(key) = node.identity()
             && !seen.insert(key)
         {
+            // Never more freed than charged: a second name's private bytes
+            // are the first name's, and a clone family's members share
+            // every block, so none has any of its own.
             node.bytes = 0;
+            node.unshared = 0;
         }
         return;
     }
 
     let mut bytes = 0;
+    let mut unshared = 0;
     let mut files = 0;
     let mut dirs: u32 = 1;
     let mut modified = 0;
@@ -391,10 +406,12 @@ fn aggregate_at(
         modified = modified.max(child.modified);
         // Saturating: a corrupt volume's file table can claim any size.
         bytes = child.bytes.saturating_add(bytes);
+        unshared = child.unshared.saturating_add(unshared);
         files += child.files;
         dirs += child.dirs;
     }
     node.bytes = bytes;
+    node.unshared = unshared;
     node.files = files;
     node.dirs = dirs;
     node.modified = modified;
@@ -441,7 +458,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn a_node_stays_small() {
-        assert_eq!(size_of::<Node>(), 88);
+        assert_eq!(size_of::<Node>(), 96);
     }
 
     #[test]
@@ -513,6 +530,42 @@ mod tests {
             .iter()
             .find(|child| &*child.name == name)
             .unwrap_or_else(|| panic!("no child named {name}"))
+    }
+
+    #[test]
+    fn what_is_sure_to_be_freed_is_derived_and_charged_once() {
+        let family = Some((1, NonZeroU64::new(7).unwrap()));
+        let mut clones = Node::directory("clones");
+        for name in ["a", "b"] {
+            // Each copy reports the family's blocks and none of its own.
+            let mut copy = leaf(name, 1000);
+            copy.unshared = 0;
+            copy.inode = family;
+            clones.children.push(copy);
+        }
+        let mut edited = leaf("edited", 1000);
+        edited.unshared = 100;
+        let mut linked = Node::directory("linked");
+        for name in ["first", "second"] {
+            let mut link = leaf(name, 400);
+            link.inode = Some((1, NonZeroU64::new(9).unwrap()));
+            linked.children.push(link);
+        }
+        let mut root = Node::directory("root");
+        root.children.push(clones);
+        root.children.push(edited);
+        root.children.push(linked);
+        root.children.push(leaf("plain", 500));
+
+        aggregate_deduped(&mut root, Metric::Bytes, &Seen::new());
+        assert_eq!(root.bytes, 1000 + 1000 + 400 + 500);
+        assert_eq!(root.unshared, 100 + 400 + 500);
+        assert_eq!(child_named(&root, "clones").bytes, 1000, "charged once");
+        assert_eq!(child_named(&root, "clones").unshared, 0);
+        // A second name is charged nothing, so it frees nothing either.
+        assert_eq!(child_named(&root, "linked").unshared, 400);
+        // A leaf nobody measured for sharing is sure to free all of itself.
+        assert_eq!(leaf("x", 5).unshared, 5);
     }
 
     #[test]

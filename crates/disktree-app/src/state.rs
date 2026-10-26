@@ -2174,6 +2174,7 @@ impl Disktree {
             hidden: is_hidden(&path),
             path,
             bytes: node.bytes,
+            unshared: node.unshared,
             is_dir: node.is_dir(),
         })
     }

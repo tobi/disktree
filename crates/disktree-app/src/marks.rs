@@ -67,12 +67,14 @@ impl Marks {
             match find(root_path, root, &item.path) {
                 Some(node) => resolved.push(Target {
                     bytes: node.bytes,
+                    unshared: node.unshared,
                     is_dir: node.is_dir(),
                     hidden: is_hidden(&item.path),
                     path: item.path.clone(),
                 }),
                 None => resolved.push(Target {
                     bytes: 0,
+                    unshared: 0,
                     ..item.clone()
                 }),
             }
@@ -133,7 +135,10 @@ mod tests {
     fn tree() -> Node {
         let mut root = Node::directory("home");
         let mut cache = Node::directory(".cache");
-        cache.children.push(file("blob.bin", 900));
+        // A clone, mostly its family's: only 300 bytes are its own.
+        let mut blob = file("blob.bin", 900);
+        blob.unshared = 300;
+        cache.children.push(blob);
         root.children.push(cache);
         root.children.push(file("notes.bin", 100));
         aggregate(&mut root, Metric::Bytes);
@@ -144,6 +149,7 @@ mod tests {
         Target {
             path: PathBuf::from(path),
             bytes,
+            unshared: bytes,
             is_dir: false,
             hidden: false,
         }
@@ -178,9 +184,11 @@ mod tests {
 
         marks.refresh(root_path, &root, Metric::Bytes);
         assert_eq!(marks.items()[0].bytes, 900);
+        assert_eq!(marks.items()[0].unshared, 300, "only what it frees");
         assert!(marks.items()[0].is_dir);
         assert!(marks.items()[0].hidden, "the .cache mark is hidden");
         assert_eq!(marks.items()[1].bytes, 0, "a path that no longer exists");
+        assert_eq!(marks.items()[1].unshared, 0);
     }
 
     #[test]

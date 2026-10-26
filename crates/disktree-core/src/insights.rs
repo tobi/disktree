@@ -33,7 +33,9 @@ pub enum Finding {
 pub struct Candidate {
     /// Where it is, from the scanned root.
     pub crumbs: Vec<usize>,
-    /// What clearing it frees. For stale experiments, only the stale ones.
+    /// What clearing it is sure to free: its unshared bytes, so a folder of
+    /// APFS clones is not offered for space its copies elsewhere keep. For
+    /// stale experiments, only the stale ones.
     pub bytes: u64,
     pub finding: Finding,
 }
@@ -62,14 +64,14 @@ fn visit(
 ) {
     // Nothing beneath a small directory can reach `MIN_BYTES` either, so a
     // scan of millions of files looks at a few thousand directories.
-    if !node.is_dir() || node.bytes < MIN_BYTES {
+    if !node.is_dir() || node.unshared < MIN_BYTES {
         return;
     }
     // Topmost only: everything beneath a reclaimable directory goes with it.
     if let Some(reason) = node.reclaim {
         found.push(Candidate {
             crumbs: crumbs.clone(),
-            bytes: node.bytes,
+            bytes: node.unshared,
             finding: Finding::Reclaimable(reason),
         });
         return;
@@ -91,7 +93,7 @@ fn visit(
                 .unwrap_or(now);
             found.push(Candidate {
                 crumbs: crumbs.clone(),
-                bytes: node.bytes,
+                bytes: node.unshared,
                 finding: Finding::Worktrees {
                     count: trees.len(),
                     oldest_days: (now - oldest).max(0) / DAY,
@@ -111,7 +113,7 @@ fn visit(
             && now - child.modified > STALE_DAYS * DAY;
         if is_stale {
             stale.0 += 1;
-            stale.1 += child.bytes;
+            stale.1 += child.unshared;
             // A stale experiment is judged whole; its caches go with it.
             continue;
         }
@@ -213,6 +215,36 @@ mod tests {
         );
         assert_eq!(found[0].bytes, 5 * GIB);
         assert_eq!(found[2].bytes, 4 * GIB, "only the stale experiment counts");
+    }
+
+    /// Worktrees cloned with `cp -c` share nearly every block with the
+    /// checkout they came from: offered for what deleting them frees, not
+    /// for what each copy reports.
+    #[test]
+    fn a_finding_offers_only_what_clearing_it_frees() {
+        let mut copy = file("x", 3 * GIB, 41);
+        copy.unshared = GIB / 2;
+        let mut twin = file("y", 3 * GIB, 41);
+        twin.unshared = 0;
+        let root = scan(dir(
+            "tobi",
+            vec![dir(
+                ".codex",
+                vec![dir(
+                    "worktrees",
+                    vec![dir("a1", vec![copy]), dir("b2", vec![twin])],
+                )],
+            )],
+        ));
+        let found = worth_a_look(&root, NOW, 10);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bytes, GIB / 2);
+
+        // All of it shared: nothing to offer at all.
+        let mut alone = file("blob", 5 * GIB, 1);
+        alone.unshared = 0;
+        let cache = scan(dir("tobi", vec![dir(".cache", vec![alone])]));
+        assert!(worth_a_look(&cache, NOW, 10).is_empty());
     }
 
     #[test]

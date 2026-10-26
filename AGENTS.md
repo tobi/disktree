@@ -73,10 +73,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    folders and depth; see `mft.rs`. That path counts every stream's
    allocation, alternate data streams included since they go when the file
    goes, so for a file with alternate streams it can exceed the walk's
-   number.
-2. **Totals are derived, never tracked.** A leaf's `bytes` is the only
-   input: `tree::aggregate` computes every directory's `bytes`, `files` and
-   `dirs` from its children, and `own_bytes()`/`own_files()` read the direct
+   number. An APFS clone family is charged once, like a hardlinked file:
+   every copy's `st_blocks` counts the blocks they share; see `macos.rs`.
+2. **Totals are derived, never tracked.** A leaf's `bytes` and `unshared`
+   are the only inputs: `tree::aggregate` computes every directory's
+   `bytes`, `unshared`, `files` and `dirs` from its children, and `own_bytes()`/`own_files()` read the direct
    children when asked. Hardlink de-duplication zeroes a duplicate leaf's
    `bytes` while that pass runs; anything that patches a directory's `bytes`
    directly will be overwritten. `Node` is paid for tens of millions of
@@ -102,7 +103,9 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 8. **The view transform is the only thing zoom changes.** Layout runs in
    base-space pixels and is cached; `screen = (base - origin) * scale`.
 9. **The status bar never claims a saving it cannot measure.** Projections come
-   from marked bytes *on the volume the meter measures*, which is the scan's own
+   from marked *unshared* bytes — an APFS clone's blocks stay while another
+   copy does, so they are never projected; see `Node::unshared` —
+   *on the volume the meter measures*, which is the scan's own
    notion of a volume — the mount *source* — so a mark on a disk mounted inside
    the tree, which `-X` and the media exception allow, is reported and never
    added to this volume's free space; see `space::attribution`. The final number

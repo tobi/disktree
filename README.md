@@ -104,9 +104,12 @@ What is different from Linux:
 
 - **Free space** is what `df` reports. Finder's figure is larger: it counts
   purgeable space (caches and local snapshots macOS will clear on its own).
-- **Cloned files** (copies APFS shares blocks between, as Finder's Duplicate
-  makes) are each counted in full, so a total can exceed what deleting them
-  frees.
+- **Cloned files** (copies APFS shares blocks between, as `cp -c` and
+  Finder's Duplicate make) are counted once per family, like hardlinks. Each
+  copy holds none of those blocks alone, so marking one projects no saving:
+  deleting it frees nothing while another copy stays. A copy edited after
+  cloning still shares the rest of its blocks; it projects only what it
+  holds alone, or nothing if it is 64 KiB or smaller.
 - **Time Machine's local snapshots** are not files and do not appear; they
   are part of the gap between the scan and the disk's used space.
 - **Cloud-only folders** (iCloud Drive, Dropbox and the like, evicted to the
@@ -402,7 +405,8 @@ escaped in the prompt, so it cannot pass for another path.
 - **Disk usage** by default: `st_blocks × 512`, the number `du` reports and the
   space that actually comes back when a file is deleted. Apparent size (what
   `ls -l` shows) is one toggle away.
-- **Hardlinks once.** Two names for one inode cost one file.
+- **Hardlinks once.** Two names for one inode cost one file. On macOS an
+  APFS clone family counts once too.
 - **Hidden entries included**, because `~/.cache` is often the biggest thing in
   a home directory. Symlinks are not followed.
 - **The projection counts one volume.** The meter shows the scanned volume's
@@ -412,7 +416,8 @@ escaped in the prompt, so it cannot pass for another path.
   subvolume is left out of the projection — removing it gives its space back
   somewhere else, or, in a snapshot, shares its blocks with the live files —
   and the panel and the review screen say what was left out. A mark whose
-  volume cannot be told is not claimed either.
+  volume cannot be told is not claimed either, and neither are blocks a
+  marked APFS clone shares with copies that stay.
 
 The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built

@@ -345,9 +345,19 @@ fn delete_dialog(
         ),
         targets => format!("Delete {} items permanently?", targets.len()),
     };
+    // Only what is sure to come back: a clone's blocks stay with its
+    // family, so deleting it frees what it alone holds.
+    let shared = if plan.shared() > 0 {
+        format!(
+            "; {} more is shared with clones and stays",
+            human_bytes(plan.shared())
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        "This frees {}. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
-        human_bytes(plan.bytes())
+        "This frees {}{shared}. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
+        human_bytes(plan.frees())
     );
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
@@ -2288,11 +2298,16 @@ fn disk_section(
 }
 
 /// What the volume meter leaves out, and why, when it leaves anything out:
-/// bytes marked on another volume come back there, and bytes no volume can
-/// be found for are not claimed at all. `None` when every marked byte is
-/// this volume's, which is the usual case.
-fn not_counted(plan: &Plan) -> Option<String> {
+/// bytes shared with clones stay on the disk, bytes marked on another
+/// volume come back there, and bytes no volume can be found for are not
+/// claimed at all. `None` when every marked byte is this volume's own,
+/// which is the usual case.
+pub fn not_counted(plan: &Plan) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    if plan.shared() > 0 {
+        parts
+            .push(format!("{} shared with clones", human_bytes(plan.shared())));
+    }
     if plan.foreign() > 0 {
         parts.push(format!("{} on other volumes", human_bytes(plan.foreign())));
     }

@@ -1201,6 +1201,7 @@ fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
         app.marks.toggle(disktree_core::removal::Target {
             path: temp.path().join("junk"),
             bytes: 300_000,
+            unshared: 300_000,
             is_dir: true,
             hidden: false,
         });
@@ -1234,6 +1235,7 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
         app.marks.toggle(disktree_core::removal::Target {
             path: junk.clone(),
             bytes: 300_000,
+            unshared: 300_000,
             is_dir: true,
             hidden: false,
         });
@@ -1276,6 +1278,7 @@ fn remote_review_copies_host_guarded_script_and_prompt(
         app.marks.toggle(disktree_core::removal::Target {
             path: temp.path().join("junk"),
             bytes: 300_000,
+            unshared: 300_000,
             is_dir: true,
             hidden: false,
         });
@@ -1316,6 +1319,7 @@ fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
         app.marks.toggle(disktree_core::removal::Target {
             path: temp.path().join("junk"),
             bytes: 300_000,
+            unshared: 300_000,
             is_dir: true,
             hidden: false,
         });
@@ -1862,6 +1866,65 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
 
 fn names_at(names: &[String], index: usize) -> String {
     names.get(index).cloned().unwrap_or_default()
+}
+
+/// An APFS clone shares every block with its original, so the scan charges
+/// the pair once, and marking it projects only what deleting it frees: the
+/// meter never promises the shared blocks, and the review and the delete
+/// dialog say where they went.
+#[cfg(target_os = "macos")]
+#[gpui_kit::test]
+fn a_marked_apfs_clone_projects_only_what_it_holds_alone(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let copied = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(temp.path().join("junk/blob.bin"))
+        .arg(temp.path().join("keep/copy.bin"))
+        .status()
+        .expect("cp");
+    if !copied.success() {
+        eprintln!("skipped: no clones on {}", temp.path().display());
+        return;
+    }
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let (keep, junk) = read(&view, cx, |app| {
+        let at = |rel: &str| app.crumbs_for_path(&temp.path().join(rel));
+        (at("keep").expect("keep"), at("junk").expect("junk"))
+    });
+    let tree_bytes = read(&view, cx, |app| app.tree().expect("tree").bytes);
+    assert_eq!(tree_bytes, 1_000 + 200_000 + 100_000 + 300_000, "once");
+
+    update(&view, cx, |app, cx| {
+        app.toggle_mark(&keep, cx);
+        app.toggle_mark(&junk, cx);
+    });
+    let plan = read(&view, cx, Disktree::plan);
+    assert_eq!(plan.bytes(), 1_000 + 200_000 + 100_000);
+    assert_eq!(plan.shared(), 200_000, "the family's blocks");
+    assert_eq!(plan.frees(), 1_000 + 100_000);
+
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    let said = crate::views::not_counted(&plan).expect("the shared bytes");
+    assert!(said.contains("shared with clones"), "{said}");
+    update(&view, cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        app.commit(cx);
+    });
+    draw(cx);
+    assert!(
+        read(&view, cx, |app| app.confirm_open),
+        "the dialog is drawn"
+    );
+    assert!(temp.path().join("keep/copy.bin").exists(), "only asked");
 }
 
 #[gpui_kit::test]

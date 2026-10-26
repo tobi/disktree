@@ -57,7 +57,9 @@ pub struct ScanOptions {
     /// Stop descending past this depth. Totals below that depth are then
     /// unknown, which makes an overview scan of a huge tree cheap.
     pub max_depth: Option<usize>,
-    /// Count a hardlinked file once instead of once per link.
+    /// Count a hardlinked file once instead of once per link, and an APFS
+    /// clone family once instead of once per copy: every copy reports the
+    /// blocks the family shares.
     pub dedup_hardlinks: bool,
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
@@ -501,6 +503,13 @@ impl WalkContext {
         // What the link leads to, so a file that is also reached directly is
         // charged once.
         facts.identity = identity_of(path, &meta);
+        // And as its listing would charge it: a clone as its family.
+        #[cfg(target_os = "macos")]
+        if let Ok(entry) = crate::macos::stat(path) {
+            facts.identity = Some(entry.charged_as());
+            facts.unshared = entry.unshared(facts.size);
+            facts.shared |= entry.shared();
+        }
         self.leaf(name, kind_of(&meta, meta.file_type()), &facts)
     }
 
@@ -574,6 +583,9 @@ enum Listing {
 /// What a leaf contributes.
 struct Facts {
     size: u64,
+    /// The part of `size` no other file shares, which removing the file is
+    /// sure to give back; all of it where nothing says otherwise.
+    unshared: u64,
     identity: Option<(u64, u64)>,
     modified: i64,
     /// The file may have another name the walk could meet: its identity is
@@ -583,8 +595,10 @@ struct Facts {
 
 impl Facts {
     fn of(meta: &Metadata, apparent_size: bool) -> Self {
+        let size = measure(meta, apparent_size);
         Self {
-            size: measure(meta, apparent_size),
+            size,
+            unshared: size,
             identity: file_identity(meta),
             modified: modified_seconds(meta),
             shared: shares_inode(meta),
@@ -664,13 +678,17 @@ impl Listed for crate::macos::Entry {
     }
 
     fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        let size = if apparent_size {
+            self.apparent()
+        } else {
+            self.allocated()
+        };
         Ok(Facts {
-            size: if apparent_size {
-                self.apparent()
-            } else {
-                self.allocated()
-            },
-            identity: Some(self.identity()),
+            size,
+            unshared: self.unshared(size),
+            // A clone is charged as its family, so the family is charged
+            // once however many copies the walk meets.
+            identity: Some(self.charged_as()),
             modified: self.modified(),
             shared: self.shared(),
         })
@@ -707,12 +725,14 @@ impl Listed for crate::windows::Entry {
     }
 
     fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        let size = if apparent_size {
+            self.apparent()
+        } else {
+            self.allocated()
+        };
         Ok(Facts {
-            size: if apparent_size {
-                self.apparent()
-            } else {
-                self.allocated()
-            },
+            size,
+            unshared: size,
             identity: self.identity(),
             modified: self.modified(),
             // The listing has no link count; a file id is free here, so
@@ -834,6 +854,7 @@ impl PendingDir {
             name: partial.name,
             kind: NodeKind::Directory,
             bytes: 0,
+            unshared: 0,
             files: 0,
             dirs: 1,
             inode: None,
@@ -1225,6 +1246,7 @@ fn leaf_node(
     track: bool,
 ) -> Node {
     let mut node = Node::entry(name, kind, facts.size);
+    node.unshared = facts.unshared;
     if track {
         node.inode = facts
             .identity
@@ -1561,6 +1583,66 @@ mod tests {
             },
         );
         assert_eq!(counted.bytes, 8192);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_apfs_clone_family_is_charged_once_and_frees_only_its_own() {
+        use crate::macos::testing::{clone_file, on_apfs};
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        if !on_apfs(root) {
+            eprintln!("skipped: {} is not on APFS", root.display());
+            return;
+        }
+        // The copy in another folder, so the folder that is not charged
+        // shows what a mark on it would wrongly have claimed.
+        let original = write(root, "data/original.bin", 1 << 20);
+        fs::create_dir(root.join("copies")).expect("mkdir");
+        clone_file(&original, &root.join("copies/copy.bin"));
+        write(root, "plain.bin", 1 << 20);
+        let allocated = ScanOptions::default();
+
+        let tree = scan_dir(root, &allocated);
+        let plain = child(&tree, "plain.bin").bytes;
+        let family = {
+            use std::os::unix::fs::MetadataExt as _;
+            fs::metadata(&original).expect("stat").blocks() * 512
+        };
+        assert!(family >= 1 << 20);
+        let (data, copies) = (child(&tree, "data"), child(&tree, "copies"));
+        assert_eq!(data.bytes + copies.bytes, family, "charged once");
+        assert_eq!(tree.bytes, family + plain);
+        assert_eq!(data.unshared + copies.unshared, 0, "all of it shared");
+        assert_eq!(tree.unshared, plain, "only the plain file is sure");
+        assert_eq!(child(&tree, "plain.bin").unshared, plain);
+
+        let counted = scan_dir(
+            root,
+            &ScanOptions {
+                dedup_hardlinks: false,
+                ..allocated
+            },
+        );
+        assert_eq!(counted.bytes, 2 * family + plain, "once per copy");
+        assert_eq!(counted.unshared, plain);
+
+        // Reached again through a followed link, the copy is still its
+        // family, not a third file.
+        std::os::unix::fs::symlink(
+            root.join("copies/copy.bin"),
+            root.join("link.bin"),
+        )
+        .expect("symlink");
+        let followed = scan_dir(
+            root,
+            &ScanOptions {
+                follow_links: true,
+                ..allocated
+            },
+        );
+        assert_eq!(followed.bytes, family + plain);
+        assert_eq!(followed.unshared, plain);
     }
 
     #[test]

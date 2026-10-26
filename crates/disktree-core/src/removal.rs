@@ -28,8 +28,12 @@ use std::thread;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub path: PathBuf,
-    /// Bytes measured when the path was marked; used for the projection.
+    /// Bytes measured when the path was marked: what it spends on disk.
     pub bytes: u64,
+    /// The part of `bytes` no other file shares, measured with them: what
+    /// removing the path is sure to give back, and so all the projection
+    /// counts. See [`crate::tree::Node::unshared`].
+    pub unshared: u64,
     pub is_dir: bool,
     pub hidden: bool,
 }
@@ -78,7 +82,8 @@ pub struct Plan {
     pub blocked: Vec<Blocked>,
     /// The scanned root the targets were judged against.
     pub root: PathBuf,
-    /// Bytes the targets free on `root`'s volume; see [`Self::reclaim`].
+    /// Bytes the targets are sure to free on `root`'s volume; see
+    /// [`Self::reclaim`].
     reclaim: u64,
     /// Bytes the targets free on other volumes; see [`Self::foreign`].
     foreign: u64,
@@ -89,13 +94,14 @@ impl Plan {
         self.targets.iter().map(|target| target.bytes).sum()
     }
 
-    /// Bytes the targets free on the volume `root` is on: the only ones the
-    /// free space meter may add to that volume's projection.
+    /// Bytes the targets are sure to free on the volume `root` is on: the
+    /// only ones the free space meter may add to that volume's projection.
     ///
     /// [`Self::bytes`] counts every target, which is what a delete list
     /// wants. A mark on another volume — `-X` crosses filesystems, and a
     /// disk mounted under the root can be marked — gives its space back
     /// there, so projecting it here would lend one disk another's bytes.
+    /// And only unshared bytes count anywhere: see [`Self::shared`].
     pub const fn reclaim(&self) -> u64 {
         self.reclaim
     }
@@ -105,11 +111,30 @@ impl Plan {
         self.foreign
     }
 
-    /// Bytes whose volume could not be told: no saving is claimed for them
-    /// either, since a projection the meter cannot stand behind is worse
-    /// than a smaller one.
+    /// Bytes the targets share with other files: an APFS clone's blocks
+    /// are its family's, so deleting one copy frees none of them. No saving
+    /// is claimed for them. Deleting every copy does free them, which the
+    /// measured result then shows; nothing short of the volume's own extent
+    /// map can say so in advance, since a copy edited away from its family
+    /// still shares most of its blocks.
+    pub fn shared(&self) -> u64 {
+        self.targets
+            .iter()
+            .map(|target| target.bytes.saturating_sub(target.unshared))
+            .sum()
+    }
+
+    /// What removing the targets is sure to free, wherever it comes back:
+    /// [`Self::bytes`] less [`Self::shared`].
+    pub fn frees(&self) -> u64 {
+        self.bytes().saturating_sub(self.shared())
+    }
+
+    /// Unshared bytes whose volume could not be told: no saving is claimed
+    /// for them either, since a projection the meter cannot stand behind
+    /// is worse than a smaller one.
     pub fn unattributed(&self) -> u64 {
-        self.bytes().saturating_sub(self.reclaim + self.foreign)
+        self.frees().saturating_sub(self.reclaim + self.foreign)
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -184,7 +209,7 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     // Which volume each target's bytes come back to. Only what comes back to
     // the scanned volume may be shown against its free space.
     for target in &plan.targets {
-        let bytes = target.bytes;
+        let bytes = target.unshared.min(target.bytes);
         match crate::space::attribution(
             mounts.mounts.as_deref(),
             &plan.root,
@@ -1600,6 +1625,7 @@ mod tests {
         Target {
             path: path.to_path_buf(),
             bytes,
+            unshared: bytes,
             is_dir: path.is_dir(),
             hidden: false,
         }
@@ -1829,6 +1855,43 @@ mod tests {
         assert_eq!(plan.reclaim(), 0);
         assert_eq!(plan.foreign(), 0);
         assert_eq!(plan.unattributed(), 50, "no saving may be claimed");
+    }
+
+    /// An APFS clone's blocks are its family's: deleting one copy frees
+    /// only what it holds alone, so only that is projected, on any volume,
+    /// and the rest is said to be shared rather than silently dropped.
+    #[test]
+    fn only_unshared_bytes_are_projected() {
+        let table = "\
+/dev/sda2 / ext4 rw 0 0
+/dev/sdb1 /data ext4 rw 0 0
+";
+        let mounts = MountTable {
+            points: crate::space::parse_mounts(table)
+                .iter()
+                .map(|mount| guard_key(&mount.point))
+                .collect(),
+            media: Vec::new(),
+            mounts: Some(crate::space::parse_mounts(table)),
+        };
+        let shared = |path: &str, bytes, unshared| Target {
+            unshared,
+            ..target(Path::new(path), bytes)
+        };
+        let marked = [
+            shared("/home/tobi/copy", 1000, 0),
+            shared("/home/tobi/edited", 1000, 100),
+            target(Path::new("/home/tobi/plain"), 500),
+            shared("/data/copy", 200, 50),
+        ];
+        let plan = plan_against(&marked, Path::new("/"), &mounts);
+        assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
+        assert_eq!(plan.bytes(), 2700, "the list still says what goes");
+        assert_eq!(plan.shared(), 1000 + 900 + 150);
+        assert_eq!(plan.frees(), 650);
+        assert_eq!(plan.reclaim(), 100 + 500, "this disk's own bytes");
+        assert_eq!(plan.foreign(), 50);
+        assert_eq!(plan.unattributed(), 0);
     }
 
     #[test]
