@@ -986,6 +986,133 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
     assert!(!read(&view, cx, |app| app.show_help));
 }
 
+/// The AI agent panel opens from the explore screen, draws, hands over a
+/// prompt naming this disktree and the scanned root, and closes.
+#[gpui_kit::test]
+fn the_agent_panel_copies_a_prompt_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    assert!(
+        cx.debug_bounds("agent-actions").is_some(),
+        "the top bar buttons"
+    );
+    assert!(cx.debug_bounds("agent-panel").is_none());
+
+    press(cx, "a");
+    assert!(read(&view, cx, |app| app.show_agent));
+    assert!(
+        cx.debug_bounds("agent-panel").is_some(),
+        "the panel is drawn"
+    );
+
+    press(cx, "enter");
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("a prompt on the clipboard");
+    let exe = std::env::current_exe().expect("test binary");
+    assert!(
+        copied.contains(&format!("'{}' scan", exe.display())),
+        "{copied}"
+    );
+    let root = read(&view, cx, |app| app.root_path.clone());
+    assert!(copied.contains(&root.display().to_string()), "{copied}");
+    assert!(copied.contains("until I approve each item"), "{copied}");
+    // The panel holds the keyboard: its keys do not reach the treemap.
+    press(cx, "m");
+    let config = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("settings on the clipboard");
+    assert!(config.contains("\"mcpServers\""), "{config}");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Explore);
+
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_agent));
+}
+
+/// At every width from the smallest window up, the agent buttons sit
+/// between the trail and the settings without pushing the settings off the
+/// window or overlapping them; where there is no room they step aside.
+#[gpui_kit::test]
+fn the_top_bar_buttons_never_crowd_the_settings(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    let mut shown = Vec::new();
+    for width in [
+        900.0, 1000.0, 1100.0, 1150.0, 1250.0, 1300.0, 1440.0, 1800.0,
+    ] {
+        cx.simulate_resize(gpui_kit::size(px(width), px(900.)));
+        draw(cx);
+        let settings = cx
+            .debug_bounds("view-settings")
+            .expect("the settings are drawn");
+        let Some(actions) = cx
+            .debug_bounds("agent-actions")
+            .filter(|actions| actions.size.width > px(0.))
+        else {
+            continue;
+        };
+        // Only where the buttons are shown: at the very narrowest the
+        // settings alone already run a few pixels past the edge.
+        assert!(
+            settings.right() <= px(width + 0.5),
+            "buttons pushed the settings off a {width} px window: \
+             {settings:?}"
+        );
+        assert!(
+            actions.right() <= settings.left(),
+            "buttons overlap the settings at {width} px: {actions:?} \
+             {settings:?}"
+        );
+        shown.push(width);
+    }
+    // The default window, 1440 px wide, shows them.
+    assert!(shown.contains(&1440.0), "shown at {shown:?}");
+}
+
+/// About shows this build's version, and Escape closes it.
+#[gpui_kit::test]
+fn the_about_panel_shows_the_version(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    cx.dispatch_action(crate::app_menu::About);
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_about));
+    assert!(
+        cx.debug_bounds("about-panel").is_some(),
+        "the panel is drawn"
+    );
+    assert_eq!(crate::views::VERSION, env!("CARGO_PKG_VERSION"));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_about));
+    assert!(cx.debug_bounds("about-panel").is_none());
+}
+
+/// Without a finished scan there is nothing to export, and the window
+/// says so instead of opening a save panel.
+#[gpui_kit::test]
+fn exporting_waits_for_the_scan(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.tree = None;
+        app.export_report(cx);
+    });
+    let notice = read(&view, cx, |app| app.notice.clone());
+    assert!(
+        notice.is_some_and(|(message, _)| message.contains("scan finishes")),
+        "the export waits"
+    );
+}
+
 #[gpui_kit::test]
 fn the_volume_picker_opens_moves_and_closes(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);

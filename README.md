@@ -146,6 +146,41 @@ disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
+### Ask your AI agent
+
+You don't have to read the treemap alone. Claude, Codex, Cursor or any agent
+that can run commands can use disktree to measure your disk and suggest what
+to clean up — and disktree itself never deletes anything.
+
+In the window, click **AI agent…** in the top bar (or press `a`, or choose
+**File › Use with an AI Agent…**). It shows a prompt written for your machine,
+with the full path to your copy of disktree already filled in. Click **Copy
+prompt**, paste it into your agent, and it will scan, read the report, and come
+back with a plan that asks before removing anything. The prompt looks like
+this:
+
+```text
+I want to free up disk space on my Mac. I have disktree, a read-only disk
+usage tool, installed at:
+  '/Applications/disktree.app/Contents/MacOS/disktree'
+
+Please:
+1. Run: '/Applications/disktree.app/Contents/MacOS/disktree' scan '/Users/you' --json --only overview
+…
+4. Give me a short plan, biggest wins first: what to remove, how much space
+   each frees, how safe it is and why, and the exact command you would use.
+
+Do not delete, move or change anything until I approve each item.
+```
+
+To hand over a snapshot instead, click **Export JSON…** beside it (or press
+`e`, ⌘E, or **File › Export Report as JSON…**) and attach the saved file to a chat: it is the same report
+`disktree scan --json` prints, made from the scan on screen without scanning
+again. To make disktree a tool your agent can call whenever you ask about disk
+space, the same panel copies the MCP settings for Claude Desktop and Cursor and
+the one-line command for Claude Code; see [For scripts and AI
+agents](#for-scripts-and-ai-agents).
+
 ### Servers over SSH (read-only)
 
 ```sh
@@ -380,12 +415,14 @@ and shows how much free space was actually gained.
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
 | `o` | show it in Finder, File Explorer or the file manager |
+| `a` | use disktree from your AI agent: a prompt to copy, and the MCP settings |
+| `e` (`⌘E` / `ctrl e`) | save this scan as a JSON report |
 | right-click | show that tile in Finder, File Explorer or the file manager |
 | `?` | every key |
 | `q` | quit |
 
-On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘R to
-rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
+On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘E to
+export the JSON report, ⌘R to rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
 window quits); other ⌘ chords are left to the system. On Linux and Windows
 the same work with ctrl, with F5 to rescan too.
 
@@ -541,6 +578,123 @@ tested:
   fsmonitor, hooks and pager off, and a checkout that defines its own filter
   drivers is not asked for its status at all ("changes unknown").
 
+## For scripts and AI agents
+
+The window's **AI agent…** button (`a`) is the quick way in; this is
+the detail behind it. The same scanner runs without a window, and only ever
+**reads**: `disktree
+scan`, `disktree summary` and `disktree mcp` list files and directories and
+nothing else. They cannot delete, move, trash or change anything — the removal
+code is not reachable from them, and a test fails the build if their source
+ever names it.
+
+```sh
+disktree scan ~ --json                                # overview, breakdowns, reclaimable, 20 largest
+disktree scan ~ --json --only reclaim                 # just what can likely be freed, and how
+disktree scan ~ --json --only dirs --depth 2          # where the space goes, two levels down
+disktree scan ~ --json --only files --min-size 1G     # files over 1 GiB
+disktree scan ~ --json --only files --ext iso,dmg --older-than 6mo
+disktree scan ~ --json --only dirs --category cache   # cache folders, outermost only
+disktree scan ~/src --json --reclaim build-output     # target/, dist/ and friends
+disktree scan / -X --json --exclude /System --exclude '**/node_modules'
+disktree summary ~ --json                             # capacity and free space, no scan
+```
+
+The report does the arithmetic so an agent does not have to. Every size comes
+as exact bytes, human text and a percent of the total; every time also as an
+age in days. It splits the total three ways — by top-level folder, by kind of
+data and by age — and each split adds up to the total exactly. Reclaimable
+space (caches, build output, dependencies, trash) is totalled by reason, with
+what each reason means, counted once at its outermost folder, alongside the
+volume's free space before and after. Directory lists mark entries that sit
+inside another listed entry, so they are never added twice.
+
+Without `--json` the same report prints as a short table. Options:
+
+| option | meaning |
+| --- | --- |
+| `-n, --top N` | entries per list (default 20, at most 10000) |
+| `--only PARTS` | comma list of `overview` (volume, breakdowns, reclaimable), `reclaim`, `dirs`, `files`, or `all` (the default) |
+| `-d, --depth N` | list only entries at most N levels below PATH (deeper files too are left out of the lists); sizes still count everything beneath |
+| `-a, --apparent-size` | apparent length instead of on-disk allocation |
+| `-x, --one-filesystem` / `-X, --cross-filesystems` | stay on PATH's volume (default) or cross into others |
+| `-H, --no-hidden`, `-l, --follow-links` | as for the window |
+| `-e, --exclude PATTERN` | never enter or count matching names (`node_modules`, `*.vmdk`), or paths if the pattern has a `/`; repeatable |
+| `--min-size SIZE` | at least SIZE: `500M`, `1G`, `1.5GiB` (binary units however spelled) |
+| `--ext EXT[,EXT]` | files with these extensions |
+| `--older-than AGE` | last written before `30d`, `6mo`, `1y`, … ago, or a date `2025-01-31` |
+| `--name PATTERN` | name (or, with a `/`, path) matches |
+| `--category KIND` | `code`, `agent-scratch`, `toolchain`, `synced`, `git`, `media`, `documents`, `cache`, `other` |
+| `--reclaim REASON` | what the window hatches as reclaimable: `any`, `regenerable`, `build-output`, `package-store`, `trash`, … |
+
+Exit status is 0 on success, 1 if the scan failed and 2 for a bad command line.
+The JSON is documented field by field, with its stability promise, in
+[docs/agent-json.md](docs/agent-json.md). A directory literally named `scan`,
+`summary` or `mcp` still opens in the window as `disktree ./scan`.
+
+### MCP server
+
+`disktree mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio, so an agent can ask about disk usage directly. Its tools return the
+same JSON as `disktree scan --json`, and all of them are annotated read-only:
+
+| tool | returns |
+| --- | --- |
+| `scan_path` | the full report: volume, breakdowns, reclaimable, largest directories and files |
+| `largest_files` | the largest files, with the filters |
+| `largest_dirs` | the largest directories; `depth: 1` for an overview, `category: "cache"` for cache folders |
+| `list_files` | files matching filters (`min_size`, `extensions`, `older_than`, `name`, `category`, `reclaim`), 100 by default |
+| `reclaimable_space` | what can likely be freed: totals by reason, the largest places, free space before and after |
+| `disk_summary` | capacity, used, free and available space; nothing is scanned |
+
+The scanning tools take `path` (absolute, or `~/…`), `top`, `depth`,
+`apparent_size`, `one_filesystem`, `include_hidden`, `follow_links`, `exclude`
+and the filters. A scan is reused for five minutes by any call with the same
+path and scan options, so following `scan_path` with `list_files` costs
+nothing; `refresh: true` walks again. Long scans send progress notifications
+when the client asks for them, and a cancelled call stops its walk.
+
+Point the client at the binary by absolute path; MCP clients do not expand
+`~`. After `make install` on macOS that is `~/.local/bin/disktree` (a link
+into `~/Applications/disktree.app`); for the release download it is
+`/Applications/disktree.app/Contents/MacOS/disktree`. On Linux it is
+`~/.local/bin/disktree`; on Windows, `disktree.exe` wherever you put it.
+
+**Claude Desktop** — Settings › Developer › Edit Config opens
+`claude_desktop_config.json` (`~/Library/Application Support/Claude/` on
+macOS, `%APPDATA%\Claude\` on Windows). Add the server and restart Claude:
+
+```json
+{
+  "mcpServers": {
+    "disktree": {
+      "command": "/Users/you/.local/bin/disktree",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Cursor** — the same block in `~/.cursor/mcp.json` for every project, or
+`.cursor/mcp.json` in one:
+
+```json
+{
+  "mcpServers": {
+    "disktree": {
+      "command": "/Users/you/.local/bin/disktree",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+**Claude Code** — `claude mcp add disktree -- /Users/you/.local/bin/disktree mcp`.
+
+On macOS, a scan of your home directory skips what macOS protects (Mail,
+Messages, Safari and so on) unless the program that starts disktree has Full
+Disk Access; the report's `errors` count says how much was refused.
+
 ## On Hyprland
 
 Hyprland tiles new windows, so disktree opens into whatever tile it is given.
@@ -557,7 +711,7 @@ windowrule = size 1400 900, class:^(disktree)$
 ```sh
 make run      # release build, opening the source/root chooser
 make lint     # rustfmt --check, then clippy with every warning an error
-make test     # scanner, layout and removal tests, plus window-harness tests
+make test     # scanner, layout, removal and agent tests, plus window-harness tests
 make test-ssh # real localhost SSH scans/errors; Linux, bun + openssh required
 make ci       # lint, then test
 ```
@@ -571,6 +725,7 @@ gone while their neighbours are not.
 | path | what lives there |
 | --- | --- |
 | `crates/disktree-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
+| `crates/disktree-agent` | `disktree scan`, `summary` and `mcp`: read-only JSON reports and the MCP server — no UI, no removal |
 | `crates/disktree-app/src/state.rs` | every action the interface can take, and the key map |
 | `crates/disktree-app/src/views.rs` | the screens |
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |

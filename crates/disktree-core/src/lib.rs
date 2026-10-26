@@ -8,6 +8,7 @@
 pub mod access;
 pub mod classify;
 pub mod deployment;
+pub mod exclude;
 pub mod export;
 pub mod filter;
 pub mod identity;

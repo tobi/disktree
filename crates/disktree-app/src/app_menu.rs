@@ -39,6 +39,12 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
+            /// Save the scan as a JSON report.
+            ExportReport,
+            /// Explain how to drive disktree from an AI agent.
+            AgentGuide,
+            /// Show the version and where disktree comes from.
+            About,
         ]
     );
 }
@@ -60,8 +66,9 @@ pub fn install(cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    // `Rescan`, `OpenFolder`, `ShowInFinder` and the history are handled by
-    // the window, which owns the scan and the selection; see `views::root`.
+    // `Rescan`, `OpenFolder`, `ShowInFinder`, `ExportReport`, `AgentGuide`,
+    // `About` and the history are handled by the window, which owns the
+    // scan and the selection; see `views::root`.
     if !cfg!(target_os = "macos") {
         cx.bind_keys([
             KeyBinding::new("ctrl-q", Quit, None),
@@ -70,6 +77,7 @@ pub fn install(cx: &mut App) {
             KeyBinding::new("ctrl-r", Rescan, None),
             KeyBinding::new("f5", Rescan, None),
             KeyBinding::new("ctrl-shift-r", ShowInFinder, None),
+            KeyBinding::new("ctrl-e", ExportReport, None),
         ]);
         return;
     }
@@ -86,12 +94,15 @@ pub fn install(cx: &mut App) {
         // ⌘R is taken by Rescan, as in a browser; Xcode uses ⌘⇧R-like
         // chords for its reveals, and `o` does the same without a modifier.
         KeyBinding::new("cmd-shift-r", ShowInFinder, None),
+        KeyBinding::new("cmd-e", ExportReport, None),
         // Finder's and Safari's back and forward; alt-arrows work too.
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-]", GoForward, None),
     ]);
     cx.set_menus([
         Menu::new("disktree").items([
+            MenuItem::action("About disktree", About),
+            MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Hide disktree", Hide),
@@ -105,6 +116,9 @@ pub fn install(cx: &mut App) {
             MenuItem::action("Show in Finder", ShowInFinder),
             MenuItem::separator(),
             MenuItem::action("Rescan", Rescan),
+            MenuItem::separator(),
+            MenuItem::action("Export Report as JSON\u{2026}", ExportReport),
+            MenuItem::action("Use with an AI Agent\u{2026}", AgentGuide),
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
         ]),

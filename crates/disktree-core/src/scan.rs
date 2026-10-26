@@ -29,6 +29,7 @@ use std::thread;
 use rayon::Scope;
 use rustc_hash::FxHashSet;
 
+use crate::exclude::Exclude;
 use crate::scan_threads::{Admission, ControllerGuard, ScanThreads};
 use crate::tree::{Metric, Node, NodeKind, Seen, aggregate, aggregate_deduped};
 
@@ -61,6 +62,12 @@ pub struct ScanOptions {
     pub dedup_hardlinks: bool,
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
+    /// Names and paths left out, never entered and never counted. See
+    /// [`crate::exclude`]. Sent to an SSH helper as its patterns; left out
+    /// of the request when empty, so a request without patterns reads the
+    /// same to a helper that predates them.
+    #[serde(default, skip_serializing_if = "Exclude::is_empty")]
+    pub exclude: Exclude,
     /// Directory admission for this scan; other scans have their own budget.
     #[serde(default)]
     pub threads: ScanThreads,
@@ -76,6 +83,7 @@ impl Default for ScanOptions {
             max_depth: None,
             dedup_hardlinks: true,
             metric: Metric::Bytes,
+            exclude: Exclude::default(),
             threads: ScanThreads::default(),
         }
     }
@@ -361,6 +369,13 @@ impl WalkContext {
 
         if !self.options.include_hidden
             && (entry.name().starts_with('.') || entry.hidden())
+        {
+            return Classified::Skipped;
+        }
+        if self
+            .options
+            .exclude
+            .matches(entry.name(), || entry.entry_path(dir))
         {
             return Classified::Skipped;
         }
@@ -884,9 +899,13 @@ fn scan_on_pool(
     let resolved = root.canonicalize().ok();
     let canonical = resolved.as_deref().unwrap_or(root);
     let mut never = crate::space::never_scanned(root, canonical);
-    // Hidden-entry and depth filters can leave an alias as the only route
-    // to files. Keep every mount view when either filter is active.
-    if context.options.include_hidden && context.options.max_depth.is_none() {
+    // Hidden-entry, depth and exclude filters can leave an alias as the
+    // only route to files: `--exclude source` must not also lose the
+    // bind mount of it elsewhere. Keep every mount view when one is active.
+    if context.options.include_hidden
+        && context.options.max_depth.is_none()
+        && context.options.exclude.is_empty()
+    {
         never.extend(crate::space::repeated_mounts_for(
             root,
             canonical,
@@ -1582,6 +1601,41 @@ mod tests {
             },
         );
         assert_eq!(without.bytes, 100);
+    }
+
+    #[test]
+    fn excluded_entries_are_neither_entered_nor_counted() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        write(root, "app/node_modules/dep/index.js", 700);
+        write(root, "app/main.rs", 100);
+        write(root, "disk.iso", 50);
+        write(root, "keep/notes.txt", 10);
+
+        let tree = scan_dir(
+            root,
+            &ScanOptions {
+                exclude: Exclude::new(["node_modules", "*.iso"])
+                    .expect("patterns"),
+                ..options()
+            },
+        );
+        assert_eq!(tree.bytes, 110);
+        assert!(child(&tree, "app").child_named("node_modules").is_none());
+        assert!(tree.child_named("disk.iso").is_none());
+
+        // A path pattern is matched against the path the walk built, under
+        // whichever spelling of the root it was given.
+        let anywhere = Exclude::new(["**/keep"]).expect("patterns");
+        let tree = scan_dir(
+            root,
+            &ScanOptions {
+                exclude: anywhere,
+                ..options()
+            },
+        );
+        assert_eq!(tree.bytes, 850);
+        assert!(tree.child_named("keep").is_none());
     }
 
     /// Explorer's hidden attribute counts as hidden, as `AppData` has it.

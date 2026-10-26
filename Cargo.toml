@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/disktree-app", "crates/disktree-core", "crates/disktree-scan", "xtask"]
+members = [
+    "crates/disktree-agent",
+    "crates/disktree-app",
+    "crates/disktree-core",
+    "crates/disktree-scan",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.11.0"
@@ -10,6 +16,7 @@ license = "MIT"
 repository = "https://github.com/tobi/disktree"
 
 [workspace.dependencies]
+disktree-agent = { path = "crates/disktree-agent" }
 disktree-core = { path = "crates/disktree-core" }
 anyhow = "1"
 rayon = "1"

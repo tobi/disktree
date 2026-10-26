@@ -172,6 +172,11 @@ pub fn scan(
     if options.follow_links {
         return None;
     }
+    // Exclude patterns are applied as the walk lists each entry, and the
+    // table is read whole; the walk honours them.
+    if !options.exclude.is_empty() {
+        return None;
+    }
     let path = format!(r"\\.\{}:", drive_letter(canonical)?);
     let volume = open_volume(&path).ok()?;
     let geometry = geometry(&volume)?;

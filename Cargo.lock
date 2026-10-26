@@ -1419,10 +1419,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "disktree-agent"
+version = "0.11.0"
+dependencies = [
+ "chrono",
+ "disktree-core",
+ "dunce",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "disktree-app"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "disktree-agent",
  "disktree-core",
  "dunce",
  "gpui-kit",

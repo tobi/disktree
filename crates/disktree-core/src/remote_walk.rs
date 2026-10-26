@@ -118,6 +118,10 @@ fn stream_with_boundaries(
         if excluded.contains(&path) {
             continue;
         }
+        // The user's exclude patterns, as the local walk applies them.
+        if options.exclude.matches(name, || path.clone()) {
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&path) else {
             frame.record.5 = true;
             continue;

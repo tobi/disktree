@@ -27,11 +27,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
+    AgentCopy, ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
 use crate::widgets;
+
+/// This build's version, as About and the keyboard overlay show it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
@@ -79,6 +82,24 @@ pub fn root(
                 this.reveal_target(cx);
             },
         ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::ExportReport, _, cx| {
+                this.export_report(cx);
+            },
+        ))
+        .on_action(cx.listener(|this, _: &crate::app_menu::About, _, cx| {
+            this.show_help = false;
+            this.show_agent = false;
+            this.show_about = true;
+            cx.notify();
+        }))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::AgentGuide, _, cx| {
+                this.show_help = false;
+                this.show_agent = true;
+                cx.notify();
+            },
+        ))
         // Only where the history buttons are: the review screen has none.
         .on_action(cx.listener(|this, _: &crate::app_menu::GoBack, _, cx| {
             if this.screen == Screen::Explore {
@@ -119,6 +140,12 @@ pub fn root(
     }
     if app.show_help {
         root = root.child(help_overlay(app, cx));
+    }
+    if app.show_agent {
+        root = root.child(agent_overlay(app, cx));
+    }
+    if app.show_about {
+        root = root.child(about_overlay(cx));
     }
     if app.volumes_open {
         root = root.child(volumes_dialog(app, window, cx));
@@ -596,6 +623,11 @@ fn top_bar(
         ))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
+        .child(agent_actions(
+            app,
+            window.viewport_size().width.as_f32() / window.rem_size().as_f32(),
+            cx,
+        ))
         .child(div().flex_1())
         .child(view_settings(app, window, cx))
 }
@@ -1107,6 +1139,7 @@ fn view_settings(
     );
 
     div()
+        .debug_selector(|| "view-settings".into())
         .flex()
         .flex_row()
         .items_center()
@@ -2359,11 +2392,12 @@ fn review_button(
 /// to every other key and the scan's own numbers hold the trailing edge.
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // Most useful first, so a narrow window clips the least useful.
-    let hints: [(&str, &str); 11] = [
+    let hints: [(&str, &str); 12] = [
         ("space", "mark"),
         ("enter", "open"),
         ("\u{232b}", "up"),
         ("c", "review"),
+        ("a", "AI agent"),
         ("hjkl", "move"),
         ("/", "filter"),
         ("[ ]", "depth"),
@@ -3822,6 +3856,8 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                 "Show it in the file manager"
             },
         ),
+        ("e", "Save this scan as a JSON report"),
+        ("a", "Use disktree from your AI agent: a prompt to paste"),
         ("q", "Quit"),
         ("", ""),
         (
@@ -3904,10 +3940,343 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
                         .child(format!(
-                            "? or esc closes \u{00b7} {} \u{00b7} {}",
+                            "? or esc closes \u{00b7} {} \u{00b7} {} \
+                             \u{00b7} disktree {}",
                             app.root_path.display(),
-                            app.options.metric.label()
+                            app.options.metric.label(),
+                            VERSION,
                         )),
+                ),
+        )
+}
+
+/// The two ways out to an AI agent, in the top bar where they are seen:
+/// most people who download the app will not know it can be driven from
+/// one. Bordered, so they read as buttons beside the trail's text.
+fn agent_actions(app: &Disktree, room: f32, cx: &Context<'_, Disktree>) -> Div {
+    let theme = cx.omarchy();
+    let ready = app.tree().is_some() && app.scan.is_none();
+    // The view settings never give way, so the buttons do: both where
+    // there is room, the agent alone where it is tight, and at the
+    // narrowest neither (`a`, `e` and the File menu still reach them).
+    // Measured in rems, so interface zoom moves the thresholds with it.
+    let (agent, export) = (room >= AGENT_ROOM_REMS, room >= EXPORT_ROOM_REMS);
+    let agent_button = filled(
+        button(
+            "agent-guide",
+            "AI agent\u{2026}",
+            ButtonVariant::Outline,
+            cx,
+        ),
+        theme.accent,
+        cx,
+    )
+    .on_click(cx.listener(|this, _, _, cx| {
+        this.show_agent = true;
+        cx.notify();
+    }));
+    let export_button = filled(
+        button(
+            "export-json",
+            "Export JSON\u{2026}",
+            ButtonVariant::Outline,
+            cx,
+        ),
+        theme.bright,
+        cx,
+    )
+    .disabled(!ready)
+    .on_click(cx.listener(|this, _, _, cx| {
+        this.export_report(cx);
+    }));
+    div()
+        .debug_selector(|| "agent-actions".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .flex_shrink_0()
+        // Apart from the trail: these act on the scan, not on where you are.
+        // Only with a button to set apart: empty, it must take no room.
+        .when(agent || export, |this| this.ml(space::XXL))
+        .when(agent, |this| {
+            this.child(with_tooltip(
+                div().id("agent-guide-tip").child(agent_button),
+                "Have Claude, Codex or Cursor read this scan and plan a \
+                 cleanup \u{00b7} a",
+            ))
+        })
+        .when(export, |this| {
+            this.child(with_tooltip(
+                div().id("export-json-tip").child(export_button),
+                // A greyed-out button says nothing about why: say it.
+                if ready {
+                    "Save this scan as a JSON report \u{00b7} e"
+                } else {
+                    "Ready when the scan finishes"
+                },
+            ))
+        })
+}
+
+/// A top-bar button that reads as one against the bar: a raised fill, a
+/// border, and `text` for its label. The library's buttons are bare text
+/// until hovered, which suits a row of them and not a lone pair beside a
+/// trail.
+fn filled(
+    button: gpui_omarchy::Button,
+    text: gpui_kit::Hsla,
+    cx: &Context<'_, Disktree>,
+) -> gpui_omarchy::Button {
+    let theme = cx.omarchy();
+    button
+        .bg(theme.surface)
+        .border_color(theme.control_border())
+        .text_color(text)
+}
+
+/// Window widths, in rems, from which the top bar has room for the agent
+/// button and then the export button beside the trail and the settings.
+/// Checked by `the_top_bar_buttons_never_crowd_the_settings`.
+pub const AGENT_ROOM_REMS: f32 = 72.0;
+pub const EXPORT_ROOM_REMS: f32 = 80.0;
+
+/// How to hand this to an AI agent: a prompt to paste, written for this
+/// machine, and the settings that make disktree one of the agent's tools.
+fn agent_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+    let theme = cx.omarchy();
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("disktree"));
+    let prompt = app.agent_prompt(&exe);
+    let ready = app.tree().is_some() && app.scan.is_none();
+
+    let heading = |label: &str| {
+        div()
+            .text_size(text::BODY)
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme.bright)
+            .child(label.to_string())
+    };
+    let note = |label: &str| {
+        div()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(label.to_string())
+    };
+    // One element per line: the prompt's line breaks are part of it.
+    let mut preview = div()
+        .id("agent-prompt")
+        .flex()
+        .flex_col()
+        .max_h(size::AGENT_PROMPT)
+        .overflow_y_scroll()
+        .p(space::MD)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .text_size(text::CAPTION)
+        .text_color(theme.foreground);
+    for line in prompt.lines() {
+        preview = preview.child(if line.is_empty() {
+            div().h(space::SM)
+        } else {
+            div().child(line.to_string())
+        });
+    }
+    let row = || div().flex().flex_row().flex_wrap().gap(space::SM);
+
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.background.opacity(0.86))
+        .child(
+            div()
+                .debug_selector(|| "agent-panel".into())
+                .flex()
+                .flex_col()
+                .gap(space::MD)
+                .w(size::AGENT)
+                .p(space::XL)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .child(
+                    div()
+                        .text_size(text::TITLE)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .child("Use disktree from your AI agent"),
+                )
+                .child(note(
+                    "Claude, Codex, Cursor and other agents that can run \
+                     commands can use disktree to measure this disk, then \
+                     suggest what to clean up. disktree itself never \
+                     deletes or changes anything.",
+                ))
+                .child(heading("1. Paste this prompt into your agent"))
+                .child(preview)
+                .child(
+                    row()
+                        .child(
+                            button(
+                                "agent-copy-prompt",
+                                "Copy prompt",
+                                ButtonVariant::Primary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.copy_for_agent(AgentCopy::Prompt, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            button(
+                                "agent-export",
+                                "Export JSON\u{2026}",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .disabled(!ready)
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.export_report(cx);
+                                },
+                            )),
+                        ),
+                )
+                .child(note(
+                    "Or export the report and attach the file to a chat \
+                     instead.",
+                ))
+                .child(heading("2. Or make it one of your agent's tools"))
+                .child(note(
+                    "As an MCP server, disktree answers your agent directly \
+                     whenever you ask about disk space. Claude Desktop and \
+                     Cursor: add the MCP settings to their config. Claude \
+                     Code: run the command in a terminal.",
+                ))
+                .child(
+                    row()
+                        .child(
+                            button(
+                                "agent-copy-mcp",
+                                "Copy MCP settings",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.copy_for_agent(
+                                        AgentCopy::McpConfig,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                        .child(
+                            button(
+                                "agent-copy-claude-code",
+                                "Copy Claude Code command",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.copy_for_agent(
+                                        AgentCopy::ClaudeCode,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        ),
+                )
+                .children(app.notice.as_ref().map(|(message, _)| {
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.accent)
+                        .child(message.clone())
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(note(
+                            "enter copies the prompt \u{00b7} e exports \
+                             \u{00b7} esc closes",
+                        ))
+                        .child(
+                            button(
+                                "agent-close",
+                                "Close",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.show_agent = false;
+                                    cx.notify();
+                                    window.focus(&this.focus, cx);
+                                },
+                            )),
+                        ),
+                ),
+        )
+}
+
+/// The version, what disktree is, and where it comes from: what the app
+/// menu's About item shows.
+fn about_overlay(cx: &Context<'_, Disktree>) -> Div {
+    let theme = cx.omarchy();
+    let line = |label: String| {
+        div()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(label)
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.background.opacity(0.86))
+        .child(
+            div()
+                .debug_selector(|| "about-panel".into())
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(space::SM)
+                .p(space::XL)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.surface)
+                .child(logo(theme))
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.foreground)
+                        .child(format!("Version {VERSION}")),
+                )
+                .child(line("A treemap of what is using your disk".to_owned()))
+                .child(line(
+                    "github.com/tobi/disktree \u{00b7} MIT licence".to_owned(),
+                ))
+                .child(
+                    div().pt(space::SM).child(
+                        button("about-close", "OK", ButtonVariant::Primary, cx)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_about = false;
+                                cx.notify();
+                                window.focus(&this.focus, cx);
+                            })),
+                    ),
                 ),
         )
 }

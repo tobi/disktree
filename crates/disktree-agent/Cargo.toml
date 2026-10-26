@@ -1,0 +1,19 @@
+[package]
+name = "disktree-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only, headless disktree for scripts and AI agents: JSON reports and an MCP server"
+
+[lints]
+workspace = true
+
+[dependencies]
+disktree-core = { workspace = true }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+dunce = "1.0.5"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"

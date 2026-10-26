@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use disktree_core::access::file_table_readable;
 use disktree_core::filter::{Keep, Matches, filter};
@@ -98,6 +98,33 @@ pub fn panel_width(pointer_x: f32, viewport: f32, rem: f32) -> f32 {
     let max =
         (viewport / rem - PANEL_MIN_REMS).clamp(PANEL_MIN_REMS, PANEL_MAX_REMS);
     width.clamp(PANEL_MIN_REMS, max)
+}
+
+/// Entries per list in an exported report: more than a terminal wants,
+/// since a file is read at leisure or handed to an agent.
+const EXPORTED_TOP: usize = 100;
+
+/// Unreadable paths quoted in an exported report, as the command line does.
+const EXPORTED_ERRORS: usize = 10;
+
+/// What the AI agent panel can copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentCopy {
+    /// A prompt asking an agent to plan a cleanup with disktree.
+    Prompt,
+    /// The `mcpServers` block for Claude Desktop, Cursor and the like.
+    McpConfig,
+    /// The command that adds disktree to Claude Code.
+    ClaudeCode,
+}
+
+/// Seconds since the Unix epoch; `0`, which reports read as unknown, for
+/// a clock set before it.
+fn unix_seconds(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_secs()).ok())
+        .unwrap_or_default()
 }
 
 /// How many "worth a look" findings the panel lists.
@@ -418,6 +445,10 @@ pub struct Disktree {
     /// Enter was pressed before the search finished: apply on arrival.
     apply_pending: bool,
     pub show_help: bool,
+    /// The panel that explains how to drive disktree from an AI agent.
+    pub show_agent: bool,
+    /// The About panel: the version and where disktree comes from.
+    pub show_about: bool,
     pub show_selection: bool,
     pub focus: FocusHandle,
     /// A trail crumb's sibling menu, when open.
@@ -592,6 +623,8 @@ impl Disktree {
             finding: false,
             apply_pending: false,
             show_help: false,
+            show_agent: false,
+            show_about: false,
             show_selection: true,
             focus: cx.focus_handle(),
             crumb_menu: None,
@@ -3010,6 +3043,127 @@ impl Disktree {
         cx.notify();
     }
 
+    /// Save this scan as the JSON report `disktree scan --json` prints,
+    /// wherever the user chooses. Nothing is scanned again: the report is
+    /// made off the UI thread from the tree on screen.
+    pub fn export_report(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(tree) = self.tree.clone().filter(|_| self.scan.is_none())
+        else {
+            self.notice = Some((
+                "the report can be saved once the scan finishes".into(),
+                Status::Warning,
+            ));
+            cx.notify();
+            return;
+        };
+        let now = SystemTime::now();
+        let scanned = disktree_agent::report::Scanned {
+            root: self.root_path.clone(),
+            tree,
+            host: self.remote.clone(),
+            settings: disktree_agent::query::ScanSettings::from_options(
+                &self.options,
+            ),
+            scanned_at: self.scanned_at,
+            elapsed: self.scan_elapsed.unwrap_or_default(),
+            errors: self.progress.errors,
+            error_examples: self
+                .progress
+                .messages
+                .iter()
+                .take(EXPORTED_ERRORS)
+                .cloned()
+                .collect(),
+        };
+        let mut query =
+            disktree_agent::query::Query::new(self.root_path.clone());
+        query.settings = scanned.settings.clone();
+        query.top = EXPORTED_TOP;
+        let directory =
+            self.home.clone().unwrap_or_else(|| self.root_path.clone());
+        let chosen =
+            cx.prompt_for_new_path(&directory, Some("disktree-report.json"));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            let target = path.clone();
+            let written = cx
+                .background_executor()
+                .spawn(async move {
+                    let report = disktree_agent::report::report(
+                        &scanned,
+                        &query,
+                        unix_seconds(now),
+                    )?;
+                    let text = disktree_agent::report::json_text(&report);
+                    std::fs::write(&target, text)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let notice = match written {
+                Ok(()) => (
+                    format!("saved the report to {}", path.display()),
+                    Status::Success,
+                ),
+                Err(error) => (
+                    format!("could not save {}: {error}", path.display()),
+                    Status::Error,
+                ),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.notice = Some(notice);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The prompt the AI agent panel offers: commands for this computer,
+    /// or, for a scan made over SSH, a prompt that works from the exported
+    /// report, since this computer's disktree cannot reach the server.
+    pub fn agent_prompt(&self, exe: &Path) -> String {
+        match &self.remote {
+            Some(host) => {
+                disktree_agent::guide::remote_prompt(host, &self.root_path)
+            }
+            None => disktree_agent::guide::agent_prompt(exe, &self.root_path),
+        }
+    }
+
+    /// Copy something from the AI agent panel: a prompt to paste into an
+    /// agent, or the settings that make disktree one of its tools. Every
+    /// command in it names this copy of disktree by its full path.
+    pub fn copy_for_agent(
+        &mut self,
+        what: AgentCopy,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("disktree"));
+        let (text, notice) = match what {
+            AgentCopy::Prompt => (
+                self.agent_prompt(&exe),
+                if self.remote.is_some() {
+                    "copied: paste it with the exported JSON into your agent"
+                } else {
+                    "copied: paste it into Claude, Codex, Cursor or your agent"
+                },
+            ),
+            AgentCopy::McpConfig => (
+                disktree_agent::guide::mcp_config(&exe),
+                "copied the MCP settings for Claude Desktop or Cursor",
+            ),
+            AgentCopy::ClaudeCode => (
+                disktree_agent::guide::claude_code_command(&exe),
+                "copied: run it in a terminal to add disktree to Claude Code",
+            ),
+        };
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        self.notice = Some((notice.into(), Status::Success));
+        cx.notify();
+    }
+
     /// Show the tile a key acts on in Finder (or the file manager), selected.
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
         if self.remote.is_some() {
@@ -3089,6 +3243,28 @@ impl Disktree {
             if matches!(key, "escape" | "?" | "/" | "q") {
                 self.show_help = false;
                 cx.notify();
+            }
+            return;
+        }
+
+        if self.show_about {
+            if matches!(key, "escape" | "enter" | "q") {
+                self.show_about = false;
+                cx.notify();
+            }
+            return;
+        }
+
+        if self.show_agent {
+            match key {
+                "escape" | "a" | "q" => {
+                    self.show_agent = false;
+                    cx.notify();
+                }
+                "enter" | "c" => self.copy_for_agent(AgentCopy::Prompt, cx),
+                "m" => self.copy_for_agent(AgentCopy::McpConfig, cx),
+                "e" => self.export_report(cx),
+                _ => {}
             }
             return;
         }
@@ -3261,6 +3437,11 @@ impl Disktree {
                 cx.notify();
             }
             "o" if !control => self.reveal_target(cx),
+            "e" if !control => self.export_report(cx),
+            "a" if !control => {
+                self.show_agent = true;
+                cx.notify();
+            }
             "?" => {
                 self.show_help = true;
                 cx.notify();
