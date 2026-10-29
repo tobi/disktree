@@ -382,6 +382,10 @@ pub struct Disktree {
     /// The permanent-deletion alert dialog is open. Trash needs no dialog: it
     /// is reversible, so it commits directly.
     pub confirm_open: bool,
+    #[cfg(target_os = "linux")]
+    pub resize_dialog: Option<crate::resize::Dialog>,
+    #[cfg(target_os = "linux")]
+    pub resize_epoch: u64,
     /// Focus owner for the alert dialog while it is open.
     pub confirm_focus: FocusHandle,
     /// Focus to move on the next occasion a window is in hand. Key handling
@@ -572,6 +576,10 @@ impl Disktree {
             },
             trash_backend,
             confirm_open: false,
+            #[cfg(target_os = "linux")]
+            resize_dialog: None,
+            #[cfg(target_os = "linux")]
+            resize_epoch: 0,
             confirm_focus: cx.focus_handle(),
             focus_request: None,
             window_title: String::new(),
@@ -737,7 +745,10 @@ impl Disktree {
     /// is left alone until a volume is picked; picking calls [`set_root`],
     /// which cancels it.
     pub fn open_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        if self.run.is_some() || self.screen != Screen::Explore {
+        if self.run.is_some()
+            || self.screen != Screen::Explore
+            || self.resize_open()
+        {
             return;
         }
         self.volumes_open = true;
@@ -2843,6 +2854,23 @@ impl Disktree {
         self.screen == Screen::Explore
             && !self.confirm_open
             && !self.volumes_open
+            && !self.resize_open()
+    }
+
+    pub const fn resize_open(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.resize_dialog.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn supports_resize(&self) -> bool {
+        self.remote.is_none()
+            && self
+                .device
+                .as_deref()
+                .is_some_and(|d| d.starts_with("/dev/"))
     }
 
     /// Ask for a directory and scan it: an app opened from the Dock has no
@@ -3049,7 +3077,7 @@ impl Disktree {
 
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
-        if self.confirm_open {
+        if self.confirm_open || self.resize_open() {
             return;
         }
 

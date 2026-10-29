@@ -16,6 +16,8 @@ pub mod insights;
 mod macos;
 #[cfg(windows)]
 mod mft;
+#[cfg(target_os = "linux")]
+pub mod partition_editor;
 pub mod payload;
 pub mod remote;
 pub mod remote_progress;

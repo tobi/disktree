@@ -92,6 +92,148 @@ fn read<R>(
     view.read_with(cx, |app, _| f(app))
 }
 
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn resize_dialog_owns_keys_and_cancels_without_touching_files(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::partition_editor::Target;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.device = Some("/dev/mapper/root".into());
+        app.resize_dialog = Some(crate::resize::Dialog::Ready(Target {
+            disk: "/dev/nvme0n1".into(),
+            partition: Some("/dev/nvme0n1p5".into()),
+            // A mistaken implicit launch must fail this test, never open a
+            // real editor or authenticate against the machine running it.
+            editor: "/no-such-partition-editor".into(),
+        }));
+        app.focus_request = Some(crate::state::FocusTarget::Dialog);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("resize-dialog").is_some());
+    assert!(!read(&view, cx, Disktree::can_start_over));
+    for key in ["space", "c", "v", "r"] {
+        press(cx, key);
+        assert!(read(&view, cx, |app| matches!(
+            app.resize_dialog,
+            Some(crate::resize::Dialog::Ready(_))
+        )));
+        assert!(read(&view, cx, |app| app.marks.is_empty()));
+        assert!(!read(&view, cx, |app| app.volumes_open));
+    }
+    press(cx, "escape");
+    assert!(!read(&view, cx, Disktree::resize_open));
+    assert!(read(&view, cx, Disktree::can_start_over));
+    assert!(temp.path().join("junk/blob.bin").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn resize_is_unavailable_for_ssh_and_non_block_mounts(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.device = Some("/dev/nvme0n1p5".into());
+        app.remote = Some("fixture-only".into());
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("resize-partition").is_none());
+    update(&view, cx, Disktree::open_resize);
+    assert!(!read(&view, cx, Disktree::resize_open));
+    update(&view, cx, |app, _| {
+        app.remote = None;
+        app.device = Some("tmpfs".into());
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("resize-partition").is_none());
+    update(&view, cx, Disktree::open_resize);
+    assert!(!read(&view, cx, Disktree::resize_open));
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn resize_discovery_and_errors_never_launch_an_editor(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    for state in [
+        crate::resize::Dialog::Loading,
+        crate::resize::Dialog::Failed("Install GParted".into()),
+    ] {
+        update(&view, cx, |app, _| {
+            app.resize_dialog = Some(state);
+            app.focus_request = Some(crate::state::FocusTarget::Dialog);
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("resize-open").is_some());
+        update(&view, cx, Disktree::launch_partition_editor);
+        press(cx, "enter");
+        assert!(read(&view, cx, Disktree::resize_open));
+        let close = cx.debug_bounds("resize-cancel").unwrap();
+        cx.simulate_click(close.center(), gpui_kit::Modifiers::none());
+        draw(cx);
+        assert!(!read(&view, cx, Disktree::resize_open));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn cancelled_resize_discovery_cannot_reopen_the_dialog(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.device = Some("/dev/mapper/root".into());
+        app.open_resize(cx);
+        assert!(app.resize_open());
+        app.close_resize(cx);
+    });
+    cx.run_until_parked();
+    assert!(!read(&view, cx, Disktree::resize_open));
+}
+
+#[cfg(target_os = "linux")]
+#[gpui_kit::test]
+fn editor_failure_is_shown_and_success_refreshes_the_scan(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::partition_editor::Target;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    for (editor, success) in [("/bin/false", false), ("/bin/true", true)] {
+        update(&view, cx, |app, _| {
+            app.resize_dialog = Some(crate::resize::Dialog::Ready(Target {
+                disk: "/dev/fixture-never-opened".into(),
+                partition: None,
+                editor: editor.into(),
+            }));
+            app.focus_request = Some(crate::state::FocusTarget::Dialog);
+        });
+        draw(cx);
+        press(cx, "enter");
+        cx.run_until_parked();
+        if success {
+            assert!(!read(&view, cx, Disktree::resize_open));
+            finish_scan(&view, cx);
+        } else {
+            assert!(read(&view, cx, |app| matches!(
+                &app.resize_dialog,
+                Some(crate::resize::Dialog::Failed(error)) if error.contains("exit")
+            )));
+        }
+    }
+    assert!(temp.path().join("junk/blob.bin").exists());
+}
+
 #[gpui_kit::test]
 fn remote_indexing_draws_live_activity_and_the_sampled_directory(
     cx: &mut TestAppContext,

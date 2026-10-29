@@ -17,6 +17,8 @@ mod git;
 mod marks;
 mod palette;
 mod power;
+#[cfg(target_os = "linux")]
+mod resize;
 mod state;
 #[cfg(test)]
 mod tests;

@@ -16,6 +16,28 @@ Built with [GPUI](https://gpui-kit.com/) through
 [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
 Omarchy theme and behaves like the rest of the desktop.
 
+## Resize a partition (Linux)
+
+The Disk panel's **Resize partition…** action opens the local volume's
+physical disk in [GParted](https://gparted.org/). Select the partition in
+GParted, choose **Resize/Move** to grow or shrink it, then review and apply
+the queued operations. Opening the editor does not change the disk.
+Install `gparted` separately; it is an optional dependency and handles its
+own administrator authentication. Disktree stays unprivileged and refreshes
+the scan after the editor closes.
+
+Growing needs adjacent unallocated space. Shrinking depends on filesystem
+support; free space inside another partition is not unallocated space.
+Back up important files before resizing. Use a live USB when the system
+partition is busy or an operation requires unmounting. LUKS volumes must be
+unlocked in GParted; support depends on the complete storage layout. This
+does not change a physical disk's capacity. See the
+[GParted manual](https://gparted.org/display-doc.php?name=help-manual).
+
+This action is for local Linux disks and simple partition/LUKS layouts.
+SSH sessions remain read-only. RAID, LVM, loop devices and ambiguous device
+ancestry are refused rather than selecting an arbitrary disk.
+
 ## Install
 
 Download `disktree-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the

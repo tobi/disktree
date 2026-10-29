@@ -81,13 +81,13 @@ pub fn root(
         ))
         // Only where the history buttons are: the review screen has none.
         .on_action(cx.listener(|this, _: &crate::app_menu::GoBack, _, cx| {
-            if this.screen == Screen::Explore {
+            if this.screen == Screen::Explore && !this.resize_open() {
                 this.go_back(cx);
             }
         }))
         .on_action(cx.listener(
             |this, _: &crate::app_menu::GoForward, _, cx| {
-                if this.screen == Screen::Explore {
+                if this.screen == Screen::Explore && !this.resize_open() {
                     this.go_forward(cx);
                 }
             },
@@ -125,6 +125,10 @@ pub fn root(
     }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
+    }
+    #[cfg(target_os = "linux")]
+    if app.resize_open() {
+        root = root.child(crate::resize::dialog(app, cx));
     }
     root
 }
@@ -301,7 +305,7 @@ fn volumes_dialog(
 /// the click that dismisses a dialog, so the click is taken here instead. The
 /// card stops a mouse-down from reaching this wrapper, so a click on the
 /// dialog itself stays the dialog's own.
-fn centred_popup(
+pub fn centred_popup(
     card: impl IntoElement,
     on_outside: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
@@ -2180,6 +2184,23 @@ fn disk_section(
                 })),
         );
     let mut section = div().flex().flex_col().gap(space::SM).child(header);
+    #[cfg(target_os = "linux")]
+    if app.supports_resize() {
+        section = section.child(
+            button(
+                "resize-partition",
+                "Resize partition…",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .debug_selector(|| "resize-partition".into())
+            .tab_stop(false)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_resize(cx);
+                this.apply_focus(window, cx);
+            })),
+        );
+    }
     let Some(space_info) = app.space else {
         return section.child(
             div()
