@@ -1993,6 +1993,30 @@ mod tests {
     }
 
     #[test]
+    fn a_search_can_reach_a_nested_empty_directory() {
+        let temp = fixture_dir();
+        let parent = temp.path().join("Projects");
+        let empty = parent.join("empty-match");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        let tree = scan(temp.path(), ScanOptions::default()).expect("scan");
+        let mut app =
+            App::new(temp.path().to_path_buf(), ScanOptions::default());
+        if let Some(scan) = app.scan.take() {
+            scan.cancel();
+        }
+        app.tree = Some(tree);
+        app.set_viewport(45, 13);
+        app.search = "empty-match".to_string();
+        app.apply_search();
+        assert_eq!(app.visible_children().len(), 1);
+        assert_eq!(app.selected_path().as_deref(), Some(parent.as_path()));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected_path().as_deref(), Some(empty.as_path()));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.notice.as_deref(), Some("Directory is empty"));
+    }
+
+    #[test]
     fn depth_keys_follow_the_gui_range() {
         let temp = fixture_dir();
         let mut app =

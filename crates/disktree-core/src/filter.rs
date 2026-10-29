@@ -107,8 +107,10 @@ fn visit(
             total.0 += child.bytes;
             total.1 += child.files;
         } else if !child.children.is_empty() {
+            let count_before = matches.count;
             let (bytes, files) = visit(child, crumbs, matches);
-            if bytes > 0 || files > 0 {
+            // An empty matching directory still needs a reachable ancestor.
+            if matches.count > count_before {
                 matches
                     .keep
                     .insert(crumbs.clone(), Keep::Partial { bytes, files });
@@ -238,6 +240,30 @@ mod tests {
         let found = filter(&tree(), &[], "zzz").expect("needle");
         assert_eq!(found.count, 0);
         assert!(found.keep.is_empty());
+    }
+
+    #[test]
+    fn a_nested_empty_directory_keeps_its_ancestors() {
+        let mut root = dir(
+            "root",
+            vec![
+                dir("parent", vec![dir("empty-match", vec![])]),
+                file("unrelated", 10),
+            ],
+        );
+        aggregate(&mut root, Metric::Bytes);
+        let found = filter(&root, &[], "empty-match").expect("needle");
+        let parent = crumbs_of(&root, &["parent"]);
+        let empty = crumbs_of(&root, &["parent", "empty-match"]);
+
+        assert_eq!(found.count, 1);
+        assert_eq!((found.bytes, found.files), (0, 0));
+        assert_eq!(
+            found.keep(&parent),
+            Some(Keep::Partial { bytes: 0, files: 0 })
+        );
+        assert_eq!(found.keep(&empty), Some(Keep::Whole));
+        assert_eq!(found.keep(&crumbs_of(&root, &["unrelated"])), None);
     }
 
     #[test]
