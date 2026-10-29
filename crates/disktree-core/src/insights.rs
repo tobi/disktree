@@ -14,6 +14,9 @@ const DAY: i64 = 86_400;
 /// An experiment untouched this long is worth a look.
 pub const STALE_DAYS: i64 = 30;
 
+/// Maximum findings shown by either interface.
+pub const INSIGHT_LIMIT: usize = 6;
+
 /// Smaller than this is not worth a line.
 const MIN_BYTES: u64 = 64 * 1024 * 1024;
 
