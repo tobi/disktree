@@ -76,6 +76,118 @@ fn press(cx: &mut Window, keys: &str) {
     draw(cx);
 }
 
+#[gpui_kit::test]
+fn language_switch_saves_and_keeps_the_scan_and_marks(cx: &mut TestAppContext) {
+    use crate::i18n::{self, Language};
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let config = tempfile::tempdir().expect("config");
+    let path = config.path().join("language");
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    update(&view, cx, |app, cx| {
+        app.language_settings_path = Some(path.clone());
+        let junk = app
+            .crumbs_for_path(&temp.path().join("junk"))
+            .expect("junk");
+        app.toggle_mark(&junk, cx);
+    });
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    let root = read(&view, cx, |app| app.root_path.clone());
+    press(cx, "f2");
+    press(cx, "tab");
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.language_open));
+    assert_eq!(i18n::load(&path).expect("keyboard save"), Language::English);
+    press(cx, "f2");
+    assert!(read(&view, cx, |app| app.language_open));
+    let chinese = cx.debug_bounds("zh-CN").expect("Chinese choice");
+    cx.simulate_click(chinese.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    let language = cx.debug_bounds("language").expect("language control");
+    assert!(language.left() >= px(0.) && language.right() <= px(900.));
+    let power = cx.debug_bounds("power-efficiency").expect("power control");
+    assert!(power.left() >= px(0.) && power.right() <= px(900.));
+    assert_eq!(
+        i18n::load(&path).expect("saved"),
+        Language::SimplifiedChinese
+    );
+    update(&view, cx, |app, cx| {
+        assert_eq!(i18n::text(cx, "Delete permanently"), "永久删除");
+        assert_eq!(app.scan_epoch, epoch);
+        assert_eq!(app.root_path, root);
+        assert_eq!(app.marks.len(), 1);
+        assert!(app.tree.is_some());
+        assert!(!app.language_open);
+    });
+    press(cx, "f2");
+    press(cx, "tab");
+    press(cx, "tab");
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.language_open));
+    assert_eq!(
+        i18n::load(&path).expect("keyboard Chinese"),
+        Language::SimplifiedChinese
+    );
+    press(cx, "f2");
+    press(cx, "shift-tab");
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.language_open));
+    assert_eq!(
+        i18n::load(&path).expect("cancel keeps choice"),
+        Language::SimplifiedChinese
+    );
+    // Draw the help, review and permanent-deletion dialog in Chinese.
+    press(cx, "?");
+    press(cx, "escape");
+    press(cx, "c");
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::Permanent;
+    });
+    press(cx, "enter");
+    assert!(read(&view, cx, |app| app.confirm_open));
+    press(cx, "f2");
+    assert!(!read(&view, cx, |app| app.language_open));
+    press(cx, "escape");
+    press(cx, "f2");
+    let english = cx.debug_bounds("en").expect("English choice");
+    cx.simulate_click(english.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert_eq!(i18n::load(&path).expect("saved"), Language::English);
+    assert!(temp.path().join("junk/blob.bin").exists());
+}
+
+#[gpui_kit::test]
+fn language_dialog_returns_to_picker_and_reports_save_failures(
+    cx: &mut TestAppContext,
+) {
+    use crate::i18n::Language;
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.open_volumes(cx);
+        app.language_settings_path = Some(temp.path().to_owned());
+    });
+    draw(cx);
+    press(cx, "f2");
+    assert!(cx.debug_bounds("zh-CN").is_some());
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.language_open));
+    assert!(read(&view, cx, |app| app.volumes_open));
+    assert!(cx.debug_bounds("source-picker").is_some());
+    update(&view, cx, |app, cx| {
+        app.set_language(Language::SimplifiedChinese, cx);
+    });
+    assert!(read(&view, cx, |app| app.notice.as_ref().is_some_and(
+        |(message, status)| {
+            message.contains("无法保存")
+                && *status == gpui_omarchy::Status::Warning
+        }
+    )));
+    draw(cx);
+}
+
 fn update<R>(
     view: &Entity<Disktree>,
     cx: &mut Window,
@@ -481,22 +593,23 @@ fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
             machine_id: Some("machine-a".into()),
         };
         app.remote = Some("stable-alias".into());
-        app.update_remote_identity(Some(old.clone()));
+        app.update_remote_identity(Some(old.clone()), cx);
         let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
         app.select(Some(crumbs), cx);
         app.toggle_mark_selected(cx);
-        app.update_remote_identity(Some(old.clone()));
+        app.update_remote_identity(Some(old.clone()), cx);
         assert!(!app.marks.is_empty(), "same machine keeps its marks");
-        app.update_remote_identity(Some(
-            disktree_core::identity::HostIdentity {
+        app.update_remote_identity(
+            Some(disktree_core::identity::HostIdentity {
                 hostname: old.hostname,
                 machine_id: Some("machine-b".into()),
-            },
-        ));
+            }),
+            cx,
+        );
         assert!(app.marks.is_empty(), "same alias is not proof of identity");
         app.toggle_mark_selected(cx);
         assert!(!app.marks.is_empty());
-        app.update_remote_identity(None);
+        app.update_remote_identity(None, cx);
         assert!(app.marks.is_empty(), "lost identity also fails closed");
     });
 }
@@ -750,7 +863,7 @@ fn a_parents_name_gets_its_own_band_above_its_children(
     draw(cx);
 
     let (band, lowest_child_top, bands_in_mosaic) =
-        update(&view, cx, |app, _| {
+        update(&view, cx, |app, cx| {
             let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
             let parent = tiles
                 .iter()
@@ -766,7 +879,7 @@ fn a_parents_name_gets_its_own_band_above_its_children(
                 })
                 .map(|tile| tile.rect.y)
                 .fold(f32::INFINITY, f32::min);
-            let mosaic = app.prepare();
+            let mosaic = app.prepare(cx);
             let bands_in_mosaic = mosaic
                 .labels
                 .iter()
@@ -1554,14 +1667,14 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
     draw(cx);
 
-    let (paths, labels) = update(&view, cx, |app, _| {
+    let (paths, labels) = update(&view, cx, |app, cx| {
         let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
         let paths: Vec<_> = tiles
             .iter()
             .filter_map(|tile| app.path_at(tile.crumbs()))
             .collect();
         let labels: Vec<String> = app
-            .prepare()
+            .prepare(cx)
             .labels
             .into_iter()
             .map(|label| label.text)
@@ -1593,8 +1706,8 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     assert_eq!(marked[0].bytes, 200_000);
 
     // And the mark is drawn on the right tile: its crumbs resolve here.
-    let hatched = update(&view, cx, |app, _| {
-        app.prepare()
+    let hatched = update(&view, cx, |app, cx| {
+        app.prepare(cx)
             .tiles
             .iter()
             .filter(|tile| tile.marked)
@@ -1896,7 +2009,7 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
 
     // Every tile inside it is drawn marked: the ones below the mark are
     // "covered", which paints the same fill and label.
-    let mosaic = update(&view, cx, |app, _| app.prepare());
+    let mosaic = update(&view, cx, |app, cx| app.prepare(cx));
     let (inside, covered) = update(&view, cx, |app, _| {
         let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
         let inside: Vec<bool> = tiles

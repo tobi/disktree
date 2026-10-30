@@ -29,22 +29,31 @@ impl GitState {
     }
 
     /// One short line: `clean, no stash`, `3 changed, 1 stash, 2 unpushed`.
-    pub fn summary(&self) -> String {
+    pub fn summary(&self, language: crate::i18n::Language) -> String {
         let mut parts = Vec::new();
         parts.push(match self.changed {
-            Some(0) => "clean".to_string(),
-            Some(count) => format!("{count} changed"),
-            None => "changes unknown".to_string(),
+            Some(0) => language.text("clean").to_string(),
+            Some(count) => crate::i18n::format(
+                language.text("{0} changed"),
+                &[count.to_string()],
+            ),
+            None => language.text("changes unknown").to_string(),
         });
         parts.push(match self.stashes {
-            0 => "no stash".to_string(),
-            1 => "1 stash".to_string(),
-            count => format!("{count} stashes"),
+            0 => language.text("no stash").to_string(),
+            1 => language.text("1 stash").to_string(),
+            count => crate::i18n::format(
+                language.text("{0} stashes"),
+                &[count.to_string()],
+            ),
         });
         match self.unpushed {
             Some(0) => {}
-            Some(count) => parts.push(format!("{count} unpushed")),
-            None => parts.push("no upstream".to_string()),
+            Some(count) => parts.push(crate::i18n::format(
+                language.text("{0} unpushed"),
+                &[count.to_string()],
+            )),
+            None => parts.push(language.text("no upstream").to_string()),
         }
         parts.join(", ")
     }
@@ -218,25 +227,37 @@ mod tests {
             ..GitState::default()
         };
         assert!(clean.is_clean());
-        assert_eq!(clean.summary(), "clean, no stash");
+        assert_eq!(
+            clean.summary(crate::i18n::Language::English),
+            "clean, no stash"
+        );
         let busy = GitState {
             changed: Some(3),
             stashes: 1,
             unpushed: Some(2),
         };
         assert!(!busy.is_clean());
-        assert_eq!(busy.summary(), "3 changed, 1 stash, 2 unpushed");
+        assert_eq!(
+            busy.summary(crate::i18n::Language::English),
+            "3 changed, 1 stash, 2 unpushed"
+        );
         let local = GitState {
             changed: Some(0),
             ..GitState::default()
         };
-        assert_eq!(local.summary(), "clean, no stash, no upstream");
+        assert_eq!(
+            local.summary(crate::i18n::Language::English),
+            "clean, no stash, no upstream"
+        );
         assert!(!local.is_clean(), "unpushed history could be lost");
         let guarded = GitState {
             unpushed: Some(0),
             ..GitState::default()
         };
-        assert_eq!(guarded.summary(), "changes unknown, no stash");
+        assert_eq!(
+            guarded.summary(crate::i18n::Language::English),
+            "changes unknown, no stash"
+        );
         assert!(!guarded.is_clean(), "unknown is not clean");
     }
 

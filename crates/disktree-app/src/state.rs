@@ -4,6 +4,8 @@
 //! decisions — what is selected, what a mark means, what a key does, when to
 //! re-scan — live here so they can be reasoned about in one place.
 
+use crate::i18n::t;
+
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -344,6 +346,12 @@ pub struct Disktree {
     /// The pointer is on the menu's button. A press there is the button's
     /// to toggle, not a press outside the menu that closes it first.
     pub power_hover: bool,
+    /// The language chooser overlays any screen without changing scan state.
+    pub language_open: bool,
+    /// Stable tab stops for both language choices and Cancel.
+    pub language_focus: [FocusHandle; crate::i18n::Language::ALL.len() + 1],
+    /// Separate from scan roots and the power setting.
+    pub language_settings_path: Option<PathBuf>,
     pub cpu_threads: usize,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
@@ -539,6 +547,9 @@ impl Disktree {
             power_settings_path: crate::power::settings_path(),
             power_menu: None,
             power_hover: false,
+            language_open: false,
+            language_focus: std::array::from_fn(|_| cx.focus_handle()),
+            language_settings_path: crate::i18n::settings_path(),
             cpu_threads: crate::power::cpu_threads(),
             tree: None,
             scan: None,
@@ -867,7 +878,7 @@ impl Disktree {
             let value = self.volumes_source.clone().unwrap_or_default();
             let host = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("SSH alias or user@host")
+                    .placeholder(t!(cx, "SSH alias or user@host"))
                     .default_value(value)
             });
             cx.subscribe(&host, |this, _, event, cx| {
@@ -890,6 +901,15 @@ impl Disktree {
             })
             .detach();
             self.picker_path = Some(path);
+        }
+        let placeholder = t!(cx, "SSH alias or user@host");
+        if let Some(host) = &self.picker_host
+            && host.read(cx).presentation().placeholder().as_ref()
+                != placeholder
+        {
+            host.update(cx, |host, cx| {
+                host.set_placeholder(placeholder, window, cx);
+            });
         }
     }
 
@@ -1129,6 +1149,73 @@ impl Disktree {
         cx.notify();
     }
 
+    /// Open a language chooser without changing the scan, marks or source.
+    pub fn open_language(&mut self, cx: &mut Context<'_, Self>) {
+        if self.confirm_open {
+            return;
+        }
+        self.language_open = true;
+        self.power_menu = None;
+        self.crumb_menu = None;
+        self.focus_request = Some(FocusTarget::Dialog);
+        cx.notify();
+    }
+
+    /// Return focus to the source chooser when it is still open underneath.
+    pub fn close_language(&mut self, cx: &mut Context<'_, Self>) {
+        self.language_open = false;
+        self.focus_request = Some(if self.volumes_open {
+            FocusTarget::Dialog
+        } else {
+            FocusTarget::Root
+        });
+        cx.notify();
+    }
+
+    /// Keep Tab and Shift-Tab inside the chooser.
+    pub fn move_language_focus(
+        &self,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let count = self.language_focus.len();
+        let current = self
+            .language_focus
+            .iter()
+            .position(|focus| focus.is_focused(window));
+        let next = current
+            .map_or(if backwards { count - 1 } else { 0 }, |current| {
+                (current + if backwards { count - 1 } else { 1 }) % count
+            });
+        window.focus(&self.language_focus[next], cx);
+        cx.notify();
+    }
+
+    /// Apply immediately and save independently of the scan and power policy.
+    pub fn set_language(
+        &mut self,
+        language: crate::i18n::Language,
+        cx: &mut Context<'_, Self>,
+    ) {
+        cx.set_global(language);
+        crate::app_menu::update_language(cx);
+        self.notice = Some(match self.language_settings_path.as_deref() {
+            Some(path) => match crate::i18n::save(path, language) {
+                Ok(()) => (t!(cx, "Language saved").into(), Status::Success),
+                Err(error) => (
+                    t!(cx, "Language changed, but could not be saved: {0}", error),
+                    Status::Warning,
+                ),
+            },
+            None => (
+                t!(cx, "Language changed for this session; no settings directory is available").into(),
+                Status::Warning,
+            ),
+        });
+        self.close_language(cx);
+    }
+
     /// Changing resource policy leaves the current scan and result intact;
     /// rescan, navigation to a new root and restart use the new fixed budget.
     pub fn set_power_efficiency(
@@ -1145,25 +1232,28 @@ impl Disktree {
         }
         self.options.threads = preset.policy(self.cpu_threads);
         self.power_choice = Some(preset);
-        let label = preset.label(self.cpu_threads);
+        let label = preset.label(self.cpu_threads, crate::i18n::language(cx));
         self.notice = Some(match self.power_settings_path.as_deref() {
             Some(path) => match crate::power::save(path, preset) {
                 Ok(()) => (
-                    format!("{label} from the next scan; r rescans now"),
+                    t!(cx, "{0} from the next scan; r rescans now", label),
                     Status::Success,
                 ),
                 Err(error) => (
-                    format!(
-                        "{label} from the next scan, but it could not be \
-                         saved: {error}"
+                    t!(
+                        cx,
+                        "{0} from the next scan, but it could not be saved: {1}",
+                        label,
+                        error
                     ),
                     Status::Warning,
                 ),
             },
             None => (
-                format!(
-                    "{label} from the next scan; no settings directory to \
-                     save it in"
+                t!(
+                    cx,
+                    "{0} from the next scan; no settings directory to save it in",
+                    label
                 ),
                 Status::Warning,
             ),
@@ -1308,16 +1398,19 @@ impl Disktree {
         .detach();
     }
 
+    /// Adopt the scan identity, clearing marks that belonged to another host.
     pub(crate) fn update_remote_identity(
         &mut self,
         identity: Option<disktree_core::identity::HostIdentity>,
+        cx: &gpui_kit::App,
     ) {
         // A stable SSH alias can be repointed to a different machine.
         // Old marks must not acquire that machine's freshly captured guard.
         if self.remote_identity != identity && !self.marks.is_empty() {
             self.marks.clear();
             self.notice = Some((
-                "Remote identity changed; previous marks were cleared.".into(),
+                t!(cx, "Remote identity changed; previous marks were cleared.")
+                    .into(),
                 Status::Warning,
             ));
         }
@@ -1354,7 +1447,7 @@ impl Disktree {
                     self.disk_root = snapshot.header.disk_root;
                     self.space = snapshot.header.space;
                     self.remote_platform = snapshot.header.platform;
-                    self.update_remote_identity(snapshot.header.identity);
+                    self.update_remote_identity(snapshot.header.identity, cx);
                     self.device = self.remote.as_ref().map(|host| {
                         format!("{host} · read-only · space at scan")
                     });
@@ -2088,8 +2181,11 @@ impl Disktree {
         };
         if crumbs.is_empty() {
             self.notice = Some((
-                "the scanned root cannot be removed; open a directory first"
-                    .into(),
+                t!(
+                    cx,
+                    "the scanned root cannot be removed; open a directory first"
+                )
+                .into(),
                 Status::Warning,
             ));
             cx.notify();
@@ -2117,8 +2213,9 @@ impl Disktree {
             && let Some(ancestor) = self.marked_ancestor(&target.path)
         {
             self.notice = Some((
-                format!(
-                    "{} goes with the marked {}; unmark that to keep it",
+                t!(
+                    cx,
+                    "{0} goes with the marked {1}; unmark that to keep it",
                     display_path(&target.path, self.home.as_deref()),
                     display_path(&ancestor, self.home.as_deref())
                 ),
@@ -2144,11 +2241,19 @@ impl Disktree {
             }
             if !inside.is_empty() {
                 self.notice = Some((
-                    format!(
-                        "{} now covers {} mark{} inside it",
+                    t!(
+                        cx,
+                        "{0} now covers {1} mark{2} inside it",
                         display_path(&path, self.home.as_deref()),
                         inside.len(),
-                        if inside.len() == 1 { "" } else { "s" }
+                        if crate::i18n::language(cx)
+                            == crate::i18n::Language::English
+                            && inside.len() != 1
+                        {
+                            "s"
+                        } else {
+                            ""
+                        }
                     ),
                     Status::Neutral,
                 ));
@@ -2220,7 +2325,7 @@ impl Disktree {
     /// Runs once per render, before the paint callbacks: painting then only has
     /// to draw, and the marked/hidden/selected state of every tile is decided
     /// here, where the tree and the marks are both at hand.
-    pub fn prepare(&mut self) -> Mosaic {
+    pub fn prepare(&mut self, cx: &gpui_kit::App) -> Mosaic {
         let metric = self.options.metric;
         let view = self.view;
         let hovered = self.hovered.clone();
@@ -2317,7 +2422,7 @@ impl Disktree {
                     });
                 }
                 TileKind::Others { count, .. } => labels.push(Label {
-                    text: format!("+{count} more"),
+                    text: t!(cx, "+{0} more", count),
                     rect: self.animated_rect(tile.rect),
                     header: None,
                     depth: tile.depth,
@@ -2630,7 +2735,8 @@ impl Disktree {
         }
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing is marked".into(), Status::Warning));
+            self.notice =
+                Some((t!(cx, "nothing is marked").into(), Status::Warning));
             cx.notify();
             return;
         }
@@ -2638,7 +2744,7 @@ impl Disktree {
         // would stop a permanent delete halfway.
         if self.restarting {
             self.notice = Some((
-                "not while restarting as administrator".into(),
+                t!(cx, "not while restarting as administrator").into(),
                 Status::Warning,
             ));
             cx.notify();
@@ -2786,7 +2892,7 @@ impl Disktree {
         };
         if matches.count == 0 {
             self.notice = Some((
-                format!("nothing here matches {}", matches.needle),
+                t!(cx, "nothing here matches {0}", matches.needle),
                 Status::Warning,
             ));
             cx.notify();
@@ -2855,7 +2961,7 @@ impl Disktree {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Scan".into()),
+            prompt: Some(t!(cx, "Scan").into()),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = chosen.await else {
@@ -2891,7 +2997,8 @@ impl Disktree {
     fn save_export(&mut self, script: bool, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing to save".into(), Status::Warning));
+            self.notice =
+                Some((t!(cx, "nothing to save").into(), Status::Warning));
             cx.notify();
             return;
         }
@@ -2913,21 +3020,33 @@ impl Disktree {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
             };
-            let notice = match std::fs::write(&path, list) {
-                Ok(()) => (
-                    format!(
-                        "saved {count} {} to {}",
-                        if count == 1 { "path" } else { "paths" },
-                        path.display()
-                    ),
-                    Status::Success,
-                ),
-                Err(error) => (
-                    format!("could not save {}: {error}", path.display()),
-                    Status::Error,
-                ),
-            };
+            let outcome = std::fs::write(&path, list);
             let _ = this.update(cx, |this, cx| {
+                let notice = match outcome {
+                    Ok(()) => (
+                        t!(
+                            cx,
+                            "saved {0} {1} to {2}",
+                            count,
+                            if count == 1 {
+                                t!(cx, "path")
+                            } else {
+                                t!(cx, "paths")
+                            },
+                            path.display()
+                        ),
+                        Status::Success,
+                    ),
+                    Err(error) => (
+                        t!(
+                            cx,
+                            "could not save {0}: {1}",
+                            path.display(),
+                            error
+                        ),
+                        Status::Error,
+                    ),
+                };
                 this.notice = Some(notice);
                 cx.notify();
             });
@@ -2952,12 +3071,13 @@ impl Disktree {
     pub fn copy_delete_script(&mut self, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing to copy".into(), Status::Warning));
+            self.notice =
+                Some((t!(cx, "nothing to copy").into(), Status::Warning));
         } else {
             let script = self.delete_script(&plan.targets);
             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(script));
             self.notice = Some((
-                "copied delete script; previews by default, checks host before deletion".into(),
+                t!(cx, "copied delete script; previews by default, checks host before deletion").into(),
                 Status::Success,
             ));
         }
@@ -2969,7 +3089,8 @@ impl Disktree {
     pub fn copy_agent_prompt(&mut self, cx: &mut Context<'_, Self>) {
         let plan = self.plan();
         if plan.is_empty() {
-            self.notice = Some(("nothing to copy".into(), Status::Warning));
+            self.notice =
+                Some((t!(cx, "nothing to copy").into(), Status::Warning));
             cx.notify();
             return;
         }
@@ -3000,9 +3121,15 @@ impl Disktree {
         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(prompt));
         let count = plan.targets.len();
         self.notice = Some((
-            format!(
-                "copied a prompt for your agent: {count} {}, {}",
-                if count == 1 { "path" } else { "paths" },
+            t!(
+                cx,
+                "copied a prompt for your agent: {0} {1}, {2}",
+                count,
+                if count == 1 {
+                    t!(cx, "path")
+                } else {
+                    t!(cx, "paths")
+                },
                 disktree_core::size::human_bytes(plan.bytes())
             ),
             Status::Success,
@@ -3023,8 +3150,9 @@ impl Disktree {
         // GPUI's reveal cannot report failure, so check what it can't.
         if std::fs::symlink_metadata(&path).is_err() {
             self.notice = Some((
-                format!(
-                    "{} is no longer on disk",
+                t!(
+                    cx,
+                    "{0} is no longer on disk",
                     crate::marks::display_path(&path, self.home.as_deref())
                 ),
                 Status::Warning,
@@ -3050,6 +3178,18 @@ impl Disktree {
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
         if self.confirm_open {
+            return;
+        }
+
+        if key == "f2" && !control && !alt {
+            self.open_language(cx);
+            return;
+        }
+        // The dialog owns its buttons and shortcuts, including over a picker.
+        if self.language_open {
+            if key == "escape" {
+                self.close_language(cx);
+            }
             return;
         }
 
@@ -3135,7 +3275,7 @@ impl Disktree {
                 {
                     run.cancel();
                     self.notice = Some((
-                        "stopping after the current item".into(),
+                        t!(cx, "stopping after the current item").into(),
                         Status::Warning,
                     ));
                     cx.notify();
@@ -3212,7 +3352,7 @@ impl Disktree {
             "c" if !control => {
                 if self.marks.is_empty() {
                     self.notice = Some((
-                        "mark something first: space marks the selected tile"
+                        t!(cx, "mark something first: space marks the selected tile")
                             .into(),
                         Status::Warning,
                     ));
@@ -3606,7 +3746,7 @@ impl Disktree {
                 Err(error) => {
                     this.restarting = false;
                     this.notice = Some((
-                        format!("still not an administrator: {error}"),
+                        t!(cx, "still not an administrator: {0}", error),
                         Status::Warning,
                     ));
                     cx.notify();
@@ -3718,12 +3858,12 @@ impl Render for Disktree {
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
         let title = if self.awaiting_root {
-            "disktree · Choose a source".into()
+            t!(cx, "disktree · Choose a source").into()
         } else {
             format!(
                 "disktree{} · {}",
                 self.remote.as_ref().map_or_else(String::new, |host| {
-                    format!(" · {host} · read-only")
+                    t!(cx, " · {0} · read-only", host)
                 }),
                 crate::marks::display_path(
                     &self.current_path(),

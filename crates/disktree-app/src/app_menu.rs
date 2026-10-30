@@ -5,6 +5,8 @@
 //! draws no menu bar on Linux or Windows, so there the same actions get the
 //! shortcuts their users expect, with ctrl, and nothing else.
 
+use crate::i18n::t;
+
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, SystemMenuType};
 
 pub use menu_actions::*;
@@ -39,6 +41,8 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
+            /// Choose the interface language.
+            ChooseLanguage,
         ]
     );
 }
@@ -90,27 +94,39 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-]", GoForward, None),
     ]);
+    update_language(cx);
+}
+
+/// Rebuild localized menus without registering handlers or bindings twice.
+pub fn update_language(cx: &App) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     cx.set_menus([
         Menu::new("disktree").items([
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::os_submenu(t!(cx, "Services"), SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide disktree", Hide),
-            MenuItem::action("Hide Others", HideOthers),
-            MenuItem::action("Show All", ShowAll),
+            MenuItem::action(t!(cx, "Hide disktree"), Hide),
+            MenuItem::action(t!(cx, "Hide Others"), HideOthers),
+            MenuItem::action(t!(cx, "Show All"), ShowAll),
             MenuItem::separator(),
-            MenuItem::action("Quit disktree", Quit),
+            MenuItem::action(t!(cx, "Quit disktree"), Quit),
         ]),
-        Menu::new("File").items([
-            MenuItem::action("Open Folder\u{2026}", OpenFolder),
-            MenuItem::action("Show in Finder", ShowInFinder),
+        Menu::new(t!(cx, "File")).items([
+            MenuItem::action(t!(cx, "Open Folder\u{2026}"), OpenFolder),
+            MenuItem::action(t!(cx, "Show in Finder"), ShowInFinder),
             MenuItem::separator(),
-            MenuItem::action("Rescan", Rescan),
+            MenuItem::action(t!(cx, "Rescan"), Rescan),
             MenuItem::separator(),
-            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::action(t!(cx, "Close Window"), CloseWindow),
         ]),
-        Menu::new("Go").items([
-            MenuItem::action("Back", GoBack),
-            MenuItem::action("Forward", GoForward),
+        Menu::new("Language / 语言").items([MenuItem::action(
+            t!(cx, "Choose interface language"),
+            ChooseLanguage,
+        )]),
+        Menu::new(t!(cx, "Go")).items([
+            MenuItem::action(t!(cx, "Back"), GoBack),
+            MenuItem::action(t!(cx, "Forward"), GoForward),
         ]),
     ]);
 }

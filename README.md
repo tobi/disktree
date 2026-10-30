@@ -146,6 +146,19 @@ disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
+### Interface language
+
+Click **Language / 语言** in the top bar or source chooser, or press `F2`,
+then choose **English** or **简体中文**. The window changes immediately; the
+current scan, navigation and marked paths stay in place. The choice is saved
+for the next launch in the user configuration directory, beside the Power
+Efficiency setting. English is the default and fallback.
+
+The language setting covers the window and macOS application menus. Command
+line help, exported prompts/scripts and technical filesystem/SSH diagnostics
+retain their original wording. See [Adding a language](docs/translations.md)
+to contribute another translation.
+
 ### Servers over SSH (read-only)
 
 ```sh

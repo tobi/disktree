@@ -4,6 +4,8 @@
 //! always exactly what the state says — there is no second copy of anything to
 //! keep in sync.
 
+use crate::i18n::t;
+
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{Plan, RemovalMode, Target};
@@ -92,15 +94,23 @@ pub fn root(
                 }
             },
         ))
+        .on_action(cx.listener(|this, _: &crate::app_menu::ChooseLanguage, _, cx| {
+            this.open_language(cx);
+        }))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if this.zoom_interface(event, window) {
                 cx.notify();
                 return;
             }
+            if this.language_open && event.keystroke.key == "tab" {
+                this.move_language_focus(event.keystroke.modifiers.shift, window, cx);
+                cx.stop_propagation();
+                return;
+            }
             if this.volumes_open {
                 let editing = [&this.picker_host, &this.picker_path].into_iter()
                     .flatten().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
-                if editing && event.keystroke.key != "escape" { return; }
+                if editing && !matches!(event.keystroke.key.as_str(), "escape" | "f2") { return; }
             }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
@@ -120,13 +130,109 @@ pub fn root(
     if app.show_help {
         root = root.child(help_overlay(app, cx));
     }
-    if app.volumes_open {
+    if app.volumes_open && !app.language_open {
         root = root.child(volumes_dialog(app, window, cx));
     }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
     }
+    if app.language_open {
+        root = root.child(language_dialog(app, cx));
+    }
     root
+}
+
+/// A bilingual label remains recognizable in either supported language.
+fn language_button(cx: &Context<'_, Disktree>) -> impl IntoElement {
+    with_tooltip(
+        button("language", "Language / 语言", ButtonVariant::Secondary, cx)
+            .debug_selector(|| "language".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_language(cx);
+                this.apply_focus(window, cx);
+            })),
+        t!(cx, "Choose interface language · F2"),
+    )
+}
+
+/// Stable focus handles let the modal confirm the button reached with Tab.
+fn language_dialog(
+    app: &Disktree,
+    cx: &mut Context<'_, Disktree>,
+) -> impl IntoElement {
+    let mut choices = div().flex().flex_col().gap(space::SM);
+    for (index, language) in crate::i18n::Language::ALL.into_iter().enumerate()
+    {
+        choices = choices.child(
+            button(
+                language.key(),
+                language.name(),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .track_focus(&app.language_focus[index])
+            .debug_selector(move || language.key().into())
+            .selected(crate::i18n::language(cx) == language)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_language(language, cx);
+                this.apply_focus(window, cx);
+            })),
+        );
+    }
+    let popup = dialog_popup(cx)
+        .child(dialog_title("Language / 语言", cx))
+        .child(choices)
+        .child(
+            dialog_button(
+                "language-cancel",
+                t!(cx, "Cancel"),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .track_focus(&app.language_focus[crate::i18n::Language::ALL.len()])
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_language(cx);
+                this.apply_focus(window, cx);
+            })),
+        );
+    let entity = cx.entity().downgrade();
+    let accept = entity.clone();
+    let outside = entity.clone();
+    let popup = centred_popup(popup, move |_, window, cx| {
+        let _ = outside.update(cx, |this, cx| {
+            this.close_language(cx);
+            this.apply_focus(window, cx);
+        });
+    });
+    alert_dialog(&app.confirm_focus, cx)
+        .open(true)
+        .on_ok(move |_, window, cx| {
+            let _ = accept.update(cx, |this, cx| {
+                if let Some(index) = this
+                    .language_focus
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+                {
+                    if let Some(language) =
+                        crate::i18n::Language::ALL.get(index)
+                    {
+                        this.set_language(*language, cx);
+                    } else {
+                        this.close_language(cx);
+                    }
+                    this.apply_focus(window, cx);
+                }
+            });
+            false
+        })
+        .on_cancel(move |_, window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.close_language(cx);
+                this.apply_focus(window, cx);
+            });
+            false
+        })
+        .popup(popup)
 }
 
 /// Discovery is lightweight; a separate, explicit action starts the walk.
@@ -139,8 +245,8 @@ fn volumes_dialog(
     let cancel = cx.entity().downgrade();
     let source_ready = app.picker_source_matches(cx);
     let source = app.volumes_source.as_ref().map_or_else(
-        || "This computer".to_owned(),
-        |host| format!("{host} · SSH · read-only"),
+        || t!(cx, "This computer").to_owned(),
+        |host| t!(cx, "{0} · SSH · read-only", host),
     );
     let mut rows = div()
         .id("volume-rows")
@@ -152,14 +258,14 @@ fn volumes_dialog(
         .overflow_y_scroll();
     if app.volumes_loading {
         rows = rows.child(dialog_description(
-            "Listing mounts, not scanning files…",
+            t!(cx, "Listing mounts, not scanning files…"),
             cx,
         ));
     } else if let Some(error) = &app.volumes_error {
         rows = rows.child(div().text_color(theme.danger).child(error.clone()));
     } else if app.volumes.is_empty() {
         rows = rows.child(dialog_description(
-            "No mounts listed. Enter a directory below.",
+            t!(cx, "No mounts listed. Enter a directory below."),
             cx,
         ));
     }
@@ -168,7 +274,10 @@ fn volumes_dialog(
         let label = format!(
             "{}  ·  {}",
             volume.point.display(),
-            volume.device.as_deref().unwrap_or("Mounted volume")
+            volume
+                .device
+                .as_deref()
+                .unwrap_or_else(|| t!(cx, "Mounted volume"))
         );
         rows = rows.child(
             div()
@@ -201,34 +310,37 @@ fn volumes_dialog(
         .as_ref()
         .expect("picker prepared before rendering");
     let popup = dialog_popup(cx).w_full()
-        .child(dialog_title("Choose what to scan", cx))
+        .child(div().flex().items_center().justify_between()
+            .child(dialog_title(t!(cx, "Choose what to scan"), cx))
+            .child(language_button(cx)))
         .child(dialog_description(
-            "Connect, then select a mount or directory. No new scan starts until you choose Scan.",
+            t!(cx, "Connect, then select a mount or directory. No new scan starts until you choose Scan."),
             cx))
         .child(div().flex().flex_row().gap(space::SM)
-            .child(button("source-local", "This computer", ButtonVariant::Secondary, cx)
+            .child(button("source-local", t!(cx, "This computer"), ButtonVariant::Secondary, cx)
                 .on_click(cx.listener(|this, _, window, cx| this.choose_local_source(window, cx))))
             .child(gpui_omarchy::input("source-host", host, window, cx)
                 .debug_selector(|| "source-host".into()).flex_1())
-            .child(button("source-connect", "Connect SSH", ButtonVariant::Secondary, cx)
+            .child(button("source-connect", t!(cx, "Connect SSH"), ButtonVariant::Secondary, cx)
                 .on_click(cx.listener(|this, _, _, cx| this.connect_picker(cx)))))
         .child(div().text_color(theme.bright).child(source))
+        .children(notice_line(app, &theme, cx))
         .child(rows)
         .child(dialog_description(
-            "Nested mounts and symlinks are not traversed. Space is measured only after selection.", cx))
+            t!(cx, "Nested mounts and symlinks are not traversed. Space is measured only after selection."), cx))
         .child(div().flex().flex_row().gap(space::SM)
             .child(gpui_omarchy::input("source-path", path, window, cx)
                 .debug_selector(|| "source-path".into()).flex_1())
-            .child(button("source-scan-path", "Scan directory", ButtonVariant::Secondary, cx)
+            .child(button("source-scan-path", t!(cx, "Scan directory"), ButtonVariant::Secondary, cx)
                 .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some())
                 .on_click(cx.listener(|this, _, _, cx| this.choose_picker_path(cx)))))
-        .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(error.clone())))
+        .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(t!(cx, error).to_owned())))
         .child(div().flex().flex_row().justify_end().gap(space::SM)
-            .child(dialog_button("source-cancel", "Cancel", ButtonVariant::Secondary, cx)
+            .child(dialog_button("source-cancel", t!(cx, "Cancel"), ButtonVariant::Secondary, cx)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.close_volumes(cx); this.apply_focus(window, cx);
                 })))
-            .child(dialog_button("source-scan", "Scan selected root", ButtonVariant::Primary, cx)
+            .child(dialog_button("source-scan", t!(cx, "Scan selected root"), ButtonVariant::Primary, cx)
                 .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.choose_volume(cx); this.apply_focus(window, cx);
@@ -339,14 +451,12 @@ fn delete_dialog(
 ) -> impl IntoElement {
     let plan = app.plan();
     let title = match plan.targets.as_slice() {
-        [only] => format!(
-            "Delete \u{201c}{}\u{201d} permanently?",
-            short_name(&only.path)
-        ),
-        targets => format!("Delete {} items permanently?", targets.len()),
+        [only] => t!(cx, "Delete “{0}” permanently?", short_name(&only.path)),
+        targets => t!(cx, "Delete {0} items permanently?", targets.len()),
     };
-    let body = format!(
-        "This frees {}. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
+    let body = t!(
+        cx,
+        "This frees {0}. Deleted files can’t be recovered; move them to the trash if you might need them again.",
         human_bytes(plan.bytes())
     );
     let confirm = cx.entity().downgrade();
@@ -359,7 +469,7 @@ fn delete_dialog(
         .child(
             dialog_button(
                 "delete-cancel",
-                "Cancel",
+                t!(cx, "Cancel"),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -371,7 +481,7 @@ fn delete_dialog(
         .child(
             dialog_button(
                 "delete-confirm",
-                "Delete",
+                t!(cx, "Delete"),
                 ButtonVariant::Danger,
                 cx,
             )
@@ -435,15 +545,16 @@ fn explore(
             .child(
                 div()
                     .text_size(text::HEADING)
-                    .child("Choose a source. Then choose a root."),
+                    .child(t!(cx, "Choose a source. Then choose a root.")),
             )
-            .child(div().text_color(theme.secondary).child(
-                "Local or SSH · one mount at a time · no background scan",
-            ))
+            .child(div().text_color(theme.secondary).child(t!(
+                cx,
+                "Local or SSH · one mount at a time · no background scan"
+            )))
             .child(
                 button(
                     "choose-source",
-                    "Choose source…",
+                    t!(cx, "Choose source…"),
                     ButtonVariant::Primary,
                     cx,
                 )
@@ -453,9 +564,11 @@ fn explore(
                         this.apply_focus(window, cx);
                     },
                 )),
-            );
+            )
+            .child(language_button(cx))
+            .children(notice_line(app, &theme, cx));
     }
-    let mosaic: Mosaic = app.prepare();
+    let mosaic: Mosaic = app.prepare(cx);
     let width_rems = window.viewport_size().width.as_f32() / app.rem;
     // The panel is where the selection, the marks and the disk live; it
     // only gives way when the mosaic would be too narrow to read.
@@ -592,12 +705,13 @@ fn top_bar(
                     this.open_volumes(cx);
                     this.apply_focus(window, cx);
                 })),
-            "Choose local or SSH source · v",
+            t!(cx, "Choose local or SSH source · v"),
         ))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
         .child(div().flex_1())
         .child(view_settings(app, window, cx))
+        .child(language_button(cx))
 }
 
 /// The trail, from `/`. Above the scanned root, a crumb widens the scan;
@@ -652,7 +766,7 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.widen_to(path.clone(), cx);
                         })),
-                    "Scan from here · what is below is reused",
+                    t!(cx, "Scan from here · what is below is reused"),
                 )
                 .into_any_element()
             }
@@ -802,7 +916,7 @@ fn sibling_menu(
                 .py(space::XS)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.8))
-                .child(format!("Siblings in {parent_name}")),
+                .child(t!(cx, "Siblings in {0}", parent_name)),
         );
     for (row_index, row) in rows.into_iter().enumerate() {
         let current =
@@ -871,7 +985,7 @@ fn sibling_menu(
                 .py(space::XS)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.7))
-                .child(format!("+{more} smaller")),
+                .child(t!(cx, "+{0} smaller", more)),
         );
     }
     panel
@@ -934,9 +1048,9 @@ fn view_settings(
         button_group(
             "mode",
             vec![
-                ChoiceItem::new("size", "Size"),
-                ChoiceItem::new("files", "Files"),
-                ChoiceItem::new("age", "Age"),
+                ChoiceItem::new("size", t!(cx, "Size")),
+                ChoiceItem::new("files", t!(cx, "Files")),
+                ChoiceItem::new("age", t!(cx, "Age")),
             ],
             Some(app.mode_index()),
             move |index, window, cx| {
@@ -964,7 +1078,7 @@ fn view_settings(
         let focus = focus.clone();
         checkbox(
             "hidden",
-            "Hidden files",
+            t!(cx, "Hidden files"),
             check(app.options.include_hidden),
             cx,
         )
@@ -980,7 +1094,7 @@ fn view_settings(
     let apparent = {
         checkbox(
             "apparent",
-            "Apparent size",
+            t!(cx, "Apparent size"),
             check(app.options.apparent_size),
             cx,
         )
@@ -1099,11 +1213,11 @@ fn view_settings(
                     .px(space::SM)
                     .text_size(text::BODY)
                     .text_color(theme.foreground)
-                    .child(format!("Depth {depth}")),
+                    .child(t!(cx, "Depth {0}", depth)),
             )
             .child(stepper("depth-less", "\u{2212}", -1, cx))
             .child(stepper("depth-more", "+", 1, cx)),
-        "Levels drawn at once \u{00b7} [ and ]",
+        t!(cx, "Levels drawn at once \u{00b7} [ and ]"),
     );
 
     div()
@@ -1144,7 +1258,7 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
     let theme = cx.omarchy().clone();
     let cpus = app.cpu_threads;
     let threads = app.options.threads.max_threads.min(cpus);
-    let name = app.power_choice.map_or("Custom", PowerEfficiency::name);
+    let name = t!(cx, app.power_choice.map_or("Custom", PowerEfficiency::name));
     let open = app.power_menu.is_some();
     let trigger = div()
         .id("power-efficiency")
@@ -1160,7 +1274,7 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
         }))
         .child(
             button("power-toggle", "", ButtonVariant::Secondary, cx)
-                .accessibility_label(format!("Power Efficiency: {name}"))
+                .accessibility_label(t!(cx, "Power Efficiency: {0}", name))
                 .selected(open)
                 .tab_stop(false)
                 .child(widgets::signal(
@@ -1184,10 +1298,13 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
     } else {
         with_tooltip(
             trigger,
-            format!(
-                "Power Efficiency: {name} \u{00b7} {} of {cpus} CPUs\n\
-                 {POWER_TRADEOFF}\nUsed from the next scan, and remembered.",
-                power::workers(threads)
+            t!(
+                cx,
+                "Power Efficiency: {0} · {1} of {2} CPUs\n{3}\nUsed from the next scan, and remembered.",
+                name,
+                power::workers(threads, crate::i18n::language(cx)),
+                cpus,
+                t!(cx, POWER_TRADEOFF)
             ),
         )
     };
@@ -1223,8 +1340,8 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
                 .py(space::XS)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary.opacity(0.8))
-                .child("Scan workers")
-                .child(format!("{cpus} CPUs")),
+                .child(t!(cx, "Scan workers"))
+                .child(t!(cx, "{0} CPUs", cpus)),
         );
     for (index, preset) in PowerEfficiency::ALL.into_iter().enumerate() {
         let offered = preset.available(cpus);
@@ -1261,7 +1378,7 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(preset.name()),
+                    .child(t!(cx, preset.name())),
             )
             .child(div().flex_shrink_0().w(size::ROW_BAR).child(widgets::bar(
                 count as f32 / cpus as f32,
@@ -1276,7 +1393,7 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
                     .justify_end()
                     .text_size(text::BODY)
                     .text_color(theme.secondary)
-                    .child(power::workers(count)),
+                    .child(power::workers(count, crate::i18n::language(cx))),
             );
         // A preset this machine cannot tell apart from the one below it is
         // shown, so the scale stays the same everywhere, but not offered.
@@ -1294,10 +1411,10 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
                 window.focus(&this.focus, cx);
             }))
         } else {
-            let below = PowerEfficiency::ALL[index - 1].name();
+            let below = t!(cx, PowerEfficiency::ALL[index - 1].name());
             with_tooltip(
                 row.opacity(0.45),
-                format!("Same as {below} with {cpus} CPUs"),
+                t!(cx, "Same as {0} with {1} CPUs", below, cpus),
             )
         };
         menu = menu.child(row);
@@ -1335,21 +1452,24 @@ fn trail_and_legend(
         .gap(space::LG)
         .px(space::LG)
         .py(space::SM)
-        .child(scan_totals(app, theme));
+        .child(scan_totals(app, theme, cx));
     if app.find_open || !app.find.is_empty() {
-        row = row.child(find_field(app, theme));
+        row = row.child(find_field(app, theme, cx));
     }
     row.child(div().flex_1()).child(legend(app, theme, cx))
 }
 
 /// What the whole scan found, as one quiet line; unreadable paths are
 /// flagged in the warning colour when there are any.
-fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
+fn scan_totals(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     if app.is_indexing() {
         return div()
             .text_size(text::CAPTION)
             .text_color(theme.secondary)
-            .child("Live overview · incomplete · top-level contributions");
+            .child(t!(
+                cx,
+                "Live overview · incomplete · top-level contributions"
+            ));
     }
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
@@ -1365,14 +1485,16 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         .text_size(text::CAPTION)
         .text_color(theme.secondary)
         .child(div().text_color(theme.foreground).child(human_bytes(bytes)))
-        .child(format!(
-            "· {} files · {} dirs",
+        .child(t!(
+            cx,
+            "· {0} files · {1} dirs",
             widgets::human_count(files),
             widgets::human_count(dirs)
         ))
         .when(errors > 0, |this| {
-            this.child(div().text_color(theme.warning).child(format!(
-                "· {} unreadable",
+            this.child(div().text_color(theme.warning).child(t!(
+                cx,
+                "· {0} unreadable",
                 widgets::human_count(errors)
             )))
         })
@@ -1393,7 +1515,7 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 div()
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
-                    .child(label),
+                    .child(t!(cx, label)),
             )
     };
     let mut lane = div()
@@ -1427,7 +1549,10 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .gap(space::MD)
         .min_w_0()
         .overflow_hidden()
-        .child(item(widgets::hatch_swatch(hatch, ground), "Reclaimable"))
+        .child(item(
+            widgets::hatch_swatch(hatch, ground),
+            t!(cx, "Reclaimable"),
+        ))
         .child(lane)
 }
 
@@ -1510,13 +1635,13 @@ fn selection_section(
         .flex()
         .flex_col()
         .gap(space::MD)
-        .child(widgets::eyebrow("Selection", cx));
+        .child(widgets::eyebrow(t!(cx, "Selection"), cx));
     let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
     let Some(node) = app.node_at(&target) else {
         return section.child(
             div()
                 .text_color(theme.secondary)
-                .child("Point at a tile or select one with the arrows"),
+                .child(t!(cx, "Point at a tile or select one with the arrows")),
         );
     };
     let path = app.path_at(&target);
@@ -1570,7 +1695,9 @@ fn selection_section(
 
     let (number, unit) = match app.options.metric {
         Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
-        Metric::Files => (widgets::human_count(node.files), "files".into()),
+        Metric::Files => {
+            (widgets::human_count(node.files), t!(cx, "files").into())
+        }
     };
     let share = node.bytes as f32 / root_value.max(1) as f32;
     let measure = div()
@@ -1592,9 +1719,9 @@ fn selection_section(
         && crate::git::is_checkout(path)
     {
         let value = match app.git.get(path) {
-            Some(Some(state)) => state.summary(),
-            Some(None) => "not readable".to_string(),
-            None => "asking\u{2026}".to_string(),
+            Some(Some(state)) => state.summary(crate::i18n::language(cx)),
+            Some(None) => t!(cx, "not readable").to_string(),
+            None => t!(cx, "asking\u{2026}").to_string(),
         };
         let clean =
             matches!(app.git.get(path), Some(Some(state)) if state.is_clean());
@@ -1606,12 +1733,16 @@ fn selection_section(
         )
     } else {
         let kind = node.reclaim.map_or_else(
-            || node.category.label().to_string(),
+            || t!(cx, node.category.label()).to_string(),
             |reason| {
-                format!("{} \u{00b7} {}", node.category.label(), reason.label())
+                format!(
+                    "{} \u{00b7} {}",
+                    t!(cx, node.category.label()),
+                    t!(cx, reason.label())
+                )
             },
         );
-        widgets::figure("Kind", kind, theme.bright, cx)
+        widgets::figure(t!(cx, "Kind"), kind, theme.bright, cx)
     };
     let grid = div()
         .flex()
@@ -1622,13 +1753,13 @@ fn selection_section(
                 .flex()
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Of scan",
+                    t!(cx, "Of scan"),
                     widgets::percent(node.bytes, root_value),
                     theme.bright,
                     cx,
                 )))
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Files",
+                    t!(cx, "Files"),
                     widgets::human_count(node.files),
                     theme.bright,
                     cx,
@@ -1639,8 +1770,12 @@ fn selection_section(
                 .flex()
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
-                    "Last write",
-                    widgets::ago(crate::state::now_seconds(), node.modified),
+                    t!(cx, "Last write"),
+                    widgets::ago(
+                        crate::state::now_seconds(),
+                        node.modified,
+                        crate::i18n::language(cx),
+                    ),
                     theme.bright,
                     cx,
                 )))
@@ -1650,17 +1785,21 @@ fn selection_section(
     // Only states that change the decision earn a badge.
     let mut chips = Vec::new();
     if marked {
-        chips.push(widgets::chip("Marked", theme.danger, cx));
+        chips.push(widgets::chip(t!(cx, "Marked"), theme.danger, cx));
     }
     if let Some(ancestor) = &covered_by {
         chips.push(widgets::chip(
-            format!("Goes with {ancestor}"),
+            t!(cx, "Goes with {0}", ancestor),
             theme.danger,
             cx,
         ));
     }
     if node.read_error {
-        chips.push(widgets::chip("Partly unreadable", theme.warning, cx));
+        chips.push(widgets::chip(
+            t!(cx, "Partly unreadable"),
+            theme.warning,
+            cx,
+        ));
     }
     let badges = (!chips.is_empty()).then(|| {
         div()
@@ -1678,7 +1817,7 @@ fn selection_section(
         if node.is_dir() {
             let crumbs = target.clone();
             actions = actions.child(
-                button("open", "Open", ButtonVariant::Outline, cx)
+                button("open", t!(cx, "Open"), ButtonVariant::Outline, cx)
                     .tab_stop(false)
                     .flex_1()
                     .justify_center()
@@ -1696,10 +1835,10 @@ fn selection_section(
         let crumbs = target;
         let label = match &ancestor {
             Some(ancestor) if !marked => {
-                format!("Unmark {}", short_name(ancestor))
+                t!(cx, "Unmark {0}", short_name(ancestor))
             }
-            _ if marked => "Unmark".to_string(),
-            _ => "Mark for removal".to_string(),
+            _ if marked => t!(cx, "Unmark").to_string(),
+            _ => t!(cx, "Mark for removal").to_string(),
         };
         let mark = button("mark", label, ButtonVariant::Primary, cx)
             .tab_stop(false)
@@ -1753,7 +1892,7 @@ fn worth_section(
             .items_center()
             .justify_between()
             .pb(space::XS)
-            .child(widgets::eyebrow("Worth a look", cx))
+            .child(widgets::eyebrow(t!(cx, "Worth a look"), cx))
             .when(total > 0, |this| {
                 this.child(
                     div()
@@ -1769,9 +1908,9 @@ fn worth_section(
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
                 .child(if app.tree().is_some() {
-                    "Nothing obviously disposable"
+                    t!(cx, "Nothing obviously disposable")
                 } else {
-                    "Waiting for the scan"
+                    t!(cx, "Waiting for the scan")
                 }),
         );
     }
@@ -1780,7 +1919,7 @@ fn worth_section(
         let Some(node) = app.node_at(&candidate.crumbs) else {
             continue;
         };
-        let (title, detail) = insight_text(app, candidate);
+        let (title, detail) = insight_text(app, candidate, cx);
         let accent = palette::category_accent(theme, node.category);
         let active = selected.as_deref() == Some(candidate.crumbs.as_slice());
         let crumbs = candidate.crumbs.clone();
@@ -1852,7 +1991,11 @@ fn worth_section(
 
 /// A finding's title, as the last two parts of its path, and why it is on
 /// the list.
-fn insight_text(app: &Disktree, candidate: &Candidate) -> (String, String) {
+fn insight_text(
+    app: &Disktree,
+    candidate: &Candidate,
+    cx: &App,
+) -> (String, String) {
     let tree = app.tree();
     let chain = tree
         .map_or_else(Vec::new, |tree| tree.resolve_chain(&candidate.crumbs));
@@ -1860,19 +2003,38 @@ fn insight_text(app: &Disktree, candidate: &Candidate) -> (String, String) {
         chain.iter().skip(1).map(|node| &*node.name).collect();
     let tail = names[names.len().saturating_sub(2)..].join("/");
     match &candidate.finding {
-        Finding::Reclaimable(reason) => (tail, reason.label().to_string()),
+        Finding::Reclaimable(reason) => {
+            (tail, t!(cx, reason.label()).to_string())
+        }
         Finding::Worktrees { count, oldest_days } => (
             tail,
-            format!(
-                "{count} worktree{} \u{00b7} oldest {oldest_days} d",
-                if *count == 1 { "" } else { "s" }
+            t!(
+                cx,
+                "{0} worktree{1} · oldest {2} d",
+                count,
+                if crate::i18n::language(cx) == crate::i18n::Language::English
+                    && *count != 1
+                {
+                    "s"
+                } else {
+                    ""
+                },
+                oldest_days
             ),
         ),
         Finding::StaleExperiments { count } => (
-            format!("{tail} > {STALE_DAYS} days"),
-            format!(
-                "{count} experiment{} untouched",
-                if *count == 1 { "" } else { "s" }
+            t!(cx, "{0} > {1} days", tail, STALE_DAYS),
+            t!(
+                cx,
+                "{0} experiment{1} untouched",
+                count,
+                if crate::i18n::language(cx) == crate::i18n::Language::English
+                    && *count != 1
+                {
+                    "s"
+                } else {
+                    ""
+                }
             ),
         ),
     }
@@ -1893,9 +2055,9 @@ fn marked_section(
         .justify_between()
         .child(widgets::eyebrow(
             if count == 0 {
-                "Marked".to_string()
+                t!(cx, "Marked").to_string()
             } else {
-                format!("Marked · {count}")
+                t!(cx, "Marked · {0}", count)
             },
             cx,
         ))
@@ -1913,7 +2075,7 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Space marks the tile you point at"),
+                .child(t!(cx, "Space marks the tile you point at")),
         );
     }
     for (index, item) in app.marks.items().iter().take(MARKED_ROWS).enumerate()
@@ -1976,8 +2138,9 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "+{} more on the review screen",
+                .child(t!(
+                    cx,
+                    "+{0} more on the review screen",
                     count - MARKED_ROWS
                 )),
         );
@@ -1987,8 +2150,9 @@ fn marked_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} nested \u{00b7} {} kept back",
+                .child(t!(
+                    cx,
+                    "{0} nested · {1} kept back",
                     plan.covered.len(),
                     plan.blocked.len()
                 )),
@@ -2036,7 +2200,11 @@ fn privacy_line(
     }
     let color = theme.warning;
     let errors = app.progress.errors;
-    let noun = if errors == 1 { "item" } else { "items" };
+    let noun = if errors == 1 {
+        t!(cx, "item")
+    } else {
+        t!(cx, "items")
+    };
     Some(
         div()
             .flex()
@@ -2047,16 +2215,11 @@ fn privacy_line(
             .border_1()
             .border_color(color.opacity(0.5))
             .text_size(text::CAPTION)
-            .child(div().text_color(color).child(format!(
-                "macOS kept {} {noun} unreadable. Give disktree Full Disk \
-                 Access, or your terminal if you started it there, then \
-                 reopen it.",
-                widgets::human_count(errors)
-            )))
+            .child(div().text_color(color).child(t!(cx, "macOS kept {0} {1} unreadable. Give disktree Full Disk Access, or your terminal if you started it there, then reopen it.", widgets::human_count(errors), noun)))
             .child(
                 button(
                     "privacy",
-                    "Open Privacy Settings",
+                    t!(cx, "Open Privacy Settings"),
                     ButtonVariant::Outline,
                     cx,
                 )
@@ -2093,22 +2256,31 @@ fn administrator_line(
     }
     let errors = app.progress.errors;
     let message = if errors > 0 {
-        let noun = if errors == 1 { "item" } else { "items" };
+        let noun = if errors == 1 {
+            t!(cx, "item")
+        } else {
+            t!(cx, "items")
+        };
         // With `-l` the elevated copy walks too: only the reading is gained.
         let faster = if app.options.follow_links {
             ""
         } else {
-            ", and a whole drive several times faster"
+            t!(cx, ", and a whole drive several times faster")
         };
-        format!(
-            "Windows kept {} {noun} unreadable. Run as administrator to read \
-             them{faster}.",
-            widgets::human_count(errors)
+        t!(
+            cx,
+            "Windows kept {0} {1} unreadable. Run as administrator to read them{2}.",
+            widgets::human_count(errors),
+            noun,
+            faster
         )
     } else if app.file_table && !app.options.follow_links {
-        "Run as administrator to read the whole drive from its file table: \
+        t!(
+            cx,
+            "Run as administrator to read the whole drive from its file table: \
          several times faster than this walk."
-            .to_owned()
+        )
+        .to_owned()
     } else {
         return None;
     };
@@ -2116,7 +2288,7 @@ fn administrator_line(
     let message = if app.marks.is_empty() {
         message
     } else {
-        format!("{message} Restarting drops the marks.")
+        t!(cx, "{0} Restarting drops the marks.", message)
     };
     let color = theme.warning;
     Some(
@@ -2133,7 +2305,7 @@ fn administrator_line(
             .child(
                 button(
                     "administrator",
-                    "Restart as Administrator",
+                    t!(cx, "Restart as Administrator"),
                     ButtonVariant::Outline,
                     cx,
                 )
@@ -2155,7 +2327,10 @@ fn disk_section(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
-    let device = app.device.clone().unwrap_or_default();
+    let device = app.remote.as_ref().map_or_else(
+        || app.device.clone().unwrap_or_default(),
+        |host| t!(cx, "{0} · read-only · space at scan", host),
+    );
     // The disk header doubles as the way to another volume: it opens the
     // picker, like `V` does. A plain label would hide that the scan can move.
     let header = div()
@@ -2163,7 +2338,7 @@ fn disk_section(
         .flex_row()
         .items_center()
         .gap(space::SM)
-        .child(widgets::eyebrow("Disk", cx))
+        .child(widgets::eyebrow(t!(cx, "Disk"), cx))
         .child(
             div()
                 .text_size(text::CAPTION)
@@ -2172,7 +2347,7 @@ fn disk_section(
         )
         .child(div().flex_1())
         .child(
-            button("volumes", "Source…", ButtonVariant::Secondary, cx)
+            button("volumes", t!(cx, "Source…"), ButtonVariant::Secondary, cx)
                 .tab_stop(false)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_volumes(cx);
@@ -2185,7 +2360,7 @@ fn disk_section(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Free space is not available here"),
+                .child(t!(cx, "Free space is not available here")),
         );
     };
     let plan = app.plan();
@@ -2208,7 +2383,7 @@ fn disk_section(
             .child(widgets::measure(
                 number,
                 text::FIGURE,
-                format!("{unit} free"),
+                t!(cx, "{0} free", unit),
                 text::BODY,
                 cx,
             ))
@@ -2223,8 +2398,9 @@ fn disk_section(
                             (text::FIGURE.0 - text::TITLE.0) * 0.2,
                         ))
                         .text_color(highlight)
-                        .child(format!(
-                            "→ {} free",
+                        .child(t!(
+                            cx,
+                            "→ {0} free",
                             human_bytes(after.available)
                         )),
                 )
@@ -2262,12 +2438,12 @@ fn disk_section(
                     ),
             ),
     );
-    if let Some(left_out) = not_counted(&plan) {
+    if let Some(left_out) = not_counted(&plan, cx) {
         section = section.child(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("not counted here: {left_out}")),
+                .child(t!(cx, "not counted here: {0}", left_out)),
         );
     }
     section
@@ -2277,9 +2453,9 @@ fn disk_section(
                 .flex_row()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!("{} used", human_bytes(space_info.used())))
+                .child(t!(cx, "{0} used", human_bytes(space_info.used())))
                 .child(div().flex_1())
-                .child(format!("{} total", human_bytes(space_info.total))),
+                .child(t!(cx, "{0} total", human_bytes(space_info.total))),
         )
         .children(
             (!app.marks.is_empty())
@@ -2291,14 +2467,15 @@ fn disk_section(
 /// bytes marked on another volume come back there, and bytes no volume can
 /// be found for are not claimed at all. `None` when every marked byte is
 /// this volume's, which is the usual case.
-fn not_counted(plan: &Plan) -> Option<String> {
+fn not_counted(plan: &Plan, cx: &App) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if plan.foreign() > 0 {
-        parts.push(format!("{} on other volumes", human_bytes(plan.foreign())));
+        parts.push(t!(cx, "{0} on other volumes", human_bytes(plan.foreign())));
     }
     if plan.unattributed() > 0 {
-        parts.push(format!(
-            "{} could not be placed",
+        parts.push(t!(
+            cx,
+            "{0} could not be placed",
             human_bytes(plan.unattributed())
         ));
     }
@@ -2345,8 +2522,10 @@ fn review_button(
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(format!(
-                    "Review {count} marked · frees {}…",
+                .child(t!(
+                    cx,
+                    "Review {0} marked · frees {1}…",
+                    count,
                     human_bytes(reclaiming)
                 )),
         )
@@ -2360,17 +2539,17 @@ fn review_button(
 fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // Most useful first, so a narrow window clips the least useful.
     let hints: [(&str, &str); 11] = [
-        ("space", "mark"),
-        ("enter", "open"),
-        ("\u{232b}", "up"),
-        ("c", "review"),
-        ("hjkl", "move"),
-        ("/", "filter"),
-        ("[ ]", "depth"),
-        ("t", "mode"),
-        ("0", "reset"),
-        ("v", "volumes"),
-        ("r", "rescan"),
+        ("space", t!(cx, "mark")),
+        ("enter", t!(cx, "open")),
+        ("\u{232b}", t!(cx, "up")),
+        ("c", t!(cx, "review")),
+        ("hjkl", t!(cx, "move")),
+        ("/", t!(cx, "filter")),
+        ("[ ]", t!(cx, "depth")),
+        ("t", t!(cx, "mode")),
+        ("0", t!(cx, "reset")),
+        ("v", t!(cx, "volumes")),
+        ("r", t!(cx, "rescan")),
     ];
     let mut lane = div()
         .flex()
@@ -2404,22 +2583,25 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         );
     }
     let scan = if app.scan.is_some() || app.remote_scan.is_some() {
-        "Indexing · incomplete".to_string()
+        t!(cx, "Indexing · incomplete").to_string()
     } else if app.progress.cancelled {
-        format!(
-            "scan cancelled \u{00b7} {} entries \u{00b7} r scans again",
+        t!(
+            cx,
+            "scan cancelled · {0} entries · r scans again",
             widgets::human_count(app.progress.files)
         )
     } else {
         let elapsed = app.scan_elapsed.map_or_else(String::new, |time| {
             format!(" \u{00b7} {:.1} s", time.as_secs_f32())
         });
-        format!(
-            "scan {} entries{elapsed}",
-            widgets::human_count(app.progress.files)
+        t!(
+            cx,
+            "scan {0} entries{1}",
+            widgets::human_count(app.progress.files),
+            elapsed
         )
     };
-    row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
+    row.child(widgets::hint("?", t!(cx, "all keys"), cx).flex_shrink_0())
         .child(
             div()
                 .flex_shrink_0()
@@ -2457,11 +2639,11 @@ fn scanning_panel(
         .text_size(text::BODY)
         .text_color(theme.secondary)
         .child(if error.is_some() {
-            "Scan failed"
+            t!(cx, "Scan failed")
         } else if app.progress.cancelled {
-            "Indexing stopped"
+            t!(cx, "Indexing stopped")
         } else {
-            "Waiting for the first indexed entries…"
+            t!(cx, "Waiting for the first indexed entries…")
         })
         .children(error.map(|error| {
             div()
@@ -2471,11 +2653,18 @@ fn scanning_panel(
         }))
         .when(!app.is_indexing(), |panel| {
             panel.child(
-                button("scan-again", "Scan again", ButtonVariant::Outline, cx)
-                    .on_click(cx.listener(|this, _, window, cx| {
+                button(
+                    "scan-again",
+                    t!(cx, "Scan again"),
+                    ButtonVariant::Outline,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
                         this.start_scan(cx);
                         window.focus(&this.focus, cx);
-                    })),
+                    },
+                )),
             )
         })
 }
@@ -2499,8 +2688,9 @@ fn indexing_compact(
                 .min_w_0()
                 .truncate()
                 .font_family(theme.mono_font.clone())
-                .child(format!(
-                    "{} files",
+                .child(t!(
+                    cx,
+                    "{0} files",
                     widgets::human_count(app.progress.files)
                 )),
         )
@@ -2510,15 +2700,14 @@ fn indexing_compact(
                 .min_w_0()
                 .truncate()
                 .font_family(theme.mono_font.clone())
-                .child(format!("{} measured", human_bytes(app.progress.bytes))),
+                .child(t!(cx, "{0} measured", human_bytes(app.progress.bytes))),
         )
         .child(
-            button("cancel-scan", "Stop", ButtonVariant::Outline, cx).on_click(
-                cx.listener(|this, _, window, cx| {
+            button("cancel-scan", t!(cx, "Stop"), ButtonVariant::Outline, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.cancel_scan(cx);
                     window.focus(&this.focus, cx);
-                }),
-            ),
+                })),
         )
 }
 
@@ -2554,7 +2743,7 @@ fn indexing_progress(
             .and_then(|preview| preview.directory.as_ref())
     };
     let full_path = path.map_or_else(
-        || "Directory not reported yet".into(),
+        || t!(cx, "Directory not reported yet").into(),
         |path| path.display().to_string(),
     );
     let mut parts = path
@@ -2580,41 +2769,45 @@ fn indexing_progress(
         .gap(space::XS)
         .text_size(text::BODY)
         .text_color(theme.foreground)
-        .child(widgets::eyebrow("Indexing", cx))
+        .child(widgets::eyebrow(t!(cx, "Indexing"), cx))
         .child(div().h(size::PROGRESS_ROW).truncate().child(
             if app.remote.is_some() {
-                app.remote_progress.stage.label()
+                t!(cx, app.remote_progress.stage.label())
             } else {
-                "Reading this computer"
+                t!(cx, "Reading this computer")
             },
         ))
         .child(row(
-            "Files",
+            t!(cx, "Files"),
             widgets::human_count(app.progress.files),
             "indexing-files",
         ))
         .child(row(
-            "Directories",
+            t!(cx, "Directories"),
             widgets::human_count(app.progress.dirs),
             "indexing-dirs",
         ))
         .child(row(
-            "Measured",
+            t!(cx, "Measured"),
             human_bytes(app.progress.bytes),
             "indexing-bytes",
         ))
         .child(row(
-            "Read errors",
+            t!(cx, "Read errors"),
             widgets::human_count(app.progress.errors),
             "indexing-errors",
         ))
-        .child(row("Elapsed", format!("{elapsed} s"), "indexing-elapsed"))
+        .child(row(
+            t!(cx, "Elapsed"),
+            format!("{elapsed} s"),
+            "indexing-elapsed",
+        ))
         .child(
             div()
                 .h(size::PROGRESS_ROW)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Recent directory"),
+                .child(t!(cx, "Recent directory")),
         )
         .child(with_tooltip(
             div()
@@ -2631,39 +2824,51 @@ fn indexing_progress(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("Preview only · provisional totals"),
+                .child(t!(cx, "Preview only · provisional totals")),
         )
         .child(
-            button("cancel-scan", "Stop indexing", ButtonVariant::Outline, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.cancel_scan(cx);
-                    window.focus(&this.focus, cx);
-                })),
+            button(
+                "cancel-scan",
+                t!(cx, "Stop indexing"),
+                ButtonVariant::Outline,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.cancel_scan(cx);
+                window.focus(&this.focus, cx);
+            })),
         )
 }
 
-fn find_field(app: &Disktree, theme: &Theme) -> Div {
+fn find_field(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     // What the text matches, said beside it as it is typed, and what Enter
     // and Escape will do with it.
     let (summary, hint) = match app.matches.as_deref() {
         _ if app.finding && app.matches.is_none() => {
-            ("searching…".to_string(), "")
+            (t!(cx, "searching…").to_string(), "")
         }
-        None => (String::new(), "type to filter"),
+        None => (String::new(), t!(cx, "type to filter")),
         Some(matches) if matches.count == 0 => {
-            ("no matches".to_string(), "esc clears")
+            (t!(cx, "no matches").to_string(), t!(cx, "esc clears"))
         }
         Some(matches) => (
-            format!(
-                "{} match{} · {}",
+            t!(
+                cx,
+                "{0} match{1} · {2}",
                 widgets::human_count(matches.count as u64),
-                if matches.count == 1 { "" } else { "es" },
+                if crate::i18n::language(cx) == crate::i18n::Language::English
+                    && matches.count != 1
+                {
+                    "es"
+                } else {
+                    ""
+                },
                 human_bytes(matches.bytes)
             ),
             if app.filter_applied {
-                "esc clears"
+                t!(cx, "esc clears")
             } else {
-                "enter shows only these"
+                t!(cx, "enter shows only these")
             },
         ),
     };
@@ -2698,7 +2903,7 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         .child(if app.find.is_empty() {
             div()
                 .text_color(theme.secondary.opacity(0.7))
-                .child("Filter by name")
+                .child(t!(cx, "Filter by name"))
         } else {
             div().text_color(theme.bright).child(app.find.clone())
         })
@@ -2770,12 +2975,10 @@ fn review(
         .bg(theme.inset);
 
     if items.is_empty() {
-        list = list.child(
-            div()
-                .p(space::XXL)
-                .text_color(theme.secondary)
-                .child("Nothing is marked. Go back and mark what should go."),
-        );
+        list =
+            list.child(div().p(space::XXL).text_color(theme.secondary).child(
+                t!(cx, "Nothing is marked. Go back and mark what should go."),
+            ));
     }
 
     for (index, item) in items.iter().take(LIST_LIMIT).enumerate() {
@@ -2802,10 +3005,7 @@ fn review(
                 .py(space::SM)
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} more are marked and will be removed too. Unmark them in the treemap.",
-                    items.len() - LIST_LIMIT
-                )),
+                .child(t!(cx, "{0} more are marked and will be removed too. Unmark them in the treemap.", items.len() - LIST_LIMIT)),
         );
     }
 
@@ -2816,9 +3016,10 @@ fn review(
         .flex_1()
         .min_h_0()
         .child(screen_header(
-            "Review",
-            &format!(
-                "{} marked \u{00b7} {} to free",
+            t!(cx, "Review"),
+            &t!(
+                cx,
+                "{0} marked · {1} to free",
                 app.marks.len(),
                 human_bytes(plan.bytes())
             ),
@@ -2897,11 +3098,15 @@ fn mark_row(
                 ),
         )
         .children(covered.then(|| {
-            widgets::chip("Inside a marked directory", theme.secondary, cx)
+            widgets::chip(
+                t!(cx, "Inside a marked directory"),
+                theme.secondary,
+                cx,
+            )
         }))
-        .children(
-            blocked.map(|reason| widgets::chip(reason, theme.warning, cx)),
-        )
+        .children(blocked.map(|reason| {
+            widgets::chip(t!(cx, &reason).to_owned(), theme.warning, cx)
+        }))
         .child(div().w(size::SHARE_LANE).flex_shrink_0().child(
             widgets::glyph_bar(
                 item.bytes,
@@ -2924,7 +3129,7 @@ fn mark_row(
         .child(
             button(
                 ElementId::Name(SharedString::from(format!("unmark-{index}"))),
-                "Unmark",
+                t!(cx, "Unmark"),
                 ButtonVariant::Outline,
                 cx,
             )
@@ -2947,8 +3152,8 @@ fn review_summary(
     let reclaiming = plan.reclaim();
     // The part of the saving that lands elsewhere, said rather than added to
     // this volume's projection, so the two numbers cannot be confused.
-    let left_out = not_counted(plan)
-        .map(|left_out| widgets::row("Not counted here", left_out, cx));
+    let left_out = not_counted(plan, cx)
+        .map(|left_out| widgets::row(t!(cx, "Not counted here"), left_out, cx));
     let trash = app.trash_backend.is_available();
 
     // One silhouette for one either-or choice, reversible option first.
@@ -2956,8 +3161,8 @@ fn review_summary(
     let mode = button_group(
         "removal-mode",
         vec![
-            ChoiceItem::new("trash", "Move to trash").disabled(!trash),
-            ChoiceItem::new("permanent", "Delete permanently"),
+            ChoiceItem::new("trash", t!(cx, "Move to trash")).disabled(!trash),
+            ChoiceItem::new("permanent", t!(cx, "Delete permanently")),
         ],
         Some(usize::from(app.removal_mode == RemovalMode::Permanent)),
         move |index, _, cx| {
@@ -2975,17 +3180,21 @@ fn review_summary(
     );
 
     let explanation = if app.remote.is_some() {
-        "Read-only SSH session. Export the selection; nothing is \
+        t!(
+            cx,
+            "Read-only SSH session. Export the selection; nothing is \
          deleted here. Free space is sampled at scan time."
-            .to_string()
+        )
+        .to_string()
     } else {
         match app.removal_mode {
-            RemovalMode::Trash => format!(
-                "Recoverable from the trash until it is emptied. Uses {}.",
-                app.trash_backend.label()
+            RemovalMode::Trash => t!(
+                cx,
+                "Recoverable from the trash until it is emptied. Uses {0}.",
+                t!(cx, app.trash_backend.label())
             ),
             RemovalMode::Permanent => {
-                "Deleted at once, like rm -rf. Nothing is recoverable."
+                t!(cx, "Deleted at once, like rm -rf. Nothing is recoverable.")
                     .to_string()
             }
         }
@@ -3006,7 +3215,7 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::SM)
-                .child(widgets::section("What happens", cx))
+                .child(widgets::section(t!(cx, "What happens"), cx))
                 .children(app.remote.is_none().then_some(mode))
                 .child(
                     div()
@@ -3020,29 +3229,29 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::SM)
-                .child(widgets::section("Totals", cx))
+                .child(widgets::section(t!(cx, "Totals"), cx))
                 .child(widgets::row(
-                    "Marked",
+                    t!(cx, "Marked"),
                     format!("{}", app.marks.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Acted on",
+                    t!(cx, "Acted on"),
                     format!("{}", plan.targets.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Nested, go with a parent",
+                    t!(cx, "Nested, go with a parent"),
                     format!("{}", plan.covered.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Kept back",
+                    t!(cx, "Kept back"),
                     format!("{}", plan.blocked.len()),
                     cx,
                 ))
                 .child(widgets::row(
-                    "Space freed",
+                    t!(cx, "Space freed"),
                     human_bytes(plan.bytes()),
                     cx,
                 ))
@@ -3055,7 +3264,7 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::SM)
-                .child(widgets::section("Volume", cx))
+                .child(widgets::section(t!(cx, "Volume"), cx))
                 .child(widgets::space_meter(volume, reclaiming, cx)),
         );
     }
@@ -3070,7 +3279,7 @@ fn review_summary(
                     .child(format!(
                         "{}: {}",
                         short_name(&item.path),
-                        item.reason
+                        t!(cx, &item.reason)
                     )),
             );
         }
@@ -3079,7 +3288,7 @@ fn review_summary(
                 .flex()
                 .flex_col()
                 .gap(space::XS)
-                .child(widgets::section("Kept back", cx))
+                .child(widgets::section(t!(cx, "Kept back"), cx))
                 .child(blocked),
         );
     }
@@ -3105,7 +3314,7 @@ fn export_controls(
         .child(
             button(
                 "save-list",
-                "Save list\u{2026}",
+                t!(cx, "Save list\u{2026}"),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -3117,7 +3326,7 @@ fn export_controls(
         .child(
             button(
                 "copy-prompt",
-                "Copy as prompt",
+                t!(cx, "Copy as prompt"),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -3129,7 +3338,7 @@ fn export_controls(
         .child(
             button(
                 "save-script",
-                "Save delete script…",
+                t!(cx, "Save delete script…"),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -3141,7 +3350,7 @@ fn export_controls(
         .child(
             button(
                 "copy-script",
-                "Copy delete script",
+                t!(cx, "Copy delete script"),
                 ButtonVariant::Secondary,
                 cx,
             )
@@ -3161,14 +3370,18 @@ fn commit_controls(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let count = plan.targets.len();
-    let noun = if count == 1 { "item" } else { "items" };
+    let noun = if count == 1 {
+        t!(cx, "item")
+    } else {
+        t!(cx, "items")
+    };
     let (label, variant) = match app.removal_mode {
         RemovalMode::Trash => (
-            format!("Move {count} {noun} to trash"),
+            t!(cx, "Move {0} {1} to trash", count, noun),
             ButtonVariant::Primary,
         ),
         RemovalMode::Permanent => (
-            format!("Delete {count} {noun}\u{2026}"),
+            t!(cx, "Delete {0} {1}…", count, noun),
             ButtonVariant::Danger,
         ),
     };
@@ -3182,13 +3395,12 @@ fn commit_controls(
         .justify_end()
         .gap(space::SM)
         .child(
-            button("back", "Back", ButtonVariant::Secondary, cx).on_click(
-                cx.listener(|this, _, window, cx| {
+            button("back", t!(cx, "Back"), ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
                     this.screen = Screen::Explore;
                     cx.notify();
                     window.focus(&this.focus, cx);
-                }),
-            ),
+                })),
         )
         .child(
             button("commit", label, variant, cx)
@@ -3202,8 +3414,8 @@ fn commit_controls(
 
 fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     let commit = match app.removal_mode {
-        RemovalMode::Trash => "move to trash",
-        RemovalMode::Permanent => "delete\u{2026}",
+        RemovalMode::Trash => t!(cx, "move to trash"),
+        RemovalMode::Permanent => t!(cx, "delete\u{2026}"),
     };
     div()
         .flex()
@@ -3222,26 +3434,27 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .children(
             app.remote
                 .is_none()
-                .then(|| widgets::hint("m", "trash", cx)),
+                .then(|| widgets::hint("m", t!(cx, "trash"), cx)),
         )
         .children(
             app.remote
                 .is_none()
-                .then(|| widgets::hint("p", "permanent", cx)),
+                .then(|| widgets::hint("p", t!(cx, "permanent"), cx)),
         )
-        .child(widgets::hint("e", "save script", cx))
-        .child(widgets::hint("y", "copy script", cx))
-        .child(widgets::hint("!", "unmark all", cx))
-        .child(widgets::hint("s", "save list", cx))
-        .child(widgets::hint("a", "copy as prompt", cx))
-        .child(widgets::hint("esc", "back", cx))
+        .child(widgets::hint("e", t!(cx, "save script"), cx))
+        .child(widgets::hint("y", t!(cx, "copy script"), cx))
+        .child(widgets::hint("!", t!(cx, "unmark all"), cx))
+        .child(widgets::hint("s", t!(cx, "save list"), cx))
+        .child(widgets::hint("a", t!(cx, "copy as prompt"), cx))
+        .child(widgets::hint("esc", t!(cx, "back"), cx))
         .child(div().flex_1())
         .child(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} available",
+                .child(t!(
+                    cx,
+                    "{0} available",
                     app.space.map_or_else(
                         || "?".into(),
                         |space| human_bytes(space.available)
@@ -3322,8 +3535,8 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         .flex_1()
         .min_h_0()
         .child(screen_header(
-            "Removing",
-            &format!("{} of {} done", done, summary.total),
+            t!(cx, "Removing"),
+            &t!(cx, "{0} of {1} done", done, summary.total),
             &theme,
             cx,
         ))
@@ -3336,9 +3549,10 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .flex_1()
                 .min_h_0()
                 .child(widgets::meter_row(
-                    "progress",
-                    format!(
-                        "{} removed · {} to free",
+                    t!(cx, "progress"),
+                    t!(
+                        cx,
+                        "{0} removed · {1} to free",
                         summary.removed,
                         human_bytes(summary.bytes)
                     ),
@@ -3365,7 +3579,11 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .py(space::SM)
                 .border_t_1()
                 .border_color(theme.divider())
-                .child(widgets::hint("esc", "stop after the current item", cx)),
+                .child(widgets::hint(
+                    "esc",
+                    t!(cx, "stop after the current item"),
+                    cx,
+                )),
         )
 }
 
@@ -3417,14 +3635,14 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .flex_row()
                 .gap(space::XXL)
                 .child(widgets::stat_colored(
-                    "removed",
-                    format!("{} items", summary.removed),
+                    t!(cx, "removed"),
+                    t!(cx, "{0} items", summary.removed),
                     theme.success,
                     cx,
                 ))
-                .child(widgets::stat("bytes claimed", human_bytes(summary.bytes), cx))
+                .child(widgets::stat(t!(cx, "bytes claimed"), human_bytes(summary.bytes), cx))
                 .child(widgets::stat_colored(
-                    "failed",
+                    t!(cx, "failed"),
                     format!("{}", summary.failed),
                     if summary.failed > 0 {
                         theme.danger
@@ -3435,7 +3653,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 ))
                 .children(measured.map(|delta| {
                     widgets::stat_colored(
-                        "volume freed",
+                        t!(cx, "volume freed"),
                         if delta >= 0 {
                             format!("+{}", human_bytes(delta.unsigned_abs()))
                         } else {
@@ -3450,7 +3668,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("The treemap is being re-scanned so the numbers on screen match the disk again."),
+                .child(t!(cx, "The treemap is being re-scanned so the numbers on screen match the disk again.")),
         );
 
     if let Some(space) = app.space {
@@ -3458,8 +3676,8 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
     }
     if app.scan.is_some() {
         body = body.child(widgets::meter_row(
-            "re-scanning",
-            format!("{} files", widgets::human_count(app.progress.files)),
+            t!(cx, "re-scanning"),
+            t!(cx, "{0} files", widgets::human_count(app.progress.files)),
             0.0,
             theme.accent,
             cx,
@@ -3468,7 +3686,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
     if summary.failed > 0 {
         body = body
             .child(separator(cx))
-            .child(widgets::section("what could not be removed", cx))
+            .child(widgets::section(t!(cx, "what could not be removed"), cx))
             .child(failures);
     }
 
@@ -3477,7 +3695,12 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(screen_header("Done", "removal finished", &theme, cx))
+        .child(screen_header(
+            t!(cx, "Done"),
+            t!(cx, "removal finished"),
+            &theme,
+            cx,
+        ))
         .child(body)
         .child(
             div()
@@ -3491,14 +3714,21 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .border_color(theme.divider())
                 .child(
                     // An acknowledgement: the result is already on screen.
-                    button("continue", "Done", ButtonVariant::Primary, cx)
-                        .on_click(cx.listener(|this, _, window, cx| {
+                    button(
+                        "continue",
+                        t!(cx, "Done"),
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
                             this.screen = Screen::Explore;
                             cx.notify();
                             window.focus(&this.focus, cx);
-                        })),
+                        },
+                    )),
                 )
-                .child(widgets::hint("enter", "continue", cx)),
+                .child(widgets::hint("enter", t!(cx, "continue"), cx)),
         )
 }
 
@@ -3609,9 +3839,9 @@ fn card_surface(cx: &gpui_kit::App) -> Div {
 /// at the pointer, over the button itself.
 fn history_card(app: &Disktree, back: bool, cx: &gpui_kit::App) -> Div {
     let (label, keys) = if back {
-        ("Back", "alt \u{2190} \u{00b7} side button")
+        (t!(cx, "Back"), "alt \u{2190} \u{00b7} side button")
     } else {
-        ("Forward", "alt \u{2192} \u{00b7} side button")
+        (t!(cx, "Forward"), "alt \u{2192} \u{00b7} side button")
     };
     let card = app
         .history_target(back)
@@ -3630,9 +3860,9 @@ pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
     let crumbs = app.hovered.as_deref()?;
     let is_dir = app.node_at(crumbs)?.is_dir();
     let keys = if is_dir {
-        "space mark · enter open"
+        t!(cx, "space mark · enter open")
     } else {
-        "space mark"
+        t!(cx, "space mark")
     };
     node_card(app, crumbs, keys, cx)
 }
@@ -3720,8 +3950,9 @@ fn node_card(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child(format!(
-                    "{} files · {} dirs · {} direct",
+                .child(t!(
+                    cx,
+                    "{0} files · {1} dirs · {2} direct",
                     widgets::human_count(node.files),
                     widgets::human_count(
                         u64::from(node.dirs)
@@ -3733,15 +3964,19 @@ fn node_card(
 
     let mut badges = div().flex().flex_row().gap(space::XS).flex_wrap();
     if hidden {
-        badges = badges.child(widgets::chip("Hidden", theme.secondary, cx));
+        badges =
+            badges.child(widgets::chip(t!(cx, "Hidden"), theme.secondary, cx));
     }
     if marked {
-        badges =
-            badges.child(widgets::chip("Marked for removal", theme.danger, cx));
+        badges = badges.child(widgets::chip(
+            t!(cx, "Marked for removal"),
+            theme.danger,
+            cx,
+        ));
     }
     if let Some(ancestor) = covered {
         badges = badges.child(widgets::chip(
-            format!("Inside marked {ancestor}"),
+            t!(cx, "Inside marked {0}", ancestor),
             theme.secondary,
             cx,
         ));
@@ -3780,56 +4015,69 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
     let rows = [
-        ("space / x", "Mark or unmark the tile you point at"),
-        (MODIFIER_CLICK, "Mark without moving the selection"),
-        ("enter", "Open that directory, at any depth"),
-        ("\u{232b} / esc", "Go up one directory"),
+        ("space / x", t!(cx, "Mark or unmark the tile you point at")),
+        (MODIFIER_CLICK, t!(cx, "Mark without moving the selection")),
+        ("enter", t!(cx, "Open that directory, at any depth")),
+        ("\u{232b} / esc", t!(cx, "Go up one directory")),
         (
             "alt \u{2190} / \u{2192}",
-            "Back or forward, as do the mouse's side buttons",
+            t!(cx, "Back or forward, as do the mouse's side buttons"),
         ),
         (
             "\u{2190} \u{2191} \u{2193} \u{2192}",
-            "Move between tiles at this level",
+            t!(cx, "Move between tiles at this level"),
         ),
-        ("tab", "Next largest sibling"),
-        ("scroll", "Zoom toward a directory, then go into it"),
-        ("shift-scroll", "Pan the magnified view"),
-        ("[ / ]", "Draw fewer or more levels at once"),
-        ("- / = / 0", "Magnify, shrink, or reset the view"),
-        (MODIFIER_ZOOM, "Interface zoom"),
+        ("tab", t!(cx, "Next largest sibling")),
+        ("scroll", t!(cx, "Zoom toward a directory, then go into it")),
+        ("shift-scroll", t!(cx, "Pan the magnified view")),
+        ("[ / ]", t!(cx, "Draw fewer or more levels at once")),
+        ("- / = / 0", t!(cx, "Magnify, shrink, or reset the view")),
+        (MODIFIER_ZOOM, t!(cx, "Interface zoom")),
         (
             "/",
-            "Filter by name: only matches keep their colour; enter shows only them",
+            t!(
+                cx,
+                "Filter by name: only matches keep their colour; enter shows only them"
+            ),
         ),
-        ("c", "Review the marked list"),
-        ("t", "Size, files or age: what areas and colours say"),
-        ("r", "Scan again from the same root"),
-        ("esc", "Stop a scan in progress"),
-        ("v", "Scan another volume"),
-        (MODIFIER_OPEN, "Choose another directory to scan"),
-        ("g", "The whole disk; click any directory above to widen"),
-        ("d", "Disk usage or apparent size"),
-        ("i", "Include or skip hidden entries"),
-        ("p", "Show or hide the selection line"),
+        ("c", t!(cx, "Review the marked list")),
+        (
+            "t",
+            t!(cx, "Size, files or age: what areas and colours say"),
+        ),
+        ("r", t!(cx, "Scan again from the same root")),
+        ("esc", t!(cx, "Stop a scan in progress")),
+        ("v", t!(cx, "Scan another volume")),
+        (MODIFIER_OPEN, t!(cx, "Choose another directory to scan")),
+        (
+            "g",
+            t!(cx, "The whole disk; click any directory above to widen"),
+        ),
+        ("d", t!(cx, "Disk usage or apparent size")),
+        ("i", t!(cx, "Include or skip hidden entries")),
+        ("p", t!(cx, "Show or hide the selection line")),
         (
             "o",
             if cfg!(target_os = "macos") {
-                "Show it in Finder"
+                t!(cx, "Show it in Finder")
             } else if cfg!(windows) {
-                "Show it in File Explorer"
+                t!(cx, "Show it in File Explorer")
             } else {
-                "Show it in the file manager"
+                t!(cx, "Show it in the file manager")
             },
         ),
-        ("q", "Quit"),
+        ("f2", t!(cx, "Choose interface language")),
+        ("q", t!(cx, "Quit")),
         ("", ""),
         (
-            "Review screen",
-            "m trash \u{00b7} p permanent \u{00b7} ! unmark all \u{00b7} s save list \u{00b7} a copy as prompt",
+            t!(cx, "Review screen"),
+            t!(
+                cx,
+                "m trash \u{00b7} p permanent \u{00b7} ! unmark all \u{00b7} s save list \u{00b7} a copy as prompt"
+            ),
         ),
-        ("", "enter commits \u{00b7} esc goes back"),
-        ("", "A permanent deletion always asks first"),
+        ("", t!(cx, "enter commits \u{00b7} esc goes back")),
+        ("", t!(cx, "A permanent deletion always asks first")),
     ];
 
     let mut keys = div().flex().flex_col().gap(space::SM);
@@ -3895,7 +4143,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                                 .text_size(text::TITLE)
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(theme.bright)
-                                .child("Keyboard and mouse"),
+                                .child(t!(cx, "Keyboard and mouse")),
                         ),
                 )
                 .child(keys)
@@ -3903,10 +4151,11 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                     div()
                         .text_size(text::CAPTION)
                         .text_color(theme.secondary)
-                        .child(format!(
-                            "? or esc closes \u{00b7} {} \u{00b7} {}",
+                        .child(t!(
+                            cx,
+                            "? or esc closes · {0} · {1}",
                             app.root_path.display(),
-                            app.options.metric.label()
+                            t!(cx, app.options.metric.label())
                         )),
                 ),
         )

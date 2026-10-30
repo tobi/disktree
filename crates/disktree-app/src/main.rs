@@ -14,6 +14,7 @@
 mod app_menu;
 mod appearance;
 mod git;
+mod i18n;
 mod marks;
 mod palette;
 mod power;
@@ -182,6 +183,18 @@ fn run() -> Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
+            let language = i18n::settings_path()
+                .map_or_else(
+                    || Ok(i18n::Language::default()),
+                    |path| i18n::load(&path),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "Cannot load interface language: {error}; using English"
+                    );
+                    i18n::Language::default()
+                });
+            cx.set_global(language);
             app_menu::install(cx);
             let home = std::env::home_dir();
             let native_look = appearance::follows_system(home.as_deref());

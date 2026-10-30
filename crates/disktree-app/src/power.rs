@@ -54,8 +54,13 @@ impl PowerEfficiency {
         }
     }
 
-    pub fn label(self, cpus: usize) -> String {
-        format!("{} ({})", self.name(), workers(self.threads(cpus)))
+    /// The localized preset name and effective worker count.
+    pub fn label(self, cpus: usize, language: crate::i18n::Language) -> String {
+        format!(
+            "{} ({})",
+            language.text(self.name()),
+            workers(self.threads(cpus), language)
+        )
     }
 
     /// A preset that would run no more workers than the one below it, on a
@@ -89,9 +94,10 @@ impl PowerEfficiency {
     }
 }
 
-pub fn workers(count: usize) -> String {
+/// The worker count in the interface language.
+pub fn workers(count: usize, language: crate::i18n::Language) -> String {
     let unit = if count == 1 { "worker" } else { "workers" };
-    format!("{count} {unit}")
+    format!("{count} {}", language.text(unit))
 }
 
 pub fn cpu_threads() -> usize {
@@ -157,7 +163,8 @@ mod tests {
         }
         assert_eq!(PowerEfficiency::Balanced.threads(3), 3);
         assert_eq!(
-            PowerEfficiency::DrainMyBattery.label(18),
+            PowerEfficiency::DrainMyBattery
+                .label(18, crate::i18n::Language::English),
             "Drain My Battery (18 workers)"
         );
     }

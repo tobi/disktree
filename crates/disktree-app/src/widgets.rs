@@ -3,6 +3,8 @@
 //! Everything is built from the active Omarchy theme's tokens, and every piece
 //! is a plain function over borrowed data so the screens stay readable.
 
+use crate::i18n::t;
+
 use disktree_core::size::{human_bytes, human_bytes_short, share, share_bar};
 use disktree_core::space::SpaceInfo;
 use disktree_core::tree::{Metric, Node};
@@ -152,15 +154,17 @@ pub fn space_meter(space: SpaceInfo, reclaiming: u64, cx: &App) -> Div {
     let gained = gained.clamp(0.0, used_now);
 
     let label = if reclaiming > 0 {
-        format!(
-            "{} free · {} after removing {}",
+        t!(
+            cx,
+            "{0} free · {1} after removing {2}",
             human_bytes(space.available),
             human_bytes(projected.available),
             human_bytes(reclaiming)
         )
     } else {
-        format!(
-            "{} free of {}",
+        t!(
+            cx,
+            "{0} free of {1}",
             human_bytes(space.available),
             human_bytes(space.total)
         )
@@ -375,26 +379,25 @@ pub fn split_size(text: &str) -> (String, String) {
 }
 
 /// How long ago a Unix time was, in the unit a person would use.
-pub fn ago(now: i64, then: i64) -> String {
+pub fn ago(now: i64, then: i64, language: crate::i18n::Language) -> String {
     if then <= 0 {
-        return "unknown".to_string();
+        return language.text("unknown").to_string();
     }
     let seconds = (now - then).max(0);
-    let plural = |count: i64, unit: &str| {
-        if count == 1 {
-            format!("1 {unit} ago")
-        } else {
-            format!("{count} {unit}s ago")
+    let (count, singular, plural) = match seconds {
+        0..60 => return language.text("just now").to_string(),
+        60..3_600 => (seconds / 60, "{0} minute ago", "{0} minutes ago"),
+        3_600..86_400 => (seconds / 3_600, "{0} hour ago", "{0} hours ago"),
+        86_400..5_184_000 => (seconds / 86_400, "{0} day ago", "{0} days ago"),
+        5_184_000..63_072_000 => {
+            (seconds / 2_592_000, "{0} month ago", "{0} months ago")
         }
+        _ => (seconds / 31_536_000, "{0} year ago", "{0} years ago"),
     };
-    match seconds {
-        0..60 => "just now".to_string(),
-        60..3_600 => plural(seconds / 60, "minute"),
-        3_600..86_400 => plural(seconds / 3_600, "hour"),
-        86_400..5_184_000 => plural(seconds / 86_400, "day"),
-        5_184_000..63_072_000 => plural(seconds / 2_592_000, "month"),
-        _ => plural(seconds / 31_536_000, "year"),
-    }
+    crate::i18n::format(
+        language.text(if count == 1 { singular } else { plural }),
+        &[count.to_string()],
+    )
 }
 
 /// A thin bar: `fraction` of a track, in `color`.
@@ -516,19 +519,34 @@ mod tests {
 
     #[test]
     fn ages_read_in_the_unit_a_person_would_use() {
+        use crate::i18n::Language::English;
         let now = 1_800_000_000;
-        assert_eq!(ago(now, now - 5), "just now");
-        assert_eq!(ago(now, now - 120), "2 minutes ago");
-        assert_eq!(ago(now, now - 3_600), "1 hour ago");
-        assert_eq!(ago(now, now - 19 * 86_400), "19 days ago");
-        assert_eq!(ago(now, now - 90 * 86_400), "3 months ago");
-        assert_eq!(ago(now, now - 800 * 86_400), "2 years ago");
-        assert_eq!(ago(now, 0), "unknown");
+        assert_eq!(ago(now, now - 5, English), "just now");
+        assert_eq!(ago(now, now - 120, English), "2 minutes ago");
+        assert_eq!(ago(now, now - 3_600, English), "1 hour ago");
+        assert_eq!(ago(now, now - 19 * 86_400, English), "19 days ago");
+        assert_eq!(ago(now, now - 90 * 86_400, English), "3 months ago");
+        assert_eq!(ago(now, now - 800 * 86_400, English), "2 years ago");
+        assert_eq!(ago(now, 0, English), "unknown");
     }
 
     #[test]
     fn sizes_split_into_number_and_unit() {
         assert_eq!(split_size("90.1 GiB"), ("90.1".into(), "GiB".into()));
         assert_eq!(split_size("0"), ("0".into(), String::new()));
+    }
+
+    #[test]
+    fn chinese_ages_use_complete_messages_without_english_suffixes() {
+        use crate::i18n::Language::SimplifiedChinese as Chinese;
+        let now = 1_800_000_000;
+        assert_eq!(ago(now, 0, Chinese), "未知");
+        assert_eq!(ago(now, now + 1, Chinese), "刚刚");
+        assert_eq!(ago(now, now - 60, Chinese), "1 分钟前");
+        assert_eq!(ago(now, now - 120, Chinese), "2 分钟前");
+        assert_eq!(ago(now, now - 3_600, Chinese), "1 小时前");
+        assert_eq!(ago(now, now - 19 * 86_400, Chinese), "19 天前");
+        assert_eq!(ago(now, now - 90 * 86_400, Chinese), "3 个月前");
+        assert_eq!(ago(now, now - 800 * 86_400, Chinese), "2 年前");
     }
 }
