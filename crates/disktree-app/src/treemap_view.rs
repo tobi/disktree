@@ -16,8 +16,8 @@ use gpui_kit::{
     App, Bounds, ContentMask, Context, Corners, Edges, Font, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, MouseDownEvent, MouseMoveEvent,
     ParentElement as _, Pixels, Point, ScrollWheelEvent, SharedString, Size,
-    StatefulInteractiveElement as _, Styled, TextAlign, TextRun, Window,
-    canvas, div, pattern_slash, px, quad,
+    StatefulInteractiveElement as _, StrikethroughStyle, Styled, TextAlign,
+    TextRun, Window, canvas, div, pattern_slash, px, quad, underline_y_offset,
 };
 use gpui_omarchy::{ActiveTheme, Theme};
 
@@ -125,6 +125,7 @@ pub fn preview(
         };
         mosaic.labels.push(Label {
             text: node.name().to_string(),
+            found: None,
             rect: tile.rect,
             header: None,
             depth: 0,
@@ -517,6 +518,9 @@ fn paint_labels(
     let text_inset = name_size * 0.25;
     let min_width = name_size * 3.3;
     let size_gap = name_size * 0.67;
+    // Strike and underline are read as state, so they stay visible at the
+    // smallest interface zoom rather than thinning to a hairline.
+    let decoration = (name_size * 0.08).max(px(1.));
 
     for label in labels {
         // A subdivided directory's name lives in the band it reserved; a leaf's
@@ -550,6 +554,12 @@ fn paint_labels(
             color,
             // Glyph backgrounds keep hatch out of both names and values.
             background_color: Some(fill),
+            // Marked, or going with a mark: struck through, the usual sign
+            // for something on its way out, and one that costs no width.
+            strikethrough: label.marked.then_some(StrikethroughStyle {
+                thickness: decoration,
+                color: Some(color),
+            }),
             ..TextRun::default()
         };
         let line = text_system.shape_line(
@@ -570,6 +580,36 @@ fn paint_labels(
                     window,
                     cx,
                 );
+                // The part of a name the find text matched is underlined, so
+                // a match reads as one without its colour. Painted here, not
+                // as a text run's underline: GPUI sets that below the
+                // baseline, which the slim band of a deeper directory clips
+                // away. This one rises to stay inside the label's region.
+                if let Some(found) = label
+                    .found
+                    .clone()
+                    .filter(|found| found.end <= label.text.len())
+                {
+                    let left = origin.x + line.x_for_index(found.start);
+                    let right = origin.x + line.x_for_index(found.end);
+                    let top = underline_top(
+                        origin.y
+                            + underline_y_offset(
+                                name_line_height,
+                                line.ascent,
+                                line.descent,
+                            ),
+                        mask.origin.y + mask.size.height,
+                        decoration,
+                    );
+                    window.paint_quad(gpui_kit::fill(
+                        Bounds::new(
+                            Point::new(left, top),
+                            Size::new(right - left, decoration),
+                        ),
+                        color,
+                    ));
+                }
 
                 if label.size_text.is_empty() {
                     return;
@@ -641,6 +681,12 @@ fn paint_labels(
             },
         );
     }
+}
+
+/// The top of a find match's underline: where GPUI would put it, raised
+/// as far as needed to stay inside the region the label may draw in.
+fn underline_top(natural: Pixels, bottom: Pixels, thickness: Pixels) -> Pixels {
+    natural.min(bottom - thickness)
 }
 
 fn to_window(rect: &Rect, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
@@ -741,6 +787,14 @@ mod tests {
                 ) >= 4.5
             );
         }
+    }
+
+    /// A slim band would clip GPUI's own underline position, so the
+    /// underline rises to stay inside; where there is room it is unmoved.
+    #[test]
+    fn a_find_underline_stays_inside_its_label() {
+        assert_eq!(underline_top(px(17.), px(16.), px(1.)), px(15.));
+        assert_eq!(underline_top(px(17.), px(22.), px(1.)), px(17.));
     }
 
     #[test]

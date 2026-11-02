@@ -5,13 +5,14 @@
 //! re-scan — live here so they can be reasoned about in one place.
 
 use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use disktree_core::access::file_table_readable;
-use disktree_core::filter::{Keep, Matches, filter};
+use disktree_core::filter::{Keep, Matches, filter, find_ignoring_case};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::path_style::PathStyle;
 use disktree_core::removal::{
@@ -2782,22 +2783,30 @@ impl Disktree {
                     let Some(node) = self.node_at(crumbs) else {
                         continue;
                     };
+                    // State is said without colour, and without spending
+                    // the label's width on it: a marked name, and every name
+                    // inside it, is struck through, and a name the find text
+                    // matches has the matching part underlined. Words would
+                    // repeat on every tile in a mark or a search and push
+                    // narrow names out of their tiles. Only "unreadable",
+                    // which is rare, keeps a prefix.
+                    let unreadable = if node.read_error { "! " } else { "" };
+                    // A tile the filter left out holds no match: skip the
+                    // search for it.
+                    let found = self
+                        .matches
+                        .as_deref()
+                        .filter(|_| filtered != Filtered::Out)
+                        .and_then(|matches| {
+                            find_ignoring_case(node.name(), &matches.needle)
+                        })
+                        .map(|range| {
+                            range.start + unreadable.len()
+                                ..range.end + unreadable.len()
+                        });
                     labels.push(Label {
-                        text: format!(
-                            "{}{}{}{}",
-                            if is_marked || is_covered {
-                                "[marked] "
-                            } else {
-                                ""
-                            },
-                            if node.read_error { "! " } else { "" },
-                            if filtered == Filtered::Out {
-                                "[filtered] "
-                            } else {
-                                ""
-                            },
-                            node.name()
-                        ),
+                        text: format!("{unreadable}{}", node.name()),
+                        found,
                         rect: self.animated_rect(tile.rect),
                         header: tile
                             .header
@@ -2811,6 +2820,7 @@ impl Disktree {
                 }
                 TileKind::Others { count, .. } => labels.push(Label {
                     text: format!("+{count} more"),
+                    found: None,
                     rect: self.animated_rect(tile.rect),
                     header: None,
                     depth: tile.depth,
@@ -2834,6 +2844,17 @@ impl Disktree {
             labels,
             view,
         }
+    }
+
+    /// Whether the node at `crumbs` is marked, or inside a marked directory
+    /// and so removed with it. The trail strikes such a crumb, as the
+    /// mosaic strikes such a tile's name.
+    pub fn goes_with_a_mark(&self, crumbs: &[usize]) -> bool {
+        let style = self.path_style();
+        self.path_at(crumbs).is_some_and(|path| {
+            self.marks.contains(&path, style)
+                || self.marks.ancestor(&path, style).is_some()
+        })
     }
 
     /// Crumbs for an absolute path, if the tree still contains it.
@@ -4203,6 +4224,9 @@ impl Direction {
 #[derive(Clone, Debug)]
 pub struct Label {
     pub text: String,
+    /// The bytes of `text` the find text matched: underlined, so a match
+    /// reads as one without its colour.
+    pub found: Option<Range<usize>>,
     /// Base-space rectangle; the view transform is applied while painting.
     pub rect: Rect,
     /// The band this label belongs in, when its tile reserved one. A parent's
@@ -4212,6 +4236,7 @@ pub struct Label {
     pub depth: u32,
     /// Filtered out while typing: drawn quietly.
     pub dim: bool,
+    /// Marked, or inside a mark: struck through, in the marked ink.
     pub marked: bool,
     pub size_text: String,
     /// The exact fill state is needed for contrast after filtering/marking.

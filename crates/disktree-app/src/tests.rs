@@ -1366,6 +1366,30 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
     assert!(keep_filtered, "keep holds no blob");
     // Dimmed, not hidden: a non-match is still drawn while typing.
     assert!(names_drawn(&view, cx).contains(&"deeper".to_string()));
+    // A match says so without colour (WCAG 1.4.1): the part of its name the
+    // find text matched is underlined, whatever case it was typed in. A
+    // non-match keeps its plain name, with no word added to every tile.
+    let mosaic = update(&view, cx, |app, _| app.prepare());
+    let matched: Vec<_> = mosaic
+        .labels
+        .iter()
+        .filter_map(|label| Some((label, label.found.clone()?)))
+        .collect();
+    assert!(!matched.is_empty(), "a blob is labelled");
+    for (label, found) in &matched {
+        assert_eq!(label.text, "blob.bin");
+        assert_eq!(&label.text[found.clone()], "blob");
+    }
+    let unmatched: Vec<_> = mosaic
+        .labels
+        .iter()
+        .filter(|label| label.found.is_none())
+        .map(|label| label.text.as_str())
+        .collect();
+    assert!(
+        unmatched.iter().all(|text| !text.starts_with('[')),
+        "{unmatched:?}"
+    );
 
     // Enter: only the matches, and the largest selected for marking.
     press(cx, "enter");
@@ -3428,23 +3452,53 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     assert!(inside >= 2, "blob.bin and deeper are drawn inside junk");
     assert!(covered, "every tile inside junk goes with it");
 
-    // The mark is said in words as well as drawn: a label carries its
-    // tile's state, so colour is never the only cue (WCAG 1.4.1).
+    // The mark is not said by colour alone (WCAG 1.4.1): its name, and every
+    // name inside it, is struck through. The name itself is left whole, so
+    // a narrow tile still shows it rather than a repeated word.
     let label = mosaic
         .labels
         .iter()
-        .find(|label| label.text.ends_with("junk"))
-        .expect("junk is large enough to be labelled");
-    assert_eq!(label.text, "[marked] junk");
+        .find(|label| label.text == "junk")
+        .expect("junk is large enough to be labelled, under its own name");
+    assert!(label.marked, "a marked name is struck through");
     assert!(label.decoration.marked, "the label paints its tile's state");
+    let covered: Vec<_> = mosaic
+        .labels
+        .iter()
+        .filter(|label| label.decoration.covered)
+        .collect();
+    assert!(!covered.is_empty(), "something inside junk is labelled");
+    assert!(
+        covered.iter().all(|label| label.marked),
+        "what goes with a mark is struck through as going"
+    );
+    assert!(
+        covered.iter().all(|label| matches!(
+            &*label.text,
+            "blob.bin" | "deeper" | "more.bin"
+        )),
+        "covered names carry no prefix: {:?}",
+        covered.iter().map(|label| &label.text).collect::<Vec<_>>()
+    );
     assert!(
         mosaic
             .labels
             .iter()
-            .filter(|label| label.decoration.covered)
-            .all(|label| label.text.starts_with("[marked] ")),
-        "what goes with a mark is labelled as going"
+            .filter(
+                |label| !label.decoration.marked && !label.decoration.covered
+            )
+            .all(|label| !label.marked),
+        "nothing else is struck"
     );
+    // Gone inside the mark, the trail still shows it: the crumbs for junk
+    // and anything in it are struck, the rest are not.
+    let keep = crumbs(&view, cx, "keep");
+    read(&view, cx, |app| {
+        assert!(app.goes_with_a_mark(&junk));
+        assert!(app.goes_with_a_mark(&deeper));
+        assert!(!app.goes_with_a_mark(&keep));
+        assert!(!app.goes_with_a_mark(&[]), "the scanned root");
+    });
 
     // Marking something inside it is refused, and says why.
     update(&view, cx, |app, cx| app.toggle_mark(&deeper, cx));

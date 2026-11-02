@@ -126,19 +126,35 @@ fn visit(
 /// Substring search ignoring ASCII case, without allocating: a filter runs
 /// over every name in view on every keystroke.
 fn contains_ignoring_case(haystack: &str, lower_needle: &str) -> bool {
+    find_ignoring_case(haystack, lower_needle).is_some()
+}
+
+/// Where `lower_needle` first occurs in `haystack`, ignoring ASCII case, as
+/// a byte range. The same rule [`filter`] matches by, so a label can mark
+/// the part of a name that matched.
+///
+/// The range always falls on character boundaries: only ASCII bytes are
+/// folded, and a needle that is itself valid UTF-8 cannot start or end
+/// inside another character's bytes.
+pub fn find_ignoring_case(
+    haystack: &str,
+    lower_needle: &str,
+) -> Option<std::ops::Range<usize>> {
     let (hay, needle) = (haystack.as_bytes(), lower_needle.as_bytes());
     if needle.is_empty() {
-        return true;
+        return Some(0..0);
     }
     if needle.len() > hay.len() {
-        return false;
+        return None;
     }
-    hay.windows(needle.len()).any(|window| {
-        window
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.to_ascii_lowercase() == *right)
-    })
+    hay.windows(needle.len())
+        .position(|window| {
+            window
+                .iter()
+                .zip(needle)
+                .all(|(left, right)| left.to_ascii_lowercase() == *right)
+        })
+        .map(|start| start..start + needle.len())
 }
 
 #[cfg(test)]
@@ -277,5 +293,18 @@ mod tests {
         assert!(contains_ignoring_case("Cargo.TOML", "toml"));
         assert!(!contains_ignoring_case("ab", "abc"));
         assert!(contains_ignoring_case("x", ""));
+    }
+
+    /// A label underlines exactly what matched, so the range has to land on
+    /// the matched bytes, characters before it included.
+    #[test]
+    fn a_match_is_found_where_it_is_in_the_name() {
+        assert_eq!(find_ignoring_case("build-CACHE", "cache"), Some(6..11));
+        // "é" is two bytes: the range counts bytes, and stays on boundaries.
+        let name = "Résumé cache.txt";
+        let range = find_ignoring_case(name, "cache").expect("it matches");
+        assert_eq!(&name[range], "cache");
+        assert_eq!(find_ignoring_case(name, "é c"), Some(6..10));
+        assert_eq!(find_ignoring_case("obj", "cache"), None);
     }
 }

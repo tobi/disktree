@@ -1260,6 +1260,10 @@ fn tree_crumb(
             .into_any_element();
     };
     let parent = parent.to_vec();
+    // Inside a mark, the trail says so the way the tiles do: struck through.
+    // Every tile below it is struck too, but the trail is what still shows
+    // the mark itself once you have gone into it.
+    let struck = app.goes_with_a_mark(&path);
     let open = app
         .crumb_menu
         .as_ref()
@@ -1271,15 +1275,17 @@ fn tree_crumb(
         .flex_row()
         .items_center()
         .when(current || open, |this| this.bg(theme.hover_fill()))
-        .child(widgets::crumb(id.clone(), label, current, cx).on_click(
-            cx.listener(move |this, _, _, cx| {
-                if current {
-                    this.open_crumb_menu(&label_path, cx);
-                } else {
-                    this.go_to(label_path.clone(), cx);
-                }
-            }),
-        ))
+        .child(
+            widgets::crumb(id.clone(), label, current, cx)
+                .when(struck, Styled::line_through)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if current {
+                        this.open_crumb_menu(&label_path, cx);
+                    } else {
+                        this.go_to(label_path.clone(), cx);
+                    }
+                })),
+        )
         .child(
             div()
                 .id(ElementId::Name(format!("{id}-menu").into()))

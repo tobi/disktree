@@ -1167,3 +1167,29 @@ PwrSuiteLab headed E2E VM, never on the operator's desktop.
 | Folding the footer spacer into the log path left none while searching | A spacer stands in when the path is hidden, so the note and search hint stay at the right edge |
 | The diagnostic script named the retired example | It names `pwrdisk ROOT` |
 | No harness assertion for the search field's exposed value | Not added: the harness has no reader for accessibility values, so the value stays native evidence |
+
+### PWR-33 follow-up: tile state without repeated words
+
+The "Label prefix density" row above left a design question open: a
+`[marked] ` or `[filtered] ` prefix repeats on every tile inside a mark or
+a search, and on a narrow tile it is all that fits, so the name is lost.
+Five treatments were mocked in Claude Design on one contrived tree (a mark
+at the root, inside the mark, typing in Find); the operator chose
+zero-width text styling.
+
+| State | Cue now | Was |
+| --- | --- | --- |
+| Marked, or inside a mark | Name struck through, in the marked ink; the mark keeps its 2 px ring; the trail strikes a crumb that is marked or inside a mark | `[marked] ` on every label |
+| Typing in Find | The matched part of a match's name is underlined, by the same ASCII-case rule the filter uses (`filter::find_ignoring_case`); non-matches are dimmed, unchanged, with no word added | `[filtered] ` on every non-match |
+| Unreadable | `! ` prefix and the warning corner, unchanged: rare, and two characters | same |
+
+Neither line takes any width from the name. Both are at least 1 px, in
+the label's own ink, so the 4.5:1 label regression covers them. The accessible file list and the
+selection status keep the words ("marked", "inside a marked directory",
+"unreadable", "does not match filter") for assistive technology, unchanged.
+
+| Check | Observed result |
+| --- | --- |
+| Marked and covered labels | Harness test: marking `junk` labels it `junk`, struck; every covered label is struck and carries no prefix; nothing else is struck; `goes_with_a_mark` is true for `junk` and `junk/deeper`, false for `keep` and the root |
+| Find matches | Harness test: typing `BLOB` underlines exactly `blob` in each labelled `blob.bin`; no label starts with a bracketed word |
+| Underline placement | A lab capture showed GPUI's run underline clipped away in a deeper directory's 1 rem band. The underline is now painted at GPUI's position, raised to stay inside the label's region; a unit test covers the clamp, and `find_ignoring_case` returns byte ranges on character boundaries (`Résumé cache.txt`) |
