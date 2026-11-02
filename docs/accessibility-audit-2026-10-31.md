@@ -593,6 +593,8 @@ unchanged rerun passed. Ubuntu 24.04.5 x86_64 Sandboxer `sb_uihqpdf98b`,
 same source: setup 0 (1s), lint 0 (5s), tests 0 (12s; 264 app, 221 core),
 portable build 0 (44s), isolated SSH 0 (2s), all 0; stopped afterward.
 
+The watcher failure was resolved by the November 2 follow-up below.
+
 The Settings outline was observed in the native macOS window only. Native
 AX/UIA/AT-SPI and VoiceOver/Narrator/NVDA/Orca were not rerun for the
 integration; Windows is verified by CI. The native acceptance gaps above
@@ -691,6 +693,8 @@ alone three times. In full runs on this Mac it now aborts when
 gpui-omarchy's theme-file watcher wakes inside it, and does so on the
 unreviewed `dd9f2f9` too, which passed earlier the same day. Native AX and
 screen readers were not rerun for these corrections.
+
+The watcher failure was resolved by the November 2 follow-up below.
 
 ### PWR-33: contrast and non-color state cues
 
@@ -829,6 +833,26 @@ above also struck `the_agent_overlay_opens_and_closes`; it and the link test
 pass alone. Ubuntu 24.04.5 x86_64 Sandboxer at `d5990e3`: setup 0 (8s),
 lint 0 (17s), test 0 (17s), portable build 0 (49s), isolated SSH 0 (2s),
 all 0. Native AT, OS scaling and high contrast remain the PWR-36 gaps above.
+
+#### November 2 follow-up: headless theme watching
+
+gpui-omarchy 0.1.3 watches `$HOME` and theme ancestors even when no Omarchy
+theme exists. Any non-access event sends on an async channel, waking a
+GPUI foreground task from the FSEvents thread. The deterministic scheduler
+rejects that wake; a late wake can panic while async-task unwinds and abort
+the process. PR #74 routed both agent tests through the shared initializer,
+which cancels following immediately. The initializer now registers the
+same base/control bindings and applies Tokyo Night without starting a
+native watcher. Production theme following is unchanged.
+
+On macOS 27.0.1 arm64, `de5fbb0`, `305f69c` and post-#74 `00da039` each
+passed five ordinary full app-suite runs. With writes every 2 ms in an
+isolated temporary `$HOME`, both older revisions failed five of five runs
+with the FSEvents scheduler violation; `00da039` passed five of five. These
+controlled failures exited 101 rather than reproducing SIGABRT. The bug
+predates #68, whose ordinary suite median was 6.26 s versus 8.57 s before
+it; these samples do not support a slowdown explanation. The historical
+change in ambient filesystem traffic cannot be reconstructed from them.
 
 ### PWR-35 remediation: reduced motion
 

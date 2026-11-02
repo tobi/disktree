@@ -291,6 +291,10 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
   keys, including one that marks a directory, confirms the removal and checks
   the files are gone while unmarked neighbours are untouched, and one that
   drives the window over the real socket or pipe as `pwrdisk mcp` does.
+  Initialize them through `tests::init`, which applies a fixed theme without
+  native filesystem watching. Keep its control bindings aligned with
+  gpui-omarchy when updating that dependency; its normal `init` starts a
+  watcher that cannot wake GPUI's deterministic test executor safely.
 * `disktree-mcp` tests every tool as a function against a temporary tree,
   with a stand-in window on the socket or pipe for the linked cases;
   `disktree-link` tests the transport itself.

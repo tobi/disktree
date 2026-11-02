@@ -22,12 +22,56 @@ use crate::state::{Disktree, Screen};
 
 /// Native filesystem callbacks cannot run on GPUI's deterministic scheduler.
 ///
-/// `gpui_omarchy::init` follows the system theme with a `notify` watcher on
-/// `$HOME`, so any write there wakes a task from the watcher's thread and
-/// the scheduler panics. Applying a theme stops following. Every test starts
-/// here, never with `gpui_omarchy::init` itself.
+/// `gpui_omarchy::init` watches `$HOME` even without an Omarchy theme. Its
+/// callback wakes the deterministic executor from a foreign thread. The
+/// control initializers are private in gpui-omarchy 0.1.3, so mirror their
+/// bindings here and apply a fixed theme without creating a watcher at all.
 fn init(cx: &mut gpui_kit::App) {
-    gpui_omarchy::init(cx);
+    use gpui_kit::base::actions::{Cancel, Confirm, SelectLeft, SelectRight};
+    use gpui_kit::{KeyBinding, NoAction};
+    use gpui_omarchy::focus::{Next, Previous};
+
+    gpui_kit::base::init(cx);
+    cx.bind_keys([
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-c"
+            } else {
+                "ctrl-c"
+            },
+            gpui_kit::base::input::Copy,
+            Some("OmarchyFocusScope"),
+        ),
+        KeyBinding::new("tab", Next, Some("OmarchyFocusScope")),
+        KeyBinding::new("shift-tab", Previous, Some("OmarchyFocusScope")),
+        KeyBinding::new("left", SelectLeft, Some("OmarchyOptionGroup")),
+        KeyBinding::new("h", SelectLeft, Some("OmarchyOptionGroup")),
+        KeyBinding::new("right", SelectRight, Some("OmarchyOptionGroup")),
+        KeyBinding::new("l", SelectRight, Some("OmarchyOptionGroup")),
+        KeyBinding::new(
+            "enter",
+            Confirm { secondary: false },
+            Some("OmarchyOptionGroup"),
+        ),
+        KeyBinding::new(
+            "space",
+            Confirm { secondary: false },
+            Some("OmarchyOptionGroup"),
+        ),
+        KeyBinding::new("enter", NoAction, Some("OmarchyPopoverContent")),
+        KeyBinding::new("space", NoAction, Some("OmarchyPopoverContent")),
+        KeyBinding::new(
+            "enter",
+            Confirm { secondary: false },
+            Some("OmarchyDatePicker"),
+        ),
+        KeyBinding::new(
+            "space",
+            Confirm { secondary: false },
+            Some("OmarchyDatePicker"),
+        ),
+        KeyBinding::new("escape", Cancel, Some("OmarchyDatePicker")),
+    ]);
     Theme::tokyo_night().apply(cx);
 }
 
