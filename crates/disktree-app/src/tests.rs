@@ -1274,6 +1274,56 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn find_field_never_draws_over_the_legend(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    press(cx, "/");
+    // Matches bring the longest hint, "enter shows only these".
+    cx.simulate_input("BLOB");
+    cx.run_until_parked();
+    // The minimum window width up to a wide one, at 100%, 150% and 200%.
+    for width in [900., 1100., 1440.] {
+        for rem in [16., 24., 32.] {
+            cx.simulate_resize(gpui_kit::size(px(width), px(900.)));
+            cx.update(|window, _| window.set_rem_size(px(rem)));
+            draw(cx);
+            let at = format!("{width}x900 at rem {rem}");
+            let field = cx.debug_bounds("find-field").expect("find drawn");
+            let legend = cx.debug_bounds("legend").expect("legend drawn");
+            // Half a pixel for rounding where two edges meet. The field
+            // clips what it holds, so its own bounds are what is drawn.
+            assert!(
+                legend.size.width <= px(0.5)
+                    || field.right() <= legend.left() + px(0.5),
+                "{at}: field {field:?} overlaps legend {legend:?}"
+            );
+            assert!(
+                field.right() <= px(width) + px(0.5),
+                "{at}: the field stays in the window: {field:?}"
+            );
+        }
+    }
+    // Where the overlap was seen, and narrower: the whole hint reads, and
+    // the legend still shows beside it.
+    for width in [1000., 1440.] {
+        cx.simulate_resize(gpui_kit::size(px(width), px(900.)));
+        cx.update(|window, _| window.set_rem_size(px(16.)));
+        draw(cx);
+        let hint = cx.debug_bounds("find-hint").expect("hint drawn");
+        let field = cx.debug_bounds("find-field").expect("find drawn");
+        let legend = cx.debug_bounds("legend").expect("legend drawn");
+        assert!(
+            hint.size.width > px(100.)
+                && hint.right() <= field.right() + px(0.5),
+            "{width}: the whole hint fits in the field: {hint:?} {field:?}"
+        );
+        assert!(legend.size.width > px(0.), "{width}: legend {legend:?}");
+    }
+}
+
+#[gpui_kit::test]
 fn typing_filters_live_and_enter_shows_only_the_matches(
     cx: &mut TestAppContext,
 ) {
