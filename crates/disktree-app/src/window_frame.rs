@@ -1,13 +1,15 @@
 //! Where the main window opens: where the user last left it, else centred
-//! on the primary display, and always inside the display it opens on.
+//! on the display the user is working on (see `placement.rs`), and always
+//! inside the display it opens on.
 //!
 //! The frame is kept in `window-frame.json` in the settings directory, with
 //! the display it was on. GPUI reads a window's bounds relative to the
 //! display it is given (macOS) or in the desktop's coordinates (Windows),
 //! and reports them the same way, so the saved bounds go back to the same
 //! display as `WindowOptions::display_id`. A display that is gone, or one
-//! that shrank, still gets the whole window: the frame is cut to that
-//! display's visible area and moved inside it, so no edge opens under the
+//! that shrank, still gets the whole window: the frame goes to the display
+//! a new window would, is cut to that display's visible area and moved
+//! inside it, so no edge opens under the
 //! menu bar, the Dock or off the side, as 1440 points did on a laptop.
 //!
 //! The frame is remembered as the window moves and written once, as the app
@@ -56,28 +58,35 @@ pub struct Placement {
 }
 
 /// The main window's placement: the saved frame if there is one, else
-/// `default` centred on the primary display.
+/// `default` centred on the display a new window opens on.
 pub fn initial(
     default: Size<Pixels>,
     min: Size<Pixels>,
-    cx: &App,
+    cx: &mut App,
 ) -> Placement {
     let saved = path().and_then(|path| load(&path));
-    placement(saved, default, min, cx)
+    let fallback = crate::placement::display_for_new_window(cx);
+    placement(saved, fallback, default, min, cx)
 }
 
+/// [`initial`], given what was saved and `fallback`, the display for a
+/// window with no saved display to return to (`None`: the primary one).
 fn placement(
     saved: Option<Frame>,
+    fallback: Option<DisplayId>,
     default: Size<Pixels>,
     min: Size<Pixels>,
     cx: &App,
 ) -> Placement {
-    let display = saved.as_ref().and_then(|frame| {
-        let uuid = frame.display.as_deref()?;
-        cx.displays().into_iter().find(|display| {
-            display.uuid().is_ok_and(|id| id.to_string() == uuid)
+    let display = saved
+        .as_ref()
+        .and_then(|frame| {
+            let uuid = frame.display.as_deref()?;
+            cx.displays().into_iter().find(|display| {
+                display.uuid().is_ok_and(|id| id.to_string() == uuid)
+            })
         })
-    });
+        .or_else(|| fallback.and_then(|id| cx.find_display(id)));
     let display_id = display.as_ref().map(|display| display.id());
     let area = display
         .or_else(|| cx.primary_display())
@@ -294,7 +303,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_saved_frame_returns_to_its_display_or_the_primary(
+    fn a_saved_frame_returns_to_its_display_or_the_working_one(
         cx: &gpui_kit::TestAppContext,
     ) {
         let default = size(px(1440.0), px(900.0));
@@ -312,9 +321,10 @@ mod tests {
                 height: 800.0,
             };
 
-            let here = placement(Some(saved(&uuid)), default, min, cx);
+            let here = placement(Some(saved(&uuid)), None, default, min, cx);
             assert_eq!(here.display, Some(display.id()));
-            let gone = placement(Some(saved("unplugged")), default, min, cx);
+            let gone =
+                placement(Some(saved("unplugged")), None, default, min, cx);
             assert_eq!(gone.display, None, "the primary display");
             // Either way the frame is pulled onto the display it opens on.
             for placed in [here, gone] {
@@ -328,13 +338,25 @@ mod tests {
                 );
             }
 
-            let fresh = placement(None, default, min, cx);
+            let fresh = placement(None, None, default, min, cx);
             let WindowBounds::Windowed(bounds) = fresh.bounds else {
                 panic!("windowed");
             };
             assert_eq!(bounds.size, default);
             assert_eq!(bounds.center(), area.center());
             assert_eq!(fresh.min_size, min);
+
+            // The display the user is working on, when nothing saved
+            // names one still connected; a fallback since unplugged is
+            // the primary display again.
+            let working = Some(display.id());
+            let fresh = placement(None, working, default, min, cx);
+            assert_eq!(fresh.display, working);
+            let gone =
+                placement(Some(saved("unplugged")), working, default, min, cx);
+            assert_eq!(gone.display, working);
+            let stale = Some(DisplayId::new(u64::from(display.id()) + 1));
+            assert_eq!(placement(None, stale, default, min, cx).display, None);
         });
     }
 }

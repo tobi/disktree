@@ -48,24 +48,32 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# AppKit for the Dock icon of a run outside the app bundle (dock_icon.rs):
-# the crates and versions GPUI already builds, with only the classes used.
+# AppKit for the Dock icon of a run outside the app bundle (dock_icon.rs)
+# and the screen under the pointer (placement.rs): the crates and versions
+# GPUI already builds, with only the classes used.
 objc2 = "0.6"
 # The kernel release, which says which macOS this is whatever SDK linked it.
 rustix = { version = "1.1", features = ["system"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSApplication",
+    "NSEvent",
+    "NSGraphics",
     "NSImage",
     "NSResponder",
+    "NSScreen",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "NSArray",
     "NSBundle",
     "NSData",
+    "NSDictionary",
+    "NSEnumerator",
     "NSGeometry",
     "NSProcessInfo",
     "NSString",
+    "NSValue",
 ] }
 
 [target.'cfg(windows)'.dependencies]

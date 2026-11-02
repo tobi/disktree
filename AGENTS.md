@@ -263,6 +263,7 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 | colours derived from the theme | `crates/disktree-app/src/palette.rs` |
 | the title strip, window controls, the client-side frame | `crates/disktree-app/src/chrome.rs` |
 | where the main window opens, and remembering it | `crates/disktree-app/src/window_frame.rs` |
+| which display a new window opens on | `crates/disktree-app/src/placement.rs` |
 | the menu bar, its shortcuts, the strip's menu off macOS | `crates/disktree-app/src/app_menu.rs`, the dropdown in `views.rs` |
 | Help's rows, Copy Diagnostics Info | `crates/disktree-app/src/help.rs`, the report in `diagnostics.rs` |
 | Settings (Updates, Diagnostics, About) | `crates/disktree-app/src/settings.rs` |

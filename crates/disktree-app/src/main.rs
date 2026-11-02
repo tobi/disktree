@@ -33,6 +33,7 @@ mod logs_fixture;
 mod logs_window;
 mod marks;
 mod palette;
+mod placement;
 mod power;
 mod safety;
 mod semantics;
@@ -252,10 +253,10 @@ fn run() -> Result<()> {
             }
             let options = args.options.clone();
             let root_for_app = root.clone();
-            // Where the user left it, else centred; inside the display
-            // either way. Below 900 by 600 the treemap stops being
-            // readable, so ask the compositor not to go there, unless the
-            // display itself is smaller.
+            // Where the user left it, else centred on the display they are
+            // working on; inside the display either way. Below 900 by 600
+            // the treemap stops being readable, so ask the compositor not
+            // to go there, unless the display itself is smaller.
             let place = window_frame::initial(
                 size(px(1440.), px(900.)),
                 size(px(900.), px(600.)),

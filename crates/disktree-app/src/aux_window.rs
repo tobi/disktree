@@ -54,17 +54,21 @@ pub fn find<V: Render + 'static>(
     })
 }
 
-/// Opens a window in front, centred on the main display.
+/// Opens a window in front, centred on the display the user is working
+/// on: the main window's, when it is in front.
 pub fn open<V: Render + 'static>(
     spec: &Spec,
     cx: &mut App,
     build: impl FnOnce(&mut Window, &mut Context<'_, V>) -> V,
 ) -> Option<WindowHandle<V>> {
+    let display = crate::placement::display_for_new_window(cx);
     let bounds =
-        Bounds::centered(None, size(px(spec.size.0), px(spec.size.1)), cx);
+        Bounds::centered(display, size(px(spec.size.0), px(spec.size.1)), cx);
     let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // GPUI reads the bounds relative to this display.
+            display_id: display,
             titlebar: Some(TitlebarOptions {
                 title: Some(spec.title.into()),
                 // As the main window: the strip is the title bar.
