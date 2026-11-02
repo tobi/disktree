@@ -30,11 +30,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity,
     FocusHandle, Focusable as _, Font, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, LineFragment,
-    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
-    ParentElement as _, Pixels, Rems, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledText, Window,
-    WindowHandle, deferred, div, list, px,
+    IndentAdjustment, InteractiveElement as _, IntoElement, KeyDownEvent,
+    LineFragment, ListAlignment, ListOffset, ListState, MouseButton,
+    MouseDownEvent, ParentElement as _, Pixels, Rems, Render, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledText,
+    Window, WindowHandle, deferred, div, list, px,
 };
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, IconName, Theme, button, icon,
@@ -952,8 +952,10 @@ impl LogsWindow {
         let fragments = [LineFragment::text(raw)];
         let mut starts = vec![0];
         starts.extend(
+            // SameIndent is how GPUI wrapped before the argument existed;
+            // only the break offsets are used here.
             wrapper
-                .wrap_line(&fragments, px(width))
+                .wrap_line(&fragments, px(width), IndentAdjustment::SameIndent)
                 .map(|boundary| boundary.ix),
         );
         starts.push(raw.len());

@@ -89,7 +89,3 @@ lto = "thin"
 codegen-units = 1
 overflow-checks = true
 
-# gpui-pre-macros leaves a helper ungated in release builds while its module is
-# gated on debug_assertions; enable it for the host proc-macro only.
-[profile.release.package.gpui-pre-macros]
-debug-assertions = true

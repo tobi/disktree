@@ -188,8 +188,14 @@ impl DocWindow {
             let fragments = [gpui_kit::LineFragment::text(&expanded)];
             let mut starts = vec![0];
             starts.extend(
+                // SameIndent is how GPUI wrapped before the argument
+                // existed; only the break offsets are used here.
                 wrapper
-                    .wrap_line(&fragments, width)
+                    .wrap_line(
+                        &fragments,
+                        width,
+                        gpui_kit::IndentAdjustment::SameIndent,
+                    )
                     .map(|boundary| boundary.ix),
             );
             starts.push(expanded.len());
