@@ -61,9 +61,15 @@ leave alone. Read with `skill://pwrdisk-free-space/SKILL.md`.
 `/private`, `/cores`, `/opt/homebrew` and the other system trees, the home
 directory and anything holding it, mount points, and the `.fseventsd` and
 `.Spotlight-V100` stores (use `mdutil` for Spotlight, never delete either).
-Classification is independent of removal eligibility: `pwrdisk_find` may
-list `/private/tmp` as a temporary cleanup candidate, but reports the
-`/private` system-tree guard refusal. Do not mark it or bypass the guard.
+What is inside `/private/tmp` and `/private/var/tmp` (`/tmp` and
+`/var/tmp`) may be marked, as on Linux; the two folders themselves stay
+refused under `/private`, and so does `/private/var/folders`, where each
+user's `$TMPDIR` and caches hold running apps' live state. Classification
+is independent of removal eligibility: `pwrdisk_find` may list
+`/private/tmp` as a temporary cleanup candidate and report the `/private`
+guard refusal for the folder. Look inside it with `pwrdisk_ls`, propose
+entries the user recognizes as their own leftovers, and leave files a
+running program may still use. Do not bypass the guard.
 
 ## Never propose
 

@@ -287,7 +287,8 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
 /// they are part of what fills the disk, but files there belong to packages
 /// and removing them by hand breaks the system; pacman, paccache,
 /// `journalctl --vacuum` or `brew cleanup` are the right tools. Refused even
-/// where permissions would allow it, and even inside them.
+/// where permissions would allow it, and even inside them, except for the
+/// scratch space in [`SCRATCH_TREES`].
 ///
 /// One list for every platform: a macOS tree never exists on Linux, and the
 /// other way round, so the extra entries cost nothing. On macOS `/etc`,
@@ -324,6 +325,16 @@ const SYSTEM_TREES: [&str; 24] = [
     "/opt/homebrew",
     "/Network",
 ];
+
+/// Scratch space inside a system tree. On macOS `/tmp` and `/var/tmp` are
+/// `/private/tmp` and `/private/var/tmp`, so the `/private` entry above would
+/// refuse what any user leaves there, though Linux leaves the same folders
+/// removable. What is inside them may be removed; the folders themselves
+/// stay refused under `/private`. The sticky bit still keeps one user from
+/// removing another's files. `/private/var/folders` stays refused: each
+/// user's `$TMPDIR` and caches there hold running apps' live state.
+#[cfg(not(windows))]
+const SCRATCH_TREES: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
 
 /// How the guards compare paths: lexically normalized, and where the
 /// platform has more than one spelling for a place, in one of them.
@@ -383,6 +394,25 @@ fn system_tree_keys() -> &'static [(String, PathBuf)] {
 #[cfg(not(windows))]
 fn system_trees() -> Vec<PathBuf> {
     SYSTEM_TREES.iter().map(PathBuf::from).collect()
+}
+
+/// [`SCRATCH_TREES`] by guard key, computed once like the system trees.
+#[cfg(not(windows))]
+fn scratch_tree_keys() -> &'static [PathBuf] {
+    static KEYS: std::sync::LazyLock<Vec<PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            SCRATCH_TREES
+                .iter()
+                .map(|tree| guard_key(Path::new(tree)))
+                .collect()
+        });
+    &KEYS
+}
+
+/// Windows' system trees have no scratch space inside them.
+#[cfg(windows)]
+const fn scratch_tree_keys() -> &'static [PathBuf] {
+    &[]
 }
 
 /// [`SYSTEM_TREES`] on Windows: Windows itself, installed programs and
@@ -446,9 +476,16 @@ const SYSTEM_TOOLS: &str = "remove it with the tool that installed it";
 const SYSTEM_TOOLS: &str = "use Settings, or the program's own uninstaller";
 
 /// The system tree the path keyed `key` is in, if any. The home directory is
-/// never system, wherever it lives.
+/// never system, wherever it lives, and neither is what is inside the
+/// scratch space of [`SCRATCH_TREES`].
 fn system_tree(key: &Path, home: Option<&Path>) -> Option<&'static str> {
     if home.is_some_and(|home| key.starts_with(home)) {
+        return None;
+    }
+    if scratch_tree_keys()
+        .iter()
+        .any(|scratch| key != scratch && key.starts_with(scratch))
+    {
         return None;
     }
     system_tree_keys()
@@ -2941,6 +2978,87 @@ mod tests {
             assert_eq!(tree_of(Path::new(path), home), None, "{path}");
         }
     }
+
+    /// `/tmp` on macOS is `/private/tmp`: what a user leaves there is theirs
+    /// to remove, as on Linux, but the folder itself is the system's.
+    #[test]
+    #[cfg(not(windows))]
+    fn macos_scratch_space_is_removable_but_not_the_folders_themselves() {
+        let home = Path::new("/Users/tobi");
+        let macos = |path: &str| {
+            system_tree(
+                &guard_key_for(Path::new(path), true),
+                Some(&guard_key_for(home, true)),
+            )
+        };
+        for path in [
+            "/private/tmp/pwrdisk-review.kW8Ry1",
+            "/private/tmp/build/target/debug",
+            "/private/var/tmp/cache.bin",
+            // The same places by the Data volume's spelling, and by case.
+            "/System/Volumes/Data/private/tmp/pwrdisk-review",
+            "/PRIVATE/TMP/Build",
+        ] {
+            assert_eq!(macos(path), None, "{path}");
+        }
+        for path in [
+            "/private/tmp",
+            "/private/var/tmp",
+            "/System/Volumes/Data/private/tmp",
+            // A neighbour that only shares the spelling's start.
+            "/private/tmpfoo/x",
+            // Every user's `$TMPDIR` and caches stay refused.
+            "/private/var/folders/xy/T/item",
+            "/private/var/db/receipts",
+        ] {
+            assert_eq!(macos(path), Some("/private"), "{path}");
+        }
+    }
+
+    /// The whole guard, not only the tree lookup: in a whole-disk scan a
+    /// folder in `/private/tmp` is accepted and `/private/tmp` refused.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_whole_disk_scan_may_remove_what_is_in_private_tmp() {
+        let home = Home::of(Path::new("/Users/tobi"));
+        let root = Path::new("/");
+        assert_eq!(
+            refuse(
+                Path::new("/private/tmp/pwrdisk-guard-fixture"),
+                root,
+                Some(&home),
+                &[],
+                &[],
+            ),
+            None
+        );
+        let reason =
+            refuse(Path::new("/private/tmp"), root, Some(&home), &[], &[]);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason
+                    .contains("part of the system under /private")),
+            "{reason:?}"
+        );
+    }
+
+    /// The whole plan, on a real entry: the link and mount checks pass a
+    /// folder in `/private/tmp` too, so a whole-disk scan may remove it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_whole_disk_plan_accepts_a_real_entry_in_private_tmp() {
+        let temp =
+            tempfile::tempdir_in("/private/tmp").expect("scratch fixture");
+        let planned = plan(&[target(temp.path(), 1)], Path::new("/"));
+        assert!(planned.blocked.is_empty(), "{:?}", planned.blocked);
+        assert_eq!(planned.targets.len(), 1);
+
+        let planned =
+            plan(&[target(Path::new("/private/tmp"), 1)], Path::new("/"));
+        assert!(planned.targets.is_empty());
+    }
+
     #[test]
     fn limited_worker_refuses_the_entire_batch_before_removing_anything() {
         let temp = tree();
