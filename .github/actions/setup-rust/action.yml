@@ -1,0 +1,75 @@
+name: Set up Rust
+description: >-
+  Install the Rust toolchain rust-toolchain.toml pins, remove every other
+  one, and restore the Rust cache, saving it only from main unless save-if
+  says otherwise.
+
+# One copy of the setup every Rust job needs, so the pin, the prune and
+# the cache's save rule cannot drift apart between ci.yml, preview-build.yml
+# and release.yml. The reasons are in .github/workflows/README.md, under
+# "The Rust cache". A local action, so the job must check out the
+# repository first.
+inputs:
+  components:
+    description: Extra toolchain components, comma-separated.
+    required: false
+    default: ""
+  targets:
+    description: Extra compilation targets, comma-separated.
+    required: false
+    default: ""
+  cache-bin:
+    description: Whether rust-cache also caches ~/.cargo/bin.
+    required: false
+    default: "true"
+  save-if:
+    description: >-
+      Whether rust-cache saves. Empty, the default, saves only on main.
+    required: false
+    default: ""
+
+outputs:
+  toolchain:
+    description: The pinned Rust version, for keys that depend on it.
+    value: ${{ steps.pin.outputs.channel }}
+
+runs:
+  using: composite
+  steps:
+    # The checked-out rust-toolchain.toml is the only place the version is
+    # written, so a release tag builds with the Rust it pinned, not with
+    # whatever a repository variable says today. Carriage returns are
+    # dropped because a Windows checkout may convert line endings.
+    - name: Read the pinned Rust version
+      id: pin
+      shell: bash
+      run: |
+        channel=$(tr -d '\r' < rust-toolchain.toml \
+          | sed -n 's/^channel *= *"\([^"]*\)".*/\1/p')
+        if [ -z "$channel" ]; then
+          echo "::error file=rust-toolchain.toml::no channel"
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+    # The lint gate denies clippy::all and ::pedantic, and a newer clippy's
+    # new lints are a change to make on purpose, not by surprise. dtolnay
+    # installs the minimal profile, so a job that runs clippy or rustfmt
+    # asks for them.
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      with:
+        toolchain: ${{ steps.pin.outputs.channel }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # Before rust-cache, whose key hashes every installed toolchain.
+    - name: Keep only the pinned Rust toolchain
+      shell: bash
+      run: ./scripts/ci/prune-rust-toolchains.sh
+
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        # Only main saves by default, so PR saves cannot evict the entries
+        # every PR restores from the 10 GB store.
+        save-if: ${{ inputs.save-if || github.ref == 'refs/heads/main' }}
+        cache-bin: ${{ inputs.cache-bin }}

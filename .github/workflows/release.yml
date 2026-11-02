@@ -26,7 +26,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.97"
   # Through the environment, never spliced into a script: a tag typed into
   # the dispatch form is text, not shell.
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
@@ -42,27 +41,11 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - name: System libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
-            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
-
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # A cache saved under a tag is readable by that tag's runs alone.
-          save-if: false
-
       # The signing environments accept only v* tags, so a rebuild
       # dispatched from a branch would build everything and then be refused
       # at signing. Fail here instead: dispatch it from the tag itself.
+      # First, before the tag's own setup-rust action is loaded: a tag
+      # older than that action fails here with this message, not there.
       - name: Check the run starts from the tag
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -73,6 +56,20 @@ jobs:
               "Tags > $RELEASE_TAG), not from $REF_TYPE $REF_NAME" >&2
             exit 1
           fi
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: clippy, rustfmt
+          # A cache saved under a tag is readable by that tag's runs alone.
+          save-if: false
 
       # The tag, Cargo.toml and CHANGELOG.md agree before anything is
       # built; the changelog section becomes the release's notes.
@@ -116,21 +113,16 @@ jobs:
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
           save-if: false
 
       - name: Test
         run: cargo xtask test
 
       - name: Build
-        run: |
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          cargo xtask portable
+        run: cargo xtask portable
 
       # Velopack is not used on Linux: vpk's Linux output is an AppImage
       # only, and its updater runs only from one. Linux packages are not
@@ -180,13 +172,9 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
           save-if: false
 
       - name: Test
@@ -477,11 +465,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/setup-rust
         with:
           save-if: false
 

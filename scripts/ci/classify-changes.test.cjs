@@ -94,7 +94,7 @@ for (const path of [
   'assets/disktree.svg', 'assets/screenshot.png', 'packaging/macos/Info.plist.in',
   'packaging/pwrdisk.desktop.in', 'scripts/release/install-vpk.sh',
   '.github/workflows/ci.yml', '.github/workflows/release.yml',
-  'scripts/ci/classify-changes.test.cjs', 'licenses/velopack.txt',
+  '.github/actions/setup-rust/action.yml', 'scripts/ci/classify-changes.test.cjs', 'licenses/velopack.txt',
   'LICENSE', 'CHANGELOG.md', 'skills/pwrdisk-free-space/SKILL.md',
   'skills/pwrdisk-free-space/references/macos.md', '.gitignore', '.agents/config.toml', 'unknown.yaml',
 ]) {
@@ -163,7 +163,9 @@ test('license inputs and gate changes select the notice check, including renames
     'Cargo.lock', 'Cargo.toml', 'crates/disktree-app/Cargo.toml',
     'xtask/Cargo.toml', 'licenses/about.toml', 'licenses/about.hbs',
     'licenses/bundled.txt', 'licenses/velopack.txt', 'licenses/nested/NOTES.md',
-    'THIRD_PARTY_LICENSES', '.github/workflows/ci.yml', 'xtask/src/licenses.rs',
+    'THIRD_PARTY_LICENSES', '.github/workflows/ci.yml',
+    '.github/actions/setup-rust/action.yml',
+    '.github/actions/setup-rust/prune.sh', 'xtask/src/licenses.rs',
   ]) {
     for (const status of ['modified', 'added', 'removed']) {
       assert.equal((await run({ files: [{ filename: path, status }] }))

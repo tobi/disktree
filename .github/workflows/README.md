@@ -16,14 +16,16 @@ Every job runs on a standard GitHub-hosted runner: free on a public
 repository, macOS included, and discarded after the job. PwrRoute builds
 macOS on self-hosted lab machines; PwrDisk does not, because it takes pull
 requests from forks and those must never reach a persistent machine. Every
-Rust job pins Rust 1.97, the version in `rust-toolchain.toml`.
+Rust job installs the version `rust-toolchain.toml` pins, read from the
+checkout, so that file is the only place it is written.
 
 ## ci.yml
 
 The Linux `licenses` job runs `cargo xtask licenses --check` on every push
 to `main` and on PRs changing `Cargo.lock`, any `Cargo.toml`, `licenses/**`
-or `THIRD_PARTY_LICENSES`. Changes to `ci.yml` or `xtask/src/licenses.rs`
-also run it so edits to the gate or generator are checked. It installs
+or `THIRD_PARTY_LICENSES`. Changes to `ci.yml`, the `setup-rust` action or
+`xtask/src/licenses.rs` also run it so edits to the gate or generator are
+checked. It installs
 `cargo-about@0.9.2` with `cargo install --locked --features cli` and caches
 the binary by OS, architecture, generator version and Rust version. Like
 PwrRoute, the generator is pinned and the notice check runs on Linux only.
@@ -36,17 +38,33 @@ reports a result. A stale file fails with instructions to run
 
 ### The Rust cache
 
-Every `Swatinem/rust-cache` step saves only on `main`; a PR restores
-`main`'s entry for the same job, by key prefix when its `Cargo.lock`
-differs. The Actions cache store holds 10 GB and evicts the least recently
-used entry first. While PRs saved too, each wrote about 6 GB across the
-jobs, `main`'s entries were evicted, and the next PR compiled from scratch:
-the macOS job's lint went from under a minute to six, and its tests from
-two minutes to eight. As in PwrRoute, `scripts/ci/prune-rust-toolchains.sh`
-removes the runner image's own stable toolchain before the cache step,
-because rust-cache hashes every installed toolchain and image rollouts
-would otherwise change the key. A push to `main` never cancels the `main`
-run in progress, since a cancelled job saves nothing.
+Every Rust job in `ci.yml`, `preview-build.yml` and `release.yml` sets up
+through one local composite action, `.github/actions/setup-rust`, so the
+toolchain pin, the prune and the cache's save rule cannot drift apart
+between jobs. It reads the `channel` from the checked-out
+`rust-toolchain.toml`, installs it with `dtolnay/rust-toolchain`, runs
+`scripts/ci/prune-rust-toolchains.sh`, then `Swatinem/rust-cache`, saving
+only on `main`. The version is read from the file, not a repository
+variable, so a release tag builds with the Rust it pinned however the
+variable has moved since. Its inputs are what differ between jobs:
+`components` (clippy and rustfmt for the lint jobs), `targets` (both Apple
+architectures for the universal macOS build), `cache-bin` (off in the
+`licenses` job, whose own cache owns `cargo-about`) and `save-if` (`false`
+in `release.yml`, because a cache saved under a tag is readable by that
+tag's runs alone). Its `toolchain` output is the version it read, which
+keys the `cargo-about` cache. A job must check out the repository before
+using it, as with any local action.
+
+The cache saves only on `main`; a PR restores `main`'s entry for the same
+job, by key prefix when its `Cargo.lock` differs. The Actions cache store
+holds 10 GB and evicts the least recently used entry first. While PRs saved
+too, each wrote about 6 GB across the jobs, `main`'s entries were evicted,
+and the next PR compiled from scratch: the macOS job's lint went from under
+a minute to six, and its tests from two minutes to eight. As in PwrRoute,
+the prune script removes the runner image's own stable toolchain before the
+cache step, because rust-cache hashes every installed toolchain and image
+rollouts would otherwise change the key. A push to `main` never cancels the
+`main` run in progress, since a cancelled job saves nothing.
 
 Lint and test stay one job per platform. They compile separately anyway
 (clippy builds dependencies as metadata, tests as full code), so splitting

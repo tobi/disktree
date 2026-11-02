@@ -30,7 +30,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.97"
   # `0.12.0-pr.12` on a PR, `0.12.0-dev.34` on dispatch. xtask and vpk stamp
   # packages with it; Cargo.toml is left alone so `--locked` still holds.
   PREVIEW_SUFFIX: ${{ github.event.pull_request.number && format('pr.{0}', github.event.pull_request.number) || format('dev.{0}', github.run_number) }}
@@ -71,16 +70,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-apple-darwin, x86_64-apple-darwin
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves, as in ci.yml: a PR's release-build cache would
-          # evict the entries every PR's CI starts from.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build PwrDisk.app (universal)
         env:
@@ -235,15 +227,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves, as in ci.yml: a PR's release-build cache would
-          # evict the entries every PR's CI starts from.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-rust
 
       - name: Build (unsigned)
         run: cargo build --release --locked -p disktree-app

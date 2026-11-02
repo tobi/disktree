@@ -19,10 +19,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# The Rust cache: every rust-cache step saves only on main, so PR saves
-# cannot evict the entries every PR restores from the 10 GB store. Each job
-# prunes extra toolchains first so image updates keep the key. The reasons
-# and numbers are in README.md beside this file, under "The Rust cache".
+# The Rust cache: every Rust job sets up through .github/actions/setup-rust,
+# which saves the cache only on main, so PR saves cannot evict the entries
+# every PR restores from the 10 GB store, and prunes extra toolchains first
+# so image updates keep the key. The reasons and numbers are in README.md
+# beside this file, under "The Rust cache".
 jobs:
   # The pull_request trigger stays path-unfiltered so every job reports on
   # every PR: a skipped job satisfies a required check, a missing one leaves
@@ -119,6 +120,7 @@ jobs:
               path === "THIRD_PARTY_LICENSES" ||
               // Exercise changes to the gate and generator themselves.
               path === ".github/workflows/ci.yml" ||
+              path.startsWith(".github/actions/setup-rust/") ||
               path === "xtask/src/licenses.rs";
             const licensesImpacting = files.some((file) =>
               [file.filename, file.previous_filename].filter(Boolean)
@@ -160,19 +162,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/setup-rust
+        id: rust
         with:
-          toolchain: "1.97"
-
-      # Before rust-cache, whose key hashes every installed toolchain.
-      - name: Keep only the pinned Rust toolchain
-        shell: bash
-        run: ./scripts/ci/prune-rust-toolchains.sh
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves; see the note above `jobs`.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
           # The versioned binary cache below owns cargo-about.
           cache-bin: false
 
@@ -183,7 +175,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-about
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-about-0.9.2-rust-1.97
+          # The Rust that built it is part of the key, so a toolchain bump
+          # rebuilds the binary instead of restoring one it did not build.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-about-0.9.2-rust-${{ steps.rust.outputs.toolchain }}
 
       - name: Install cargo-about
         if: steps.cargo-about.outputs.cache-hit != 'true'
@@ -214,22 +208,10 @@ jobs:
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
 
-      # Pinned: the lint gate denies clippy::all and ::pedantic, and a newer
-      # clippy's new lints are a change to make on purpose, not by surprise.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      # The lint gate runs clippy and rustfmt.
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.97"
           components: clippy, rustfmt
-
-      # Before rust-cache, whose key hashes every installed toolchain.
-      - name: Keep only the pinned Rust toolchain
-        shell: bash
-        run: ./scripts/ci/prune-rust-toolchains.sh
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves; see the note above `jobs`.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo xtask lint
@@ -251,20 +233,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.97"
           components: clippy, rustfmt
-
-      # Before rust-cache, whose key hashes every installed toolchain.
-      - name: Keep only the pinned Rust toolchain
-        shell: bash
-        run: ./scripts/ci/prune-rust-toolchains.sh
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves; see the note above `jobs`.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo xtask lint
@@ -292,19 +263,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.97"
-
-      # Before rust-cache, whose key hashes every installed toolchain.
-      - name: Keep only the pinned Rust toolchain
-        shell: bash
-        run: ./scripts/ci/prune-rust-toolchains.sh
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves; see the note above `jobs`.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-rust
 
       - name: Bundle
         run: cargo xtask bundle
@@ -330,22 +289,10 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Pinned with the Linux job, for the same reason. GPUI needs nothing
-      # beyond the Windows SDK the runner already has.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      # GPUI needs nothing beyond the Windows SDK the runner already has.
+      - uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.97"
           components: clippy, rustfmt
-
-      # Before rust-cache, whose key hashes every installed toolchain.
-      - name: Keep only the pinned Rust toolchain
-        shell: bash
-        run: ./scripts/ci/prune-rust-toolchains.sh
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves; see the note above `jobs`.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo xtask lint
@@ -407,19 +354,7 @@ jobs:
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.97"
-
-      # Before rust-cache, whose key hashes every installed toolchain.
-      - name: Keep only the pinned Rust toolchain
-        shell: bash
-        run: ./scripts/ci/prune-rust-toolchains.sh
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main saves; see the note above `jobs`.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-rust
 
       - name: Test
         run: cargo xtask test
