@@ -639,6 +639,103 @@ mod tests {
         assert_eq!(nested.root().sharing().files, 2);
     }
 
+    /// A tree with a file for every table an allocation can be kept in:
+    /// clones with one name, wholly shared, modified and unknown, groups
+    /// that span directories and leave it, hardlinks, a followed link and
+    /// a clone with a resource fork.
+    fn every_kind_of_file() -> Draft {
+        let mut root = Draft::directory("root");
+        // A clone whose data fork is all of it, as nearly every one is.
+        let sized = |name: &str, id, private, references| {
+            let mut node = clone(name, 1, id, private);
+            node.bytes = 80;
+            let allocation = node.allocation.as_mut().expect("allocation");
+            allocation.bytes = 80;
+            let info = allocation.clone.as_mut().expect("clone");
+            info.references = references;
+            node
+        };
+        for (dir, inode) in [("a", 11), ("b", 12)] {
+            let mut node = Draft::directory(dir);
+            node.children = vec![
+                // A third member outside the tree: never complete.
+                sized("whole", 7, Some(0), 3),
+                sized("complete", 8, Some(0), 2),
+                sized("modified", 9, Some(30), 2),
+                sized("unknown", 10, None, 2),
+                clone("fork", 1, 11, Some(0)),
+                Draft::entry("plain", NodeKind::File, 5),
+            ];
+            let mut link = Draft::entry("link", NodeKind::File, 64);
+            link.inode =
+                Some((1, std::num::NonZeroU64::new(inode / 10).expect("ino")));
+            link.allocation = Some(Box::new(Allocation {
+                bytes: 64,
+                identity: Some((1, inode / 10)),
+                links: 2,
+                followed: false,
+                clone: None,
+            }));
+            node.children.push(link);
+            let mut followed = sized("followed", 7, Some(0), 3);
+            let allocation = followed.allocation.as_mut().expect("allocation");
+            allocation.followed = true;
+            allocation.clone = None;
+            node.children.push(followed);
+            root.children.push(node);
+        }
+        root
+    }
+
+    /// Each node's figures, the estimate of each node alone and of every
+    /// pair of nodes neither of which holds the other: what a selection
+    /// of marks reads.
+    fn figures(tree: &Tree) -> Vec<(Sharing, Estimate)> {
+        /// Nodes in preorder, each with the end of its subtree's run.
+        fn preorder<'t>(node: Node<'t>, nodes: &mut Vec<(Node<'t>, usize)>) {
+            let at = nodes.len();
+            nodes.push((node, 0));
+            for child in node.children() {
+                preorder(child, nodes);
+            }
+            nodes[at].1 = nodes.len();
+        }
+        let mut nodes = Vec::new();
+        preorder(tree.root(), &mut nodes);
+        let mut figures = Vec::new();
+        for &(node, end) in &nodes {
+            figures.push((node.sharing(), estimate([node])));
+            // What follows a node's subtree in preorder is outside it, and
+            // cannot hold it.
+            for &(other, _) in &nodes[end..] {
+                figures.push((Sharing::default(), estimate([node, other])));
+            }
+        }
+        figures
+    }
+
+    #[test]
+    fn every_figure_is_the_same_however_its_allocation_is_kept() {
+        let draft = every_kind_of_file();
+        let measured = |tree: &mut Tree| {
+            aggregate_deduped(tree, Metric::Bytes, &Seen::new());
+            let bytes = figures(tree);
+            aggregate(tree, Metric::Files);
+            (bytes, figures(tree))
+        };
+        let mut packed = Tree::from(&draft);
+        let mut whole = crate::index::kept_whole(|| Tree::from(&draft));
+        // The small records are what the packed tree keeps, or this
+        // compares the whole tables with themselves.
+        assert!(packed.storage_bytes().used < whole.storage_bytes().used);
+        let expected = crate::index::kept_whole(|| measured(&mut whole));
+        assert_eq!(measured(&mut packed), expected);
+        let root = packed.root();
+        assert!(root.sharing().duplicate_bytes > 0);
+        assert!(root.sharing().unknown_files > 0);
+        assert_ne!(root.sharing().reclaimable(root.bytes), root.bytes);
+    }
+
     #[test]
     fn clone_groups_merge_across_directories_and_refresh_after_removal() {
         let mut root = Draft::directory("root");

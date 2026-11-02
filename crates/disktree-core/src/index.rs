@@ -2,12 +2,14 @@
 //!
 //! Every node is a 64-byte record in one vector, each directory's children
 //! a contiguous run of it, every name in one string, and the allocation
-//! and sharing records, which most nodes lack, in side tables.
+//! and sharing records, which most nodes lack, in side tables. An
+//! allocation keeps only what its node does not already say; see
+//! [`records`].
 //!
 //! A tree of separately allocated nodes is freed one `free()` at a time,
 //! each write reading a page back in, from the compressor if macOS has
 //! packed it away: 0.8 to 0.9 s for a 20-million-node tree in a fresh
-//! process, 15 s in a window under memory pressure. Here a drop frees five
+//! process, 15 s in a window under memory pressure. Here a drop frees eight
 //! buffers without reading them, in under a millisecond and with no page
 //! faults. Nothing here needs `unsafe`: an index is checked where a pointer
 //! would have to be trusted, and a name is a slice of a `String`.
@@ -36,6 +38,11 @@ use rayon::prelude::*;
 use crate::classify::{Category, Reclaim};
 use crate::sharing::{Allocation, Sharing};
 use crate::tree::{Draft, Metric, NodeKind};
+
+mod records;
+use records::Records;
+#[cfg(test)]
+pub(crate) use records::kept_whole;
 
 /// The longest name a tree holds.
 ///
@@ -111,27 +118,29 @@ impl Facts {
     }
 }
 
-/// Which side table a node's [`Extra`] points into, in its top two bits.
+/// Which side table a node's [`Extra`] points into, in its top three bits.
 ///
 /// A node carries one index instead of one per table: an allocation is
-/// kept for few files and sharing figures for some directories, so two
+/// kept for some files and sharing figures for some directories, so two
 /// indices would cost every node four bytes for what most never use, and
-/// take a stored node from 64 bytes to 72.
+/// take a stored node from 64 bytes to 72. The tags `1` to `4` are the
+/// allocation tables of [`records`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Extra(u32);
 
 impl Extra {
     const NONE: Self = Self(0);
-    const SHIFT: u32 = 30;
-    const ALLOCATION: u32 = 1;
-    const SHARING: u32 = 2;
-    const BOTH: u32 = 3;
+    const SHIFT: u32 = 29;
+    const SHARING: u32 = 5;
+    const BOTH: u32 = 6;
 
     fn new(tag: u32, index: usize) -> Self {
+        // Half a billion records of one kind would sit beside at least as
+        // many 64-byte nodes: 32 GiB of tree before the first record.
         let index = u32::try_from(index)
             .ok()
             .filter(|index| *index < 1 << Self::SHIFT)
-            .expect("fewer than a billion side records");
+            .expect("fewer than half a billion side records");
         Self(tag << Self::SHIFT | index)
     }
 
@@ -168,7 +177,7 @@ struct Store {
     /// buffer valid UTF-8. A name is at most a few hundred bytes, well
     /// under the surrogate range a `char` cannot hold.
     names: String,
-    allocations: Vec<Allocation>,
+    allocations: Records,
     sharings: Vec<Sharing>,
     /// A node with both, which only a followed directory link has.
     both: Vec<(Allocation, Sharing)>,
@@ -180,16 +189,11 @@ struct Store {
 /// fault in one at a time.
 impl Clone for Store {
     fn clone(&self) -> Self {
-        fn copied<T: Copy + Send + Sync>(source: &[T]) -> Vec<T> {
-            let mut copy = Vec::with_capacity(source.len());
-            copy.par_extend(source.par_iter().copied());
-            copy
-        }
         let ((nodes, allocations), (names, sharings)) = rayon::join(
             || {
                 rayon::join(
                     || copied(&self.nodes),
-                    || copied(&self.allocations),
+                    || self.allocations.par_copy(),
                 )
             },
             || rayon::join(|| self.names.clone(), || copied(&self.sharings)),
@@ -203,6 +207,13 @@ impl Clone for Store {
             root: self.root,
         }
     }
+}
+
+/// A copy of one buffer, written by every worker: see [`Store`]'s `Clone`.
+fn copied<T: Copy + Send + Sync>(source: &[T]) -> Vec<T> {
+    let mut copy = Vec::with_capacity(source.len());
+    copy.par_extend(source.par_iter().copied());
+    copy
 }
 
 fn name_at(names: &str, at: u32) -> &str {
@@ -237,11 +248,11 @@ impl Store {
         at
     }
 
-    fn allocation(&self, extra: Extra) -> Option<&Allocation> {
+    /// The allocation of the node of `facts` that holds `extra`.
+    fn allocation(&self, extra: Extra, facts: &Facts) -> Option<Allocation> {
         match extra.tag() {
-            Extra::ALLOCATION => Some(&self.allocations[extra.index()]),
-            Extra::BOTH => Some(&self.both[extra.index()].0),
-            _ => None,
+            Extra::BOTH => Some(self.both[extra.index()].0),
+            tag => self.allocations.get(tag, extra.index(), facts),
         }
     }
 
@@ -253,16 +264,18 @@ impl Store {
         }
     }
 
+    /// Keep these records for a node of `facts`.
     fn extra(
         &mut self,
         allocation: Option<Allocation>,
         sharing: Option<Sharing>,
+        facts: &Facts,
     ) -> Extra {
         match (allocation, sharing) {
             (None, None) => Extra::NONE,
             (Some(allocation), None) => {
-                self.allocations.push(allocation);
-                Extra::new(Extra::ALLOCATION, self.allocations.len() - 1)
+                let (tag, index) = self.allocations.push(allocation, facts);
+                Extra::new(tag, index)
             }
             (None, Some(sharing)) => {
                 self.sharings.push(sharing);
@@ -279,7 +292,12 @@ impl Store {
     /// aggregating again does not grow the tables. A record left behind
     /// when a node changes table stays until the tree is dropped; only
     /// a change in what is kept does that, which re-ranking never makes.
-    fn set_sharing(&mut self, extra: Extra, sharing: Option<Sharing>) -> Extra {
+    fn set_sharing(
+        &mut self,
+        extra: Extra,
+        sharing: Option<Sharing>,
+        facts: &Facts,
+    ) -> Extra {
         let index = extra.index();
         match (extra.tag(), sharing) {
             (Extra::SHARING, Some(value)) => {
@@ -290,17 +308,17 @@ impl Store {
                 self.both[index].1 = value;
                 extra
             }
-            (Extra::ALLOCATION, Some(value)) => {
-                let allocation = self.allocations[index];
-                self.extra(Some(allocation), Some(value))
+            (tag, Some(value)) if records::holds(tag) => {
+                let allocation = self.allocations.get(tag, index, facts);
+                self.extra(allocation, Some(value), facts)
             }
             (Extra::BOTH, None) => {
                 let allocation = self.both[index].0;
-                self.extra(Some(allocation), None)
+                self.extra(Some(allocation), None, facts)
             }
             (Extra::SHARING, None) => Extra::NONE,
             (_, None) => extra,
-            (_, value) => self.extra(None, value),
+            (_, value) => self.extra(None, value, facts),
         }
     }
 
@@ -327,7 +345,7 @@ impl Store {
             name: self.push_name(name),
             first,
             len,
-            extra: self.extra(allocation, sharing),
+            extra: self.extra(allocation, sharing, &facts),
         }
     }
 
@@ -346,7 +364,7 @@ impl Store {
         self.place(
             name,
             *node.facts(),
-            node.allocation().copied(),
+            node.allocation(),
             node.stored_sharing().copied(),
             children.into_iter(),
         )
@@ -361,20 +379,20 @@ impl Store {
     fn absorb(&mut self, source: &Self, name: &str) -> Slot {
         let base = Self::index(self.nodes.len());
         let names = Self::index(self.names.len());
-        let allocations = self.allocations.len();
+        let allocations = self.allocations.starts();
         let sharings = self.sharings.len();
         let both = self.both.len();
         self.names.push_str(&source.names);
         u32::try_from(self.names.len())
             .expect("a tree's names fit in four gigabytes");
-        self.allocations.extend_from_slice(&source.allocations);
+        self.allocations.append(&source.allocations);
         self.sharings.extend_from_slice(&source.sharings);
         self.both.extend_from_slice(&source.both);
         let moved = |slot: &Slot| {
             let index = slot.extra.index();
             let extra = match slot.extra.tag() {
-                Extra::ALLOCATION => {
-                    Extra::new(Extra::ALLOCATION, allocations + index)
+                tag if records::holds(tag) => {
+                    Extra::new(tag, allocations.moved(tag, index))
                 }
                 Extra::SHARING => Extra::new(Extra::SHARING, sharings + index),
                 Extra::BOTH => Extra::new(Extra::BOTH, both + index),
@@ -473,15 +491,16 @@ impl Store {
     }
 
     const fn bytes(&self) -> StorageBytes {
+        let (allocations, room) = self.allocations.bytes();
         StorageBytes {
             used: self.nodes.len() * size_of::<Slot>()
                 + self.names.len()
-                + self.allocations.len() * size_of::<Allocation>()
+                + allocations
                 + self.sharings.len() * size_of::<Sharing>()
                 + self.both.len() * size_of::<(Allocation, Sharing)>(),
             reserved: self.nodes.capacity() * size_of::<Slot>()
                 + self.names.capacity()
-                + self.allocations.capacity() * size_of::<Allocation>()
+                + room
                 + self.sharings.capacity() * size_of::<Sharing>()
                 + self.both.capacity() * size_of::<(Allocation, Sharing)>(),
         }
@@ -531,8 +550,13 @@ impl<'t> Node<'t> {
         }
     }
 
-    pub fn allocation(self) -> Option<&'t Allocation> {
-        self.store.allocation(self.slot.extra)
+    /// What sharing reads of this file's blocks, made up from the record
+    /// its tree keeps and the node's own facts, so it is returned by
+    /// value. An identity is kept only where sharing reads one: for a file
+    /// with more than one name, reached other than through a followed
+    /// link.
+    pub fn allocation(self) -> Option<Allocation> {
+        self.store.allocation(self.slot.extra, &self.slot.facts)
     }
 
     /// Derived clone figures, sparse: see [`Node::sharing`].
@@ -723,6 +747,10 @@ impl NodeMut<'_> {
         }
     }
 
+    /// A leaf's `bytes` and `inode` are what its allocation was kept
+    /// against: a clone with one name and no inode reads its size from
+    /// the node, which is why de-duplication, the one rewrite of a leaf's
+    /// `bytes`, touches only leaves with an inode. Change neither here.
     pub fn facts_mut(&mut self) -> &mut Facts {
         &mut self.store.nodes[self.id as usize].facts
     }
@@ -786,8 +814,8 @@ impl NodeMut<'_> {
     }
 
     pub fn set_sharing(&mut self, sharing: Option<Sharing>) {
-        let extra = self.store.nodes[self.id as usize].extra;
-        let extra = self.store.set_sharing(extra, sharing);
+        let Slot { extra, facts, .. } = self.store.nodes[self.id as usize];
+        let extra = self.store.set_sharing(extra, sharing, &facts);
         self.store.nodes[self.id as usize].extra = extra;
     }
 }
@@ -885,6 +913,13 @@ fn bottom_up<L, D>(
 {
     let (leaf, directory) = visit;
     if !node.facts.kind.is_dir() {
+        // De-duplication may zero a leaf with an inode; a clone that reads
+        // its size from the node must never have one.
+        debug_assert!(
+            node.facts.inode.is_none()
+                || !records::reads_size(node.extra.tag()),
+            "a clone record whose size could be de-duplicated away"
+        );
         leaf(&mut node.facts);
         return;
     }
@@ -1027,6 +1062,10 @@ impl Deref for Built<'_> {
 }
 
 impl Built<'_> {
+    /// A leaf's `bytes` and `inode` are what its allocation was kept
+    /// against: a clone with one name and no inode reads its size from
+    /// the node, which is why de-duplication, the one rewrite of a leaf's
+    /// `bytes`, touches only leaves with an inode. Change neither here.
     pub const fn facts_mut(&mut self) -> &mut Facts {
         &mut self.slot.facts
     }
@@ -1461,12 +1500,7 @@ mod tests {
     fn assert_same(left: Node<'_>, right: Node<'_>) {
         assert_eq!(left.bytes, right.bytes, "{}", left.name());
         assert_eq!(left.kind, right.kind, "{}", left.name());
-        assert_eq!(
-            left.allocation().map(|a| a.bytes),
-            right.allocation().map(|a| a.bytes),
-            "{}",
-            left.name()
-        );
+        assert_eq!(left.allocation(), right.allocation(), "{}", left.name());
         assert_eq!(
             left.stored_sharing().map(|s| s.files),
             right.stored_sharing().map(|s| s.files),
@@ -1503,8 +1537,11 @@ mod tests {
         let tree = Tree::build(|builder| {
             // Records already in every table, so the copy's must move.
             let mut before = builder.leaf("before", file(9), Some(allocation));
-            before.slot.extra =
-                builder.lock().set_sharing(before.slot.extra, shared(4));
+            before.slot.extra = builder.lock().set_sharing(
+                before.slot.extra,
+                shared(4),
+                &before.slot.facts,
+            );
             let other = builder.leaf("other", file(1), None);
             let other = builder.directory(
                 "other-dir",
@@ -1528,6 +1565,95 @@ mod tests {
         assert_eq!(before.stored_sharing().map(|s| s.files), Some(4));
         // The source's root went in too, and nothing reaches it.
         assert_eq!(tree.store.nodes.len(), 1 + 3 + 1 + 3 + 1);
+    }
+
+    /// A file for each allocation table: a wholly shared clone, a
+    /// modified one, a second name and one kept whole.
+    fn every_record(builder: &Builder, salt: u64) -> Vec<Built<'_>> {
+        use crate::sharing::CloneInfo;
+        let info = |private| CloneInfo {
+            device: 4,
+            id: salt,
+            references: 2,
+            private_bytes: private,
+            data_bytes: 10,
+        };
+        let clone = |private| Allocation {
+            bytes: 10,
+            identity: None,
+            links: 1,
+            followed: false,
+            clone: Some(info(private)),
+        };
+        let mut tracked = file(10);
+        tracked.inode = Some((4, NonZeroU64::new(salt).expect("inode")));
+        let link = Allocation {
+            identity: Some((4, salt)),
+            links: 2,
+            clone: None,
+            ..clone(None)
+        };
+        [
+            (file(10), clone(Some(0)), records::SHARED),
+            (file(10), clone(Some(salt)), records::CLONE),
+            (tracked, link, records::LINK),
+            (tracked, clone(Some(0)), records::FULL),
+        ]
+        .into_iter()
+        .map(|(facts, allocation, tag)| {
+            let built =
+                builder.leaf(&format!("{tag}"), facts, Some(allocation));
+            assert_eq!(built.slot.extra.tag(), tag);
+            built
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_whole_tree_copied_into_a_build_keeps_every_allocation_table() {
+        let source = Tree::build(|builder| {
+            let files = every_record(builder, 7);
+            builder.directory("source", Facts::directory(), None, files)
+        });
+        let tree = Tree::build(|builder| {
+            // A record in every table first, so each of the copy's moves.
+            let before = every_record(builder, 3);
+            let before =
+                builder.directory("before", Facts::directory(), None, before);
+            let reused = builder.copy_named(source.root(), "reused");
+            builder.directory(
+                "top",
+                Facts::directory(),
+                None,
+                vec![before, reused],
+            )
+        });
+        assert_same(tree.root().children().at(1), source.root());
+        let again = Tree::build(|builder| {
+            let files = every_record(builder, 3);
+            builder.directory("before", Facts::directory(), None, files)
+        });
+        assert_same(tree.root().children().at(0), again.root());
+        // And a copy of the whole store, as the size/files toggle makes.
+        assert_same(tree.clone().root(), tree.root());
+        assert_eq!(tree.side_records().0, 8);
+    }
+
+    /// A clone that reads its size from its node, given an inode after it
+    /// was kept: de-duplication could zero the size it reads.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "could be de-duplicated away")]
+    fn an_inode_on_a_clone_that_reads_its_size_is_caught() {
+        let mut tree = Tree::build(|builder| {
+            let files = every_record(builder, 5);
+            builder.directory("root", Facts::directory(), None, files)
+        });
+        let mut root = tree.root_mut();
+        let mut shared = root.child_mut(0).expect("the shared clone");
+        assert!(records::reads_size(shared.node().slot.extra.tag()));
+        shared.facts_mut().inode = NonZeroU64::new(5).map(|inode| (4, inode));
+        crate::tree::aggregate(&mut tree, Metric::Bytes);
     }
 
     #[test]

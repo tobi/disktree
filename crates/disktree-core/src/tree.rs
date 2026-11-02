@@ -124,7 +124,7 @@ impl Node<'_> {
     /// shape and build again.
     pub fn to_draft(self) -> Draft {
         let mut draft = Draft::of(self.name(), *self.facts());
-        draft.allocation = self.allocation().copied().map(Box::new);
+        draft.allocation = self.allocation().map(Box::new);
         draft.sharing = self.stored_sharing().copied().map(Box::new);
         draft.children = self.children().iter().map(Self::to_draft).collect();
         draft

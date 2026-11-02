@@ -229,8 +229,11 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 
 15. **A tree owns a handful of buffers, by index.** Nodes live in one
     vector, each directory's children a contiguous run of it, names in one
-    string and clone records in side tables, so dropping a tree frees five
-    buffers instead of tens of millions of allocations. A node is read
+    string and clone records in side tables, so dropping a tree frees eight
+    buffers instead of tens of millions of allocations. An allocation record
+    keeps only what its node does not say (`index/records.rs`): a clone with
+    one name reads its size from the node, so a placed leaf's `bytes` and
+    `inode` change only by hardlink de-duplication. A node is read
     through a `Node<'_>` cursor from its tree and written through `NodeMut`
     or a whole-tree pass. Build with `Tree::build` (a `Draft` for tests and
     small trees); a subtree moves to another tree only as a copy. A

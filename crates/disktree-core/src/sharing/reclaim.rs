@@ -121,7 +121,7 @@ impl Accumulator {
                 self.join_links(
                     key,
                     Links {
-                        allocation: *allocation,
+                        allocation,
                         names: 1,
                     },
                 );
@@ -132,7 +132,7 @@ impl Accumulator {
             }
             return;
         }
-        if let Some(info) = self.bounds(allocation, true) {
+        if let Some(info) = self.bounds(&allocation, true) {
             work();
             self.join(
                 (info.device, info.id),
