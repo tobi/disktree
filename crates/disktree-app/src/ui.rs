@@ -82,6 +82,14 @@ pub mod size {
     /// names are four known words, but wide enough for Drain My Battery
     /// beside the check, bar and count.
     pub const POWER_MENU: Rems = Rems(22.0);
+    /// The Treemap | List glyphs: a little shorter than wide, like a text
+    /// line's x-height plus ascender, so they sit on the label's centre line.
+    pub const VIEW_GLYPH_HEIGHT: Rems = Rems(0.625);
+    /// The treemap glyph's tall tile: just over half its width, as the
+    /// largest tile in a squarified layout tends to be.
+    pub const VIEW_GLYPH_TILE: Rems = Rems(0.375);
+    /// ⋮, the bar's overflow: its longest row is Depth with its stepper.
+    pub const MORE_MENU: Rems = Rems(16.0);
     /// One bar of the Power Efficiency gauge.
     pub const SIGNAL_BAR: Rems = Rems(0.1875);
     /// A list row's share bar.

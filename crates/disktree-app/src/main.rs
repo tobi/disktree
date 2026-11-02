@@ -42,6 +42,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 mod toasts;
+mod toolbar;
 mod treemap_view;
 mod ui;
 mod update_channel;

@@ -3959,7 +3959,8 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
     let config = tempfile::tempdir().expect("config");
     let path = config.path().join("power-efficiency");
     let (view, cx) = view_over(temp.path(), cx);
-    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    // Wide enough for the gauge to sit in the bar rather than in ⋮.
+    cx.simulate_resize(gpui_kit::size(px(1280.), px(800.)));
     update(&view, cx, |app, _| {
         app.power_settings_path = Some(path.clone());
         // Enough CPUs that every preset is offered, whatever runs the test.
@@ -4010,7 +4011,7 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     let temp = fixture();
     let config = tempfile::tempdir().expect("config");
     let (view, cx) = view_over(temp.path(), cx);
-    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    cx.simulate_resize(gpui_kit::size(px(1280.), px(800.)));
     update(&view, cx, |app, _| {
         app.power_settings_path = Some(config.path().join("power"));
         // Aggressive and Drain My Battery would both run four workers.
@@ -6941,7 +6942,10 @@ fn double_scale_wraps_controls_and_keeps_pointer_targets(
     assert!(
         (cx.update(|window, _| window.rem_size().as_f32()) - 32.).abs() < 0.01
     );
-    for selector in ["depth-less-target", "depth-more-target"] {
+    // At 28 rem the bar keeps only the view switch; Depth is in ⋮.
+    assert!(cx.debug_bounds("depth-less-target").is_none());
+    click_on(cx, "more-toggle");
+    for selector in ["more-toggle", "more-depth-less", "more-depth-more"] {
         let bounds = cx.debug_bounds(selector).expect("depth target");
         assert!(
             bounds.right() <= px(900.) && bounds.bottom() <= px(600.),
@@ -7225,4 +7229,182 @@ fn reduced_motion_cancels_active_transition_and_can_be_disabled(
     draw(cx);
     assert!(read(&view, cx, |app| app.transition.is_none()));
     assert!(read(&view, cx, |app| app.crumbs.is_empty()));
+}
+
+#[gpui_kit::test]
+fn the_view_switch_and_the_view_menu_show_the_file_list(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    // The switch is in the title bar, not a row of its own over the mosaic.
+    let strip = cx.debug_bounds("title-strip").expect("strip");
+    let list = cx.debug_bounds("view-list").expect("switch");
+    assert!(strip.contains(&list.center()), "{list:?} in {strip:?}");
+
+    click_on(cx, "view-list");
+    assert!(read(&view, cx, |app| app.file_list));
+    assert!(cx.debug_bounds("file-list").is_some());
+    assert!(
+        cx.update(|window, cx| view.read(cx).file_focus.is_focused(window)),
+        "the list takes the keyboard, so a screen reader lands in it"
+    );
+
+    cx.dispatch_action(crate::app_menu::ShowTreemap);
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.file_list));
+    assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
+    cx.dispatch_action(crate::app_menu::ShowFileList);
+    draw(cx);
+    assert!(read(&view, cx, |app| app.file_list));
+    click_on(cx, "view-treemap");
+    assert!(!read(&view, cx, |app| app.file_list));
+}
+
+#[gpui_kit::test]
+fn the_bar_folds_into_more_as_the_window_narrows(cx: &mut TestAppContext) {
+    use crate::toolbar::BarFit;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Window size and interface zoom presses, then the tier it lands in.
+    let cases = [
+        (1440., 900., 0, BarFit::Full),
+        (1100., 700., 0, BarFit::Folded),
+        (900., 600., 0, BarFit::Folded),
+        (900., 600., 2, BarFit::Narrow),
+        (900., 600., 4, BarFit::Tight),
+    ];
+    let mut labelled_width = None;
+    for (width, height, zoom, fit) in cases {
+        press(cx, "ctrl-0");
+        cx.simulate_resize(gpui_kit::size(px(width), px(height)));
+        for _ in 0..zoom {
+            press(cx, "ctrl-=");
+        }
+        draw(cx);
+        assert_eq!(read(&view, cx, |app| app.bar_fit), fit, "{width} {zoom}");
+        let full = fit == BarFit::Full;
+        assert_eq!(
+            cx.debug_bounds("power-efficiency").is_some(),
+            full,
+            "{fit:?}"
+        );
+        assert_eq!(cx.debug_bounds("more-toggle").is_none(), full, "{fit:?}");
+        assert_eq!(
+            cx.debug_bounds("history-back").is_some(),
+            fit.shows_history_and_depth(),
+            "{fit:?}"
+        );
+        assert_eq!(
+            cx.debug_bounds("depth-less-target").is_some(),
+            fit.shows_history_and_depth(),
+            "{fit:?}"
+        );
+        assert_eq!(cx.debug_bounds("measure-mode").is_some(), fit.shows_mode());
+
+        // Whatever is left fits in one bar, beside the brand.
+        let strip = cx.debug_bounds("title-strip").expect("strip");
+        let brand = cx.debug_bounds("strip-brand").expect("brand");
+        let switch = cx.debug_bounds("view-treemap").expect("switch");
+        let last = cx
+            .debug_bounds(if full {
+                "power-efficiency"
+            } else {
+                "more-toggle"
+            })
+            .expect("last control");
+        assert!(switch.left() >= brand.right(), "{fit:?}: {switch:?}");
+        assert!(last.right() <= px(width), "{fit:?}: {last:?}");
+        assert!(strip.contains(&last.center()), "{fit:?}: one row");
+        assert!(switch.size.height >= px(24.), "{fit:?}: {switch:?}");
+
+        // The switch keeps its words until 64 rem.
+        if zoom == 0 && width >= 1100. {
+            labelled_width = Some(switch.size.width);
+        } else if zoom == 0 {
+            let labelled = labelled_width.expect("a labelled switch");
+            assert!(switch.size.width < labelled, "glyph alone at {width}");
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn more_holds_the_folded_controls_and_takes_the_keys(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(700.)));
+    update(&view, cx, |app, _| app.cpu_threads = 18);
+    let hidden = read(&view, cx, |app| app.options.include_hidden);
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+
+    click_on(cx, "more-toggle");
+    assert_eq!(read(&view, cx, |app| app.more_menu), Some(0));
+    assert!(cx.debug_bounds("more-menu").is_some());
+    // Hidden files rescans, as its checkbox does.
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert_eq!(app.options.include_hidden, !hidden);
+        assert_eq!(app.scan_epoch, epoch + 1);
+        assert!(app.more_menu.is_none());
+    });
+    update(&view, cx, |app, _| {
+        if let Some(scan) = app.scan.take() {
+            scan.cancel();
+        }
+    });
+
+    // Scan workers opens the power menu in ⋮'s place; ⋮ closes it again.
+    click_on(cx, "more-toggle");
+    press(cx, "end");
+    press(cx, "enter");
+    assert!(read(&view, cx, |app| app.power_menu.is_some()));
+    assert!(cx.debug_bounds("power-menu").is_some());
+    // A real press arrives after the pointer is on ⋮.
+    let more = cx.debug_bounds("more-toggle").expect("more");
+    cx.simulate_mouse_move(more.center(), None, gpui_kit::Modifiers::none());
+    click_on(cx, "more-toggle");
+    read(&view, cx, |app| {
+        assert!(app.power_menu.is_none());
+        assert!(app.more_menu.is_none());
+    });
+
+    // Escape closes without acting; a screen key closes and still acts.
+    click_on(cx, "more-toggle");
+    press(cx, "escape");
+    assert!(read(&view, cx, |app| app.more_menu.is_none()));
+    click_on(cx, "more-toggle");
+    press(cx, "?");
+    assert!(read(&view, cx, |app| app.more_menu.is_none() && app.show_help));
+}
+
+#[gpui_kit::test]
+fn more_steps_depth_in_place_when_the_stepper_folds(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    press(cx, "ctrl-=");
+    press(cx, "ctrl-=");
+    let depth = read(&view, cx, |app| app.layout_options.max_depth);
+    click_on(cx, "more-toggle");
+    // Nowhere to go back or forward yet, so ⋮ opens on Depth, past the
+    // disabled history rows; the up arrow does not land on them either.
+    assert_eq!(read(&view, cx, |app| app.more_menu), Some(2));
+    press(cx, "up");
+    assert_eq!(read(&view, cx, |app| app.more_menu), Some(2));
+    // The row stays open while the arrows step it.
+    press(cx, "left");
+    assert_eq!(
+        read(&view, cx, |app| app.layout_options.max_depth),
+        depth - 1
+    );
+    assert_eq!(read(&view, cx, |app| app.more_menu), Some(2));
+    click_on(cx, "more-depth-more");
+    assert_eq!(read(&view, cx, |app| app.layout_options.max_depth), depth);
 }

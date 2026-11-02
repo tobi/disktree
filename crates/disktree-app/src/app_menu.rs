@@ -70,6 +70,10 @@ mod menu_actions {
             ShowExplore,
             ShowReview,
             ShowKeyboardShortcuts,
+            /// View: the explore screen as a treemap or as a file list, the
+            /// way Finder's ⌘1 and ⌘2 switch icons and list.
+            ShowTreemap,
+            ShowFileList,
             /// View: interface zoom, the window's own `ctrl =` / `ctrl -` /
             /// `ctrl 0`.
             ZoomIn,
@@ -200,7 +204,7 @@ pub fn install(cx: &mut App) {
 /// Actions the main window answers. Chosen while another PwrDisk window is
 /// in front, each brings the main window forward and dispatches there, so
 /// File › Rescan from the Logs window still rescans.
-const MAIN_WINDOW_ACTIONS: [fn(&mut App); 10] = [
+const MAIN_WINDOW_ACTIONS: [fn(&mut App); 12] = [
     |cx| forward_to_main::<Rescan>(cx),
     |cx| forward_to_main::<OpenFolder>(cx),
     |cx| forward_to_main::<ChooseSource>(cx),
@@ -209,6 +213,8 @@ const MAIN_WINDOW_ACTIONS: [fn(&mut App); 10] = [
     |cx| forward_to_main::<GoForward>(cx),
     |cx| forward_to_main::<ShowExplore>(cx),
     |cx| forward_to_main::<ShowReview>(cx),
+    |cx| forward_to_main::<ShowTreemap>(cx),
+    |cx| forward_to_main::<ShowFileList>(cx),
     |cx| forward_to_main::<ShowKeyboardShortcuts>(cx),
     |cx| forward_to_main::<ConnectAgent>(cx),
 ];
@@ -250,6 +256,8 @@ fn bindings(platform: Platform) -> Vec<KeyBinding> {
         KeyBinding::new(&key("o"), OpenFolder, None),
         KeyBinding::new(&key("shift-o"), ChooseSource, None),
         KeyBinding::new(&key("r"), Rescan, None),
+        KeyBinding::new(&key("1"), ShowTreemap, None),
+        KeyBinding::new(&key("2"), ShowFileList, None),
         // ⌘R is taken by Rescan, as in a browser; `o` reveals without a
         // modifier too.
         KeyBinding::new(&key("shift-r"), ShowInFinder, None),
@@ -372,6 +380,9 @@ pub fn menus(platform: Platform) -> Vec<Menu> {
         MenuItem::action("Explore", ShowExplore),
         MenuItem::action("Review Marked", ShowReview),
         MenuItem::action("Keyboard Shortcuts", ShowKeyboardShortcuts),
+        MenuItem::separator(),
+        MenuItem::action("as Treemap", ShowTreemap),
+        MenuItem::action("as File List", ShowFileList),
         MenuItem::separator(),
         MenuItem::action("Zoom In", ZoomIn),
         MenuItem::action("Zoom Out", ZoomOut),
@@ -562,6 +573,9 @@ mod tests {
                     "Explore",
                     "Review Marked",
                     "Keyboard Shortcuts",
+                    "---",
+                    "as Treemap",
+                    "as File List",
                     "---",
                     "Zoom In",
                     "Zoom Out",

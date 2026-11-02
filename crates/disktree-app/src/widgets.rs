@@ -452,6 +452,44 @@ pub fn signal(filled: usize, cx: &App) -> Div {
     bars
 }
 
+/// The treemap view's glyph: the app's own mark in outline, one tall tile
+/// and two stacked, so it reads as "tiles" beside the list's rows.
+pub fn treemap_glyph(color: Hsla) -> Div {
+    let tile = || div().border_1().border_color(color);
+    div()
+        .flex_shrink_0()
+        .flex()
+        .flex_row()
+        .gap(space::XXS)
+        .w(crate::ui::icon::SM)
+        .h(crate::ui::size::VIEW_GLYPH_HEIGHT)
+        .child(tile().w(crate::ui::size::VIEW_GLYPH_TILE).h_full())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap(space::XXS)
+                .child(tile().flex_1())
+                .child(tile().flex_1()),
+        )
+}
+
+/// The list view's glyph: three rows.
+pub fn list_glyph(color: Hsla) -> Div {
+    let row = || div().w_full().h(space::XXS).bg(color);
+    div()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .justify_between()
+        .w(crate::ui::icon::SM)
+        .h(crate::ui::size::VIEW_GLYPH_HEIGHT)
+        .child(row())
+        .child(row())
+        .child(row())
+}
+
 /// One bar per Power Efficiency preset.
 const SIGNAL_STEPS: usize = crate::power::PowerEfficiency::ALL.len();
 

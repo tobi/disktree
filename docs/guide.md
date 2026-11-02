@@ -68,8 +68,13 @@ a root. Explicit command-line paths and `--disk` still start directly;
 
 ## The screen
 
-- **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+- **Top:** the trail from `/`, then **Treemap | List**, how the directory is
+  drawn, and what is measured — **Size**, **Files** or **Age**, **Hidden
+  files**, **Apparent size**, and the depth drawn. The list shows the same
+  directory one entry per row and is the view for screen readers. When the
+  window is too narrow for every control, the ones used least move into
+  **⋮** at the end of the bar: the scan options first, then back, forward
+  and depth, then Size | Files | Age. In the
   tree a crumb goes there, and its ▾ lists its siblings, largest first with
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
@@ -158,6 +163,7 @@ and shows how much free space was actually gained.
 | `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
 | `c` | review the marked list |
 | `t` | size, files or age: what areas and colours say |
+| `ctrl 1` `ctrl 2` (`⌘` on macOS) | treemap or file list; the list is read by screen readers |
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |

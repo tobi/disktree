@@ -92,10 +92,6 @@ impl<'a> ReviewStatus<'a> {
     }
 }
 
-/// When the panel gives way, wrap controls below the strip too. Keeping
-/// both changes at one width budget preserves the short panel's scroll lane.
-const INLINE_SETTINGS_REMS: f32 = PANEL_SHOWN_REMS;
-
 /// Below the list-plus-explanation width budget, review becomes one column.
 const REVIEW_COLUMNS_REMS: f32 = 65.0;
 
@@ -110,6 +106,22 @@ pub fn root(
         app.prepare_picker_inputs(window, cx);
     }
     app.apply_focus(window, cx);
+    let fit = crate::toolbar::BarFit::for_width(
+        window.viewport_size().width.as_f32() / app.rem,
+    );
+    // What ⋮ held at the old width is not what it holds at the new one.
+    if fit != app.bar_fit {
+        app.more_menu = None;
+        // ⋮ may vanish under the pointer, which then never reports leaving.
+        app.more_hover = false;
+    }
+    app.bar_fit = fit;
+    // A dialog owns the keys; a menu left open behind it would take them
+    // first (see `dispatch_key`).
+    if app.has_modal() {
+        app.more_menu = None;
+        app.power_menu = None;
+    }
     let theme = cx.omarchy().clone();
     let readable_status = app.accessibility_status();
     let strip = title_strip(app, frame, window, cx);
@@ -125,7 +137,6 @@ pub fn root(
         .a11y_synthetic_children(move |b| { if modal { b.parent_node().set_hidden(); } })
         .flex().flex_col().flex_1().min_h_0().w_full()
         .child(strip)
-        .children((app.screen == Screen::Explore && window.viewport_size().width.as_f32() / app.rem < INLINE_SETTINGS_REMS).then(|| div().px(space::LG).py(space::XS).child(view_settings(app, window, cx))))
         .child(body)
         .children(app.is_indexing().then(|| div().id("scan-progress")
             .role(gpui_kit::Role::ProgressIndicator)
@@ -194,6 +205,16 @@ pub fn root(
                 if this.screen == Screen::Explore && !this.has_modal() {
                     this.open_review(cx);
                 }
+            },
+        ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::ShowTreemap, window, cx| {
+                choose_view(this, false, window, cx);
+            },
+        ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::ShowFileList, window, cx| {
+                choose_view(this, true, window, cx);
             },
         ))
         .on_action(cx.listener(
@@ -1020,18 +1041,11 @@ fn explore(
                         .min_w_0()
                         .min_h_0()
                         .when(!app.file_list || !crate::file_list::compact(window, app.rem), |view| view.child(trail_and_legend(app, &theme, cx)))
-                        .child(button("file-view", if app.file_list { "Show treemap" } else { "Show accessible file list" }, ButtonVariant::Outline, cx)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.file_list = !this.file_list;
-                                this.pointer_active = false;
-                                window.focus(if this.file_list { &this.file_focus } else { &this.focus }, cx);
-                                cx.notify();
-                            })))
                         .child(
                             div()
                                 .id("file-navigation")
                                 .when(app.tree().is_some() && !app.file_list, |view| view
-                                    .role(gpui_kit::Role::Group).aria_label("Treemap navigation; arrows move, Space marks, n selects the next sibling; use Show accessible file list for file details")
+                                    .role(gpui_kit::Role::Group).aria_label("Treemap navigation; arrows move, Space marks, n selects the next sibling; choose List in the View switch for file details")
                                     .track_focus(&app.file_focus).tab_index(0).tab_stop(true)
                                     .focus_visible(|style| style.border_2().border_color(theme.accent)))
                                 .flex()
@@ -1131,7 +1145,7 @@ fn title_strip(
                     .self_stretch(),
             )
             .children(agent_pill(app, &theme, cx))
-            .when(width_rems >= INLINE_SETTINGS_REMS, |row| row.child(view_settings(app, window, cx)))
+            .child(view_settings(app, window, cx))
     } else {
         div()
             .flex()
@@ -1439,7 +1453,10 @@ fn view_settings(
     let focus = app.focus.clone();
     let entity = cx.entity().downgrade();
 
-    let mode = {
+    // What does not fit goes in ⋮, least used first; the view switch
+    // never does. See `toolbar::BarFit`. Folded controls are not built.
+    let fit = app.bar_fit;
+    let mode = fit.shows_mode().then(|| {
         let entity = entity.clone();
         let focus = focus.clone();
         button_group(
@@ -1457,11 +1474,12 @@ fn view_settings(
             window,
             cx,
         )
+        .debug_selector(|| "measure-mode".into())
         .w(size::RANKING_CHOICE)
         // Tighter than a standalone group, so the segmented control shares
         // the checkboxes' height and centre line.
         .p(space::XXS)
-    };
+    });
 
     let check = |on: bool| {
         if on {
@@ -1470,7 +1488,7 @@ fn view_settings(
             CheckboxState::Unchecked
         }
     };
-    let hidden = {
+    let hidden = fit.shows_scan_options().then(|| {
         let entity = entity.clone();
         let focus = focus.clone();
         checkbox(
@@ -1485,14 +1503,13 @@ fn view_settings(
         .self_center()
         .tab_stop(true)
         .on_change(move |_, _, window, cx| {
-            let _ = entity.update(cx, |this, cx| {
-                this.options.include_hidden = !this.options.include_hidden;
-                this.start_scan(cx);
-            });
+            let _ = entity.update(cx, Disktree::toggle_hidden);
             window.focus(&focus, cx);
         })
-    };
-    let apparent = {
+    });
+    let apparent = fit.shows_scan_options().then(|| {
+        let entity = entity.clone();
+        let focus = focus.clone();
         checkbox(
             "apparent",
             "Apparent size",
@@ -1502,13 +1519,10 @@ fn view_settings(
         .self_center()
         .tab_stop(true)
         .on_change(move |_, _, window, cx| {
-            let _ = entity.update(cx, |this, cx| {
-                this.options.apparent_size = !this.options.apparent_size;
-                this.start_scan(cx);
-            });
+            let _ = entity.update(cx, Disktree::toggle_apparent);
             window.focus(&focus, cx);
         })
-    };
+    });
 
     let theme = cx.omarchy().clone();
     // Back and forward through the directories visited, beside the choices
@@ -1569,26 +1583,28 @@ fn view_settings(
                 )
             })
     };
-    let history = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .child(travel(
-            "history-back",
-            "<",
-            app.can_go_back(),
-            true,
-            Disktree::go_back,
-            cx,
-        ))
-        .child(travel(
-            "history-forward",
-            ">",
-            app.can_go_forward(),
-            false,
-            Disktree::go_forward,
-            cx,
-        ));
+    let history = fit.shows_history_and_depth().then(|| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(travel(
+                "history-back",
+                "<",
+                app.can_go_back(),
+                true,
+                Disktree::go_back,
+                cx,
+            ))
+            .child(travel(
+                "history-forward",
+                ">",
+                app.can_go_forward(),
+                false,
+                Disktree::go_forward,
+                cx,
+            ))
+    });
 
     let depth = app.layout_options.max_depth;
     let stepper = |id: &'static str,
@@ -1611,46 +1627,430 @@ fn view_settings(
                 window.focus(&this.focus, cx);
             }))
     };
-    let depth_control = with_tooltip(
-        div()
-            .id("depth")
-            .flex()
-            .flex_row()
-            .items_center()
-            .border_1()
-            .border_color(theme.control_border())
-            .child(
-                div()
-                    .px(space::SM)
-                    .text_size(text::BODY)
-                    .text_color(theme.foreground)
-                    .child(format!("Depth {depth}")),
-            )
-            .child(stepper("depth-less", "\u{2212}", -1, cx))
-            .child(stepper("depth-more", "+", 1, cx)),
-        "Levels drawn at once \u{00b7} [ and ]",
-    );
+    let depth_control = fit.shows_history_and_depth().then(|| {
+        with_tooltip(
+            div()
+                .id("depth")
+                .flex()
+                .flex_row()
+                .items_center()
+                .border_1()
+                .border_color(theme.control_border())
+                .child(
+                    div()
+                        .px(space::SM)
+                        .text_size(text::BODY)
+                        .text_color(theme.foreground)
+                        .child(format!("Depth {depth}")),
+                )
+                .child(stepper("depth-less", "\u{2212}", -1, cx))
+                .child(stepper("depth-more", "+", 1, cx)),
+            "Levels drawn at once \u{00b7} [ and ]",
+        )
+    });
 
-    let inline =
-        window.viewport_size().width.as_f32() / app.rem >= INLINE_SETTINGS_REMS;
+    let rems = window.viewport_size().width.as_f32() / app.rem;
+    let switch =
+        view_switch(app, crate::toolbar::BarFit::labelled_switch(rems), cx);
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(space::SM)
+        .flex_shrink_0()
+        .children(history)
+        .child(switch)
+        .children(mode)
+        .children(hidden)
+        .children(apparent)
+        .children(depth_control)
         .map(|row| {
-            if inline {
-                row.flex_shrink_0()
+            if fit.shows_scan_options() {
+                row.child(power_efficiency(app, cx))
             } else {
-                row.flex_wrap().min_w_0()
+                row.child(more_menu(app, cx))
             }
         })
-        .child(history)
-        .child(mode)
-        .child(hidden)
-        .child(apparent)
-        .child(depth_control)
-        .child(power_efficiency(app, cx))
+}
+
+/// Treemap or file list, from the menu bar or the view switch. A drawn
+/// list takes the keyboard, so a screen reader lands in it; until a scan
+/// finishes there is no list yet, and the root keeps it.
+fn choose_view(
+    app: &mut Disktree,
+    on: bool,
+    window: &mut Window,
+    cx: &mut Context<'_, Disktree>,
+) {
+    if app.screen != Screen::Explore || app.has_modal() {
+        return;
+    }
+    app.show_file_list(on, cx);
+    let list = on && app.tree().is_some();
+    window.focus(if list { &app.file_focus } else { &app.focus }, cx);
+}
+
+/// Treemap | List: how the directory on screen is drawn. It is a radio
+/// group like Size | Files | Age, with a drawn glyph on each option and
+/// its word when the bar has room. Its spoken name says what the list is
+/// for, which the word on screen does not need to.
+fn view_switch(
+    app: &Disktree,
+    labelled: bool,
+    cx: &Context<'_, Disktree>,
+) -> impl IntoElement {
+    use gpui_kit::base::{Radio, RadioGroup};
+
+    let theme = cx.omarchy().clone();
+    let entity = cx.entity().downgrade();
+    let shortcut = if cfg!(target_os = "macos") {
+        "\u{2318}"
+    } else {
+        "ctrl-"
+    };
+    let option = |list: bool| {
+        let checked = app.file_list == list;
+        let (id, word, spoken, about) = if list {
+            (
+                "view-list",
+                "List",
+                "File list, for screen readers",
+                "Every entry in this folder as a row, with its size and \
+                 share. Works with screen readers.",
+            )
+        } else {
+            (
+                "view-treemap",
+                "Treemap",
+                "Treemap",
+                "Each entry's share of this folder, drawn as nested tiles.",
+            )
+        };
+        let ink = if checked {
+            theme.bright
+        } else {
+            theme.foreground
+        };
+        let glyph = if list {
+            widgets::list_glyph(ink)
+        } else {
+            widgets::treemap_glyph(ink)
+        };
+        let entity = entity.clone();
+        let keys = entity.clone();
+        let radio = Radio::new(id)
+            .debug_selector(move || id.into())
+            .checked(checked)
+            .accessibility_label(spoken)
+            .set_position(usize::from(list) + 1, 2)
+            // One stop for the group: the option that is on, as a radio
+            // group's roving focus goes.
+            .tab_stop(checked)
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .gap(space::SM)
+            .min_w(size::POINTER_TARGET)
+            .min_h(size::POINTER_TARGET)
+            .px(space::SM)
+            .border_1()
+            .border_color(theme.foreground.opacity(0.))
+            .text_size(text::BODY)
+            .text_color(ink)
+            .when(checked, |this| this.bg(theme.selected_fill()))
+            .when(!checked, |this| {
+                this.hover(|style| style.bg(theme.hover_fill()))
+            })
+            .focus_visible(|style| style.border_color(theme.focus_border()))
+            .child(glyph)
+            .when(labelled, |this| this.child(word))
+            .on_change(move |_, _, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    choose_view(this, list, window, cx);
+                });
+            })
+            // The arrows choose, as in any radio group. Focus moves into
+            // the view chosen, as a click does, so the list is read out.
+            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                let to = match event.keystroke.key.as_str() {
+                    "left" | "up" => false,
+                    "right" | "down" => true,
+                    _ => return,
+                };
+                cx.stop_propagation();
+                let _ = keys.update(cx, |this, cx| {
+                    choose_view(this, to, window, cx);
+                });
+            });
+        with_tooltip(
+            radio,
+            format!(
+                "{} \u{00b7} {shortcut}{}\n{about}",
+                if list { "File list" } else { "Treemap" },
+                if list { 2 } else { 1 }
+            ),
+        )
+    };
+    RadioGroup::new("view-switch")
+        .axis(gpui_kit::Axis::Horizontal)
+        .aria_label("View")
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .gap(space::XXS)
+        // Framed and padded as Size | Files | Age is, so both groups share
+        // a height and a centre line.
+        .p(space::XXS)
+        .border_1()
+        .border_color(theme.divider())
+        .child(option(false))
+        .child(option(true))
+}
+
+/// ⋮: the bar's controls that did not fit, in the sibling and power menus'
+/// grammar. When the scan workers are among them, their menu opens here.
+fn more_menu(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+    use crate::toolbar::MoreItem;
+
+    let theme = cx.omarchy().clone();
+    let open = app.more_menu.is_some();
+    let trigger = div()
+        .id("more-hover")
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            this.more_hover = *hovered;
+            cx.notify();
+        }))
+        .child(
+            button("more-toggle", "", ButtonVariant::Secondary, cx)
+                .debug_selector(|| "more-toggle".into())
+                .accessibility_label("More view options")
+                .selected(open)
+                .tab_stop(true)
+                .min_w(size::POINTER_TARGET)
+                .min_h(size::POINTER_TARGET)
+                .border_1()
+                .border_color(theme.control_border())
+                .child(
+                    gpui_omarchy::icon(
+                        gpui_omarchy::IconName::EllipsisVertical,
+                    )
+                    .size(icon::SM)
+                    .text_color(theme.bright),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_more_menu(cx);
+                    // The menu's keys reach it through the root, as the
+                    // power menu's do.
+                    window.focus(&this.focus, cx);
+                })),
+        );
+    let trigger = if open {
+        trigger
+    } else {
+        with_tooltip(trigger, "More view options")
+    };
+    let mut control = div().relative().flex_shrink_0().child(trigger);
+    if app.power_menu.is_some() {
+        if let Some(popup) = power_popup(app, cx) {
+            control = control.child(popup);
+        }
+        return control;
+    }
+    let Some(highlighted) = app.more_menu else {
+        return control;
+    };
+
+    let items = app.bar_fit.more_items();
+    let mut menu = div()
+        .id("more-menu")
+        .debug_selector(|| "more-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .w(size::MORE_MENU)
+        .p(space::XS)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.control_border())
+        .shadow_lg()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            if !this.more_hover {
+                this.more_menu = None;
+                cx.notify();
+            }
+        }));
+    let mut section = "";
+    for (index, item) in items.into_iter().enumerate() {
+        if item.section() != section {
+            if !section.is_empty() {
+                menu = menu
+                    .child(div().h(px(1.)).my(space::XS).bg(theme.divider()));
+            }
+            section = item.section();
+            menu = menu.child(
+                div()
+                    .px(space::SM)
+                    .py(space::XS)
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary.opacity(0.8))
+                    .child(section),
+            );
+        }
+        let enabled = app.more_item_enabled(item);
+        let check = |on: bool| {
+            div().flex_shrink_0().w(icon::SM).when(on, |this| {
+                this.child(
+                    gpui_omarchy::icon(gpui_omarchy::IconName::Check)
+                        .size(icon::SM)
+                        .text_color(theme.accent),
+                )
+            })
+        };
+        let (lead, name, trail): (Div, String, Option<AnyElement>) = match item
+        {
+            MoreItem::Mode(mode) => (
+                check(app.mode_index() == mode),
+                ["Size", "Files", "Age"][mode].to_owned(),
+                None,
+            ),
+            MoreItem::Back => (check(false), "Back".into(), None),
+            MoreItem::Forward => (check(false), "Forward".into(), None),
+            MoreItem::Depth => {
+                let depth = app.layout_options.max_depth;
+                let step = |id: &'static str, label: &'static str, by: i32| {
+                    button(id, label, ButtonVariant::Secondary, cx)
+                        .debug_selector(move || id.into())
+                        .accessibility_label(if by < 0 {
+                            "Decrease treemap depth"
+                        } else {
+                            "Increase treemap depth"
+                        })
+                        .min_w(size::POINTER_TARGET)
+                        .min_h(size::POINTER_TARGET)
+                        .semantic_disabled(if by < 0 {
+                            depth <= 1
+                        } else {
+                            depth >= 6
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.adjust_depth(by, cx);
+                            window.focus(&this.focus, cx);
+                        }))
+                };
+                (
+                    check(false),
+                    format!("Depth {depth}"),
+                    Some(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .border_1()
+                            .border_color(theme.control_border())
+                            .child(step("more-depth-less", "\u{2212}", -1))
+                            .child(step("more-depth-more", "+", 1))
+                            .into_any_element(),
+                    ),
+                )
+            }
+            MoreItem::Hidden => (
+                check(app.options.include_hidden),
+                "Hidden files".into(),
+                None,
+            ),
+            MoreItem::Apparent => (
+                check(app.options.apparent_size),
+                "Apparent size".into(),
+                None,
+            ),
+            MoreItem::Workers => (
+                check(false),
+                "Scan workers".into(),
+                Some(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(format!(
+                            "{} \u{203a}",
+                            app.power_choice.map_or(
+                                "Custom",
+                                crate::power::PowerEfficiency::name
+                            )
+                        ))
+                        .into_any_element(),
+                ),
+            ),
+        };
+        let key = match item {
+            MoreItem::Back => Some(if cfg!(target_os = "macos") {
+                "\u{2318}["
+            } else {
+                "Alt+\u{2190}"
+            }),
+            MoreItem::Forward => Some(if cfg!(target_os = "macos") {
+                "\u{2318}]"
+            } else {
+                "Alt+\u{2192}"
+            }),
+            _ => None,
+        };
+        let row = div()
+            .id(ElementId::Name(format!("more-item-{index}").into()))
+            .debug_selector(move || format!("more-item-{index}"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::MD)
+            .min_h(size::POINTER_TARGET)
+            .px(space::SM)
+            .when(index == highlighted && enabled, |this| {
+                this.bg(theme.hover_fill())
+            })
+            .when(!enabled, |this| this.opacity(0.45))
+            .child(lead)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(text::BODY)
+                    .text_color(theme.bright)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(name),
+            )
+            .children(key.map(|key| {
+                div()
+                    .flex_shrink_0()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(key)
+            }))
+            .children(trail)
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered && this.more_menu.is_some() {
+                    this.more_menu = Some(index);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.activate_more(item, cx);
+                window.focus(&this.focus, cx);
+            }));
+        menu = menu.child(row);
+    }
+    control.child(
+        div().absolute().top_full().right_0().child(
+            deferred(
+                anchored()
+                    .anchor(gpui_kit::Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .offset(gpui_kit::point(px(0.), px(4.)))
+                    .child(menu),
+            )
+            .with_priority(2),
+        ),
+    )
 }
 
 /// What the tooltip says the choice will do, where the gauge alone cannot.
@@ -1724,10 +2124,23 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
             ),
         )
     };
-    let mut control = div().relative().child(trigger);
-    let Some(highlighted) = app.power_menu else {
-        return control;
-    };
+    div()
+        .relative()
+        .child(trigger)
+        .children(power_popup(app, cx))
+}
+
+/// The Power Efficiency menu, hung from the right edge of whichever control
+/// opened it: the gauge, or ⋮ once the gauge has folded into it.
+fn power_popup(
+    app: &Disktree,
+    cx: &Context<'_, Disktree>,
+) -> Option<impl IntoElement> {
+    use crate::power::{self, PowerEfficiency};
+
+    let theme = cx.omarchy().clone();
+    let cpus = app.cpu_threads;
+    let highlighted = app.power_menu?;
 
     let mut menu = div()
         .id("power-menu")
@@ -1742,7 +2155,8 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
         .border_color(theme.control_border())
         .shadow_lg()
         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-            if !this.power_hover {
+            // A press on its button (the gauge, or ⋮) is the button's.
+            if !this.power_hover && !this.more_hover {
                 this.power_menu = None;
                 cx.notify();
             }
@@ -1835,11 +2249,11 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
         };
         menu = menu.child(row);
     }
-    control = control.child(
+    Some(
         div().absolute().top_full().right_0().child(
             deferred(
-                // Hung from the gauge's right edge: the bar's last control,
-                // so the menu opens inward rather than off the window.
+                // Hung from the right edge: the bar's last control, so the
+                // menu opens inward rather than off the window.
                 anchored()
                     .anchor(gpui_kit::Anchor::TopRight)
                     .snap_to_window_with_margin(px(8.))
@@ -1848,8 +2262,7 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
             )
             .with_priority(2),
         ),
-    );
-    control
+    )
 }
 
 // ── trail and legend ────────────────────────────────────────────────────
@@ -4786,6 +5199,12 @@ const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
     "ctrl-o"
 };
 
+const MODIFIER_VIEW: &str = if cfg!(target_os = "macos") {
+    "\u{2318}1 / \u{2318}2"
+} else {
+    "ctrl-1 / ctrl-2"
+};
+
 fn help_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Stateful<Div> {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
@@ -4819,6 +5238,10 @@ fn help_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Stateful<Div> {
         ),
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
+        (
+            MODIFIER_VIEW,
+            "Treemap or file list; the list is read by screen readers",
+        ),
         ("r", "Scan again from the same root"),
         ("esc", "Stop a scan in progress"),
         ("v", "Scan another volume"),

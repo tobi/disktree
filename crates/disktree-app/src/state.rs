@@ -362,6 +362,14 @@ pub struct Disktree {
     /// The pointer is on the menu's button. A press there is the button's
     /// to toggle, not a press outside the menu that closes it first.
     pub power_hover: bool,
+    /// The ⋮ menu, when open: the row the arrow keys are on, as an index
+    /// into [`crate::toolbar::BarFit::more_items`].
+    pub more_menu: Option<usize>,
+    /// The pointer is on ⋮, as [`Self::power_hover`] is for its button.
+    pub more_hover: bool,
+    /// How much of the explore bar fit when it was last drawn, which says
+    /// what ⋮ holds.
+    pub bar_fit: crate::toolbar::BarFit,
     pub cpu_threads: usize,
     pub tree: Option<Arc<Tree>>,
     pub scan: Option<ScanHandle>,
@@ -618,6 +626,9 @@ impl Disktree {
             removal_settings_dir: crate::updater::settings_dir(),
             power_menu: None,
             power_hover: false,
+            more_menu: None,
+            more_hover: false,
+            bar_fit: crate::toolbar::BarFit::default(),
             cpu_threads: crate::power::cpu_threads(),
             tree: None,
             scan: None,
@@ -1487,6 +1498,19 @@ impl Disktree {
         }
         cx.notify();
         true
+    }
+
+    /// `i`, the Hidden files checkbox and its ⋮ row: rescan with or without
+    /// hidden entries.
+    pub fn toggle_hidden(&mut self, cx: &mut Context<'_, Self>) {
+        self.options.include_hidden = !self.options.include_hidden;
+        self.start_scan(cx);
+    }
+
+    /// `d`, the Apparent size checkbox and its ⋮ row.
+    pub fn toggle_apparent(&mut self, cx: &mut Context<'_, Self>) {
+        self.options.apparent_size = !self.options.apparent_size;
+        self.start_scan(cx);
     }
 
     /// Start a fresh scan, abandoning any walk still in progress.
@@ -3395,6 +3419,7 @@ impl Disktree {
             // A modal must not leave another keyboard owner behind it.
             self.crumb_menu = None;
             self.power_menu = None;
+            self.more_menu = None;
             self.app_menu_open = false;
             self.export_menu_open = false;
             self.show_help = true;
@@ -3659,6 +3684,9 @@ impl Disktree {
         if self.power_menu.is_some() && self.on_power_key(key, cx) {
             return;
         }
+        if self.more_menu.is_some() && self.on_more_key(key, cx) {
+            return;
+        }
 
         if self.app_menu_open {
             if key == "escape" {
@@ -3854,14 +3882,8 @@ impl Disktree {
             "r" if !control => self.start_scan(cx),
             "g" if !control => self.go_to_disk(cx),
             "v" if !control && !shift => self.open_volumes(cx),
-            "i" if !control => {
-                self.options.include_hidden = !self.options.include_hidden;
-                self.start_scan(cx);
-            }
-            "d" if !control => {
-                self.options.apparent_size = !self.options.apparent_size;
-                self.start_scan(cx);
-            }
+            "i" if !control => self.toggle_hidden(cx),
+            "d" if !control => self.toggle_apparent(cx),
             "p" if !control => {
                 self.show_selection = !self.show_selection;
                 cx.notify();
