@@ -61,7 +61,7 @@ fn main() -> std::io::Result<()> {
     let (now, peak) = footprint_mib();
     println!(
         "copy={cloned:.2}s reorder={reordered:.2}s aggregate={aggregated:.2}s \
-         classify={classified:.2}s footprint+={:.0}MiB peak+={:.0}MiB",
+         classify={classified:.3}s footprint+={:.0}MiB peak+={:.0}MiB",
         now - before,
         peak - before,
     );

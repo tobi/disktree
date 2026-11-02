@@ -792,20 +792,59 @@ impl NodeMut<'_> {
     }
 }
 
-/// One directory's children, as a bottom-up pass sees them: their facts
-/// and names to read, and their order to change.
+/// One directory's children, as a whole-tree pass sees them: their facts
+/// and names to read, and their facts and order to change.
 #[derive(Debug)]
 pub struct Block<'a> {
     slots: &'a mut [Slot],
     names: &'a str,
+    /// Where the block starts in the tree's nodes.
+    first: u32,
 }
 
 impl Block<'_> {
+    pub const fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The child at `index`, which must exist.
+    pub fn at(&self, index: usize) -> Sibling<'_> {
+        let slot = &self.slots[index];
+        Sibling {
+            facts: &slot.facts,
+            name: name_at(self.names, slot.name),
+        }
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Sibling<'_>> {
         self.slots.iter().map(|slot| Sibling {
             facts: &slot.facts,
             name: name_at(self.names, slot.name),
         })
+    }
+
+    /// The facts of the child at `index`, which must exist.
+    pub fn facts_mut(&mut self, index: usize) -> &mut Facts {
+        &mut self.slots[index].facts
+    }
+
+    /// Every child's facts, in order.
+    pub fn for_each_facts_mut(&mut self, visit: impl FnMut(&mut Facts)) {
+        self.slots
+            .iter_mut()
+            .map(|slot| &mut slot.facts)
+            .for_each(visit);
+    }
+
+    /// The [`Node::id`] of the child at `index`: what a pass that read the
+    /// tree first found out about it can be looked up by.
+    pub(crate) fn id(&self, index: usize) -> u32 {
+        debug_assert!(index < self.slots.len(), "a child of this block");
+        self.first + Store::index(index)
     }
 
     /// Reorder the children; see [`NodeMut::sort_children_by`].
@@ -858,26 +897,7 @@ fn bottom_up<L, D>(
     let (block, rest) = region[start..].split_at_mut(len);
     let rest_base = base + start + len;
     if depth < crate::tree::PARALLEL_LEVELS && len > 1 {
-        // Each child's run, in the order the runs were laid out, which
-        // sorting the block since has not changed.
-        let mut runs: Vec<usize> =
-            (0..len).filter(|&index| block[index].len > 0).collect();
-        runs.sort_unstable_by_key(|&index| block[index].first);
-        let mut parts: Vec<(&mut [Slot], usize)> =
-            (0..len).map(|_| (&mut [][..], rest_base)).collect();
-        let mut rest = rest;
-        let mut at = rest_base;
-        for (order, &index) in runs.iter().enumerate() {
-            let begin = block[index].first as usize;
-            let end = runs
-                .get(order + 1)
-                .map_or(at + rest.len(), |&next| block[next].first as usize);
-            let (_, tail) = std::mem::take(&mut rest).split_at_mut(begin - at);
-            let (run, tail) = tail.split_at_mut(end - begin);
-            parts[index] = (run, begin);
-            rest = tail;
-            at = end;
-        }
+        let parts = runs(block, rest, rest_base);
         block
             .par_iter_mut()
             .zip(parts)
@@ -889,13 +909,91 @@ fn bottom_up<L, D>(
             bottom_up(child, rest, rest_base, names, depth + 1, visit);
         }
     }
+    let first = node.first;
     directory(
         &mut node.facts,
         Block {
             slots: block,
             names,
+            first,
         },
     );
+}
+
+/// Beneath `block`, whose facts are written: each child directory's own
+/// block with `directory`, then beneath that. `rest` holds the runs of
+/// all of `block`'s children and starts at index `base`, as in
+/// [`bottom_up`].
+fn top_down<D>(
+    block: &[Slot],
+    rest: &mut [Slot],
+    base: usize,
+    names: &str,
+    depth: usize,
+    directory: &D,
+) where
+    D: Fn(&Facts, Block<'_>) + Sync,
+{
+    // As in `bottom_up`, a node that is not a directory is a leaf, and a
+    // directory that holds nothing has no block to visit.
+    let below = |child: &Slot, region: &mut [Slot], base: usize| {
+        let len = child.len as usize;
+        if !child.facts.kind.is_dir() || len == 0 {
+            return;
+        }
+        let start = child.first as usize - base;
+        let (block, rest) = region[start..].split_at_mut(len);
+        directory(
+            &child.facts,
+            Block {
+                slots: &mut *block,
+                names,
+                first: child.first,
+            },
+        );
+        top_down(block, rest, base + start + len, names, depth + 1, directory);
+    };
+    if depth < crate::tree::PARALLEL_LEVELS && block.len() > 1 {
+        block
+            .par_iter()
+            .zip(runs(block, rest, base))
+            .for_each(|(child, (run, base))| below(child, run, base));
+    } else {
+        for child in block {
+            below(child, rest, base);
+        }
+    }
+}
+
+/// Each child's run of `rest`, which holds the runs of all of `block`'s
+/// children and starts at index `base`, with the index it starts at; an
+/// empty run for a child with no children. Runs are in the order they
+/// were laid out, which sorting the block since has not changed.
+fn runs<'r>(
+    block: &[Slot],
+    rest: &'r mut [Slot],
+    base: usize,
+) -> Vec<(&'r mut [Slot], usize)> {
+    let len = block.len();
+    let mut runs: Vec<usize> =
+        (0..len).filter(|&index| block[index].len > 0).collect();
+    runs.sort_unstable_by_key(|&index| block[index].first);
+    let mut parts: Vec<(&mut [Slot], usize)> =
+        (0..len).map(|_| (&mut [][..], base)).collect();
+    let mut rest = rest;
+    let mut at = base;
+    for (order, &index) in runs.iter().enumerate() {
+        let begin = block[index].first as usize;
+        let end = runs
+            .get(order + 1)
+            .map_or(at + rest.len(), |&next| block[next].first as usize);
+        let (_, tail) = std::mem::take(&mut rest).split_at_mut(begin - at);
+        let (run, tail) = tail.split_at_mut(end - begin);
+        parts[index] = (run, begin);
+        rest = tail;
+        at = end;
+    }
+    parts
 }
 
 /// Where a tree is built: nodes are appended under a lock, so any number
@@ -1153,6 +1251,42 @@ impl Tree {
         bottom_up(root, region, 1, names, 0, &(leaf, directory));
     }
 
+    /// The root's children with `root`, which writes the root's facts and
+    /// theirs, then each directory's children with `directory` once its
+    /// own facts are written, given those facts; separate subtrees near
+    /// the top run on separate workers, as in [`Self::par_bottom_up`].
+    pub fn par_top_down(
+        &mut self,
+        root: impl FnOnce(&mut Facts, Block<'_>),
+        directory: impl Fn(&Facts, Block<'_>) + Sync,
+    ) {
+        let Store { nodes, names, .. } = &mut self.store;
+        let (node, region) =
+            nodes.split_first_mut().expect("a tree has a root");
+        // The root's block, if it has one, is the first after the root.
+        debug_assert!(node.len == 0 || node.first == 1, "a laid-out tree");
+        let (block, rest) = region.split_at_mut(node.len as usize);
+        root(
+            &mut node.facts,
+            Block {
+                slots: &mut *block,
+                names,
+                first: node.first,
+            },
+        );
+        let base = 1 + block.len();
+        top_down(block, rest, base, names, 0, &directory);
+    }
+
+    /// Every node, spread across workers, for a pass that only reads and
+    /// needs no particular order. The n-th has [`Node::id`] n.
+    pub(crate) fn par_nodes(
+        &self,
+    ) -> impl IndexedParallelIterator<Item = Node<'_>> {
+        let store = &self.store;
+        store.nodes.par_iter().map(move |slot| Node { store, slot })
+    }
+
     /// Records in each side table, for measuring what they cost.
     pub const fn side_records(&self) -> (usize, usize, usize) {
         (
@@ -1403,6 +1537,65 @@ mod tests {
             .join()
             .expect("joined");
         assert_eq!(count, 3);
+    }
+
+    /// Deeper than the levels that run in parallel, and with every block
+    /// re-sorted so blocks no longer list children in the order their runs
+    /// were laid out.
+    #[test]
+    fn top_down_writes_every_node_once_from_its_parent() {
+        fn draft(name: &str, depth: usize) -> Draft {
+            let mut node = Draft::directory(name);
+            if depth < crate::tree::PARALLEL_LEVELS + 3 {
+                node.children = (0..3)
+                    .map(|index| draft(&format!("{name}/{index}"), depth + 1))
+                    .collect();
+            }
+            node.children.push(Draft::entry(
+                format!("{name}/file").as_str(),
+                NodeKind::File,
+                0,
+            ));
+            node.children
+                .push(Draft::directory(format!("{name}/empty").as_str()));
+            node
+        }
+        fn check(node: Node<'_>, depth: i64, nodes: &mut usize) {
+            *nodes += 1;
+            assert_eq!(node.bytes, 1, "{} written once", node.name());
+            assert_eq!(node.modified, depth, "{} at its depth", node.name());
+            for child in node.children() {
+                check(child, depth + 1, nodes);
+            }
+        }
+        let mut tree = Tree::from(draft("root", 0));
+        tree.par_bottom_up(
+            |_| {},
+            |_, mut block| {
+                block.sort_by(|left, right| right.name.cmp(left.name));
+            },
+        );
+        // Each write counts itself in `bytes` and records its depth in
+        // `modified`, which only the parent's own facts can give.
+        tree.par_top_down(
+            |root, mut block| {
+                root.bytes += 1;
+                root.modified = 0;
+                block.for_each_facts_mut(|child| {
+                    child.bytes += 1;
+                    child.modified = 1;
+                });
+            },
+            |parent, mut block| {
+                block.for_each_facts_mut(|child| {
+                    child.bytes += 1;
+                    child.modified = parent.modified + 1;
+                });
+            },
+        );
+        let mut nodes = 0;
+        check(tree.root(), 0, &mut nodes);
+        assert_eq!(nodes, tree.store.nodes.len());
     }
 
     #[test]
