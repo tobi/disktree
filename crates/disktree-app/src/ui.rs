@@ -100,8 +100,14 @@ pub mod size {
     pub const METER: Rems = Rems(0.3125);
     /// Fixed progress rows keep paths and changing counters from reflowing.
     pub const PROGRESS_ROW: Rems = Rems(1.375);
-    pub const SCAN_STATUS: Rems = Rems(2.0);
+    /// The scan heading's box and its one line, in `text::FIGURE` type.
+    /// It clips, so the line must hold the mono font's whole ascent and
+    /// descent: `JetBrains Mono`, the usual Linux fallback, needs 1.32 em.
+    pub const SCAN_STATUS: Rems = Rems(2.25);
     pub const PROGRESS_VALUE: Rems = Rems(9.0);
+
+    // Checked at build time: the headless tests cannot see a clipped glyph.
+    const _: () = assert!(SCAN_STATUS.0 >= super::text::FIGURE.0 * 1.32);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.

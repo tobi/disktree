@@ -4328,6 +4328,10 @@ fn indexing_progress(
                 .truncate()
                 .font_family(theme.mono_font.clone())
                 .text_size(text::FIGURE)
+                // The default line height is ~1.6x the type, taller than
+                // this box, and `truncate` clips the overflow: descenders
+                // were cut off. A line the box's height fits it exactly.
+                .line_height(size::SCAN_STATUS)
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(fraction.map_or_else(
                     || {
