@@ -44,7 +44,7 @@ pub const DWELL: Duration = Duration::from_millis(500);
 pub const PROBE_LIMIT: Duration = Duration::from_secs(5);
 
 /// When an answer is old enough to ask again, for the selected checkout.
-const FRESH_FOR: Duration = Duration::from_mins(1);
+pub const FRESH_FOR: Duration = Duration::from_mins(1);
 /// A failure is asked again much later: another time-out costs as much.
 const FAILURE_FRESH_FOR: Duration = Duration::from_mins(10);
 
@@ -54,10 +54,22 @@ const BUCKET: u32 = 4;
 /// minute once the bucket is empty.
 const REFILL: Duration = Duration::from_secs(2);
 
-/// Runs one probe of the checkout at a path, stopping when the flag is
-/// set. The window's is `git::probe` within [`PROBE_LIMIT`]; tests count
-/// calls with their own.
-pub type GitProbe = Arc<dyn Fn(&Path, &Arc<AtomicBool>) -> Probe + Send + Sync>;
+/// Starts one probe of the checkout at a path, stopping when the flag is
+/// set, and hands back where its answer will arrive. The window's runs
+/// `git::probe` within [`PROBE_LIMIT`] on a thread of its own
+/// (`git::probe_on_thread`); tests count calls with their own and answer
+/// at once ([`ready`]). A channel closed without an answer reads as
+/// [`Probe::Unreadable`].
+pub type GitProbe =
+    Arc<dyn Fn(&Path, &Arc<AtomicBool>) -> async_channel::Receiver<Probe>>;
+
+/// A probe's answer that is already there, for the tests' probes.
+#[cfg(test)]
+pub fn ready(probe: Probe) -> async_channel::Receiver<Probe> {
+    let (sender, answer) = async_channel::bounded(1);
+    let _ = sender.try_send(probe);
+    answer
+}
 
 /// What brought the ask, most urgent first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -271,6 +283,11 @@ impl GitStore {
         self.answers
             .insert(job.path.clone(), Answer { probe, at: now });
         true
+    }
+
+    /// Whether there is an answer for `path`, stale or not.
+    pub fn answered(&self, path: &Path) -> bool {
+        self.answers.contains_key(path)
     }
 
     pub fn shown(&self, path: &Path) -> Shown<'_> {

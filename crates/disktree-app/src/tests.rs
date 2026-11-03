@@ -1953,7 +1953,7 @@ fn count_probes(
         let counter = runs.clone();
         app.git_probe = Arc::new(move |_, _| {
             counter.fetch_add(1, Ordering::SeqCst);
-            answer.clone()
+            crate::git_store::ready(answer.clone())
         });
         app.git.clear();
     });
@@ -2084,6 +2084,46 @@ fn selecting_a_checkout_asks_once_and_then_reads_the_answer(
     draw(cx);
     cx.run_until_parked();
     assert_eq!(probe_runs(&runs), 2, "alpha's answer is remembered");
+}
+
+/// A checkout left selected is not asked again while the window is in
+/// the background, however stale its answer gets; it is refreshed once
+/// when the window comes back.
+#[gpui_kit::test]
+fn a_background_window_leaves_a_stale_answer_until_it_is_active(
+    cx: &mut TestAppContext,
+) {
+    use crate::git_store::{FRESH_FOR, Probe};
+
+    cx.update(init);
+    let temp = checkouts();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    // A test window opens in the background; bring it to the front.
+    cx.update(|window, _| window.activate_window());
+    let runs = count_probes(&view, cx, Probe::Known(clean_checkout()));
+    draw(cx);
+    cx.run_until_parked();
+    assert!(cx.update(|window, _| window.is_window_active()));
+    assert_eq!(probe_runs(&runs), 1, "the selection is asked about");
+
+    cx.deactivate_window();
+    for _ in 0..5 {
+        cx.executor().advance_clock(FRESH_FOR);
+        cx.run_until_parked();
+        draw(cx);
+        cx.run_until_parked();
+    }
+    assert_eq!(probe_runs(&runs), 1, "nobody is looking");
+
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    draw(cx);
+    cx.run_until_parked();
+    assert_eq!(probe_runs(&runs), 2, "back in front, it is refreshed");
+    draw(cx);
+    cx.run_until_parked();
+    assert_eq!(probe_runs(&runs), 2, "once");
 }
 
 /// A checkout git could not read within its limit is drawn as such, and

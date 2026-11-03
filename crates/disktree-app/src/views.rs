@@ -1000,7 +1000,7 @@ fn explore(
     let panel = (app.show_selection || app.is_indexing())
         && width_rems >= PANEL_SHOWN_REMS;
     if panel && let Some(path) = panel_checkout(app) {
-        app.want_git(&path, cx);
+        app.want_git(&path, window.is_window_active(), cx);
     }
 
     let viewport = if app.tree().is_none() {

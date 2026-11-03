@@ -767,13 +767,7 @@ impl Disktree {
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
             git: GitStore::new(cx.background_executor().now()),
-            git_probe: Arc::new(|path, cancel| {
-                let limit = crate::git::Limit::new(
-                    git_store::PROBE_LIMIT,
-                    cancel.clone(),
-                );
-                crate::git::probe(path, &limit)
-            }),
+            git_probe: default_git_probe(),
             git_wake: None,
             hover_since: None,
             checkout: None,
@@ -1373,8 +1367,18 @@ impl Disktree {
     /// The panel shows the checkout at `path`: say so to the git store,
     /// and start what it lets run. A selection asks at once; a hover only
     /// once the pointer has rested on it for `git_store::DWELL`.
-    pub fn want_git(&mut self, path: &Path, cx: &Context<'_, Self>) {
-        if self.remote.is_some() {
+    ///
+    /// While the window is not `active` a known answer is left as it is,
+    /// stale or not, and nothing is set to wake for it: a checkout left
+    /// selected behind other windows would otherwise be walked by git every
+    /// `FRESH_FOR`. Activation draws the window again, which refreshes it.
+    pub fn want_git(
+        &mut self,
+        path: &Path,
+        active: bool,
+        cx: &Context<'_, Self>,
+    ) {
+        if self.remote.is_some() || (!active && self.git.answered(path)) {
             return;
         }
         let now = cx.background_executor().now();
@@ -1406,13 +1410,10 @@ impl Disktree {
     fn run_git(&mut self, cx: &Context<'_, Self>) {
         let now = cx.background_executor().now();
         for job in self.git.next_jobs(now) {
-            let probe = self.git_probe.clone();
-            let task = cx.background_executor().spawn({
-                let job = job.clone();
-                async move { probe(&job.path, &job.cancel) }
-            });
+            let answer = (self.git_probe)(&job.path, &job.cancel);
             cx.spawn(async move |this, cx| {
-                let answer = task.await;
+                let answer =
+                    answer.recv().await.unwrap_or(git_store::Probe::Unreadable);
                 let _ = this.update(cx, |this, cx| {
                     let now = cx.background_executor().now();
                     if this.git.finish(&job, answer, now) {
@@ -4774,6 +4775,27 @@ impl Drop for Disktree {
             discard(Some(held));
         }
     }
+}
+
+/// Git, on a thread of its own per probe.
+#[cfg(not(test))]
+fn default_git_probe() -> GitProbe {
+    Arc::new(|path, cancel| {
+        crate::git::probe_on_thread(
+            path,
+            git_store::PROBE_LIMIT,
+            cancel.clone(),
+        )
+    })
+}
+
+/// In the window tests, an answer at once and no git: a probe's own thread
+/// would wake GPUI's deterministic test executor from outside it. Tests
+/// that count probes put in their own (`tests::count_probes`); `git.rs`
+/// tests the real one.
+#[cfg(test)]
+fn default_git_probe() -> GitProbe {
+    Arc::new(|_, _| git_store::ready(git_store::Probe::Unreadable))
 }
 
 /// Let go of a tree, or anything holding one, off the UI thread: freeing
