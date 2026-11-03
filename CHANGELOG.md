@@ -7,6 +7,65 @@ an update. Keep new entries under Unreleased until the version is cut.
 
 ## Unreleased
 
+## v0.15.0
+
+- Large scans - Use less memory for file names and allocation records,
+  classify large trees in parallel, and quit without waiting for every
+  file record to be freed on the main thread.
+- APFS sharing - Show private and shared bytes per entry in the inspector,
+  hover cards, List view and MCP reports. Reclaim estimates account for
+  the selected set together, including clones, and distinguish known
+  savings from uncertain bounds without changing treemap weights.
+- Agent estimates - Add read-only `pwrdisk_estimate` for up to 200 paths,
+  with accepted, covered and refused paths, per-volume reclaim bounds,
+  and bounded discovery of other clone holders. Estimates do not mark
+  paths or authorize removal.
+- List view - Switch between Treemap and List from the title strip or
+  Cmd/Ctrl+1 and Cmd/Ctrl+2. Browse the complete file list with paging,
+  keyboard navigation and accessible names. Less-used toolbar controls
+  move into an overflow menu when space is tight.
+- Legend filters - Cycle category, age and Reclaimable chips through only,
+  hidden and shown. Filters apply to Treemap, List and search, with partial
+  folder sizes and an explicit empty result. Marking a partly shown folder
+  still marks the whole folder; the inspector explains this.
+- Marked totals - Keep the combined marked size, reclaim estimate and
+  Review button visible above the Disk meter, with marked paths first in
+  the side panel.
+- Treemap navigation - A click selects; clicking the selection opens one
+  level toward it. Double-clicks no longer skip through multiple levels.
+  Improve tile contrast, strike marked names and underline search matches
+  without adding prefixes to file names.
+- Removal - Keep the scan snapshot by default instead of starting a full
+  rescan after every removal. Removed entries stay greyed out and cannot
+  be marked again until a rescan. Choose Move & rescan or Delete & rescan
+  when a fresh tree is wanted; MCP removal also accepts `rescan`.
+- Freed space - Keep a ledger of removals since the scan, separating listed
+  bytes, private-byte estimates and the measured free-space change. MCP
+  status exposes the ledger, and listings and searches identify entries
+  removed since the scan.
+- Removal checks - Allow entries inside macOS `/tmp` and `/var/tmp` while
+  keeping the temporary-directory roots and other system paths protected.
+  Fix Windows volume-capacity checks for individual files. Confirmation,
+  capacity limits and the other removal guards still apply.
+- Keyboard and accessibility - Improve focus traversal, modal containment,
+  source and scan status, Review summaries, document reading and Logs
+  selection. Expose text and search values to native accessibility APIs.
+  Help, Settings and readers reflow through 200% interface zoom, and
+  directory navigation honors Reduce motion.
+- Window placement - Remember the main window's position and size,
+  keep restored windows on screen, and open macOS windows on the active
+  display. Improve Settings organization, About build information and
+  platform-specific dialog button placement.
+- Updates - Show checking and download progress, keep a downloaded update
+  ready across later checks, and offer Restart from a persistent title-strip
+  chip. Restart runs once in the background and saves the window position.
+- SSH and volumes - Preserve POSIX paths for Unix SSH hosts on Windows,
+  omit Linux kernel pseudo-filesystems from source discovery, and handle
+  escaped mount sources consistently. Searches retain matching nested
+  empty directories.
+- Compatibility - The window link now uses protocol version 6. Update
+  and restart both the PwrDisk window and MCP process together.
+
 ## v0.14.0
 
 - Removal safety - Settings > Safety adds a per-operation limit, defaulting
