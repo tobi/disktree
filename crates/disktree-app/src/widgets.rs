@@ -47,37 +47,6 @@ pub fn short_share(
     }
 }
 
-/// A value with a status colour rather than the neutral one.
-pub fn stat_colored(
-    label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    color: Hsla,
-    cx: &App,
-) -> Div {
-    let theme = cx.omarchy();
-    div()
-        .flex()
-        .flex_col()
-        .gap(space::XXS)
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(crate::palette::ink_on(
-                    theme.secondary,
-                    theme.background,
-                    4.5,
-                ))
-                .child(label.into()),
-        )
-        .child(
-            div()
-                .text_size(text::TITLE)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(color)
-                .child(value.into()),
-        )
-}
-
 /// A square chip, used for counts and states.
 pub fn chip(label: impl Into<SharedString>, color: Hsla, cx: &App) -> Div {
     let theme = cx.omarchy();

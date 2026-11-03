@@ -38,6 +38,8 @@ mod marks;
 mod palette;
 mod placement;
 mod power;
+mod run_list;
+mod run_view;
 mod safety;
 mod semantics;
 mod settings;
