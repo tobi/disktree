@@ -7,6 +7,36 @@ an update. Keep new entries under Unreleased until the version is cut.
 
 ## Unreleased
 
+## v0.16.0
+
+- Removal progress - Keep the complete approved list available from the
+  start of removal through Done. Each row shows whether it is waiting,
+  being removed, in trash, removed, failed or not reached after Stop, with
+  failures explained beside the affected item.
+- Following removal - Follow the item being processed automatically.
+  Scroll it out of view to pause following; use Follow the removal or
+  scroll back to resume. Large lists draw only the rows in view.
+- Removal totals - Show running progress, listed bytes, private-byte
+  estimates, observed free-space change and the disk meter beside the
+  list. Keep the final results and the ledger of removals since the scan
+  available on Done; moving to trash explains why space is not yet freed.
+- Review rows - Show each item's category or reclaim reason and its parent
+  folder consistently across Review, Removing and Done. Deep paths shorten
+  in the middle to fit one line; tooltips and accessible names retain the
+  complete path. Narrow windows move the progress sidebar below the list.
+- Git status - Check selected checkouts promptly and hovered checkouts
+  only after a pause, with at most two checks at once and a five-second
+  limit. Keep cached answers while refreshing, cancel checks on a rescan
+  or source change, and stop periodic refreshes while the window is in the
+  background. Slow checkouts report too large to check.
+- Git inspection - Avoid checkout-defined hooks, filters and network
+  access when inspecting repositories. Checkouts with their own filters
+  report changes unknown, and macOS does not prompt to install developer
+  tools merely because a checkout was selected.
+- Responsiveness - Stop rereading checkout metadata and saved Safety
+  settings on every frame. Run Git checks on separate threads so they do
+  not occupy the app's shared background workers.
+
 ## v0.15.0
 
 - Large scans - Use less memory for file names and allocation records,
