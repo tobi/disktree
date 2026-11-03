@@ -1158,6 +1158,26 @@ fn spawn_checked(
     mode: RemovalMode,
     limit: Option<crate::removal_limit::Limit>,
 ) -> RemovalHandle {
+    start(plan, mode, limit, |work| {
+        thread::Builder::new()
+            .name("disktree-remove".into())
+            .spawn(work)
+            .map(drop)
+    })
+}
+
+/// The work a removal thread runs, boxed so a test can hand it to a
+/// spawner that refuses it.
+type Work = Box<dyn FnOnce() + Send + 'static>;
+
+/// [`spawn_checked`] with the thread's start passed in, so a test can make
+/// it fail as a process out of threads would.
+fn start(
+    plan: Plan,
+    mode: RemovalMode,
+    limit: Option<crate::removal_limit::Limit>,
+    spawn: impl FnOnce(Work) -> io::Result<()>,
+) -> RemovalHandle {
     let (sender, events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
@@ -1166,53 +1186,65 @@ fn spawn_checked(
     } else {
         TrashBackend::Unavailable
     };
+    // Shared, not moved: a spawn that fails drops the work unrun, and the
+    // targets are still needed to report that each one failed.
+    let plan = Arc::new(plan);
 
-    let worker = thread::Builder::new()
-        .name("disktree-remove".into())
-        .spawn({
-            let sender = sender.clone();
-            move || {
-                if let Some(limit) = limit {
-                    let fresh = self::plan(&plan.targets, &plan.root);
-                    let checked = if fresh.blocked.is_empty() {
-                        crate::removal_limit::measured(&plan.targets)
-                            .and_then(|targets| limit.check(&targets))
-                    } else {
-                        Err("Removal guards changed before preflight; nothing was removed".into())
-                    };
-                    if let Err(reason) = checked {
-                        let _ = sender.send(RemovalEvent::Start {
-                            total: plan.targets.len(),
-                        });
-                        for target in &plan.targets {
-                            let _ = sender.send(RemovalEvent::Item {
-                                path: target.path.clone(),
-                                bytes: 0,
-                                outcome: Err(reason.clone()),
-                            });
-                        }
-                        let _ = sender.send(RemovalEvent::Done {
-                            removed: 0,
-                            bytes: 0,
-                            failed: plan.targets.len(),
-                        });
-                        return;
-                    }
+    let worker = spawn(Box::new({
+        let plan = Arc::clone(&plan);
+        let sender = sender.clone();
+        move || {
+            if let Some(limit) = limit {
+                let fresh = self::plan(&plan.targets, &plan.root);
+                let checked = if fresh.blocked.is_empty() {
+                    crate::removal_limit::measured(&plan.targets)
+                        .and_then(|targets| limit.check(&targets))
+                } else {
+                    Err("Removal guards changed before preflight; nothing was removed".into())
+                };
+                if let Err(reason) = checked {
+                    fail_all(&plan.targets, &reason, &sender);
+                    return;
                 }
-                run(&plan, mode, backend, &worker_cancel, &sender);
             }
-        });
+            run(&plan, mode, backend, &worker_cancel, &sender);
+        }
+    }));
+    // Without `Done` the app would wait on the Removing screen for good:
+    // the dropped sender reads the same as a worker with nothing new.
     if let Err(error) = worker {
-        let _ = sender.send(RemovalEvent::Item {
-            path: PathBuf::new(),
-            bytes: 0,
-            outcome: Err(format!(
-                "could not start the removal worker: {error}"
-            )),
-        });
+        fail_all(
+            &plan.targets,
+            &format!("could not start the removal worker: {error}"),
+            &sender,
+        );
     }
 
     RemovalHandle { events, cancel }
+}
+
+/// A whole run that removed nothing: every target failed for `reason`,
+/// then the end, so the run finishes and reads as failed, item by item.
+fn fail_all(
+    targets: &[Target],
+    reason: &str,
+    sender: &mpsc::Sender<RemovalEvent>,
+) {
+    let _ = sender.send(RemovalEvent::Start {
+        total: targets.len(),
+    });
+    for target in targets {
+        let _ = sender.send(RemovalEvent::Item {
+            path: target.path.clone(),
+            bytes: 0,
+            outcome: Err(reason.to_owned()),
+        });
+    }
+    let _ = sender.send(RemovalEvent::Done {
+        removed: 0,
+        bytes: 0,
+        failed: targets.len(),
+    });
 }
 
 fn run(
@@ -2755,6 +2787,60 @@ mod tests {
         }
         assert!(!root.join("a/b").exists());
         assert!(root.join("a/one.bin").exists());
+    }
+
+    #[test]
+    fn a_worker_that_cannot_start_ends_the_run_as_failed() {
+        let temp = tree();
+        let root = temp.path();
+        let plan = plan(
+            &[
+                target(&root.join("a/b"), 0),
+                target(&root.join("a/c.bin"), 20),
+            ],
+            root,
+        );
+        let paths: Vec<PathBuf> = plan
+            .targets
+            .iter()
+            .map(|target| target.path.clone())
+            .collect();
+        assert_eq!(paths.len(), 2);
+
+        // The spawner refuses the work as a process out of threads would,
+        // so every event below was sent before `start` returned.
+        let handle = start(plan, RemovalMode::Permanent, None, |_work| {
+            Err(io::Error::other("out of threads"))
+        });
+        let events: Vec<_> = std::iter::from_fn(|| handle.poll()).collect();
+
+        // Start, one failure per listed target, then the end: without
+        // `Done` the window would wait on the Removing screen for good.
+        assert_eq!(events.len(), paths.len() + 2, "{events:?}");
+        assert!(matches!(events[0], RemovalEvent::Start { total: 2 }));
+        for (event, expected) in events[1..=paths.len()].iter().zip(&paths) {
+            match event {
+                RemovalEvent::Item {
+                    path,
+                    bytes: 0,
+                    outcome: Err(reason),
+                } => {
+                    assert_eq!(path, expected);
+                    assert!(reason.contains("out of threads"), "{reason}");
+                }
+                other => panic!("expected a failed item, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            events.last(),
+            Some(RemovalEvent::Done {
+                removed: 0,
+                bytes: 0,
+                failed: 2,
+            })
+        ));
+        assert!(root.join("a/b").exists());
+        assert!(root.join("a/c.bin").exists());
     }
 
     #[cfg(unix)]

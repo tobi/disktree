@@ -69,8 +69,9 @@ pub struct RunList {
     /// The wheel moved the list since the last poll, which then decides
     /// whether that paused following.
     pub scrolled_by_hand: bool,
-    /// Failures reported against no listed target: the worker could not
-    /// start. Counted, so the run never reads as clean when it was not.
+    /// Failures reported against no listed target. The worker reports
+    /// every failure, a start that failed included, against a listed one;
+    /// counted anyway, so the run never reads as clean when it was not.
     unlisted_failures: usize,
 }
 
@@ -81,8 +82,7 @@ pub struct Totals {
     /// Listed items that failed, so `removed + failed` never exceeds
     /// `total` and the rest are the ones not reached.
     pub failed: usize,
-    /// Failures reported against no listed item: the worker could not
-    /// start.
+    /// Failures reported against no listed item.
     pub unlisted: usize,
     pub total: usize,
     pub reported_done: u64,
@@ -94,7 +94,7 @@ pub struct Totals {
 
 impl Totals {
     /// Every failure the worker reported, listed or not: what the agent
-    /// and the ledger are told, so a run that never started is not clean.
+    /// and the ledger are told, so no failure is lost to a stray path.
     pub const fn failed_all(&self) -> usize {
         self.failed + self.unlisted
     }
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(totals.private_all, Some(54));
         assert_eq!(list.items[1].status, Status::Failed("denied".into()));
         // A path it never listed settles no item, but a failure still
-        // counts: it is how the worker says it could not start.
+        // counts.
         assert_eq!(list.settle(Path::new(""), &Err("x".into())), None);
         assert_eq!(list.totals().failed, 1);
         assert_eq!(list.totals().failed_all(), 2);
