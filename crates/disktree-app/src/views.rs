@@ -127,11 +127,14 @@ pub fn root(
     let theme = cx.omarchy().clone();
     let readable_status = app.accessibility_status();
     let strip = title_strip(app, frame, window, cx);
+    // Each screen anchors the toasts in its content, above its footer, so
+    // they never cover the footer's buttons. Dialogs draw over them.
+    let toasts = crate::toasts::stack(app, window, cx);
     let body = match app.screen {
-        Screen::Explore => explore(app, window, cx),
-        Screen::Review => review(app, window, cx),
-        Screen::Running => running(app, cx),
-        Screen::Done => done(app, cx),
+        Screen::Explore => explore(app, toasts, window, cx),
+        Screen::Review => review(app, toasts, window, cx),
+        Screen::Running => running(app, toasts, cx),
+        Screen::Done => done(app, toasts, cx),
     };
     let modal = app.has_modal() || app.app_menu_open;
     let background = div().id("application-content")
@@ -293,10 +296,6 @@ pub fn root(
     // otherwise sit, or drift, behind the dialog.
     if !modal && let Some(tip) = cursor_tooltip(app, window, cx) {
         root = root.child(tip);
-    }
-    // Under the overlays and dialogs, which take the mouse while open.
-    if let Some(toasts) = crate::toasts::stack(app, cx) {
-        root = root.child(toasts);
     }
     if app.show_help {
         root = root.child(help_overlay(app, cx));
@@ -953,6 +952,7 @@ fn compact_space(app: &Disktree) -> String {
 
 fn explore(
     app: &mut Disktree,
+    toasts: Option<AnyElement>,
     window: &Window,
     cx: &Context<'_, Disktree>,
 ) -> Div {
@@ -960,6 +960,8 @@ fn explore(
     if app.awaiting_root {
         return div()
             .debug_selector(|| "choose-root-idle".into())
+            .relative()
+            .children(toasts)
             .flex()
             .flex_col()
             .flex_1()
@@ -1065,6 +1067,7 @@ fn explore(
                 ))
                 .child(
                     div()
+                        .relative()
                         .flex()
                         .flex_col()
                         .flex_1()
@@ -1084,7 +1087,10 @@ fn explore(
                                 .px(space::LG)
                                 .pb(space::SM)
                                 .child(viewport),
-                        ),
+                        )
+                        // Over the mosaic's lower left, clear of the side
+                        // panel and the bands below.
+                        .children(toasts),
                 )
                 .children(panel.then(|| side_panel(app, &theme, cx))),
         )
@@ -1175,6 +1181,7 @@ fn title_strip(
                     .self_stretch(),
             )
             .children(agent_pill(app, &theme, cx))
+            .children(update_chip(app, &theme, cx))
             .child(view_settings(app, window, cx))
     } else {
         div()
@@ -1188,6 +1195,7 @@ fn title_strip(
                     .flex_1()
                     .self_stretch(),
             )
+            .children(update_chip(app, &theme, cx))
     };
     chrome::strip(frame, wordmark, content, window, cx)
 }
@@ -4536,6 +4544,7 @@ fn marks_ancestor(
 
 fn review(
     app: &Disktree,
+    toasts: Option<AnyElement>,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
@@ -4674,16 +4683,21 @@ fn review(
                 if app.removal_mode == RemovalMode::Trash { "Move to trash; recoverable until emptied" } else { "Permanent deletion; not recoverable" },
                 savings(plan.reclaimable_bytes(), plan.possible_bytes()))))
         .child(
-            div().id("review-scroll").debug_selector(|| "review-scroll".into())
-                .overflow_y_scroll().track_scroll(&app.review_scroll)
-                .flex()
-                .flex_row().when(compact, gpui_kit::Styled::flex_col)
-                .gap(space::LG)
-                .p(space::LG)
-                .flex_1()
-                .min_h_0()
-                .child(list)
-                .child(summary),
+            // The toasts sit over the list's lower left, outside the
+            // scroll so they stay put, above the hints and the footer.
+            div().relative().flex().flex_col().flex_1().min_h_0()
+                .child(div().id("review-scroll")
+                    .debug_selector(|| "review-scroll".into())
+                    .overflow_y_scroll().track_scroll(&app.review_scroll)
+                    .flex()
+                    .flex_row().when(compact, gpui_kit::Styled::flex_col)
+                    .gap(space::LG)
+                    .p(space::LG)
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .child(summary))
+                .children(toasts),
         )
         .when(
             chrome::Platform::current() == chrome::Platform::Linux,
@@ -5217,7 +5231,11 @@ fn screen_footer(row: Div, theme: &Theme) -> Div {
 
 // ── running ─────────────────────────────────────────────────────────────
 
-fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
+fn running(
+    app: &Disktree,
+    toasts: Option<AnyElement>,
+    cx: &gpui_kit::Context<'_, Disktree>,
+) -> Div {
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
     let done = summary.removed + summary.failed as u64;
@@ -5318,7 +5336,9 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                 .children(
                     app.space.map(|space| widgets::space_meter(space, 0, cx)),
                 )
-                .child(log),
+                .child(log)
+                .relative()
+                .children(toasts),
         )
         .child(screen_footer(
             dialog_footer(
@@ -5352,7 +5372,11 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
 
 // ── done ────────────────────────────────────────────────────────────────
 
-fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
+fn done(
+    app: &Disktree,
+    toasts: Option<AnyElement>,
+    cx: &gpui_kit::Context<'_, Disktree>,
+) -> Div {
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
     let cohorts = app.ledger.cohorts();
@@ -5487,7 +5511,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         .flex_1()
         .min_h_0()
         .child(screen_header("Done", "removal finished", &theme, cx))
-        .child(body)
+        .child(body.relative().children(toasts))
         .child(screen_footer(
             dialog_footer(
                 [],
@@ -6379,6 +6403,87 @@ fn app_menu_dropdown(
 
 /// Who is driving the window, in the top bar: the agent's name and what it
 /// last did. Only while an agent is connected; a click opens the overlay.
+/// The strip's id for the update chip, for tests.
+pub const UPDATE_CHIP_ID: &str = "strip-update";
+
+/// "0.15.0 ready · Restart": the release Restart to update installs, offered
+/// quietly on every screen, Later or not (design: Update Notices 3a). A
+/// press is Restart to update, which waits for a running removal. At the
+/// tightest bar it keeps only the verb.
+fn update_chip(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Stateful<Div>> {
+    let held = app.update_watch.ready()?;
+    let restarting = app.update_watch.seen().restarting;
+    let verb = match (restarting, held.switch_back) {
+        (true, _) => "Restarting\u{2026}",
+        (false, true) => "Switch",
+        (false, false) => "Restart",
+    };
+    let action = if held.switch_back { "switch" } else { "update" };
+    let label = format!("Restart to {action} to {}", held.version);
+    let tight = app.bar_fit == crate::toolbar::BarFit::Tight;
+    let lead = if tight {
+        format!("{} \u{00b7}", held.version)
+    } else {
+        format!("{} ready \u{00b7}", held.version)
+    };
+    let hover = theme.accent.opacity(0.1);
+    Some(with_tooltip(
+        div()
+            .id(UPDATE_CHIP_ID)
+            .debug_selector(|| UPDATE_CHIP_ID.into())
+            .role(gpui_kit::Role::Button)
+            .aria_label(label.clone())
+            .focusable()
+            .tab_stop(true)
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .items_center()
+            .gap(space::XS)
+            .px(space::SM)
+            .py(space::XXS)
+            .mr(space::SM)
+            .border_1()
+            .border_color(theme.accent)
+            .font_family(theme.mono_font.clone())
+            .text_size(text::CAPTION)
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .focus_visible(|style| style.border_color(theme.focus_border()))
+            .on_key_down(cx.listener(
+                move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        if !this.update_watch.seen().restarting {
+                            this.restart_to_update(cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.update_watch.seen().restarting {
+                    this.restart_to_update(cx);
+                }
+            }))
+            .child(
+                div()
+                    .size(size::SWATCH)
+                    .rounded_full()
+                    .flex_shrink_0()
+                    .bg(theme.accent),
+            )
+            .child(div().text_color(theme.secondary).child(lead))
+            .child(div().text_color(theme.accent).underline().child(verb)),
+        label,
+    ))
+}
+
 fn agent_pill(
     app: &Disktree,
     theme: &Theme,

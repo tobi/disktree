@@ -150,13 +150,25 @@ pub fn open_window(
 }
 
 /// Redraws Settings when the updater's state moves (`updater::install`).
+/// Never for a download's percent, which Settings does not show: this
+/// collects the diagnostics again.
 pub fn refresh(cx: &mut App) {
+    #[cfg(test)]
+    REFRESHES.set(REFRESHES.get() + 1);
     if let Some(handle) = aux_window::find::<SettingsWindow>(cx, |_| true) {
         let _ = handle.update(cx, |view, _, cx| {
             view.diagnostics = diagnostics::collect(cx);
             cx.notify();
         });
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`refresh`] ran, for the test that a download's
+    /// percent does not rebuild Settings.
+    pub static REFRESHES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The window's view.
@@ -255,9 +267,7 @@ impl SettingsWindow {
                     app.restart_to_update(cx);
                 });
             }
-            None => {
-                let _ = updater::restart_to_update();
-            }
+            None => updater::restart_in_background(),
         }
     }
 
@@ -303,7 +313,9 @@ impl SettingsWindow {
             "r" => {
                 let installed = updater::installed_version();
                 let slot = updater::selection().resolve(&installed);
-                if updater::ready(&updater::state(), &installed, slot).is_some()
+                let state = updater::state();
+                if !state.restarting
+                    && updater::ready(&state, &installed, slot).is_some()
                 {
                     cx.defer(Self::restart);
                 }
@@ -698,17 +710,18 @@ impl SettingsWindow {
         );
         if let Some(held) = &ready {
             let verb = if held.switch_back { "switch" } else { "update" };
+            let label = if state.restarting {
+                "Restarting\u{2026}".to_owned()
+            } else {
+                format!("Restart to {verb} to {}", held.version)
+            };
             actions = actions.child(
-                button(
-                    RESTART_ID,
-                    format!("Restart to {verb} to {}", held.version),
-                    ButtonVariant::Primary,
-                    cx,
-                )
+                button(RESTART_ID, label, ButtonVariant::Primary, cx)
                 .debug_selector(|| RESTART_ID.into())
                 // As the panel had it: never while a removal runs, which an
-                // exit would stop partway through the marked list.
-                .semantic_disabled(!Self::can_restart(cx))
+                // exit would stop partway through the marked list; and once
+                // pressed, until it fails.
+                .semantic_disabled(state.restarting || !Self::can_restart(cx))
                 .on_click(|_, _, cx| cx.defer(Self::restart)),
             );
         }

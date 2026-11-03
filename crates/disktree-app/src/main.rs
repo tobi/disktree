@@ -368,13 +368,12 @@ fn run() -> Result<()> {
                 window.focus(&focus, cx);
             });
             // A check that starts or finishes redraws the window, which
-            // answers it in a toast, and Settings › Updates.
-            updater::install(cx, move |cx| {
-                let _ = window.update(cx, |this, _, cx| {
-                    this.updates_changed(cx);
-                });
-                settings::refresh(cx);
+            // answers it in a toast, and Settings › Updates; a download's
+            // percent only the toast.
+            let _ = window.update(cx, |this, _, cx| {
+                this.apply_update_fixture(cx);
             });
+            updater::install(cx, toasts::updater_changed);
             updater::check_in_background(updater::Trigger::Startup);
 
             // Listen for an agent. Another window already linked, or a

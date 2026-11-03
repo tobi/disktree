@@ -277,6 +277,7 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 | `THIRD_PARTY_LICENSES` | `cargo xtask licenses` (cargo-about), then commit it; non-crate parts in `licenses/bundled.txt` |
 | the macOS icon, in any of its looks | `packaging/macos/` — the SVGs and `AppIcon.icon`, then `make dock-icons` |
 | checking, downloading and applying updates | `crates/disktree-app/src/updater.rs` |
+| what the window says about updates: the toasts, the strip's ready chip | `crates/disktree-app/src/toasts.rs`, the chip in `views.rs` |
 | which release a release channel picks | `crates/disktree-app/src/update_channel.rs` |
 | release packaging, the DMG, `vpk` | `scripts/release/`, `xtask/src/bundle.rs`, `.github/workflows/release.yml` |
 | what an agent can ask of the window, and the answer | `crates/disktree-link/src/lib.rs` (messages), `crates/disktree-app/src/agent.rs` (handling) |

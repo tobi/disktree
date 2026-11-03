@@ -6977,32 +6977,46 @@ fn routing_review_help_dismisses_menus_and_contains_navigation(
     assert!(temp.path().join("junk/blob.bin").exists());
 }
 
-/// A made-up updater state: the check that finished at `secs`, and the
-/// download held for the default channel, if any.
+/// A made-up updater state: `finished` checks done, the last ending in
+/// `outcome`, and the download held for the default channel, if any.
 fn update_state(
-    secs: u64,
+    finished: u64,
     outcome: crate::updater::Outcome,
     held: Option<&str>,
 ) -> crate::updater::State {
     use crate::update_channel::Slot;
     crate::updater::State {
-        checking: false,
+        finished,
         last: Some((
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(finished),
             outcome,
         )),
-        releases: None,
         held: held.map(|version| crate::updater::Held {
             version: version.to_owned(),
             file_name: format!("PwrDisk-{version}-full.nupkg"),
             slot: Slot::default().key(),
             switch_back: false,
         }),
+        ..crate::updater::State::default()
     }
 }
 
-/// Check for Updates… always answers in the main window, and the toast
-/// draws: here, that this copy is the latest.
+/// Asks as Check for Updates… does, against a made-up check that has not
+/// finished yet, without starting a real one.
+fn ask_for_updates(view: &Entity<Disktree>, cx: &mut Window) {
+    use crate::update_channel::Slot;
+    update(view, cx, |app, cx| {
+        app.update_watch.ask(0);
+        let state = crate::updater::State {
+            checking: true,
+            ..crate::updater::State::default()
+        };
+        app.follow_updates(state, "0.14.0", Slot::default(), cx);
+    });
+}
+
+/// Check for Updates… shows a live card, then answers in its place: here,
+/// that this copy is the latest.
 #[gpui_kit::test]
 fn a_check_asked_for_answers_in_a_toast(cx: &mut TestAppContext) {
     use crate::update_channel::Slot;
@@ -7010,16 +7024,18 @@ fn a_check_asked_for_answers_in_a_toast(cx: &mut TestAppContext) {
     cx.update(init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
-    update(&view, cx, |app, cx| {
-        app.update_watch.asked = true;
-        app.show_toast(crate::toasts::checking(Slot::default()), cx);
-    });
+    ask_for_updates(&view, cx);
     draw(cx);
     assert!(cx.debug_bounds("toast-update").is_some(), "checking shows");
+    assert!(cx.debug_bounds("toast-track").is_some(), "with its sweep");
+    assert!(
+        cx.debug_bounds("toast-update-timer").is_none(),
+        "work under way has no countdown"
+    );
 
-    let state = update_state(10, Outcome::UpToDate("0.14.0".into()), None);
+    let state = update_state(1, Outcome::UpToDate("0.14.0".into()), None);
     update(&view, cx, |app, cx| {
-        app.react_to_updates(&state, "0.14.0", Slot::default(), cx);
+        app.follow_updates(state, "0.14.0", Slot::default(), cx);
     });
     draw(cx);
     let title = read(&view, cx, |app| {
@@ -7027,15 +7043,77 @@ fn a_check_asked_for_answers_in_a_toast(cx: &mut TestAppContext) {
             .get(crate::toasts::UPDATE)
             .map(|t| t.title.clone())
     });
-    assert_eq!(title.as_deref(), Some("Up to date"), "replaced in place");
+    assert_eq!(
+        title.as_deref(),
+        Some("PwrDisk is up to date"),
+        "replaced in place"
+    );
     assert!(cx.debug_bounds("toast-release-notes").is_some());
+    assert!(
+        cx.debug_bounds("toast-update-timer").is_some(),
+        "counts down"
+    );
+    assert!(cx.debug_bounds("toast-track").is_none());
     assert!(cx.debug_bounds("toast-restart").is_none());
 }
 
-/// A background check says nothing unless a download is ready, and then
-/// only once per version: dismissed, it stays quiet until a newer one.
+/// A download's percent redraws the live card, and only Check for
+/// Updates… shows one: a background download raises nothing until it is
+/// ready.
 #[gpui_kit::test]
-fn a_ready_download_is_announced_once_per_version(cx: &mut TestAppContext) {
+fn a_menu_check_shows_its_download_percent(cx: &mut TestAppContext) {
+    use crate::updater::Download;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let download = Download {
+        version: "0.15.0".into(),
+        switch_back: false,
+        percent: Some(42),
+    };
+    update(&view, cx, |app, _| {
+        app.update_watch.follow_progress(Some(download.clone()));
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("toast-stack").is_none(),
+        "nobody asked: a background download is silent"
+    );
+
+    ask_for_updates(&view, cx);
+    update(&view, cx, |app, _| {
+        app.update_watch.follow_progress(Some(download));
+    });
+    draw(cx);
+    let card = read(&view, cx, crate::toasts::update_card).expect("live");
+    assert_eq!(card.title, "Downloading update");
+    assert_eq!(card.body, "PwrDisk 0.15.0 \u{00b7} 42%");
+    assert!(cx.debug_bounds("toast-track").is_some());
+}
+
+/// A download's percent is drawn by the toast alone: it never rebuilds
+/// Settings, which collects the diagnostics again. A real change does.
+#[gpui_kit::test]
+fn a_progress_tick_does_not_rebuild_settings(cx: &mut TestAppContext) {
+    use crate::settings::REFRESHES;
+    use crate::updater::Change;
+    cx.update(init);
+    let temp = fixture();
+    let (_view, cx) = view_over(temp.path(), cx);
+    let before = REFRESHES.get();
+    for _ in 0..100 {
+        cx.update(|_, cx| crate::toasts::updater_changed(Change::Progress, cx));
+    }
+    assert_eq!(REFRESHES.get(), before, "a hundred ticks, no rebuild");
+    cx.update(|_, cx| crate::toasts::updater_changed(Change::State, cx));
+    assert_eq!(REFRESHES.get(), before + 1, "a real change refreshes");
+}
+
+/// A ready release stays: a background check offers it, Later puts that
+/// version away (the strip's chip still offers it), and a newer one comes
+/// back.
+#[gpui_kit::test]
+fn a_ready_download_stays_until_later(cx: &mut TestAppContext) {
     use crate::update_channel::Slot;
     use crate::updater::Outcome;
     cx.update(init);
@@ -7043,49 +7121,123 @@ fn a_ready_download_is_announced_once_per_version(cx: &mut TestAppContext) {
     let (view, cx) = view_over(temp.path(), cx);
     let slot = Slot::default();
 
-    let quiet = update_state(10, Outcome::UpToDate("0.14.0".into()), None);
+    let quiet = update_state(1, Outcome::UpToDate("0.14.0".into()), None);
     update(&view, cx, |app, cx| {
-        app.react_to_updates(&quiet, "0.14.0", slot, cx);
+        app.follow_updates(quiet, "0.14.0", slot, cx);
     });
-    assert!(read(&view, cx, |app| app.toasts.is_empty()), "nothing new");
+    draw(cx);
+    assert!(cx.debug_bounds("toast-stack").is_none(), "nothing new");
+    assert!(cx.debug_bounds(crate::views::UPDATE_CHIP_ID).is_none());
 
     let ready =
-        update_state(20, Outcome::Downloaded("0.15.0".into()), Some("0.15.0"));
+        update_state(2, Outcome::Downloaded("0.15.0".into()), Some("0.15.0"));
     update(&view, cx, |app, cx| {
-        app.react_to_updates(&ready, "0.14.0", slot, cx);
+        app.follow_updates(ready, "0.14.0", slot, cx);
     });
     draw(cx);
-    let dismiss = cx.debug_bounds("toast-dismiss").expect("ready toast");
     assert!(cx.debug_bounds("toast-restart").is_some());
-    cx.simulate_click(dismiss.center(), gpui_kit::Modifiers::none());
+    assert!(cx.debug_bounds(crate::views::UPDATE_CHIP_ID).is_some());
+    let later = cx.debug_bounds("toast-later").expect("ready toast");
+    cx.simulate_click(later.center(), gpui_kit::Modifiers::none());
     draw(cx);
-    assert!(read(&view, cx, |app| app.toasts.is_empty()), "dismissed");
-
-    // The next background check finds the same download: still quiet.
-    let again =
-        update_state(30, Outcome::Pending("0.15.0".into()), Some("0.15.0"));
-    update(&view, cx, |app, cx| {
-        app.react_to_updates(&again, "0.14.0", slot, cx);
-    });
+    assert!(cx.debug_bounds("toast-update").is_none(), "put away");
     assert!(
-        read(&view, cx, |app| app.toasts.is_empty()),
+        cx.debug_bounds(crate::views::UPDATE_CHIP_ID).is_some(),
+        "the chip still offers it"
+    );
+
+    // The next background check finds the same download: still down.
+    let again =
+        update_state(3, Outcome::Pending("0.15.0".into()), Some("0.15.0"));
+    update(&view, cx, |app, cx| {
+        app.follow_updates(again, "0.14.0", slot, cx);
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("toast-update").is_none(),
         "once per version"
     );
 
     let newer =
-        update_state(40, Outcome::Downloaded("0.15.1".into()), Some("0.15.1"));
+        update_state(4, Outcome::Downloaded("0.15.1".into()), Some("0.15.1"));
     update(&view, cx, |app, cx| {
-        app.react_to_updates(&newer, "0.14.0", slot, cx);
+        app.follow_updates(newer, "0.14.0", slot, cx);
     });
-    let body = read(&view, cx, |app| {
-        app.toasts
-            .get(crate::toasts::UPDATE)
-            .map(|t| t.body.clone())
-    });
+    draw(cx);
+    let body = read(&view, cx, crate::toasts::update_card).map(|t| t.body);
     assert_eq!(
         body.as_deref(),
-        Some("Restart to update to PwrDisk 0.15.1.")
+        Some(
+            "PwrDisk 0.15.1 is downloaded. It installs when you restart or quit."
+        )
     );
+}
+
+/// An answer takes the ready card's place while it stands, and the ready
+/// card comes back once it leaves: a failed check never hides a release.
+#[gpui_kit::test]
+fn the_ready_card_comes_back_after_an_answer(cx: &mut TestAppContext) {
+    use crate::update_channel::Slot;
+    use crate::updater::Outcome;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let slot = Slot::default();
+    let ready =
+        update_state(1, Outcome::Downloaded("0.15.0".into()), Some("0.15.0"));
+    update(&view, cx, |app, cx| {
+        app.follow_updates(ready, "0.14.0", slot, cx);
+    });
+    ask_for_updates(&view, cx);
+    let mut failed =
+        update_state(2, Outcome::Failed("timed out".into()), Some("0.15.0"));
+    failed.checking = false;
+    update(&view, cx, |app, cx| {
+        app.update_watch.ask(1);
+        app.follow_updates(failed, "0.14.0", slot, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("toast-check-again").is_some(), "the answer");
+    assert!(cx.debug_bounds("toast-restart").is_none(), "in its place");
+    cx.executor().advance_clock(crate::toasts::ANSWER);
+    cx.run_until_parked();
+    draw(cx);
+    assert!(cx.debug_bounds("toast-check-again").is_none(), "gone");
+    assert!(cx.debug_bounds("toast-restart").is_some(), "offered again");
+}
+
+/// Restart pressed says so and cannot be pressed again; a failed restart
+/// is offered again, with why.
+#[gpui_kit::test]
+fn restarting_waits_and_a_failure_is_offered_again(cx: &mut TestAppContext) {
+    use crate::update_channel::Slot;
+    use crate::updater::Outcome;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let slot = Slot::default();
+    let mut state =
+        update_state(1, Outcome::Downloaded("0.15.0".into()), Some("0.15.0"));
+    state.restarting = true;
+    update(&view, cx, |app, cx| {
+        app.follow_updates(state.clone(), "0.14.0", slot, cx);
+    });
+    draw(cx);
+    let card = read(&view, cx, crate::toasts::update_card).expect("ready");
+    assert!(card.actions.contains(&crate::toasts::Action::Restart {
+        switch_back: false,
+        restarting: true,
+    }));
+
+    state.restarting = false;
+    state.restart_failed = Some("the updater did not start".into());
+    update(&view, cx, |app, cx| {
+        app.follow_updates(state, "0.14.0", slot, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("toast-update-problem").is_some());
+    let notice = read(&view, cx, |app| app.notice.clone());
+    assert!(notice.is_some_and(|(text, _)| text.contains("did not start")));
 }
 
 /// A failed check asked for by hand says why, with the log one click away.
@@ -7096,19 +7248,22 @@ fn a_failed_check_says_why(cx: &mut TestAppContext) {
     cx.update(init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
-    let failed = update_state(10, Outcome::Failed("rate limited".into()), None);
+    ask_for_updates(&view, cx);
+    let failed = update_state(1, Outcome::Failed("rate limited".into()), None);
     update(&view, cx, |app, cx| {
-        app.update_watch.asked = true;
-        app.react_to_updates(&failed, "0.14.0", Slot::default(), cx);
+        app.follow_updates(failed, "0.14.0", Slot::default(), cx);
     });
     draw(cx);
     assert!(cx.debug_bounds("toast-open-logs").is_some());
     assert!(cx.debug_bounds("toast-check-again").is_some());
-    let asked = read(&view, cx, |app| app.update_watch.asked);
-    assert!(!asked, "answered");
+    assert!(
+        !read(&view, cx, |app| app.update_watch.is_asking()),
+        "answered"
+    );
 }
 
-/// An answer leaves on its own: the window wakes when it runs out.
+/// An answer leaves on its own after 8 s, and under Reduce Motion too: the
+/// strip only stops draining.
 #[gpui_kit::test]
 fn an_answer_leaves_on_its_own(cx: &mut TestAppContext) {
     use crate::update_channel::Slot;
@@ -7116,18 +7271,27 @@ fn an_answer_leaves_on_its_own(cx: &mut TestAppContext) {
     cx.update(init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
-    let up = update_state(10, Outcome::UpToDate("0.14.0".into()), None);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    ask_for_updates(&view, cx);
+    let up = update_state(1, Outcome::UpToDate("0.14.0".into()), None);
     update(&view, cx, |app, cx| {
-        app.update_watch.asked = true;
-        app.react_to_updates(&up, "0.14.0", Slot::default(), cx);
+        app.follow_updates(up, "0.14.0", Slot::default(), cx);
     });
     draw(cx);
+    let full = cx.debug_bounds("toast-update").expect("answer").size.width;
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(5));
     cx.run_until_parked();
+    draw(cx);
     assert!(
         !read(&view, cx, |app| app.toasts.is_empty()),
         "still reading"
+    );
+    let strip = cx.debug_bounds("toast-update-timer").expect("strip");
+    // The card's border lies outside the strip: within two pixels is full.
+    assert!(
+        strip.size.width >= full - px(2.),
+        "Reduce Motion: the strip holds still"
     );
     cx.executor()
         .advance_clock(std::time::Duration::from_secs(4));
@@ -7138,6 +7302,74 @@ fn an_answer_leaves_on_its_own(cx: &mut TestAppContext) {
         "gone after 8 s"
     );
     assert!(cx.debug_bounds("toast-update").is_none());
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+}
+
+/// The toasts sit above each screen's footer: on Review they never cover
+/// Export, Unmark all, Back or the removal button.
+#[gpui_kit::test]
+fn a_toast_never_covers_the_review_footer(cx: &mut TestAppContext) {
+    use crate::update_channel::Slot;
+    use crate::updater::Outcome;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx, _tree) = review_with_tree(temp.path(), cx);
+    // Short enough that a stack anchored to the window would reach the
+    // footer.
+    cx.simulate_resize(gpui_kit::size(px(900.), px(420.)));
+    ask_for_updates(&view, cx);
+    let failed = update_state(1, Outcome::Failed("timed out".into()), None);
+    update(&view, cx, |app, cx| {
+        app.follow_updates(failed, "0.14.0", Slot::default(), cx);
+    });
+    draw(cx);
+    let stack = cx.debug_bounds("toast-stack").expect("the answer");
+    let footer = cx.debug_bounds("review-footer").expect("footer");
+    assert!(
+        stack.bottom() <= footer.top(),
+        "the stack ends above the footer: {stack:?} over {footer:?}"
+    );
+    for id in ["unmark-all", "back", "commit"] {
+        let button = cx.debug_bounds(id).expect(id);
+        assert!(!stack.intersects(&button), "{id} is clear");
+    }
+}
+
+/// The ready card gives way while a removal runs (Restart would wait for
+/// it anyway); the strip's chip still offers the release. The pointer that
+/// rested on the card is forgotten with it, so the next answer still runs
+/// out.
+#[gpui_kit::test]
+fn a_removal_keeps_the_ready_card_down(cx: &mut TestAppContext) {
+    use crate::update_channel::Slot;
+    use crate::updater::Outcome;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let ready =
+        update_state(1, Outcome::Downloaded("0.15.0".into()), Some("0.15.0"));
+    update(&view, cx, |app, cx| {
+        app.follow_updates(ready, "0.14.0", Slot::default(), cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("toast-update").is_some());
+    update(&view, cx, |app, cx| {
+        // The pointer is on the card when the removal starts.
+        let now = cx.background_executor().now();
+        app.toasts.set_hovered(true, now);
+        app.run = Some(disktree_core::removal::spawn(
+            disktree_core::removal::Plan::default(),
+            RemovalMode::Trash,
+        ));
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("toast-update").is_none());
+    assert!(cx.debug_bounds(crate::views::UPDATE_CHIP_ID).is_some());
+    assert!(
+        !read(&view, cx, |app| app.toasts.is_hovered()),
+        "a stack that is not drawn holds no pointer"
+    );
+    update(&view, cx, |app, _| app.run = None);
 }
 
 /// A window over the fixture, on the review screen with `junk` marked, and

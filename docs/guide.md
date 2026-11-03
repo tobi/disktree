@@ -526,10 +526,17 @@ once from **Restart to update**. Nothing is sent but the request for the
 release list.
 
 **Check for Updates…** (in the PwrDisk menu on macOS, the strip's menu
-elsewhere) checks at once and answers in a toast at the bottom left of the
-main window: up to date, an update ready to install with **Restart to
-update**, or why the check failed. A check on its own says nothing unless it
-has downloaded an update, and then says so once for each version.
+elsewhere) checks at once and answers in a toast at the lower left of the
+main window, above the screen's buttons. While it works the toast says so,
+and while it downloads it shows how far along it is. Then it answers: up
+to date, an update ready to install, or why the check failed. An answer
+goes after eight seconds; resting the pointer on it holds it.
+
+An update ready to install, found by any check, stays in a toast with
+**Restart to update** until you restart or choose **Later**. Later puts away
+that version only: a newer one, or Check for Updates…, brings it back. The
+title strip offers it too, as **0.15.0 ready · Restart**, Later or not.
+Restarting forgets your marks, and it waits while a removal runs.
 
 **Shift-U** opens the Updates panel: the version, what the last check found,
 **Check now**, and the release channel:

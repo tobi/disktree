@@ -328,6 +328,15 @@ fn session(app: &Disktree, cx: &App) -> Session {
 /// "macOS 26.1 (aarch64)": the release from the system's own files, as
 /// PwrRoute reads it; Windows by name only.
 pub fn os_description() -> String {
+    // Read once: Settings collects the diagnostics again whenever the
+    // updater's state moves, and the OS does not change under a running
+    // process.
+    static DESCRIPTION: std::sync::OnceLock<String> =
+        std::sync::OnceLock::new();
+    DESCRIPTION.get_or_init(read_os_description).clone()
+}
+
+fn read_os_description() -> String {
     let arch = std::env::consts::ARCH;
     let version = if cfg!(target_os = "macos") {
         fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")

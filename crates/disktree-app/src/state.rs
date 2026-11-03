@@ -486,11 +486,13 @@ pub struct Disktree {
     /// The running removal as it started.
     run_start: Option<crate::ledger::Start>,
     pub notice: Option<(String, Status)>,
-    /// Toasts over the window's bottom right: the updater's answers.
+    /// Toasts over the lower left of the screen's content: the updater's
+    /// answers, which run out.
     pub toasts: crate::toasts::Toasts,
     /// Wakes when the next toast runs out.
     pub toast_timer: Option<gpui_kit::Task<()>>,
-    /// What the updater has said that the toasts have answered.
+    /// What the updater has said as of its last change: the live card, the
+    /// ready release and whether it was put away.
     pub update_watch: crate::toasts::UpdateWatch,
 
     pub find: String,
@@ -1486,9 +1488,11 @@ impl Disktree {
         self.run.is_none()
     }
 
-    /// Install the downloaded release and start again. Returns only when
-    /// that could not start, or a removal is running, which the notice then
-    /// says.
+    /// Install the downloaded release and start again, from the toast,
+    /// the strip's chip or Settings. Refused while a removal runs, which
+    /// the notice then says. Velopack exits the process without the quit
+    /// hooks, so the window's frame is saved here first. A restart that
+    /// fails comes back through the updater's state (`toasts.rs`).
     pub fn restart_to_update(&mut self, cx: &mut Context<'_, Self>) {
         if !self.can_restart_to_update() {
             self.notice = Some((
@@ -1498,11 +1502,8 @@ impl Disktree {
             cx.notify();
             return;
         }
-        if let Err(error) = crate::updater::restart_to_update() {
-            self.notice =
-                Some((format!("Cannot update: {error}"), Status::Warning));
-            cx.notify();
-        }
+        crate::window_frame::save();
+        crate::updater::restart_in_background();
     }
 
     /// Open the Power Efficiency menu on the current preset, or close it.
@@ -4461,7 +4462,7 @@ impl Disktree {
 /// when asked. Re-sample before a transition starts and on each of its
 /// frames so a running app honors an OS toggle too. Base preserves explicit
 /// application overrides.
-fn prefers_reduced_motion(cx: &mut gpui_kit::App) -> bool {
+pub fn prefers_reduced_motion(cx: &mut gpui_kit::App) -> bool {
     gpui_kit::base::apply_system_reduce_motion(cx);
     cx.reduce_motion()
 }

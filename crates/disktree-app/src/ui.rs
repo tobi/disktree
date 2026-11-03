@@ -125,9 +125,11 @@ pub mod size {
     /// A toast: PwrDisk's 330 px, a little under the family's 380 to 460,
     /// since it sits over the treemap.
     pub const TOAST: Rems = Rems(20.625);
-    /// How far the toasts sit above the window's bottom edge: clear of the
-    /// key bar.
-    pub const TOAST_BOTTOM: Rems = Rems(3.0);
+    /// The answer's countdown strip along a toast's top edge: the family's
+    /// 2 px.
+    pub const TOAST_TIMER: Rems = Rems(0.125);
+    /// A toast's progress track: the family's 4 px.
+    pub const TOAST_TRACK: Rems = Rems(0.25);
     /// The key column of the keyboard overlay.
     pub const KEY_LANE: Rems = Rems(7.0);
     /// A document's measure (the changelog): about 90 characters.

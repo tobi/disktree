@@ -26,10 +26,12 @@
 //! ([`Held`], `update-download.json` beside the other settings); after
 //! another slot is picked it is neither shown nor installed.
 //!
-//! What a check found is kept in [`state`] for the Updates panel, which
-//! [`install`] redraws when it changes; apart from the channel and the held
-//! download nothing is persisted, so a fresh launch starts at "not checked
-//! yet".
+//! What a check found is kept in [`state`] for the Updates panel and the
+//! main window's notices (`toasts.rs`), which [`install`] tells when it
+//! changes. A download's percent is a [`Change::Progress`]: only what draws
+//! progress follows it, so Settings is not rebuilt a hundred times a
+//! download. Apart from the channel and the held download nothing is
+//! persisted, so a fresh launch starts at "not checked yet".
 
 use std::{
     cmp::Ordering as Precedence,
@@ -68,6 +70,9 @@ pub const CHECK_EVERY: Duration = Duration::from_hours(6);
 /// One check at a time: a second "Check for Updates…" while the startup
 /// check is still downloading would only contend for Velopack's lock.
 static CHECKING: AtomicBool = AtomicBool::new(false);
+
+/// A restart to update is under way: a second press waits for it.
+static RESTARTING: AtomicBool = AtomicBool::new(false);
 
 /// A check asked for while one was running, to run when it ends.
 static AGAIN: Mutex<Option<Trigger>> = Mutex::new(None);
@@ -221,6 +226,39 @@ pub struct State {
     pub releases: Option<Result<Vec<Release>, String>>,
     /// The package downloaded and not installed yet, and its slot.
     pub held: Option<Held>,
+    /// The download running now, if the check found one to fetch.
+    pub download: Option<Download>,
+    /// How many checks have finished this launch: Check for Updates…
+    /// waits for the next one (`toasts.rs`).
+    pub finished: u64,
+    /// Restart to update was pressed and has not failed: the process is
+    /// about to be replaced ([`restart_in_background`]).
+    pub restarting: bool,
+    /// Why the last restart to update did not happen, until the next try.
+    pub restart_failed: Option<String>,
+}
+
+/// A download in progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Download {
+    /// Velopack's version: "0.1.1".
+    pub version: String,
+    /// Older than this copy: Restart to switch installs it.
+    pub switch_back: bool,
+    /// 0-100, once Velopack has said.
+    pub percent: Option<u8>,
+}
+
+/// What moved in [`state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A check started or finished, a download landed, a restart began or
+    /// failed, or the channel changed: everything that reads the state
+    /// redraws.
+    State,
+    /// Only [`State::download`]: a download began or its percent moved.
+    /// Only what draws progress follows it.
+    Progress,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -228,6 +266,10 @@ static STATE: Mutex<State> = Mutex::new(State {
     last: None,
     releases: None,
     held: None,
+    download: None,
+    finished: 0,
+    restarting: false,
+    restart_failed: None,
 });
 
 /// The release channel as `update-channel.json` has it; [`set_selection`]
@@ -280,7 +322,7 @@ pub fn installed_version() -> String {
 }
 
 /// Wakes [`install`]'s task after every change to [`state`].
-static CHANGED: OnceLock<async_channel::Sender<()>> = OnceLock::new();
+static CHANGED: OnceLock<async_channel::Sender<Change>> = OnceLock::new();
 
 /// Where the channel and the held download are kept: PwrDisk's settings
 /// folder, beside the Power Efficiency preset.
@@ -290,24 +332,43 @@ pub fn settings_dir() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The download running now: what a progress tick changed, without
+/// cloning the rest of the state.
+pub fn download() -> Option<Download> {
+    STATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .download
+        .clone()
+}
+
 /// The updater's state as it stands.
 pub fn state() -> State {
     STATE.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 fn set_state(edit: impl FnOnce(&mut State)) {
+    changed(Change::State, edit);
+}
+
+/// [`set_state`] for the download's percent: wakes only what draws it.
+fn set_progress(edit: impl FnOnce(&mut Option<Download>)) {
+    changed(Change::Progress, |state| edit(&mut state.download));
+}
+
+fn changed(change: Change, edit: impl FnOnce(&mut State)) {
     edit(&mut STATE.lock().unwrap_or_else(PoisonError::into_inner));
     if let Some(changed) = CHANGED.get() {
-        let _ = changed.try_send(());
+        let _ = changed.try_send(change);
     }
 }
 
 /// Reads the saved channel, runs `changed` (which redraws the window)
-/// whenever a check starts or finishes, checks again every [`CHECK_EVERY`]
-/// on a Velopack install, and applies a downloaded update when the app
-/// quits. Call once, after the window is open.
-pub fn install(cx: &App, changed: impl Fn(&mut App) + 'static) {
-    let (tx, rx) = async_channel::unbounded::<()>();
+/// whenever the state moves, saying how, checks again every
+/// [`CHECK_EVERY`] on a Velopack install, and applies a downloaded update
+/// when the app quits. Call once, after the window is open.
+pub fn install(cx: &App, changed: impl Fn(Change, &mut App) + 'static) {
+    let (tx, rx) = async_channel::unbounded::<Change>();
     if CHANGED.set(tx).is_err() {
         return;
     }
@@ -324,8 +385,8 @@ pub fn install(cx: &App, changed: impl Fn(&mut App) + 'static) {
     })
     .detach();
     cx.spawn(async move |cx| {
-        while rx.recv().await.is_ok() {
-            cx.update(|cx| changed(cx));
+        while let Ok(change) = rx.recv().await {
+            cx.update(|cx| changed(change, cx));
         }
     })
     .detach();
@@ -400,10 +461,7 @@ pub fn check_in_background(trigger: Trigger) {
             let outcome = check_and_download(trigger);
             CHECKING.store(false, Ordering::Release);
             log(trigger, &outcome);
-            set_state(|state| {
-                state.checking = false;
-                state.last = Some((SystemTime::now(), outcome));
-            });
+            set_state(|state| finish(state, outcome));
             let again =
                 AGAIN.lock().unwrap_or_else(PoisonError::into_inner).take();
             if let Some(again) = again {
@@ -414,18 +472,23 @@ pub fn check_in_background(trigger: Trigger) {
         CHECKING.store(false, Ordering::Release);
         let outcome = Outcome::Failed(error.to_string());
         log(trigger, &outcome);
-        set_state(|state| {
-            state.checking = false;
-            state.last = Some((SystemTime::now(), outcome));
-        });
+        set_state(|state| finish(state, outcome));
     }
+}
+
+/// A check ended with `outcome`.
+fn finish(state: &mut State, outcome: Outcome) {
+    state.checking = false;
+    state.download = None;
+    state.finished += 1;
+    state.last = Some((SystemTime::now(), outcome));
 }
 
 /// Installs the downloaded release and starts PwrDisk again: the Updates
 /// panel's Restart to update (or Restart to switch, for an older release).
 /// Velopack swaps the package and relaunches, so this returns only when
 /// there is nothing to apply or it could not start.
-pub fn restart_to_update() -> Result<(), String> {
+fn restart_to_update() -> Result<(), String> {
     let locator =
         locator::auto_locate_app_manifest(LocationContext::FromCurrentExe)
             .map_err(|e| e.to_string())?;
@@ -446,9 +509,60 @@ pub fn restart_to_update() -> Result<(), String> {
                 .get_update_pending_restart()
                 .ok_or_else(|| "no downloaded update to install".to_owned())?,
         };
-    manager
-        .apply_updates_and_restart(&pending)
-        .map_err(|e| e.to_string())
+    // The quit hook hands the same package off too. This runs off the GPUI
+    // thread, so a Quit can land before Velopack exits the process: claim
+    // the hand-off, or two updaters race for Velopack's lock.
+    if !first_hand_off(&HANDED_OFF) {
+        return Err("PwrDisk is already quitting to install it".to_owned());
+    }
+    manager.apply_updates_and_restart(&pending).map_err(|e| {
+        // Nothing was handed off: the next quit or restart may try.
+        HANDED_OFF.store(false, Ordering::SeqCst);
+        e.to_string()
+    })
+}
+
+/// [`restart_to_update`] on a thread of its own: Velopack exits this
+/// process once the updater is waiting, so nothing waits on it, and the
+/// window keeps drawing meanwhile. The toast, the strip's chip and
+/// Settings all restart through this. One restart at a time
+/// ([`State::restarting`]); a failed one clears it and says why, so they
+/// offer Restart again.
+pub fn restart_in_background() {
+    if !begin(&RESTARTING) {
+        return;
+    }
+    set_state(|state| {
+        state.restarting = true;
+        state.restart_failed = None;
+    });
+    let failed = |why: String| {
+        log::warn!("updates: could not restart to update: {why}");
+        RESTARTING.store(false, Ordering::Release);
+        set_state(|state| restart_ended(state, why));
+    };
+    let spawned = thread::Builder::new()
+        .name("pwrdisk-restart".to_owned())
+        .spawn(move || {
+            if let Err(why) = restart_to_update() {
+                failed(why);
+            }
+        });
+    if let Err(error) = spawned {
+        failed(error.to_string());
+    }
+}
+
+/// True for the first caller until `guard` is cleared: a double-clicked
+/// Restart starts Velopack's apply once.
+fn begin(guard: &AtomicBool) -> bool {
+    !guard.swap(true, Ordering::AcqRel)
+}
+
+/// A restart that did not happen: offered again, with why.
+fn restart_ended(state: &mut State, why: String) {
+    state.restarting = false;
+    state.restart_failed = Some(why);
 }
 
 /// A downloaded package and the slot it was downloaded for. Velopack keeps
@@ -628,7 +742,7 @@ fn check_and_download(trigger: Trigger) -> Outcome {
     match manager.check_for_updates() {
         Ok(UpdateCheck::UpdateAvailable(update)) => {
             let target = &update.TargetFullRelease;
-            if let Err(error) = manager.download_updates(&update, None) {
+            if let Err(error) = fetch(&manager, &update, switch_back) {
                 return Outcome::Failed(error.to_string());
             }
             let held = Held {
@@ -650,6 +764,49 @@ fn check_and_download(trigger: Trigger) -> Outcome {
         }
         Err(error) => Outcome::Failed(error.to_string()),
     }
+}
+
+/// Downloads `update`, keeping [`State::download`]'s percent current. Each
+/// whole percent is one [`Change::Progress`], so Velopack's finer reports
+/// cost nothing on the GPUI thread.
+fn fetch(
+    manager: &UpdateManager,
+    update: &velopack::UpdateInfo,
+    switch_back: bool,
+) -> Result<(), velopack::Error> {
+    let version = update.TargetFullRelease.Version.clone();
+    set_progress(|download| {
+        *download = Some(Download {
+            version,
+            switch_back,
+            percent: None,
+        });
+    });
+    let (progress, percents) = std::sync::mpsc::channel::<i16>();
+    // Ends when Velopack drops the sender, at the end of the download.
+    let follow = thread::Builder::new()
+        .name("pwrdisk-download".to_owned())
+        .spawn(move || {
+            let mut last = None;
+            for raw in percents {
+                if let Some(percent) = next_percent(last, raw) {
+                    last = Some(percent);
+                    set_progress(|download| {
+                        if let Some(download) = download {
+                            download.percent = Some(percent);
+                        }
+                    });
+                }
+            }
+        });
+    manager.download_updates(update, follow.is_ok().then_some(progress))
+}
+
+/// The percent to show after Velopack says `raw`, when it moved from
+/// `last`; `None` when it did not.
+fn next_percent(last: Option<u8>, raw: i16) -> Option<u8> {
+    let percent = u8::try_from(raw.clamp(0, 100)).unwrap_or(0);
+    (last != Some(percent)).then_some(percent)
 }
 
 /// Whether `held`'s package is still in Velopack's packages directory.
@@ -825,6 +982,50 @@ mod tests {
         let handed_off = AtomicBool::new(false);
         assert!(first_hand_off(&handed_off));
         assert!(!first_hand_off(&handed_off), "a second updater");
+    }
+
+    #[test]
+    fn a_restart_runs_once_until_it_fails() {
+        let guard = AtomicBool::new(false);
+        assert!(begin(&guard));
+        assert!(!begin(&guard), "a second press waits");
+        // A failure clears the guard and says why, so Restart is offered
+        // again.
+        let mut state = State {
+            restarting: true,
+            ..State::default()
+        };
+        guard.store(false, Ordering::Release);
+        restart_ended(&mut state, "no updater".to_owned());
+        assert!(!state.restarting);
+        assert_eq!(state.restart_failed.as_deref(), Some("no updater"));
+        assert!(begin(&guard), "offered again");
+    }
+
+    #[test]
+    fn progress_moves_once_per_whole_percent() {
+        assert_eq!(next_percent(None, 0), Some(0));
+        assert_eq!(next_percent(Some(0), 0), None, "the same percent");
+        assert_eq!(next_percent(Some(0), 42), Some(42));
+        assert_eq!(next_percent(Some(42), 250), Some(100), "clamped");
+        assert_eq!(next_percent(None, -3), Some(0), "clamped");
+    }
+
+    #[test]
+    fn a_finished_check_clears_its_download_and_counts() {
+        let mut state = State {
+            checking: true,
+            download: Some(Download {
+                version: "0.15.0".into(),
+                switch_back: false,
+                percent: Some(99),
+            }),
+            ..State::default()
+        };
+        finish(&mut state, Outcome::Downloaded("0.15.0".into()));
+        assert!(!state.checking);
+        assert_eq!(state.download, None);
+        assert_eq!(state.finished, 1);
     }
 
     #[test]
