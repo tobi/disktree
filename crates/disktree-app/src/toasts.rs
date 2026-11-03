@@ -808,6 +808,12 @@ pub fn stack(
         .flex()
         .flex_col()
         .gap(space::SM)
+        // The stack floats over the treemap and the lists. Without this the
+        // hit test reaches through it: the tile under a card kept its
+        // tooltip over the card, and a click or a scroll on the card
+        // selected or zoomed what lay beneath. Scroll too, since nothing
+        // here scrolls and a zoom behind the card is never what was meant.
+        .occlude()
         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
             this.set_toasts_hovered(*hovered, cx);
         }));

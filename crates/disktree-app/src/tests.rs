@@ -7911,6 +7911,80 @@ fn a_toast_never_covers_the_review_footer(cx: &mut TestAppContext) {
     }
 }
 
+/// A toast drawn over the treemap takes the pointer: the tile under it
+/// shows no tooltip while the pointer is on the card, and a click or a
+/// scroll on the card never reaches the mosaic.
+#[gpui_kit::test]
+fn a_toast_hides_the_treemap_under_it(cx: &mut TestAppContext) {
+    use crate::update_channel::Slot;
+    use crate::updater::Outcome;
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    ask_for_updates(&view, cx);
+    let failed = update_state(1, Outcome::Failed("timed out".into()), None);
+    update(&view, cx, |app, cx| {
+        app.follow_updates(failed, "0.14.0", Slot::default(), cx);
+    });
+    draw(cx);
+    let stack = cx.debug_bounds("toast-stack").expect("the answer");
+    let treemap = cx.debug_bounds("treemap").expect("the mosaic");
+    // On the card's padding, clear of its buttons, and over the mosaic.
+    let on_card = stack.origin + Point::new(px(6.), px(6.));
+    assert!(treemap.contains(&on_card), "{stack:?} over {treemap:?}");
+
+    // Into the mosaic first, so there is a tooltip for the card to end.
+    let beside = Point::new(stack.right() + px(20.), on_card.y);
+    assert!(treemap.contains(&beside), "{beside:?} in {treemap:?}");
+    cx.simulate_mouse_move(beside, None, Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("cursor-tooltip").is_some(), "a tile's card");
+
+    cx.simulate_mouse_move(on_card, None, Modifiers::none());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("cursor-tooltip").is_none(),
+        "the pointer is on the toast, not the tile under it"
+    );
+    assert!(
+        read(&view, cx, |app| app.hovered.is_none()),
+        "nothing hovered"
+    );
+    assert!(
+        read(&view, cx, |app| app.toasts.is_hovered()),
+        "the stack is"
+    );
+
+    let (selected, zoom) =
+        read(&view, cx, |app| (app.selected.clone(), app.view));
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: on_card,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: on_card,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+    });
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: on_card,
+        delta: gpui_kit::ScrollDelta::Lines(Point::new(0., 3.)),
+        modifiers: Modifiers::none(),
+        touch_phase: gpui_kit::TouchPhase::Moved,
+    });
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| (app.selected.clone(), app.view)),
+        (selected, zoom),
+        "a click or a scroll on the card leaves the mosaic alone"
+    );
+}
+
 /// The ready card gives way while a removal runs (Restart would wait for
 /// it anyway); the strip's chip still offers the release. The pointer that
 /// rested on the card is forgotten with it, so the next answer still runs
