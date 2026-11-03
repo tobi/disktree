@@ -164,8 +164,8 @@ pub fn done(
     let theme = cx.omarchy().clone();
     let totals = app.run_list.totals();
     let mut subtitle = format!("{} removed", totals.removed);
-    if totals.failed > 0 {
-        let _ = write!(subtitle, " \u{b7} {} failed", totals.failed);
+    if totals.failed_all() > 0 {
+        let _ = write!(subtitle, " \u{b7} {} failed", totals.failed_all());
     }
     let skipped = totals.total - totals.removed - totals.failed;
     if skipped > 0 {
@@ -335,7 +335,8 @@ fn list_column(
                             }
                             Status::Waiting => Row::Waiting,
                         };
-                        let folder = folder_line(app, &item.path, budget);
+                        let folder =
+                            folder_line(app, &item.target.path, budget);
                         Some(row(
                             index, item, state, folder, compact, app, &theme,
                             cx,
@@ -519,11 +520,11 @@ fn row(
 ) -> Stateful<Div> {
     let accent = palette::category_accent(theme, item.category);
     let kind = item.kind();
-    let full = app.display_path(&item.path);
+    let full = app.display_path(&item.target.path);
     let label = state.label(app.removal_mode);
     let name = app
         .path_style()
-        .file_name(&item.path)
+        .file_name(&item.target.path)
         .map_or_else(|| full.clone(), |name| name.to_string_lossy().into());
     let second = match state {
         Row::Failed(reason) => {
@@ -539,7 +540,7 @@ fn row(
         .role(gpui_kit::Role::ListItem)
         .aria_label(format!(
             "{full}; {}; {}{label}",
-            human_bytes(item.bytes),
+            human_bytes(item.target.bytes),
             kind.map_or_else(String::new, |kind| format!("{kind}; "))
         ))
         .relative()
@@ -606,7 +607,7 @@ fn row(
                 .flex()
                 .justify_end()
                 .text_color(theme.bright)
-                .child(human_bytes(item.bytes)),
+                .child(human_bytes(item.target.bytes)),
         )
         .when(!compact, |row| {
             row.child(
@@ -693,8 +694,8 @@ fn sidebar(
         let now = app.run_list.current().map(|index| {
             let item = &app.run_list.items[index];
             let style = app.path_style();
-            let name = style.file_name(&item.path).map_or_else(
-                || app.display_path(&item.path),
+            let name = style.file_name(&item.target.path).map_or_else(
+                || app.display_path(&item.target.path),
                 |name| name.to_string_lossy().into_owned(),
             );
             div()

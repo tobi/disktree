@@ -640,6 +640,7 @@ impl Disktree {
         let Some(agent) = &mut self.agent else {
             return;
         };
+        let totals = self.run_list.totals();
         let freed = space_info(&self.root_path)
             .ok()
             .zip(self.space_baseline)
@@ -651,10 +652,9 @@ impl Disktree {
                 RemovalMode::Trash => "trash".to_string(),
                 RemovalMode::Permanent => "permanent".to_string(),
             },
-            removed: usize::try_from(self.run_summary.removed)
-                .unwrap_or(usize::MAX),
-            failed: self.run_summary.failed,
-            bytes: self.run_summary.bytes,
+            removed: totals.removed,
+            failed: totals.failed_all(),
+            bytes: totals.reported_done,
             freed,
             at: now_seconds(),
         });

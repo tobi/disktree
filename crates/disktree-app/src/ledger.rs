@@ -8,16 +8,14 @@
 //! first two; the third runs from the first cohort's start to the last
 //! one's finish, so it is a measurement and never a sum of guesses.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use disktree_core::removal::{RemovalMode, Target};
+use disktree_core::removal::RemovalMode;
 
-/// A removal as it started: what it targets and the free space before.
+/// A removal as it started: how, and the free space before. What it
+/// targets and what became of each is the run's list, `run_list`.
 #[derive(Clone, Debug)]
 pub struct Start {
-    pub targets: Vec<Target>,
     pub mode: RemovalMode,
     /// Bytes available on the scanned volume, measured as it started.
     pub before: Option<u64>,
@@ -121,26 +119,6 @@ impl Ledger {
             finished: last.finished,
         })
     }
-}
-
-/// The paths a run removed: its targets whose outcome was success. A set,
-/// since an agent can mark tens of thousands of paths and this runs on
-/// the UI thread as the removal finishes.
-pub fn removed(
-    start: &Start,
-    log: &[(PathBuf, Result<(), String>)],
-) -> Vec<Target> {
-    let done: HashSet<&Path> = log
-        .iter()
-        .filter(|(_, outcome)| outcome.is_ok())
-        .map(|(path, _)| path.as_path())
-        .collect();
-    start
-        .targets
-        .iter()
-        .filter(|target| done.contains(target.path.as_path()))
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]

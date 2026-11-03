@@ -322,15 +322,6 @@ pub struct History {
 /// through, and small enough that pruning after a scan costs nothing.
 const HISTORY_DEPTH: usize = 100;
 
-/// Result of the removal run, summarised for the final screen.
-#[derive(Clone, Debug, Default)]
-pub struct RunSummary {
-    pub total: usize,
-    pub removed: u64,
-    pub bytes: u64,
-    pub failed: usize,
-}
-
 /// Scan-derived display estimates; never cached removal authorization.
 #[derive(Default)]
 struct AccountingCache {
@@ -487,10 +478,8 @@ pub struct Disktree {
     /// Stop was asked for: the removal ends after the current item.
     pub stop_requested: bool,
     pub run_epoch: u64,
-    pub run_summary: RunSummary,
-    pub run_log: Vec<(PathBuf, Result<(), String>)>,
-    /// Every target of the latest run and what happened to it, which
-    /// Removing and Done draw.
+    /// Every target of the latest run and what happened to it: what
+    /// Removing and Done draw, and the run's only record of its outcome.
     pub run_list: crate::run_list::RunList,
     pub run_scroll: gpui_kit::UniformListScrollHandle,
     /// Free bytes on the scanned volume as the latest run started, for
@@ -760,8 +749,6 @@ impl Disktree {
             run: None,
             stop_requested: false,
             run_epoch: 0,
-            run_summary: RunSummary::default(),
-            run_log: Vec::new(),
             run_list: crate::run_list::RunList::default(),
             run_scroll: gpui_kit::UniformListScrollHandle::new(),
             run_free_before: None,
@@ -3516,18 +3503,12 @@ impl Disktree {
         self.space_baseline = before.or(self.space_baseline);
         self.ledger.begin(self.scans_done);
         self.run_start = Some(crate::ledger::Start {
-            targets: plan.targets.clone(),
             mode: self.removal_mode,
             before: before.map(|space| space.available),
             started: std::time::SystemTime::now(),
         });
         self.run_epoch += 1;
         let epoch = self.run_epoch;
-        self.run_summary = RunSummary {
-            total: plan.targets.len(),
-            ..RunSummary::default()
-        };
-        self.run_log.clear();
         self.run_list =
             crate::run_list::RunList::new(self.run_items(&plan.targets));
         self.run_scroll = gpui_kit::UniformListScrollHandle::new();
@@ -3584,37 +3565,43 @@ impl Disktree {
         while let Some(event) = run.poll() {
             changed = true;
             match event {
-                RemovalEvent::Start { total } => self.run_summary.total = total,
-                RemovalEvent::Item {
-                    path,
-                    bytes,
-                    outcome,
-                } => {
-                    if outcome.is_ok() {
-                        self.run_summary.removed += 1;
-                        self.run_summary.bytes += bytes;
-                    } else {
-                        self.run_summary.failed += 1;
-                    }
+                // The list was built from the plan, so it already holds
+                // the total the worker announces.
+                RemovalEvent::Start { .. } => {}
+                RemovalEvent::Item { path, outcome, .. } => {
                     if self.run_list.settle(&path, &outcome).is_some() {
                         self.scroll_to_focus();
                     }
-                    self.run_log.push((path, outcome));
                 }
                 RemovalEvent::Done {
                     removed,
                     bytes,
                     failed,
                 } => {
-                    self.run_summary.removed = removed;
-                    self.run_summary.bytes = bytes;
-                    self.run_summary.failed = failed;
                     // Counts only: the paths removed are the user's.
                     log::info!(
                         target: "pwrdisk::removal",
                         "removal finished: {removed} removed, {bytes} bytes, \
                          {failed} failed"
                     );
+                    // The worker's own tally, kept only to check the list:
+                    // a report the list could not place would show here.
+                    let totals = self.run_list.totals();
+                    if (
+                        totals.removed as u64,
+                        totals.reported_done,
+                        totals.failed_all(),
+                    ) != (removed, bytes, failed)
+                    {
+                        log::warn!(
+                            target: "pwrdisk::removal",
+                            "the run's list counts {} removed, {} bytes, \
+                             {} failed; the worker counted otherwise",
+                            totals.removed,
+                            totals.reported_done,
+                            totals.failed_all()
+                        );
+                    }
                     finished = true;
                 }
             }
@@ -3730,13 +3717,14 @@ impl Disktree {
         let Some(start) = self.run_start.take() else {
             return Vec::new();
         };
-        let removed = crate::ledger::removed(&start, &self.run_log);
+        let removed: Vec<_> = self.run_list.removed().cloned().collect();
         let private = self.private_estimate(&removed);
+        let totals = self.run_list.totals();
         self.ledger.push(crate::ledger::Cohort {
             mode: start.mode,
-            removed: removed.len() as u64,
-            failed: self.run_summary.failed,
-            reported: removed.iter().map(|target| target.bytes).sum(),
+            removed: totals.removed as u64,
+            failed: totals.failed_all(),
+            reported: totals.reported_done,
             private,
             before: start.before,
             after: space_info(&self.root_path)
@@ -3801,8 +3789,7 @@ impl Disktree {
                     .and_then(|resolver| resolver.resolve(&target.path))
                     .map(|(_, node)| node);
                 crate::run_list::Item {
-                    path: target.path.clone(),
-                    bytes: target.bytes,
+                    target: target.clone(),
                     category: node
                         .map(|node| node.category)
                         .unwrap_or_default(),

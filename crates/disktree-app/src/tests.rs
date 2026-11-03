@@ -1090,7 +1090,7 @@ fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
     assert!(finished, "the removal finished");
     draw(cx);
 
-    let summary = read(&view, cx, |app| app.run_summary.clone());
+    let summary = read(&view, cx, |app| app.run_list.totals());
     assert_eq!(summary.removed, 1, "{summary:?}");
     assert_eq!(summary.failed, 0, "{summary:?}");
     assert!(
@@ -5880,7 +5880,7 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     assert!(!root.join("junk").exists());
     assert!(root.join("keep/notes.txt").exists());
     assert!(root.join(".cache/blob.bin").exists());
-    assert_eq!(read(&view, cx, |app| app.run_summary.failed), 0);
+    assert_eq!(read(&view, cx, |app| app.run_list.totals().failed), 0);
 
     // Hanging up takes the name out of the header.
     drop(link);
@@ -6494,10 +6494,10 @@ fn the_removal_list_stays_on_screen_from_start_to_done(
         assert_eq!(app.run_list.current(), Some(0));
         let cache = items
             .iter()
-            .find(|item| item.path.ends_with(".cache"))
+            .find(|item| item.target.path.ends_with(".cache"))
             .expect("the cache is listed");
         assert_eq!(cache.kind(), Some("regenerable"), "and says why");
-        assert_eq!(cache.bytes, 300_000);
+        assert_eq!(cache.target.bytes, 300_000);
     });
 
     let mut finished = false;
@@ -6604,8 +6604,12 @@ fn the_removal_list_follows_the_item_in_hand_like_the_live_log(
         app.run_list = RunList::new(
             (0..80)
                 .map(|index| Item {
-                    path: path(index),
-                    bytes: 1_000,
+                    target: disktree_core::removal::Target {
+                        path: path(index),
+                        bytes: 1_000,
+                        is_dir: true,
+                        hidden: false,
+                    },
                     category: disktree_core::classify::Category::Other,
                     // Every other row has a kind chip, so rows differ in
                     // what they hold.

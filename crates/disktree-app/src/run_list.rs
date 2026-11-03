@@ -3,11 +3,14 @@
 //!
 //! Removing and Done both draw it, so the list a person approved stays on
 //! screen while it is worked through and after, instead of only the names
-//! of what already went.
+//! of what already went. It is also the run's only record: the counts the
+//! agent is told, the ledger's cohort and what the tree marks as gone are
+//! all read from it, so they cannot disagree with what the screen shows.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use disktree_core::classify::{Category, Reclaim};
+use disktree_core::removal::Target;
 
 /// What happened to one item.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,9 +24,9 @@ pub enum Status {
 /// One target of the run.
 #[derive(Clone, Debug)]
 pub struct Item {
-    pub path: PathBuf,
-    /// Listed allocation when it was marked, as the plan carries it.
-    pub bytes: u64,
+    /// The plan's target, as the worker is given it: its path and the
+    /// listed allocation when it was marked.
+    pub target: Target,
     /// The scan's kind for it, for its colour.
     pub category: Category,
     /// Why the scan thinks its space can be had back, if it does.
@@ -66,19 +69,35 @@ pub struct RunList {
     /// The wheel moved the list since the last poll, which then decides
     /// whether that paused following.
     pub scrolled_by_hand: bool,
+    /// Failures reported against no listed target: the worker could not
+    /// start. Counted, so the run never reads as clean when it was not.
+    unlisted_failures: usize,
 }
 
 /// The run's figures so far, beside what the whole run would come to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Totals {
     pub removed: usize,
+    /// Listed items that failed, so `removed + failed` never exceeds
+    /// `total` and the rest are the ones not reached.
     pub failed: usize,
+    /// Failures reported against no listed item: the worker could not
+    /// start.
+    pub unlisted: usize,
     pub total: usize,
     pub reported_done: u64,
     pub reported_all: u64,
     /// `None` once any item's private part is unknown.
     pub private_done: Option<u64>,
     pub private_all: Option<u64>,
+}
+
+impl Totals {
+    /// Every failure the worker reported, listed or not: what the agent
+    /// and the ledger are told, so a run that never started is not clean.
+    pub const fn failed_all(&self) -> usize {
+        self.failed + self.unlisted
+    }
 }
 
 impl RunList {
@@ -88,17 +107,19 @@ impl RunList {
             next: 0,
             follow: true,
             scrolled_by_hand: false,
+            unlisted_failures: 0,
         }
     }
 
-    /// Record the worker's report on `path`. Returns the item's index.
+    /// Record the worker's report on `path`. Returns the item's index, or
+    /// `None` for a path it never listed, which still counts if it failed.
     pub fn settle(
         &mut self,
         path: &Path,
         outcome: &Result<(), String>,
     ) -> Option<usize> {
         let waiting = |item: &Item| {
-            item.status == Status::Waiting && item.path.as_path() == path
+            item.status == Status::Waiting && item.target.path == path
         };
         // Reports come in plan order, so the expected one is checked
         // first; the whole list only if the worker ever skips ahead.
@@ -107,7 +128,13 @@ impl RunList {
             .get(self.next..)
             .and_then(|rest| rest.iter().position(waiting))
             .map(|offset| self.next + offset)
-            .or_else(|| self.items.iter().position(waiting))?;
+            .or_else(|| self.items.iter().position(waiting));
+        let Some(index) = index else {
+            if outcome.is_err() {
+                self.unlisted_failures += 1;
+            }
+            return None;
+        };
         self.items[index].status = match outcome {
             Ok(()) => Status::Removed,
             Err(error) => Status::Failed(error.clone()),
@@ -131,8 +158,18 @@ impl RunList {
         self.current().or_else(|| self.next.checked_sub(1))
     }
 
+    /// The targets that went, in plan order: what the tree shows as gone
+    /// and the ledger's cohort counts. One pass, however long the list.
+    pub fn removed(&self) -> impl Iterator<Item = &Target> {
+        self.items
+            .iter()
+            .filter(|item| item.status == Status::Removed)
+            .map(|item| &item.target)
+    }
+
     pub fn totals(&self) -> Totals {
         let mut totals = Totals {
+            unlisted: self.unlisted_failures,
             total: self.items.len(),
             private_done: Some(0),
             private_all: Some(0),
@@ -142,12 +179,12 @@ impl RunList {
             sum.zip(part).map(|(sum, part)| sum + part)
         };
         for item in &self.items {
-            totals.reported_all += item.bytes;
+            totals.reported_all += item.target.bytes;
             totals.private_all = add(totals.private_all, item.private);
             match item.status {
                 Status::Removed => {
                     totals.removed += 1;
-                    totals.reported_done += item.bytes;
+                    totals.reported_done += item.target.bytes;
                     totals.private_done =
                         add(totals.private_done, item.private);
                 }
@@ -196,8 +233,12 @@ mod tests {
 
     fn item(path: &str, bytes: u64, private: Option<u64>) -> Item {
         Item {
-            path: PathBuf::from(path),
-            bytes,
+            target: Target {
+                path: path.into(),
+                bytes,
+                is_dir: true,
+                hidden: false,
+            },
             category: Category::Other,
             reclaim: None,
             private,
@@ -270,10 +311,18 @@ mod tests {
         assert_eq!(totals.private_done, Some(4));
         assert_eq!(totals.private_all, Some(54));
         assert_eq!(list.items[1].status, Status::Failed("denied".into()));
-        // A path it never listed changes nothing.
+        // A path it never listed settles no item, but a failure still
+        // counts: it is how the worker says it could not start.
         assert_eq!(list.settle(Path::new(""), &Err("x".into())), None);
+        assert_eq!(list.totals().failed, 1);
+        assert_eq!(list.totals().failed_all(), 2);
+        assert_eq!(list.settle(Path::new(""), &Ok(())), None);
+        assert_eq!(list.totals().failed_all(), 2);
         assert_eq!(list.settle(Path::new("/r/c"), &Ok(())), Some(2));
         assert_eq!(list.current(), None);
+        let removed: Vec<_> =
+            list.removed().map(|target| target.path.clone()).collect();
+        assert_eq!(removed, [Path::new("/r/a"), Path::new("/r/c")]);
     }
 
     #[test]
