@@ -9,6 +9,7 @@ use crate::semantics::AccessibleButton as _;
 use std::path::Path;
 
 use disktree_core::classify::Category;
+use disktree_core::filter::Keep;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::path_style::PathStyle;
 use disktree_core::removal::{Plan, RemovalMode, Target};
@@ -995,10 +996,24 @@ fn explore(
             scanning_panel(app, &theme, cx).into_any_element()
         }
     } else {
-        if app.file_list {
+        let view = if app.file_list {
             crate::file_list::list(app, window, cx).into_any_element()
         } else {
             treemap_view::mosaic(mosaic, app, window, cx).into_any_element()
+        };
+        // A filter that keeps nothing here says so over the empty view,
+        // rather than leave a blank mosaic or list to puzzle over.
+        match app.legend_empty_here() {
+            Some(kept) => div()
+                .relative()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(view)
+                .child(legend_empty(app, kept, &theme, cx))
+                .into_any_element(),
+            None => view,
         }
     };
 
@@ -2273,8 +2288,8 @@ fn power_popup(
 
 // ── trail and legend ────────────────────────────────────────────────────
 
-/// Where you are, as a clickable trail, and what the colours mean, on one
-/// row over the mosaic.
+/// What the scan holds and the search, on one row over the mosaic, and
+/// what the colours mean on the row under it.
 fn trail_and_legend(
     app: &Disktree,
     theme: &Theme,
@@ -2285,13 +2300,21 @@ fn trail_and_legend(
         .flex_row()
         .items_center()
         .gap(space::LG)
-        .px(space::LG)
-        .py(space::SM)
         .child(scan_totals(app, theme));
     if app.find_open || !app.find.is_empty() {
         row = row.child(find_field(app, theme));
     }
-    row.child(div().flex_1()).child(legend(app, theme, cx))
+    // The legend has a row of its own: its chips are filters, so each
+    // must stay reachable, and sharing the row with the search clipped
+    // the last of them whenever the window was not wide.
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .px(space::LG)
+        .py(space::SM)
+        .child(row)
+        .child(legend(app, theme, cx))
 }
 
 /// What the whole scan found, as one quiet line; unreadable paths are
@@ -2308,7 +2331,31 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
     let files = tree.map_or(app.progress.files, |node| node.files);
     let dirs = tree.map_or(app.progress.dirs, |node| u64::from(node.dirs));
     let errors = app.progress.errors;
+    // Filtered, the line says what share of the scan is on screen, in the
+    // bright colour, so a filtered mosaic is never taken for the whole.
+    if tree.is_some() && app.legend.is_active() {
+        let shown = match app.legend_matches.as_deref() {
+            Some(matches) if !app.legend_pending => format!(
+                "Showing {} of {}",
+                human_bytes(matches.bytes),
+                human_bytes(bytes)
+            ),
+            _ => "Filtering\u{2026}".to_owned(),
+        };
+        return div()
+            .debug_selector(|| "scan-totals".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .flex_shrink_0()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(div().text_color(theme.bright).child(shown))
+            .child(format!("\u{00b7} {}", app.legend.summary()));
+    }
     div()
+        .debug_selector(|| "scan-totals".into())
         .flex()
         .flex_row()
         .items_center()
@@ -2343,66 +2390,296 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         })
 }
 
-/// How much more readily the legend gives up width than the find field.
-/// Flex shrinking is proportional, so with equal weights the field lost
-/// width while the legend was still drawn and its no-wrap hint spilled
-/// over "Reclaimable". A weight this lopsided makes the legend clip away
-/// first; only once it is gone does the field narrow, clipping its hint.
-const LEGEND_YIELDS: f32 = 1000.;
+/// The key to the colours, and the filter: the categories, or the age
+/// ramp in age mode, each a chip that cycles shown → only → hidden (see
+/// `legend.rs`). It wraps onto another line rather than clip a chip.
+fn legend(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
+    use crate::legend::ChipId;
+    let ground = palette::category_fill(theme, Category::Other, 0);
+    let hatch = cx.omarchy().bright.opacity(0.5);
+    let mut chips = vec![legend_chip(
+        app,
+        theme,
+        ChipId::Reclaimable,
+        widgets::hatch_swatch(hatch, ground),
+        cx,
+    )];
+    // The set of chips that is not on screen still filters, so it shows as
+    // one pill that clears it.
+    let (off_screen, pill) = if app.color_mode == ColorMode::Age {
+        for (index, _) in palette::AGE_BUCKETS.iter().enumerate() {
+            let color = palette::age_accent(theme, index);
+            chips.push(legend_chip(
+                app,
+                theme,
+                ChipId::Age(index),
+                legend_swatch(app.legend.get(ChipId::Age(index)), color),
+                cx,
+            ));
+        }
+        (ChipId::Kind(0), app.legend.kinds_summary())
+    } else {
+        for (index, category) in Category::LEGEND.iter().enumerate() {
+            let color = palette::category_accent(theme, *category);
+            chips.push(legend_chip(
+                app,
+                theme,
+                ChipId::Kind(index),
+                legend_swatch(app.legend.get(ChipId::Kind(index)), color),
+                cx,
+            ));
+        }
+        (ChipId::Age(0), app.legend.ages_summary())
+    };
+    let pill = pill.map(|summary| {
+        legend_button(
+            "legend-other",
+            summary,
+            true,
+            "Click to clear this filter",
+            theme,
+            cx,
+            move |this, cx| this.clear_legend(Some(off_screen), cx),
+        )
+    });
+    let clear = app
+        .legend
+        .is_active()
+        .then(|| show_all_button("legend-clear", theme, cx));
+    // One wrapping row: Show all and the pill lead, so they are never the
+    // part that moves to another line.
+    div()
+        .debug_selector(|| "legend".into())
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(space::XS)
+        .min_w_0()
+        .children(clear)
+        .children(pill)
+        .children(chips)
+}
 
-/// The key to the colours: the categories, or the age ramp in age mode.
-/// Clipped from the trailing end when the row runs out of room.
-fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
-    let item = |swatch: Div, label: &'static str| {
+/// Over a mosaic or list the legend has emptied: that nothing here
+/// passes, whether anything elsewhere in the scan does, and Show all.
+fn legend_empty(
+    app: &Disktree,
+    (bytes, files): (u64, u64),
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let headline =
+        format!("Nothing here passes the filter: {}", app.legend.summary());
+    // The scanned root sums everything that passed, so it is only empty
+    // when nothing did; anywhere else, what passed is in other folders.
+    let elsewhere = if files == 0 {
+        "Nothing in the scan passes it.".to_owned()
+    } else {
+        format!(
+            "{} in {} {} elsewhere in the scan passes it; \u{232b} goes up.",
+            human_bytes(bytes),
+            widgets::human_count(files),
+            if files == 1 { "file" } else { "files" }
+        )
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .debug_selector(|| "legend-empty".into())
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(space::SM)
+                .p(space::LG)
+                .bg(theme.surface)
+                .border_1()
+                .border_color(theme.divider())
+                // Announced as it appears: the mosaic emptying says
+                // nothing to someone who cannot see it.
+                .child(
+                    crate::semantics::status(
+                        "legend-empty-status",
+                        format!("{headline}. {elsewhere}"),
+                    )
+                    .debug_selector(|| "legend-empty-status".into()),
+                )
+                .child(
+                    div()
+                        .text_size(text::BODY)
+                        .text_color(theme.bright)
+                        .child(headline),
+                )
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(elsewhere),
+                )
+                .child(show_all_button("legend-empty-clear", theme, cx)),
+        )
+}
+
+/// Show all: clears every chip of the legend.
+fn show_all_button(
+    id: &'static str,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    legend_button(
+        id,
+        "Show all \u{00d7}".into(),
+        false,
+        "Show everything again · esc",
+        theme,
+        cx,
+        |this, cx| this.clear_legend(None, cx),
+    )
+}
+
+/// A chip's square: filled while it shows, hollow once hidden.
+fn legend_swatch(state: crate::legend::Chip, color: gpui_kit::Hsla) -> Div {
+    if state == crate::legend::Chip::Hidden {
         div()
+            .flex_shrink_0()
+            .size(size::SWATCH)
+            .border_1()
+            .border_color(color)
+    } else {
+        widgets::swatch(color)
+    }
+}
+
+/// One legend chip. Filled while set to only, faded while another chip
+/// of its set is, and struck through while hidden.
+fn legend_chip(
+    app: &Disktree,
+    theme: &Theme,
+    id: crate::legend::ChipId,
+    swatch: Div,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    use crate::legend::Chip;
+    let state = app.legend.get(id);
+    let only = state == Chip::Only;
+    let faded = state == Chip::Shown && app.legend.narrowed(id);
+    let hover = theme.foreground.opacity(0.06);
+    let key = id.key();
+    with_tooltip(
+        div()
+            .id(ElementId::Name(key.clone().into()))
+            .debug_selector(move || key)
+            .role(gpui_kit::Role::Button)
+            .aria_label(id.label())
+            .aria_value(state.spoken())
+            .focusable()
+            .tab_stop(true)
             .flex()
             .flex_row()
             .items_center()
             .gap(space::XS)
             .flex_shrink_0()
+            .min_h(size::POINTER_TARGET)
+            .px(space::XS)
+            .border_1()
+            .border_color(if only {
+                theme.foreground.opacity(0.35)
+            } else {
+                gpui_kit::transparent_black()
+            })
+            .when(only, |chip| chip.bg(theme.foreground.opacity(0.14)))
+            .when(!only, |chip| chip.hover(move |style| style.bg(hover)))
+            .when(faded, |chip| chip.opacity(0.42))
+            .when(state == Chip::Hidden, |chip| chip.opacity(0.6))
+            .cursor_pointer()
+            .on_key_down(cx.listener(
+                move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        this.cycle_legend(id, cx);
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.cycle_legend(id, cx);
+                window.focus(&this.focus, cx);
+            }))
             .child(swatch)
             .child(
                 div()
                     .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
-                    .child(label),
-            )
-    };
-    let mut lane = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::MD)
-        .min_w_0()
-        .overflow_hidden();
-    if app.color_mode == ColorMode::Age {
-        for (bucket, (_, label)) in palette::AGE_BUCKETS.iter().enumerate() {
-            lane = lane.child(item(
-                widgets::swatch(palette::age_accent(theme, bucket)),
-                label,
-            ));
-        }
-    } else {
-        for category in Category::LEGEND {
-            lane = lane.child(item(
-                widgets::swatch(palette::category_accent(theme, category)),
-                category.label(),
-            ));
-        }
-    }
-    let ground = palette::category_fill(theme, Category::Other, 0);
-    let hatch = cx.omarchy().bright.opacity(0.5);
-    div()
-        .debug_selector(|| "legend".into())
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::MD)
-        .min_w_0()
-        .flex_shrink(LEGEND_YIELDS)
-        .overflow_hidden()
-        .child(item(widgets::hatch_swatch(hatch, ground), "Reclaimable"))
-        .child(lane)
+                    .text_color(if only {
+                        theme.bright
+                    } else {
+                        theme.secondary
+                    })
+                    .when(state == Chip::Hidden, Styled::line_through)
+                    .child(id.label()),
+            ),
+        app.legend.hint(id),
+    )
+}
+
+/// Show all, or the pill that stands for the chips not on screen. A tab
+/// stop that Space and Enter press, like the chips beside it.
+fn legend_button(
+    id: &'static str,
+    label: String,
+    filled: bool,
+    hint: &'static str,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+    press: impl Fn(&mut Disktree, &mut Context<'_, Disktree>) + Clone + 'static,
+) -> Stateful<Div> {
+    let hover = theme.foreground.opacity(0.1);
+    let on_key = press.clone();
+    with_tooltip(
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .role(gpui_kit::Role::Button)
+            .aria_label(label.clone())
+            .focusable()
+            .tab_stop(true)
+            .on_key_down(cx.listener(
+                move |this, event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    {
+                        on_key(this, cx);
+                        window.focus(&this.focus, cx);
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                press(this, cx);
+                window.focus(&this.focus, cx);
+            }))
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_shrink_0()
+            .min_h(size::POINTER_TARGET)
+            .px(space::SM)
+            .text_size(text::CAPTION)
+            .text_color(theme.bright)
+            .when(filled, |pill| pill.bg(theme.foreground.opacity(0.14)))
+            .when(!filled, |button| {
+                button
+                    .border_1()
+                    .border_color(theme.foreground.opacity(0.4))
+            })
+            .hover(move |style| style.bg(hover))
+            .cursor_pointer()
+            .child(label),
+        hint,
+    )
 }
 
 // ── side panel ──────────────────────────────────────────────────────────
@@ -2415,6 +2692,9 @@ fn side_panel(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let indexing = app.is_indexing();
+    // Once per frame: the marked list, the marked total and the disk all
+    // read it, and building it reads the mount table.
+    let plan = app.plan();
     let rule = || div().h(px(1.)).bg(theme.divider());
     // A hairline to look at, a wider strip to grab; double-click resets.
     let handle = div()
@@ -2466,15 +2746,19 @@ fn side_panel(
                     indexing_progress(app, theme, cx).flex_shrink_0()
                 }))
                 .children(indexing.then(|| rule().flex_shrink_0()))
-                .child(worth_section(app, theme, cx))
+                // The marked list leads: the pinned total below takes room
+                // from this scroll, and on a short window what comes last
+                // scrolls out of sight. Suggestions can; the cart cannot.
+                .child(marked_section(app, &plan, theme, cx))
                 .child(rule())
-                .child(marked_section(app, theme, cx))
+                .child(worth_section(app, theme, cx))
                 .children(macos_services_section(app, theme, cx)),
         )
         .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
-        .child(disk_section(app, theme, cx).flex_shrink_0())
+        .children(marked_total(app, &plan, theme, cx))
+        .child(disk_section(app, &plan, theme, cx).flex_shrink_0())
         .child(agent_line(app, theme, cx))
 }
 
@@ -2593,12 +2877,15 @@ fn selection_section(
             )
         })
         .when(node.sharing().estimate.is_some(), |this| {
+            // Said as this entry's own estimate, so it is never read as
+            // what the marks free together (that is the Marked block's).
             this.child(
                 div()
+                    .debug_selector(|| "selection-frees".into())
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
                     .child(format!(
-                        "Estimated space freed · ≈ {}",
+                        "Removed on its own, frees ≈ {}",
                         savings(
                             node.sharing().reclaimable(node.bytes),
                             node.sharing().possible(node.bytes)
@@ -2609,6 +2896,31 @@ fn selection_section(
                 this.child("Some clone private sizes are unavailable")
             })
         });
+
+    // A filter changes what is shown, never what a mark takes: say so
+    // before Space marks a folder that holds more than is on screen.
+    let partly_shown = app
+        .legend_matches
+        .as_deref()
+        .filter(|_| !app.legend_pending)
+        .and_then(|matches| match matches.keep_at(&target, node) {
+            Some(Keep::Partial { bytes, .. }) => Some(bytes),
+            _ => None,
+        });
+    let measure = measure.when_some(partly_shown, |this, shown| {
+        this.child(
+            div()
+                .debug_selector(|| "selection-partly-shown".into())
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!(
+                    "{} passes the filter. Marking takes all {}, including \
+                     what is filtered out.",
+                    human_bytes(shown),
+                    human_bytes(node.bytes)
+                )),
+        )
+    });
 
     let fourth = if app.remote.is_none()
         && node.is_dir()
@@ -2911,23 +3223,28 @@ fn worth_section(
     let total: u64 = app.insights.iter().map(|candidate| candidate.bytes).sum();
     let largest = app.insights.first().map_or(1, |candidate| candidate.bytes);
     let highlight = palette::highlight(theme);
-    let mut section = div().flex().flex_col().gap(space::XS).child(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .pb(space::XS)
-            .child(widgets::eyebrow("Worth a look", cx))
-            .when(total > 0, |this| {
-                this.child(
-                    div()
-                        .text_size(text::CAPTION)
-                        .text_color(highlight)
-                        .child(human_bytes(total)),
-                )
-            }),
-    );
+    let mut section = div()
+        .debug_selector(|| "worth-section".into())
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .pb(space::XS)
+                .child(widgets::eyebrow("Worth a look", cx))
+                .when(total > 0, |this| {
+                    this.child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(highlight)
+                            .child(human_bytes(total)),
+                    )
+                }),
+        );
     if app.insights.is_empty() {
         return section.child(
             div()
@@ -3046,10 +3363,10 @@ fn insight_text(app: &Disktree, candidate: &Candidate) -> (String, String) {
 /// What is queued for removal, each with a way off the list.
 fn marked_section(
     app: &Disktree,
+    plan: &Plan,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
-    let plan = app.plan();
     let count = app.marks.len();
     let header = div()
         .flex()
@@ -3063,15 +3380,7 @@ fn marked_section(
                 format!("Marked · {count}")
             },
             cx,
-        ))
-        .when(count > 0, |this| {
-            this.child(
-                div()
-                    .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
-                    .child(human_bytes(plan.bytes())),
-            )
-        });
+        ));
     let mut section = div().flex().flex_col().gap(space::XS)
         .child(crate::semantics::status("marked-summary", format!("{} marked paths; {} listed bytes; {} included, {} blocked, {} covered. Estimated reclaimable: {}. Projections use only the measured volume.",
             count, plan.bytes(), plan.targets.len(), plan.blocked.len(), plan.covered.len(), savings(plan.reclaimable_bytes(), plan.possible_bytes()))))
@@ -3093,6 +3402,7 @@ fn marked_section(
         let path = item.path.clone();
         section = section.child(
             div()
+                .debug_selector(move || format!("marked-row-{index}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -3322,6 +3632,7 @@ fn administrator_line(
 /// Free space on the volume now, and after the marks go.
 fn disk_section(
     app: &Disktree,
+    plan: &Plan,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
@@ -3363,7 +3674,6 @@ fn disk_section(
                 .child("Free space is not available here"),
         );
     };
-    let plan = app.plan();
     // The meter measures this volume, so it projects only the marks whose
     // bytes come back to it; the rest is said, never added.
     let reclaiming = plan.reclaim();
@@ -3437,7 +3747,7 @@ fn disk_section(
                     ),
             ),
     );
-    if let Some(left_out) = not_counted(&plan) {
+    if let Some(left_out) = not_counted(plan) {
         section = section.child(
             div()
                 .text_size(text::CAPTION)
@@ -3445,21 +3755,161 @@ fn disk_section(
                 .child(format!("not counted here: {left_out}")),
         );
     }
-    section
-        .child(
+    section.child(
+        div()
+            .flex()
+            .flex_row()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(format!("{} used", human_bytes(space_info.used())))
+            .child(div().flex_1())
+            .child(format!("{} total", human_bytes(space_info.total))),
+    )
+}
+
+/// The marks taken together, pinned above Disk so it never scrolls away:
+/// how much is marked, what removing all of it frees, and the way to the
+/// review. Marked clones free together what each frees little of alone,
+/// so this is the number to decide by, not the selection's.
+fn marked_total(
+    app: &Disktree,
+    plan: &Plan,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    if app.marks.is_empty() {
+        return None;
+    }
+    let total = plan.bytes();
+    // An SSH host's marks are an export, and its scan says nothing of what
+    // removal would free: no estimate is claimed.
+    let estimate = app.remote.is_none().then(|| {
+        let lower = plan.reclaimable_bytes().min(total);
+        (lower, plan.possible_bytes().clamp(lower, total))
+    });
+    let highlight = palette::highlight(theme);
+    let (number, unit) = widgets::split_size(&human_bytes(total));
+    let figure = div()
+        .flex()
+        .flex_row()
+        .items_end()
+        .gap(space::SM)
+        .child(widgets::measure(
+            number,
+            text::FIGURE,
+            format!("{unit} marked"),
+            text::BODY,
+            cx,
+        ))
+        .child(div().flex_1())
+        .when_some(estimate, |this, (lower, upper)| {
+            this.child(
+                div()
+                    .debug_selector(|| "marked-frees".into())
+                    .text_size(text::TITLE)
+                    .line_height(text::TITLE)
+                    // Lifts the smaller line onto the figure's baseline: a
+                    // fifth of the size gap is about the descender space the
+                    // figure's line keeps below its digits.
+                    .pb(gpui_kit::Rems((text::FIGURE.0 - text::TITLE.0) * 0.2))
+                    .text_color(highlight)
+                    .whitespace_nowrap()
+                    .child(if upper == total && lower == total {
+                        format!("frees {}", human_bytes(total))
+                    } else {
+                        format!("frees ≈ {}", savings(lower, upper))
+                    }),
+            )
+        });
+    let mut block = div()
+        .debug_selector(|| "marked-total".into())
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .flex_shrink_0()
+        .px(space::MD)
+        .py(space::SM)
+        .bg(theme.background)
+        .border_t_2()
+        .border_color(highlight)
+        .child(figure);
+    if let Some((lower, upper)) = estimate {
+        let share =
+            |bytes: u64| (bytes as f32 / total.max(1) as f32).clamp(0.0, 1.0);
+        let (frees, may) = (share(lower), share(upper) - share(lower));
+        let stays = theme.foreground.opacity(0.16);
+        // What comes back is hatched, as on the Disk meter; what may is a
+        // wash of the same colour; the rest stays, held by clones elsewhere.
+        block = block.child(
             div()
-                .flex()
-                .flex_row()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(format!("{} used", human_bytes(space_info.used())))
-                .child(div().flex_1())
-                .child(format!("{} total", human_bytes(space_info.total))),
-        )
-        .children(
-            (!app.marks.is_empty())
-                .then(|| review_button(app, reclaiming, theme, cx)),
-        )
+                .relative()
+                .w_full()
+                .h(size::METER)
+                .bg(stays)
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .h_full()
+                        .w(relative(frees))
+                        .bg(highlight.opacity(0.25))
+                        .child(
+                            div()
+                                .size_full()
+                                .bg(pattern_slash(highlight, 1.0, 3.0)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(relative(frees))
+                        .top_0()
+                        .h_full()
+                        .w(relative(may))
+                        .bg(highlight.opacity(0.18)),
+                ),
+        );
+        if upper < total {
+            let key = |swatch: Div, label: &'static str| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::XS)
+                    .child(swatch)
+                    .child(label)
+            };
+            block = block.child(
+                div()
+                    .debug_selector(|| "marked-split".into())
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_x(space::MD)
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(key(
+                        widgets::hatch_swatch(
+                            highlight,
+                            highlight.opacity(0.25),
+                        ),
+                        "frees",
+                    ))
+                    .when(upper > lower, |this| {
+                        this.child(key(
+                            widgets::swatch(highlight.opacity(0.18)),
+                            "may free",
+                        ))
+                    })
+                    .child(key(
+                        widgets::swatch(stays),
+                        "stays: clone data used elsewhere",
+                    )),
+            );
+        }
+    }
+    Some(block.child(review_button(app, theme, cx)))
 }
 
 /// What the volume meter leaves out, and why, when it leaves anything out:
@@ -3486,7 +3936,6 @@ fn not_counted(plan: &Plan) -> Option<String> {
 /// "Mark for removal" above it.
 fn review_button(
     app: &Disktree,
-    reclaiming: u64,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> impl IntoElement {
@@ -3494,6 +3943,7 @@ fn review_button(
     let count = app.marks.len();
     div()
         .id("review")
+        .debug_selector(|| "review".into())
         .flex()
         .flex_row()
         .items_center()
@@ -3520,10 +3970,7 @@ fn review_button(
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(format!(
-                    "Review {count} marked · frees ≈ {}…",
-                    human_bytes(reclaiming)
-                )),
+                .child(format!("Review {count} marked\u{2026}")),
         )
         .child(gpui_omarchy::keycap("c", cx))
 }
@@ -3920,9 +4367,8 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         .px(space::SM)
         .py(space::XS)
         .debug_selector(|| "find-field".into())
-        // Gives up width only once the legend has (see `LEGEND_YIELDS`),
-        // and then clips its own content rather than drawing past its
-        // border.
+        // Narrows with the window, and then clips its own content rather
+        // than drawing past its border.
         .min_w_0()
         .overflow_hidden()
         .border_1()
@@ -5269,6 +5715,10 @@ fn help_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Stateful<Div> {
         (
             "/",
             "Filter by name: only matches keep their colour; enter shows only them",
+        ),
+        (
+            "click legend",
+            "Show only a kind or age, then hide it; esc clears",
         ),
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),

@@ -5,6 +5,7 @@ use crate::semantics::AccessibleButton as _;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use disktree_core::filter::Keep;
 use disktree_core::size::human_bytes;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -48,7 +49,8 @@ fn entry_semantics(
 
 impl Disktree {
     pub fn file_turn_page(&mut self, step: isize, cx: &mut Context<'_, Self>) {
-        let entries = self.filter_applied.then(|| self.file_entries());
+        let entries =
+            self.layout_filter().is_some().then(|| self.file_entries());
         let count = entries.as_ref().map_or_else(
             || self.current().map_or(0, |node| node.children().len()),
             Vec::len,
@@ -74,24 +76,59 @@ impl Disktree {
         self.pointer_active = false;
         self.select(Some(crumbs), cx);
     }
+    /// What the list's header adds when a filter thins it. Compact, the
+    /// legend row is not drawn, so the list itself says what the legend
+    /// keeps; a search says so in its own field.
+    pub fn list_filter_note(&self) -> String {
+        if self.filter_applied {
+            " · filtered".to_owned()
+        } else if self.legend.is_active() {
+            format!(" · filtered: {} (esc clears)", self.legend.summary())
+        } else {
+            String::new()
+        }
+    }
+
+    /// An entry's size as its row says it. A partly shown folder says what
+    /// passed and what it holds in all, as its tile does: "48 MiB of 196
+    /// MiB".
+    pub fn entry_size(
+        &self,
+        crumbs: &[usize],
+        node: disktree_core::tree::Node<'_>,
+    ) -> String {
+        match self.layout_filter().and_then(|m| m.keep(crumbs)) {
+            Some(Keep::Partial { bytes, .. }) => {
+                format!("{} of {}", human_bytes(bytes), human_bytes(node.bytes))
+            }
+            _ => human_bytes(node.bytes),
+        }
+    }
+
     pub fn file_entries(&self) -> Vec<usize> {
-        self.current().map_or_else(Vec::new, |node| {
-            (0..node.children().len())
-                .filter(|index| {
-                    let mut crumbs = self.crumbs.clone();
-                    crumbs.push(*index);
-                    !self.filter_applied
-                        || self
-                            .matches
-                            .as_ref()
-                            .is_none_or(|m| m.keep(&crumbs).is_some())
-                })
-                .collect()
-        })
+        let Some(node) = self.current() else {
+            return Vec::new();
+        };
+        let children = node.children();
+        let Some(filter) = self.layout_filter() else {
+            return (0..children.len()).collect();
+        };
+        // One buffer for every child: under a filter this runs per frame,
+        // in directories that can hold millions of files.
+        let mut crumbs = self.crumbs.clone();
+        crumbs.push(0);
+        let last = crumbs.len() - 1;
+        (0..children.len())
+            .filter(|index| {
+                crumbs[last] = *index;
+                filter.keep_at(&crumbs, children.at(*index)).is_some()
+            })
+            .collect()
     }
 
     pub fn file_step(&mut self, step: isize, cx: &mut Context<'_, Self>) {
-        let entries = self.filter_applied.then(|| self.file_entries());
+        let entries =
+            self.layout_filter().is_some().then(|| self.file_entries());
         let count = entries.as_ref().map_or_else(
             || self.current().map_or(0, |node| node.children().len()),
             Vec::len,
@@ -137,7 +174,7 @@ pub fn list(
     let theme = cx.omarchy();
     // Unfiltered navigation needs only the visible page, even in a directory
     // with millions of zero-weight files that the mosaic cannot draw.
-    let entries = app.filter_applied.then(|| app.file_entries());
+    let entries = app.layout_filter().is_some().then(|| app.file_entries());
     let count = entries.as_ref().map_or_else(
         || app.current().map_or(0, |node| node.children().len()),
         Vec::len,
@@ -145,17 +182,13 @@ pub fn list(
     let page = app.file_page.min(count.saturating_sub(1) / PAGE_SIZE);
     let start = page * PAGE_SIZE;
     let end = (start + PAGE_SIZE).min(count);
+    let filtered = app.list_filter_note();
     let summary = format!(
-        "{} · {} entries · showing {}–{}{}",
+        "{} · {} entries · showing {}–{}{filtered}",
         app.current_path().display(),
         count,
         usize::from(count > 0) + start,
         end,
-        if app.filter_applied {
-            " · filtered"
-        } else {
-            ""
-        }
     );
     let mut rows = div().id("file-rows").role(Role::ListBox)
         .track_focus(&app.file_focus)
@@ -193,7 +226,8 @@ pub fn list(
         let filtered = app
             .matches
             .as_ref()
-            .is_some_and(|m| m.keep(&crumbs).is_none());
+            .is_some_and(|m| m.keep_at(&crumbs, node).is_none());
+        let size = app.entry_size(&crumbs, node);
         // Clone blocks are not what removing the entry frees; say so
         // where the size is read, and nowhere when there are none.
         let split = crate::views::clone_split(node);
@@ -207,7 +241,7 @@ pub fn list(
             "{}; {}; {} ({} bytes){}; {}; last written {}; {}{}{}",
             path.display(),
             if node.is_dir() { "directory" } else { "file" },
-            human_bytes(node.bytes),
+            size,
             node.bytes,
             spoken,
             node.category.label(),
@@ -242,7 +276,7 @@ pub fn list(
                 "{}{} · {}{clones} · {}",
                 if node.is_dir() { "▸ " } else { "" },
                 node.name(),
-                human_bytes(node.bytes),
+                size,
                 if marked {
                     "Marked"
                 } else {
@@ -285,7 +319,7 @@ pub fn list(
                                 ),
                         )
                         .child(div().flex_shrink_0().child(format!(
-                            "{count} entries · {}–{end}",
+                            "{count} entries · {}–{end}{filtered}",
                             usize::from(count > 0) + start
                         )))
                 })

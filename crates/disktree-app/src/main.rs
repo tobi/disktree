@@ -27,6 +27,7 @@ mod file_list;
 mod git;
 mod github_releases;
 mod help;
+mod legend;
 mod log_view;
 #[cfg(debug_assertions)]
 mod logs_fixture;

@@ -1,13 +1,19 @@
-//! Typeahead filtering: which parts of a tree match a name.
+//! Filtering: which parts of a tree match a name, or a [`Rule`] on what
+//! the files are.
 //!
 //! A node whose name contains the needle (ignoring ASCII case) matches, and
 //! is kept whole: everything under a matching directory goes with it. Its
 //! ancestors are kept only partly, and sized by what matched beneath them,
 //! so a filtered treemap shows exactly the matches, at their true relative
 //! sizes, in the places they live.
+//!
+//! A rule is judged per file, from its own kind, age and reclaimability,
+//! and summed up the tree the same way: a directory is whole when every
+//! file beneath it passes, partial when some do, and gone when none do.
 
 use rustc_hash::FxHashMap;
 
+use crate::classify::Category;
 use crate::tree::{Metric, Node};
 
 /// How a node takes part in a filtered view.
@@ -29,10 +35,91 @@ pub struct Matches {
     /// Keyed by absolute crumbs. Only matches and their ancestors appear;
     /// a match's own descendants are implied.
     pub keep: FxHashMap<Vec<usize>, Keep>,
-    /// Topmost matches: a match inside a match is not counted again.
+    /// Topmost matches: a match inside a match is not counted again. Only
+    /// names are counted; a filter by [`Rule`] alone counts nothing.
     pub count: usize,
     pub bytes: u64,
     pub files: u64,
+    /// What a file must be to be kept, besides matching the needle.
+    pub rule: Option<Rule>,
+}
+
+/// What a filtered view keeps of each file, from its own facts: its kind,
+/// whether its space is reclaimable, and how long ago it was written. The
+/// legend sets it, one chip per kind and age.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rule {
+    /// Kinds to keep, one bit per [`Category`] (see [`Self::bit`]); none
+    /// set keeps every kind.
+    pub only: u16,
+    /// Kinds to leave out, whatever `only` says.
+    pub hidden: u16,
+    /// `Some(true)` keeps only reclaimable space, `Some(false)` leaves it
+    /// out. Reclaimable is a property, not a kind, so it narrows `only`
+    /// rather than adding to it.
+    pub reclaimable: Option<bool>,
+    /// Age buckets to keep, one bit per entry of `age_limits`; none set
+    /// keeps every age.
+    pub ages_only: u8,
+    /// Age buckets to leave out.
+    pub ages_hidden: u8,
+    /// Each bucket's upper bound in days, ascending; a file belongs to the
+    /// first one its age is within, or the last.
+    pub age_limits: Vec<i64>,
+    /// The moment ages are measured from, in Unix seconds.
+    pub now: i64,
+}
+
+impl Rule {
+    /// The bit for `category` in [`Self::only`] and [`Self::hidden`].
+    pub const fn bit(category: Category) -> u16 {
+        1 << category as u16
+    }
+
+    /// Whether the rule keeps everything.
+    pub const fn is_empty(&self) -> bool {
+        self.only == 0
+            && self.hidden == 0
+            && self.reclaimable.is_none()
+            && self.ages_only == 0
+            && self.ages_hidden == 0
+    }
+
+    /// Whether the rule keeps `node`, judged by its own facts. Meant for
+    /// files: a directory's facts are its own or inherited, not a summary
+    /// of what it holds.
+    pub fn passes(&self, node: Node<'_>) -> bool {
+        let kind = Self::bit(node.category);
+        if self.hidden & kind != 0 || (self.only != 0 && self.only & kind == 0)
+        {
+            return false;
+        }
+        if self
+            .reclaimable
+            .is_some_and(|wanted| node.reclaim.is_some() != wanted)
+        {
+            return false;
+        }
+        if self.ages_only == 0 && self.ages_hidden == 0 {
+            return true;
+        }
+        // An unknown write time is in no bucket: kept unless the rule
+        // keeps only some ages.
+        if node.modified <= 0 {
+            return self.ages_only == 0;
+        }
+        let bit = 1 << self.age_bucket(node.modified);
+        self.ages_hidden & bit == 0
+            && (self.ages_only == 0 || self.ages_only & bit != 0)
+    }
+
+    fn age_bucket(&self, modified: i64) -> usize {
+        let days = (self.now - modified) / 86_400;
+        self.age_limits
+            .iter()
+            .position(|limit| days <= *limit)
+            .unwrap_or_else(|| self.age_limits.len().saturating_sub(1))
+    }
 }
 
 impl Matches {
@@ -62,6 +149,23 @@ impl Matches {
         })
     }
 
+    /// [`Self::keep`], for `node` found at `crumbs`. A rule's files are
+    /// judged as they are asked about, not recorded: a partly kept
+    /// directory can hold millions of them.
+    pub fn keep_at(&self, crumbs: &[usize], node: Node<'_>) -> Option<Keep> {
+        let keep = self.keep(crumbs);
+        if keep.is_none()
+            && self.needle.is_empty()
+            && node.children().is_empty()
+            && self.rule.as_ref().is_some_and(|rule| rule.passes(node))
+        {
+            // Only a kept directory holds a passing file, so the parent
+            // that left this one unrecorded was partial, not absent.
+            return Some(Keep::Whole);
+        }
+        keep
+    }
+
     /// The value a kept node is laid out by.
     pub const fn value(keep: Keep, node: Node<'_>, metric: Metric) -> u64 {
         match (keep, metric) {
@@ -89,6 +193,110 @@ pub fn filter(node: Node<'_>, base: &[usize], needle: &str) -> Option<Matches> {
     matches.bytes = bytes;
     matches.files = files;
     Some(matches)
+}
+
+/// Search `node`, found at absolute `base`, for what `rule` keeps and, when
+/// the needle is not blank, for names containing it. `None` when neither
+/// filters anything.
+pub fn filter_with(
+    node: Node<'_>,
+    base: &[usize],
+    needle: &str,
+    rule: Option<&Rule>,
+) -> Option<Matches> {
+    let Some(rule) = rule.filter(|rule| !rule.is_empty()) else {
+        return filter(node, base, needle);
+    };
+    let mut matches = Matches {
+        needle: needle.trim().to_ascii_lowercase(),
+        base: base.to_vec(),
+        rule: Some(rule.clone()),
+        ..Matches::default()
+    };
+    let named = matches.needle.is_empty();
+    let mut crumbs = base.to_vec();
+    let mut kept = Vec::new();
+    let tally =
+        visit_rule(node, rule, &mut crumbs, &mut matches, &mut kept, named);
+    matches.keep = kept.into_iter().collect();
+    matches.bytes = tally.bytes;
+    matches.files = tally.files;
+    Some(matches)
+}
+
+/// What a rule kept beneath a node.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    bytes: u64,
+    files: u64,
+    /// Something passed, even if it weighs nothing.
+    any: bool,
+    /// Everything passed.
+    all: bool,
+}
+
+/// [`visit`] under a rule. Entries go on `kept` in depth-first order, so a
+/// directory that turns out whole drops its descendants' entries by
+/// truncating: they are a run at the end. `named` is set when the needle is
+/// blank or an ancestor matched it.
+fn visit_rule(
+    node: Node<'_>,
+    rule: &Rule,
+    crumbs: &mut Vec<usize>,
+    matches: &mut Matches,
+    kept: &mut Vec<(Vec<usize>, Keep)>,
+    named: bool,
+) -> Tally {
+    let mut total = Tally {
+        all: true,
+        ..Tally::default()
+    };
+    for (index, child) in node.children().iter().enumerate() {
+        crumbs.push(index);
+        let hit = !matches.needle.is_empty()
+            && contains_ignoring_case(child.name(), &matches.needle);
+        let child_named = named || hit;
+        let tally = if child.children().is_empty() {
+            let passes = child_named && rule.passes(child);
+            // Without a needle a passing file is judged again when asked
+            // (`Matches::keep_at`); with one it must be recorded.
+            if passes && !matches.needle.is_empty() {
+                kept.push((crumbs.clone(), Keep::Whole));
+            }
+            Tally {
+                bytes: if passes { child.bytes } else { 0 },
+                files: if passes { child.files } else { 0 },
+                any: passes,
+                all: passes,
+            }
+        } else {
+            let start = kept.len();
+            let tally =
+                visit_rule(child, rule, crumbs, matches, kept, child_named);
+            if tally.all {
+                kept.truncate(start);
+                kept.push((crumbs.clone(), Keep::Whole));
+            } else if tally.any {
+                kept.push((
+                    crumbs.clone(),
+                    Keep::Partial {
+                        bytes: tally.bytes,
+                        files: tally.files,
+                    },
+                ));
+            }
+            tally
+        };
+        if hit && !named && tally.any {
+            matches.count += 1;
+        }
+        total.bytes += tally.bytes;
+        total.files += tally.files;
+        total.any |= tally.any;
+        total.all &= tally.all;
+        crumbs.pop();
+    }
+    total
 }
 
 /// Returns the bytes and files that matched at or beneath `node`'s
@@ -286,6 +494,183 @@ mod tests {
         );
         assert_eq!(found.keep(&empty), Some(Keep::Whole));
         assert_eq!(found.keep(&crumbs_of(root, &["unrelated"])), None);
+    }
+
+    /// A file of `category`, reclaimable or not, written `days` ago.
+    fn kind(
+        name: &str,
+        bytes: u64,
+        category: Category,
+        reclaim: bool,
+        days: i64,
+    ) -> Draft {
+        let mut node = file(name, bytes);
+        node.category = category;
+        node.reclaim = reclaim.then_some(crate::classify::Reclaim::BuildOutput);
+        node.modified = NOW - days * 86_400;
+        node
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// `src` is all code (its `target` reclaimable), `mixed` holds code
+    /// beside a photo, and `photos` holds only media.
+    fn kinds() -> Tree {
+        let root = dir(
+            "root",
+            vec![
+                dir(
+                    "src",
+                    vec![
+                        kind("main.rs", 10, Category::Code, false, 1),
+                        dir(
+                            "target",
+                            vec![kind("app", 40, Category::Code, true, 1)],
+                        ),
+                    ],
+                ),
+                dir(
+                    "mixed",
+                    vec![
+                        kind("lib.rs", 5, Category::Code, false, 400),
+                        kind("cat.jpg", 20, Category::Media, false, 400),
+                    ],
+                ),
+                dir(
+                    "photos",
+                    vec![kind("dog.jpg", 100, Category::Media, false, 3)],
+                ),
+            ],
+        );
+        let mut root = Tree::from(root);
+        aggregate(&mut root, Metric::Bytes);
+        root
+    }
+
+    fn rule() -> Rule {
+        Rule {
+            age_limits: vec![7, 30, 182, 365, i64::MAX],
+            now: NOW,
+            ..Rule::default()
+        }
+    }
+
+    /// How `names` takes part, asked the way a layout asks.
+    fn kept(found: &Matches, root: Node<'_>, names: &[&str]) -> Option<Keep> {
+        let crumbs = crumbs_of(root, names);
+        found.keep_at(&crumbs, root.resolve(&crumbs).expect("present"))
+    }
+
+    #[test]
+    fn a_kind_keeps_its_files_and_sizes_the_folders_that_hold_them() {
+        let tree = kinds();
+        let root = tree.root();
+        let code = Rule {
+            only: Rule::bit(Category::Code),
+            ..rule()
+        };
+        let found = filter_with(root, &[], "", Some(&code)).expect("a rule");
+        assert_eq!((found.bytes, found.files), (55, 3));
+        assert_eq!(kept(&found, root, &["src"]), Some(Keep::Whole));
+        assert_eq!(
+            kept(&found, root, &["mixed"]),
+            Some(Keep::Partial { bytes: 5, files: 1 })
+        );
+        assert_eq!(kept(&found, root, &["mixed", "lib.rs"]), Some(Keep::Whole));
+        assert_eq!(kept(&found, root, &["mixed", "cat.jpg"]), None);
+        assert_eq!(kept(&found, root, &["photos"]), None);
+        assert_eq!(found.count, 0, "a rule alone counts no names");
+        // Files of a whole folder, and of a partial one, are not recorded.
+        assert_eq!(found.keep.len(), 2, "{:?}", found.keep);
+    }
+
+    #[test]
+    fn a_hidden_kind_leaves_everything_else_whole() {
+        let tree = kinds();
+        let root = tree.root();
+        let no_media = Rule {
+            hidden: Rule::bit(Category::Media),
+            ..rule()
+        };
+        let found = filter_with(root, &[], "", Some(&no_media)).expect("rule");
+        assert_eq!(found.bytes, 55);
+        assert_eq!(kept(&found, root, &["src"]), Some(Keep::Whole));
+        assert_eq!(kept(&found, root, &["src", "target"]), Some(Keep::Whole));
+        assert_eq!(kept(&found, root, &["photos"]), None);
+    }
+
+    #[test]
+    fn reclaimable_narrows_the_kinds_instead_of_adding_to_them() {
+        let tree = kinds();
+        let root = tree.root();
+        let both = Rule {
+            only: Rule::bit(Category::Code) | Rule::bit(Category::Media),
+            reclaimable: Some(true),
+            ..rule()
+        };
+        let found = filter_with(root, &[], "", Some(&both)).expect("rule");
+        assert_eq!(found.bytes, 40, "only src/target is reclaimable");
+        assert_eq!(kept(&found, root, &["src", "target"]), Some(Keep::Whole));
+        assert_eq!(kept(&found, root, &["src", "main.rs"]), None);
+        assert_eq!(kept(&found, root, &["mixed"]), None);
+
+        let kept_back = Rule {
+            reclaimable: Some(false),
+            ..rule()
+        };
+        let found = filter_with(root, &[], "", Some(&kept_back)).expect("rule");
+        assert_eq!(found.bytes, 135);
+    }
+
+    #[test]
+    fn ages_filter_by_when_each_file_was_written() {
+        let tree = kinds();
+        let root = tree.root();
+        let old = Rule {
+            ages_only: 1 << 4,
+            ..rule()
+        };
+        let found = filter_with(root, &[], "", Some(&old)).expect("rule");
+        assert_eq!(found.bytes, 25, "only mixed's files are over a year old");
+        assert_eq!(kept(&found, root, &["mixed"]), Some(Keep::Whole));
+
+        let not_this_week = Rule {
+            ages_hidden: 1,
+            ..rule()
+        };
+        let found =
+            filter_with(root, &[], "", Some(&not_this_week)).expect("rule");
+        assert_eq!(found.bytes, 25);
+    }
+
+    #[test]
+    fn a_needle_and_a_rule_keep_only_what_both_allow() {
+        let tree = kinds();
+        let root = tree.root();
+        let code = Rule {
+            only: Rule::bit(Category::Code),
+            ..rule()
+        };
+        let found = filter_with(root, &[], "i", Some(&code)).expect("both");
+        // "mixed" matches the name, but only its code passes the rule;
+        // "main.rs" matches too. "photos" holds no code.
+        assert_eq!(found.count, 2);
+        assert_eq!(found.bytes, 15);
+        assert_eq!(
+            kept(&found, root, &["mixed"]),
+            Some(Keep::Partial { bytes: 5, files: 1 })
+        );
+        assert_eq!(kept(&found, root, &["mixed", "lib.rs"]), Some(Keep::Whole));
+        assert_eq!(kept(&found, root, &["mixed", "cat.jpg"]), None);
+        assert_eq!(kept(&found, root, &["src", "main.rs"]), Some(Keep::Whole));
+        assert_eq!(kept(&found, root, &["src", "target"]), None);
+    }
+
+    #[test]
+    fn an_empty_rule_is_the_plain_search() {
+        let tree = kinds();
+        assert!(filter_with(tree.root(), &[], "", Some(&rule())).is_none());
+        assert!(filter_with(tree.root(), &[], " ", None).is_none());
     }
 
     #[test]

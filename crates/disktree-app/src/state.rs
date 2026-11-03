@@ -12,7 +12,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use disktree_core::access::file_table_readable;
-use disktree_core::filter::{Keep, Matches, filter, find_ignoring_case};
+use disktree_core::filter::{Keep, Matches, filter_with, find_ignoring_case};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::path_style::PathStyle;
 use disktree_core::removal::{
@@ -483,7 +483,18 @@ pub struct Disktree {
     pub matches: Option<Arc<Matches>>,
     /// Enter was pressed: the mosaic lays out only the matches.
     pub filter_applied: bool,
-    filter_epoch: u64,
+    /// Bumped whenever what the mosaic lays out may have changed: a search
+    /// or the legend.
+    pub filter_epoch: u64,
+    /// The legend's chips: what kinds, ages and reclaimable space to show.
+    pub legend: crate::legend::LegendFilter,
+    /// What the legend keeps, from the scanned root down. Laid out in
+    /// place of the tree whenever no search is applied.
+    pub legend_matches: Option<Arc<Matches>>,
+    /// Bumped per legend change; only the newest result is kept.
+    pub legend_epoch: u64,
+    /// The legend's filter is being worked out off the UI thread.
+    pub legend_pending: bool,
     /// Bumped per keystroke; only the newest search's result is kept.
     find_epoch: u64,
     /// A search is running off the UI thread.
@@ -704,6 +715,10 @@ impl Disktree {
             matches: None,
             filter_applied: false,
             filter_epoch: 0,
+            legend: crate::legend::LegendFilter::default(),
+            legend_matches: None,
+            legend_epoch: 0,
+            legend_pending: false,
             find_epoch: 0,
             finding: false,
             apply_pending: false,
@@ -799,6 +814,7 @@ impl Disktree {
         app.tree = Some(Arc::new(tree));
         app.cache = None;
         app.refresh_insights();
+        app.refresh_legend(cx);
         app.select_largest(cx);
         app
     }
@@ -1537,6 +1553,9 @@ impl Disktree {
             self.remember();
         }
         discard(self.tree.take());
+        // Its crumbs were the old tree's; the new one gets its own.
+        self.legend_matches = None;
+        self.legend_epoch += 1;
         self.file_page = 0;
         self.crumbs.clear();
         self.selected = None;
@@ -1655,6 +1674,7 @@ impl Disktree {
                     );
                     self.tree = Some(Arc::new(node));
                     self.refresh_insights();
+                    self.refresh_legend(cx);
                     self.select_largest(cx);
                     self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
                 }
@@ -1710,6 +1730,7 @@ impl Disktree {
                 discard(self.tree.replace(Arc::new(node)));
                 self.cache = None;
                 self.refresh_insights();
+                self.refresh_legend(cx);
                 self.scan_elapsed =
                     self.scan_started.map(|started| started.elapsed());
                 if let Some(from) = came_from {
@@ -2739,12 +2760,32 @@ impl Disktree {
                         (now - node.map_or(now, |n| n.modified)) / 86_400;
                     crate::palette::age_bucket(days)
                 });
-            let filtered = match self.matches.as_deref().map(|m| m.keep(crumbs))
-            {
+            // A search being typed dims what it does not match; otherwise
+            // the legend says which folders hold more than is shown.
+            let keep = self
+                .matches
+                .as_deref()
+                .or(self.legend_matches.as_deref())
+                .map(|matches| match node {
+                    Some(node) => matches.keep_at(crumbs, node),
+                    None => matches.keep(crumbs),
+                });
+            let filtered = match keep {
                 None | Some(Some(Keep::Whole)) => Filtered::Shown,
                 Some(Some(Keep::Partial { .. })) => Filtered::Holds,
                 Some(None) => Filtered::Out,
             };
+            // A partly shown folder is laid out by what passed, so its label
+            // says that and what it holds in all: "48G of 196G".
+            let partial =
+                self.layout_filter().and_then(|matches| {
+                    match matches.keep(crumbs) {
+                        Some(Keep::Partial { bytes, files }) => {
+                            Some((bytes, files))
+                        }
+                        _ => None,
+                    }
+                });
             let is_marked = marked.contains(crumbs);
             // Everything inside a marked directory goes with it, so it is
             // drawn marked too.
@@ -2814,7 +2855,14 @@ impl Disktree {
                         depth: tile.depth,
                         dim: filtered == Filtered::Out,
                         marked: is_marked || is_covered,
-                        size_text: crate::widgets::short_value(node, metric),
+                        size_text: partial.map_or_else(
+                            || crate::widgets::short_value(node, metric),
+                            |(bytes, files)| {
+                                crate::widgets::short_share(
+                                    node, bytes, files, metric,
+                                )
+                            },
+                        ),
                         decoration: decoration.clone(),
                     });
                 }
@@ -2914,8 +2962,7 @@ impl Disktree {
             let tree = self.tree.clone()?;
             let node = tree.root().resolve(&self.crumbs)?;
             let rect = Rect::new(0.0, 0.0, key.width, key.height);
-            let filter =
-                self.matches.as_deref().filter(|_| self.filter_applied);
+            let filter = self.layout_filter();
             let tiles = layout_filtered(
                 node,
                 &key.crumbs,
@@ -2927,6 +2974,16 @@ impl Disktree {
             self.cache = Some(LayoutCache { key, tiles });
         }
         self.cache.as_ref().map(|cache| cache.tiles.as_slice())
+    }
+
+    /// What the mosaic lays out instead of the whole tree: an applied
+    /// search, which already keeps to the legend, or else the legend.
+    pub fn layout_filter(&self) -> Option<&Matches> {
+        if self.filter_applied {
+            self.matches.as_deref()
+        } else {
+            self.legend_matches.as_deref()
+        }
     }
 
     /// Base-space rect of the tile at `crumbs`, if it is currently drawn.
@@ -3054,6 +3111,11 @@ impl Disktree {
         self.crumb_menu = None;
         self.transition = None;
         self.refresh_insights();
+        // Every crumb moved, so the legend's result points at other
+        // children now; drop it rather than lay it out until the new one
+        // comes back.
+        self.legend_matches = None;
+        self.refresh_legend(cx);
         self.clear_filter();
         self.cache = None;
         cx.notify();
@@ -3331,10 +3393,11 @@ impl Disktree {
         };
         self.finding = true;
         let base = self.crumbs.clone();
+        let rule = self.legend_rule();
         let task = cx.background_executor().spawn(async move {
-            tree.root()
-                .resolve(&base)
-                .and_then(|node| filter(node, &base, &needle))
+            tree.root().resolve(&base).and_then(|node| {
+                filter_with(node, &base, &needle, rule.as_ref())
+            })
         });
         cx.spawn(async move |this, cx| {
             let found = task.await;
@@ -3861,6 +3924,10 @@ impl Disktree {
             "escape" if self.matches.is_some() => self.clear_filter(),
             "escape" if self.scan.is_some() || self.remote_scan.is_some() => {
                 self.cancel_scan(cx);
+            }
+            // Then the legend's, before Escape goes back to moving around.
+            "escape" if self.legend.is_active() => {
+                self.clear_legend(None, cx);
             }
             "escape" => {
                 if self.selected.is_some() {

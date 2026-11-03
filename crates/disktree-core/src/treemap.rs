@@ -208,7 +208,7 @@ fn place_children(
                 None => child.value(metric),
                 Some(filter) => {
                     crumbs.push(index);
-                    let keep = filter.keep(crumbs);
+                    let keep = filter.keep_at(crumbs, child);
                     crumbs.pop();
                     Matches::value(keep?, child, metric)
                 }
@@ -730,5 +730,58 @@ mod tests {
         };
         let ratio = area_of("src") / area_of("unit_test.txt");
         assert!((ratio - 3.0).abs() < 0.05, "ratio {ratio}");
+    }
+
+    /// A rule's files are not recorded in the matches, so the layout must
+    /// judge them itself: a partly kept folder still shows its passing
+    /// files, and only those.
+    #[test]
+    fn a_rule_lays_out_the_passing_files_of_a_partial_folder() {
+        use crate::classify::Category;
+        use crate::filter::{Rule, filter_with};
+        use crate::tree::{NodeKind, aggregate};
+
+        let file = |name: &str, bytes, category| {
+            let mut node = Draft::entry(name, NodeKind::File, bytes);
+            node.category = category;
+            node
+        };
+        let mut mixed = Draft::directory("mixed");
+        mixed.children = vec![
+            file("lib.rs", 300, Category::Code),
+            file("cat.jpg", 700, Category::Media),
+        ];
+        let mut root = Draft::directory("root");
+        root.children = vec![mixed, file("main.rs", 100, Category::Code)];
+        let mut root = Tree::from(root);
+        aggregate(&mut root, Metric::Bytes);
+        let root = root.root();
+
+        let code = Rule {
+            only: Rule::bit(Category::Code),
+            ..Rule::default()
+        };
+        let matches = filter_with(root, &[], "", Some(&code)).expect("rule");
+        let options = LayoutOptions {
+            padding: 0.0,
+            padding_outer: 0.0,
+            ..LayoutOptions::default()
+        };
+        let tiles = layout_filtered(
+            root,
+            &[],
+            Rect::new(0.0, 0.0, 400.0, 400.0),
+            Metric::Bytes,
+            &options,
+            Some(&matches),
+        );
+        let names: Vec<&str> = tiles
+            .iter()
+            .filter_map(|tile| root.resolve(tile.crumbs()))
+            .map(crate::tree::Node::name)
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"lib.rs") && names.contains(&"main.rs"));
+        assert!(!names.contains(&"cat.jpg"));
     }
 }

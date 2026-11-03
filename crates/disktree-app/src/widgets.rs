@@ -28,6 +28,25 @@ pub fn short_value(node: Node<'_>, metric: Metric) -> String {
     }
 }
 
+/// What part of `node` a filter shows, and all of it: "48G of 196G".
+pub fn short_share(
+    node: Node<'_>,
+    bytes: u64,
+    files: u64,
+    metric: Metric,
+) -> String {
+    match metric {
+        Metric::Bytes => format!(
+            "{} of {}",
+            human_bytes_short(bytes),
+            human_bytes_short(node.bytes)
+        ),
+        Metric::Files => {
+            format!("{} of {}", human_count(files), human_count(node.files))
+        }
+    }
+}
+
 /// A dim label above a number, for the header strip.
 pub fn stat(
     label: impl Into<SharedString>,

@@ -1294,8 +1294,9 @@ fn find_field_never_draws_over_the_legend(cx: &mut TestAppContext) {
             let legend = cx.debug_bounds("legend").expect("legend drawn");
             // Half a pixel for rounding where two edges meet. The field
             // clips what it holds, so its own bounds are what is drawn.
+            // The legend has its own row under the field's.
             assert!(
-                legend.size.width <= px(0.5)
+                field.bottom() <= legend.top() + px(0.5)
                     || field.right() <= legend.left() + px(0.5),
                 "{at}: field {field:?} overlaps legend {legend:?}"
             );
@@ -1306,7 +1307,7 @@ fn find_field_never_draws_over_the_legend(cx: &mut TestAppContext) {
         }
     }
     // Where the overlap was seen, and narrower: the whole hint reads, and
-    // the legend still shows beside it.
+    // the legend, on its own row now, is still drawn.
     for width in [1000., 1440.] {
         cx.simulate_resize(gpui_kit::size(px(width), px(900.)));
         cx.update(|window, _| window.set_rem_size(px(16.)));
@@ -7533,4 +7534,383 @@ fn more_steps_depth_in_place_when_the_stepper_folds(cx: &mut TestAppContext) {
     assert_eq!(read(&view, cx, |app| app.more_menu), Some(2));
     click_on(cx, "more-depth-more");
     assert_eq!(read(&view, cx, |app| app.layout_options.max_depth), depth);
+}
+
+/// The names the mosaic lays out, top to bottom of the tree.
+fn laid_out(view: &Entity<Disktree>, cx: &mut Window) -> Vec<String> {
+    update(view, cx, |app, _| {
+        let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
+        tiles
+            .iter()
+            .filter_map(|tile| app.node_at(tile.crumbs()))
+            .map(|node| node.name().to_string())
+            .collect()
+    })
+}
+
+#[gpui_kit::test]
+fn a_legend_chip_shows_only_then_hides_its_kind(cx: &mut TestAppContext) {
+    use crate::legend::{Chip, ChipId};
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    assert!(
+        cx.debug_bounds("legend-clear").is_none(),
+        "nothing filtered"
+    );
+
+    // Reclaimable, once: only `.cache`, the fixture's one regenerable tree.
+    click_on(cx, "legend-reclaimable");
+    cx.run_until_parked();
+    let chip = read(&view, cx, |app| app.legend.get(ChipId::Reclaimable));
+    assert_eq!(chip, Chip::Only);
+    let drawn = laid_out(&view, cx);
+    assert!(drawn.contains(&".cache".to_string()), "{drawn:?}");
+    assert!(
+        !drawn.iter().any(|name| name == "junk" || name == "keep"),
+        "{drawn:?}"
+    );
+    // The totals line says the share on screen, and Show all appears.
+    let shown = read(&view, cx, |app| {
+        app.legend_matches.as_deref().map(|matches| matches.bytes)
+    });
+    assert_eq!(shown, Some(300_000));
+    assert!(cx.debug_bounds("legend-clear").is_some());
+
+    // Again: hidden, so everything but `.cache`.
+    click_on(cx, "legend-reclaimable");
+    cx.run_until_parked();
+    let drawn = laid_out(&view, cx);
+    assert!(!drawn.contains(&".cache".to_string()), "{drawn:?}");
+    assert!(drawn.contains(&"junk".to_string()), "{drawn:?}");
+
+    // Show all gives everything back, and keys reach the mosaic again.
+    click_on(cx, "legend-clear");
+    cx.run_until_parked();
+    assert!(!read(&view, cx, |app| app.legend.is_active()));
+    assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
+    let drawn = laid_out(&view, cx);
+    assert!(
+        drawn.contains(&".cache".to_string())
+            && drawn.contains(&"junk".to_string())
+    );
+
+    // A kind set to only, cleared by Escape.
+    update(&view, cx, |app, cx| app.cycle_legend(ChipId::Kind(7), cx));
+    cx.run_until_parked();
+    let drawn = laid_out(&view, cx);
+    assert!(drawn.contains(&".cache".to_string()), "Cache: {drawn:?}");
+    assert!(!drawn.contains(&"keep".to_string()), "{drawn:?}");
+    press(cx, "escape");
+    cx.run_until_parked();
+    assert!(!read(&view, cx, |app| app.legend.is_active()));
+}
+
+#[gpui_kit::test]
+fn the_legend_filter_follows_into_folders_and_into_a_search(
+    cx: &mut TestAppContext,
+) {
+    use crate::legend::ChipId;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    // Hide Cache: `.cache` goes, and a search for blobs finds only junk's.
+    update(&view, cx, |app, cx| {
+        app.cycle_legend(ChipId::Kind(7), cx);
+        app.cycle_legend(ChipId::Kind(7), cx);
+    });
+    cx.run_until_parked();
+    press(cx, "/");
+    cx.simulate_input("blob");
+    cx.run_until_parked();
+    let count = read(&view, cx, |app| app.matches.as_deref().map(|m| m.count));
+    assert_eq!(count, Some(1), "the cached blob is hidden");
+    press(cx, "escape");
+    cx.run_until_parked();
+
+    // Descending keeps the filter: no search runs, the root's answer holds.
+    let junk = read(&view, cx, |app| {
+        app.crumbs_for_path(&temp.path().join("junk"))
+            .expect("junk")
+    });
+    update(&view, cx, |app, cx| app.go_to(junk, cx));
+    draw(cx);
+    assert!(read(&view, cx, |app| app.legend.is_active()));
+    let drawn = laid_out(&view, cx);
+    assert!(drawn.contains(&"blob.bin".to_string()), "{drawn:?}");
+}
+
+#[gpui_kit::test]
+fn marking_a_partly_shown_folder_says_it_takes_all_of_it(
+    cx: &mut TestAppContext,
+) {
+    use crate::legend::ChipId;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.cycle_legend(ChipId::Reclaimable, cx);
+        app.cycle_legend(ChipId::Reclaimable, cx);
+    });
+    cx.run_until_parked();
+    // The scanned root holds `.cache`, which the filter hides.
+    update(&view, cx, |app, _| app.selected = Some(Vec::new()));
+    draw(cx);
+    assert!(cx.debug_bounds("selection-partly-shown").is_some());
+    // A folder that passes whole needs no such note.
+    let junk = read(&view, cx, |app| {
+        app.crumbs_for_path(&temp.path().join("junk"))
+            .expect("junk")
+    });
+    update(&view, cx, |app, _| app.selected = Some(junk));
+    draw(cx);
+    assert!(cx.debug_bounds("selection-partly-shown").is_none());
+}
+
+/// Every chip is a filter, so none may be clipped away: the legend wraps
+/// instead, at any width and text size, in both colour modes.
+#[gpui_kit::test]
+fn every_legend_chip_stays_inside_the_window(cx: &mut TestAppContext) {
+    use crate::legend::ChipId;
+    use disktree_core::classify::Category;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    for age in [false, true] {
+        update(&view, cx, |app, cx| {
+            app.color_mode = if age {
+                crate::state::ColorMode::Age
+            } else {
+                crate::state::ColorMode::Kind
+            };
+            cx.notify();
+        });
+        let chips: Vec<ChipId> = if age {
+            (0..crate::palette::AGE_BUCKETS.len())
+                .map(ChipId::Age)
+                .collect()
+        } else {
+            (0..Category::LEGEND.len()).map(ChipId::Kind).collect()
+        };
+        for width in [900., 1100., 1440.] {
+            for rem in [16., 24., 32.] {
+                cx.simulate_resize(gpui_kit::size(px(width), px(900.)));
+                cx.update(|window, _| window.set_rem_size(px(rem)));
+                draw(cx);
+                let legend = cx.debug_bounds("legend").expect("legend");
+                for id in chips.iter().copied().chain([ChipId::Reclaimable]) {
+                    let at = format!("{id:?} at {width} rem {rem}");
+                    let key = Box::leak(id.key().into_boxed_str());
+                    let chip = cx.debug_bounds(key).expect(&at);
+                    assert!(
+                        chip.right() <= px(width) + px(0.5)
+                            && chip.left() >= px(0.)
+                            && chip.size.width > px(0.),
+                        "{at}: {chip:?}"
+                    );
+                    // Clipped chips used to run on past the legend's edge,
+                    // under the side panel, while still inside the window.
+                    assert!(
+                        chip.right() <= legend.right() + px(0.5)
+                            && chip.bottom() <= legend.bottom() + px(0.5),
+                        "{at}: {chip:?} inside the legend {legend:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A filter that keeps nothing in the folder on screen says so, says
+/// whether anything elsewhere passes, and offers Show all, in the mosaic
+/// and in List view alike.
+#[gpui_kit::test]
+fn a_legend_filter_that_keeps_nothing_says_so(cx: &mut TestAppContext) {
+    use crate::legend::ChipId;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    assert!(cx.debug_bounds("legend-empty").is_none());
+
+    // Reclaimable toolchains: the fixture's only reclaimable tree is a
+    // cache, so nothing anywhere passes.
+    update(&view, cx, |app, cx| {
+        app.cycle_legend(ChipId::Reclaimable, cx);
+        app.cycle_legend(ChipId::Kind(2), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::legend_empty_here), Some((0, 0)));
+    assert!(cx.debug_bounds("legend-empty").is_some(), "in the mosaic");
+    update(&view, cx, |app, cx| {
+        app.file_list = true;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("legend-empty").is_some(), "in List view");
+    assert!(
+        cx.debug_bounds("legend-empty-status").is_some(),
+        "announced"
+    );
+    // Compact List view draws no legend, so its header says what filters.
+    let note = read(&view, cx, Disktree::list_filter_note);
+    assert!(note.contains("reclaimable Toolchains"), "{note}");
+    click_on(cx, "legend-empty-clear");
+    cx.run_until_parked();
+    draw(cx);
+    assert!(!read(&view, cx, |app| app.legend.is_active()));
+    assert!(cx.debug_bounds("legend-empty").is_none());
+
+    // Reclaimable alone, from inside `keep`: nothing here, but `.cache`
+    // passes elsewhere.
+    let keep = read(&view, cx, |app| {
+        app.crumbs_for_path(&temp.path().join("keep"))
+            .expect("keep")
+    });
+    update(&view, cx, |app, cx| {
+        app.file_list = false;
+        app.crumbs = keep;
+        app.selected = None;
+        app.cycle_legend(ChipId::Reclaimable, cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, Disktree::legend_empty_here),
+        Some((300_000, 1))
+    );
+    assert!(cx.debug_bounds("legend-empty").is_some());
+}
+
+/// The age chips judge by the scan's clock, as the age colours do, and
+/// a partly shown folder's row in List view says what share passed.
+#[gpui_kit::test]
+fn the_age_filter_keeps_the_scan_clock_and_lists_partial_shares(
+    cx: &mut TestAppContext,
+) {
+    use crate::legend::ChipId;
+
+    cx.update(init);
+    let temp = fixture();
+    // Two years old: in the Older bucket, unlike everything else.
+    let old = std::time::SystemTime::now()
+        - std::time::Duration::from_hours(800 * 24);
+    std::fs::File::options()
+        .write(true)
+        .open(temp.path().join("junk/deeper/more.bin"))
+        .and_then(|file| file.set_modified(old))
+        .expect("age the file");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.file_list = true;
+        app.scanned_at -= 3 * 86_400;
+        app.cycle_legend(ChipId::Age(4), cx);
+    });
+    cx.run_until_parked();
+    let (now, scanned) = read(&view, cx, |app| {
+        (app.legend_rule().map(|rule| rule.now), app.scanned_at)
+    });
+    assert_eq!(now, Some(scanned), "ages measured from the scan");
+
+    let junk = read(&view, cx, |app| {
+        app.crumbs_for_path(&temp.path().join("junk"))
+            .expect("junk")
+    });
+    let size = read(&view, cx, |app| {
+        app.entry_size(&junk, app.node_at(&junk).expect("junk"))
+    });
+    assert!(size.contains(" of "), "partly shown: {size}");
+    let keep = read(&view, cx, |app| {
+        app.crumbs_for_path(&temp.path().join("keep"))
+            .expect("keep")
+    });
+    let listed = read(&view, cx, Disktree::file_entries);
+    assert!(
+        !listed.contains(keep.last().expect("a child")),
+        "{listed:?}"
+    );
+}
+
+/// Switching size and file count reorders every folder, so the legend's
+/// result, keyed by position, is dropped at once and worked out again.
+#[gpui_kit::test]
+fn switching_the_metric_recomputes_the_legend(cx: &mut TestAppContext) {
+    use crate::legend::ChipId;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.cycle_legend(ChipId::Reclaimable, cx);
+    });
+    cx.run_until_parked();
+    assert!(read(&view, cx, |app| app.legend_matches.is_some()));
+    update(&view, cx, |app, cx| {
+        app.toggle_metric(cx);
+        assert!(app.legend_matches.is_none(), "old positions dropped");
+    });
+    cx.run_until_parked();
+    let drawn = laid_out(&view, cx);
+    assert!(drawn.contains(&".cache".to_string()), "{drawn:?}");
+    assert!(!drawn.contains(&"junk".to_string()), "{drawn:?}");
+}
+
+#[gpui_kit::test]
+fn the_marked_total_is_pinned_above_the_disk_with_the_review(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    assert!(cx.debug_bounds("marked-total").is_none(), "nothing marked");
+
+    for name in ["junk", ".cache"] {
+        let crumbs = read(&view, cx, |app| {
+            app.crumbs_for_path(&temp.path().join(name))
+                .expect("present")
+        });
+        update(&view, cx, |app, cx| app.toggle_mark(&crumbs, cx));
+    }
+    draw(cx);
+    let total = cx.debug_bounds("marked-total").expect("marked total drawn");
+    let disk = cx.debug_bounds("disk-section").expect("disk drawn");
+    let scroll = cx.debug_bounds("side-panel-scroll").expect("lists drawn");
+    assert!(total.bottom() <= disk.top() + px(0.5), "{total:?} {disk:?}");
+    assert!(
+        scroll.bottom() <= total.top() + px(0.5),
+        "pinned below lists"
+    );
+    // The list leads the scroll, so on a short window it is suggestions
+    // that scroll out of sight, not what is marked.
+    let row = cx.debug_bounds("marked-row-0").expect("marked row drawn");
+    let worth = cx.debug_bounds("worth-section").expect("worth drawn");
+    assert!(row.bottom() <= worth.top(), "{row:?} {worth:?}");
+    assert!(row.bottom() <= scroll.bottom(), "{row:?} {scroll:?}");
+    // Without clones what is marked is what is freed, said once.
+    assert!(cx.debug_bounds("marked-frees").is_some());
+    assert!(cx.debug_bounds("marked-split").is_none());
+    let review = cx.debug_bounds("review").expect("review button");
+    assert!(
+        total.contains(&review.center()),
+        "the review is in the block"
+    );
+    click_on(cx, "review");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
 }

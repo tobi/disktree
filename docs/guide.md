@@ -79,7 +79,9 @@ a root. Explicit command-line paths and `--disk` still start directly;
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
   there (see [The whole disk](#the-whole-disk)).
-- **Under it:** the scan totals, the filter when one is typed, and the legend.
+- **Under it:** the scan totals and the filter when one is typed, and on
+  its own row the legend, which wraps onto another line rather than hide
+  an entry.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches — at one muted
   level, lighter with depth. A diagonal hatch is space that can be had back
@@ -87,12 +89,25 @@ a root. Explicit command-line paths and `--disk` still start directly;
   colour. Top-level directories carry a strip of their colour and a name
   band; deeper open directories a slim label row. In **Age** mode colour is
   the last write instead, from this week to older.
+- **Legend:** each entry is also a filter. Click it once to show only that
+  kind (or age), again to hide it, and a third time to show it again.
+  Kinds set to only add up ("Code" and "Cache" show both), while
+  **Reclaimable** narrows them to their reclaimable part. The mosaic lays
+  out only what passes, at its own size, and a folder that only partly
+  passes says so: `48G of 196G`. Kind and age filters apply together, so
+  "old code" is a click in each mode. **Show all** or `esc` clears them.
+  When nothing in the folder on screen passes, the mosaic or list says
+  so, and whether anything elsewhere in the scan does.
+  A filter changes what is shown, never what a mark takes: marking a
+  folder that is only partly shown marks all of it, and the panel says so.
 - **Panel:** the selection (its size set large, share of the scan, files,
   last write, and for a checkout what git says — changes, stashes, unpushed
-  commits); *Worth a look*, the largest things that could plausibly go;
-  what is marked; and the disk, free now and after the marks, with the way
-  to the review screen. Drag its left edge to resize it; double-click the
-  edge to reset.
+  commits); what is marked; *Worth a look*, the largest things that could
+  plausibly go; then, pinned above the disk, the marks taken together —
+  how much is marked, what removing all of it frees, and the way to the
+  review screen; and the disk, free now and after the marks. On a short
+  window *Worth a look* is what scrolls. Drag its left edge to resize it;
+  double-click the edge to reset.
 
 One colour is kept apart: amber marks the selection, the main action, and
 what can be had back.
@@ -161,6 +176,7 @@ and shows how much free space was actually gained.
 | `-` `=` `0` | magnify, shrink, reset the view |
 | `ctrl =` `ctrl -` `ctrl 0` (`⌘` on macOS) | interface zoom, 75–200%, shared by all windows |
 | `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
+| click a legend entry | show only that kind or age, then hide it, then show it again; `esc` clears |
 | `c` | review the marked list |
 | `t` | size, files or age: what areas and colours say |
 | `ctrl 1` `ctrl 2` (`⌘` on macOS) | treemap or file list; the list is read by screen readers |
@@ -532,8 +548,10 @@ What is different from Linux:
   alone`, and the scan and listing headers say how much is counted again
   and what the files take on disk. Rows without clones, and every row off
   APFS or in an apparent-size scan, read as before.
-  The selection, review and permanent-delete confirmation estimate savings
-  from the accepted set of marks together. Complete clone groups credit
+  The panel's marked total, the review and the permanent-delete
+  confirmation estimate savings from the accepted set of marks together;
+  the selection's own line says what that entry frees removed on its own,
+  which for one of several clones can be far less. Complete clone groups credit
   shared data once; a remaining hardlink retains its file data. Unknown or
   modified sharing and allocation outside the data fork supply a range,
   with only its lower bound used by the volume meter. Unknown private sizes

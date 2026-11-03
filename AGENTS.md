@@ -261,6 +261,7 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 | clone sharing totals and conservative savings | `crates/disktree-core/src/sharing.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | what the explore bar folds into ⋮ at each width, and ⋮'s keys | `crates/disktree-app/src/toolbar.rs` |
+| the legend as a filter: its chips and what they keep | `crates/disktree-app/src/legend.rs`, the rule in `crates/disktree-core/src/filter.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
 | layout of a screen | `crates/disktree-app/src/views.rs` |
