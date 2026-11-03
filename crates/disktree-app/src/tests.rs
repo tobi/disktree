@@ -5265,6 +5265,28 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     assert_eq!(preview.estimate.lower, 0, "apparent fixture sizes");
     assert_eq!(preview.estimate.upper, None);
     assert!(preview.estimate.partial);
+    // Estimation must leave the pending single-use removal intent intact.
+    let before = ask(cx, Request::State);
+    let estimated = ask(
+        cx,
+        Request::Estimate {
+            paths: vec![root.join("junk")],
+            peer_scope: None,
+            peer_limit: 10,
+        },
+    );
+    let Response::Estimate(report) = estimated else {
+        panic!("estimate response");
+    };
+    assert_eq!(report.accepted, [root.join("junk")]);
+    assert!(report.reclaim.is_none(), "apparent fixture");
+    assert_eq!(ask(cx, Request::State), before);
+    assert!(read(&view, cx, |app| app
+        .agent
+        .as_ref()
+        .expect("agent")
+        .removal_preview
+        .is_some()));
     let confirmed = |preview: &disktree_link::RemovalPreview| {
         disktree_link::ConfirmedRemoval {
             preview_id: preview.preview_id.clone(),

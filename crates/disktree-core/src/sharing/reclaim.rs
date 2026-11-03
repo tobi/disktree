@@ -51,6 +51,7 @@ impl Group {
     }
 }
 
+#[derive(Clone)]
 struct Links {
     allocation: Allocation,
     names: u64,
@@ -62,7 +63,7 @@ impl Links {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Accumulator {
     base: Estimate,
     credit: Estimate,
@@ -311,11 +312,43 @@ const fn replace(total: &mut Estimate, before: Estimate, after: Estimate) {
 ///
 /// Callers cache this scan-derived answer; removal authorization must still be checked afresh.
 pub fn estimate<'a>(nodes: impl IntoIterator<Item = Node<'a>>) -> Estimate {
-    let mut total = Accumulator::new(super::MAX_CLONE_GROUPS);
-    for node in nodes {
-        total.merge(gather(node));
+    Selected::new(nodes).estimate()
+}
+
+/// Reuse one gathered selection for its total, attribution and bounded peers.
+pub struct Selected(Accumulator);
+
+impl Selected {
+    pub fn new<'a>(nodes: impl IntoIterator<Item = Node<'a>>) -> Self {
+        let mut total = Accumulator::new(super::MAX_CLONE_GROUPS);
+        for node in nodes {
+            total.merge(gather(node));
+        }
+        Self(total)
     }
-    total.estimate()
+
+    pub const fn estimate(&self) -> Estimate {
+        self.0.estimate()
+    }
+
+    /// Disjoint alternatives and their combined union use the same engine.
+    /// Only candidates are gathered here; the selected tree is never re-walked.
+    pub fn additions(
+        &self,
+        candidates: &[Node<'_>],
+    ) -> (Vec<(Estimate, Estimate)>, Estimate) {
+        let mut combined = self.0.clone();
+        let mut answers = Vec::with_capacity(candidates.len());
+        for node in candidates {
+            let addition = gather(*node);
+            let alone = addition.estimate();
+            let mut union = self.0.clone();
+            union.merge(addition.clone());
+            combined.merge(addition);
+            answers.push((alone, union.estimate()));
+        }
+        (answers, combined.estimate())
+    }
 }
 
 fn gather(node: Node<'_>) -> Accumulator {
@@ -615,6 +648,58 @@ mod tests {
         assert!(counts[1] <= counts[0] * 16, "{counts:?}");
         eprintln!(
             "selected-set accounting operations 128->1024 groups: {counts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod addition_tests {
+    use super::*;
+    use crate::tree::{Draft, Metric, NodeKind, Tree, aggregate};
+
+    #[test]
+    fn bounded_peer_unions_scale_with_metadata_not_pairs_of_files() {
+        let mut counts = Vec::new();
+        for count in [128_u64, 1024] {
+            let mut root = Draft::directory("root");
+            for member in 0..=20 {
+                let mut dir = Draft::directory(format!("member-{member}"));
+                for group in 1..=count {
+                    let mut file =
+                        Draft::entry(group.to_string(), NodeKind::File, 4096);
+                    file.allocation = Some(Box::new(Allocation {
+                        bytes: 4096,
+                        identity: None,
+                        links: 1,
+                        followed: false,
+                        clone: Some(CloneInfo {
+                            device: 1,
+                            id: group,
+                            references: 21,
+                            private_bytes: Some(0),
+                            data_bytes: 4096,
+                        }),
+                    }));
+                    dir.children.push(file);
+                }
+                root.children.push(dir);
+            }
+            let mut tree = Tree::from(root);
+            aggregate(&mut tree, Metric::Bytes);
+            let nodes: Vec<_> = tree.root().children().iter().collect();
+            WORK.set(0);
+            let (alternatives, together) =
+                Selected::new(nodes[..1].iter().copied())
+                    .additions(&nodes[1..]);
+            assert!(alternatives.iter().all(|(_, union)| union.upper == 0));
+            assert_eq!(together.lower, count * 4096);
+            let operations = WORK.get();
+            assert!(operations < count * 200, "{count}: {operations}");
+            counts.push(operations);
+        }
+        assert!(counts[1] <= counts[0] * 9, "{counts:?}");
+        eprintln!(
+            "20 peer union accounting operations, 128 -> 1024 groups: {counts:?}"
         );
     }
 }

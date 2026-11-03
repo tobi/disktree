@@ -165,6 +165,13 @@ impl Plan {
         self.estimate_partial = total.partial || local.partial;
     }
 
+    /// Target-root attribution from the same mount read as the guards.
+    pub fn attributed_targets(
+        &self,
+    ) -> impl Iterator<Item = (&Target, crate::space::Attribution)> {
+        self.targets.iter().zip(self.attribution.iter().copied())
+    }
+
     /// Bytes the targets free on other volumes, which the meter leaves out.
     pub const fn foreign(&self) -> u64 {
         self.foreign

@@ -219,6 +219,11 @@ impl Disktree {
             }
             Request::Ls { path, limit } => self.agent_ls(path, *limit),
             Request::Find(request) => self.agent_find(request),
+            Request::Estimate {
+                paths,
+                peer_scope,
+                peer_limit,
+            } => self.agent_estimate(paths, peer_scope.as_deref(), *peer_limit),
             Request::Mark { root, targets } => {
                 self.agent_marks(root, targets, cx)
             }
@@ -336,6 +341,36 @@ impl Disktree {
                     display_path(path, self.home.as_deref(), PathStyle::Native)
                 )
             })
+    }
+
+    /// Estimate from the complete window tree without changing any state.
+    fn agent_estimate(
+        &self,
+        paths: &[PathBuf],
+        peer_scope: Option<&Path>,
+        peer_limit: usize,
+    ) -> Response {
+        if self.scan.is_some() || self.screen == Screen::Running {
+            return Response::error(
+                "Wait for the scan or removal to finish before estimating.",
+            );
+        }
+        let Some(tree) = self.tree.as_deref() else {
+            return Response::error("The window has no completed scan.");
+        };
+        let summary = self.agent_state().tree;
+        let context = disktree_core::planning::Context::of(
+            &self.root_path,
+            &self.options,
+            summary.as_ref().map_or(0, |tree| tree.scanned_at),
+            summary.as_ref().map_or(0, |tree| tree.unreadable),
+        );
+        match disktree_core::planning::estimate(
+            tree, context, paths, peer_scope, peer_limit,
+        ) {
+            Ok(report) => Response::Estimate(report),
+            Err(message) => Response::error(message),
+        }
     }
 
     /// What is in a directory of the tree on screen.

@@ -27,8 +27,8 @@ use rmcp::{
 };
 
 use crate::session::{
-    FindParams, LsParams, PathsParams, RemovalPreviewParams, RemoveParams,
-    ScanParams, ScanPlan, Session, ShowParams, run_scan,
+    EstimateParams, FindParams, LsParams, PathsParams, RemovalPreviewParams,
+    RemoveParams, ScanParams, ScanPlan, Session, ShowParams, run_scan,
 };
 use crate::skills::{self, SKILLS};
 
@@ -42,7 +42,9 @@ const SCAN_WAIT: Duration = Duration::from_mins(10);
 /// and safely, without reading a skill first.
 const INSTRUCTIONS: &str = "\
 Start with pwrdisk_status, then scan and explore with pwrdisk_ls and \
-pwrdisk_find. Browsing never moves the displayed directory. Call \
+pwrdisk_find. Use pwrdisk_estimate for a hypothetical path list without \
+changing the cart; bounded clone-holder peers are inspection leads only. \
+Browsing never moves the displayed directory. Call \
 pwrdisk_show only when the user asks to see a path or requests following. \
 pwrdisk_scan explicitly changes the linked window's scan root. \
 Agree the list before pwrdisk_mark unless a standing instruction covers \
@@ -195,6 +197,25 @@ impl Server {
         Parameters(params): Parameters<FindParams>,
     ) -> Result<String, String> {
         self.with(|s| s.find(&params))
+    }
+
+    /// Estimate removing a supplied path set without changing marks, scan
+    /// root, navigation or removal intents. Returns accepted/covered/refused
+    /// paths, allocation, selected-set physical bounds and scan limitations.
+    /// Bounded directory peers identify retained clones within the scan and
+    /// quantify union savings; these are inspection leads, not advice to remove.
+    #[tool(
+        name = "pwrdisk_estimate",
+        annotations(
+            title = "Estimate hypothetical path set",
+            read_only_hint = true
+        )
+    )]
+    async fn estimate(
+        &self,
+        Parameters(params): Parameters<EstimateParams>,
+    ) -> Result<String, String> {
+        self.with(|s| s.estimate_paths(&params))
     }
 
     /// Show a path in the PwrDisk window, selected in its directory, so
@@ -602,6 +623,14 @@ mod tests {
         assert_eq!(flags.read_only_hint, Some(false));
         assert_eq!(flags.destructive_hint, Some(true));
         assert_eq!(flags.idempotent_hint, Some(false));
+        let estimate = tools
+            .iter()
+            .find(|tool| tool.name == "pwrdisk_estimate")
+            .expect("estimate");
+        assert_eq!(
+            estimate.annotations.as_ref().expect("read").read_only_hint,
+            Some(true)
+        );
         let listing = tools
             .iter()
             .find(|tool| tool.name == "pwrdisk_ls")

@@ -48,7 +48,7 @@ pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Protocol version, bumped when a message changes shape. Both sides are
 /// built from one tree, so a mismatch means an old window is still open.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Updating the GUI does not replace a process hosted by an MCP client.
 pub const RECONNECT_MCP: &str = "Updating PwrDisk's GUI does not restart its MCP server. In your MCP client, restart/reconnect the PwrDisk MCP server using `pwrdisk mcp` from the updated installation. If the GUI is outdated, quit and reopen the updated PwrDisk app.";
@@ -247,6 +247,13 @@ pub enum Request {
     /// The largest entries matching a description; answered with
     /// [`FoundList`].
     Find(FindRequest),
+    /// Read-only hypothetical selection, with bounded retained clone peers.
+    /// Does not change marks, navigation or a pending removal preview.
+    Estimate {
+        paths: Vec<PathBuf>,
+        peer_scope: Option<PathBuf>,
+        peer_limit: usize,
+    },
     /// Show `path` in the mosaic. `root` is the agent's scan root: when the
     /// window shows something else, it rescans from there first.
     Show { root: PathBuf, path: PathBuf },
@@ -613,6 +620,7 @@ pub enum Response {
     },
     Listing(Listing),
     Found(FoundList),
+    Estimate(disktree_core::planning::Report),
     RemovalPreview(RemovalPreview),
     Ok,
     Error {

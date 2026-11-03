@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use crate::tree::{Node, Tree};
 
 mod reclaim;
+pub(crate) use reclaim::Selected;
 pub use reclaim::{Estimate, estimate};
 
 /// Sparse allocation facts survive hardlink weight de-duplication.
@@ -139,6 +140,40 @@ impl Group {
 }
 
 type Groups = FxHashMap<(u64, u64), Group>;
+
+/// Union duplicate reporting uses exactly the same grouping as aggregation.
+#[derive(Default)]
+pub(crate) struct DuplicateSummary {
+    groups: Groups,
+    summary: Sharing,
+    incomplete: bool,
+}
+
+impl DuplicateSummary {
+    pub(crate) fn add(&mut self, node: Node<'_>) {
+        self.incomplete |= node
+            .allocation()
+            .and_then(|allocation| allocation.clone)
+            .is_some_and(CloneInfo::incomplete);
+        if let Some((key, group)) = own(node, &mut self.summary) {
+            join(
+                &mut self.groups,
+                key,
+                group,
+                MAX_CLONE_GROUPS,
+                &mut self.summary,
+            );
+        }
+    }
+
+    pub(crate) const fn bytes(&self) -> Option<u64> {
+        if self.incomplete || self.summary.groups_truncated {
+            None
+        } else {
+            Some(self.summary.duplicate_bytes)
+        }
+    }
+}
 // Bound temporary grouping memory on volumes with millions of clone IDs.
 const MAX_CLONE_GROUPS: usize = 1_000_000;
 

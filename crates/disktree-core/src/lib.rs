@@ -22,6 +22,7 @@ pub mod macos_services;
 mod mft;
 pub mod path_style;
 pub mod payload;
+pub mod planning;
 pub mod query;
 pub mod remote;
 pub mod remote_progress;

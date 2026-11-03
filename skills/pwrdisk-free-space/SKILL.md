@@ -31,7 +31,7 @@ marked:
 Looking is free; acting is the user's call.
 
 - **Read-only tools need no permission.** `pwrdisk_status`, `pwrdisk_ls`,
-  `pwrdisk_find` and a home-directory `pwrdisk_scan` only read. Say before
+  `pwrdisk_find`, `pwrdisk_estimate` and a home-directory `pwrdisk_scan` only read. Say before
   a `disk: true` scan that it walks the whole volume and can take minutes.
 - **Confirm the list before `pwrdisk_mark`.** Show each candidate with its
   path, its size, what it is, and why it is safe to lose or how it comes
@@ -81,6 +81,15 @@ Looking is free; acting is the user's call.
 
 ## Ground rules
 
+- **Estimate before marking.** For a hypothetical path list use
+  `pwrdisk_estimate` without changing the cart. Evaluate the whole set;
+  never sum directory reclaim estimates or mark worktrees temporarily.
+  Allocation includes internal clone duplicates. Check bounds, scan and
+  metadata completeness, unavailable values and volume attribution.
+  Retained clone-holder directories are inspection leads, not removal
+  recommendations. Agree each added path separately; a larger estimated
+  saving does not establish that a worktree is disposable. See the macOS
+  reference for bounded peer discovery and unresolved references.
 - **Keep browsing stationary.** `pwrdisk_ls` and `pwrdisk_find` never move
   the window. Call `pwrdisk_show` only if the user asks to see a directory
   or explicitly asks the window to follow along. Do not enable following

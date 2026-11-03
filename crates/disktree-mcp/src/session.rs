@@ -187,6 +187,20 @@ pub struct LsParams {
     pub show: bool,
 }
 
+/// A hypothetical selection; the marked cart is never used or modified.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EstimateParams {
+    /// 1 to 200 paths from one completed scan. Overlaps are covered once.
+    pub paths: Vec<PathBuf>,
+    /// Group retained clones by direct child directories of this scanned
+    /// directory. Default: the selected paths' common parent. Widen this
+    /// scope to search elsewhere in the scan; no owner discovery outside it.
+    pub peer_scope: Option<PathBuf>,
+    /// Maximum directory peers, default 10, at most 20. Zero skips peers.
+    pub peer_limit: Option<usize>,
+}
+
 /// What kind of entry `pwrdisk_find` matches; [`Kind`] as a parameter.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq,
@@ -769,6 +783,100 @@ impl Session {
             &found.path,
             found.node,
             limit,
+        ))
+    }
+
+    /// Estimate without adopting or handing over marks from either side.
+    pub fn estimate_paths(
+        &self,
+        params: &EstimateParams,
+    ) -> Result<String, String> {
+        use disktree_core::planning::{self, Context};
+        if params.paths.is_empty() || params.paths.len() > planning::MAX_PATHS {
+            return Err(format!("Supply 1 to {} paths.", planning::MAX_PATHS));
+        }
+        let paths = params
+            .paths
+            .iter()
+            .map(|p| self.absolute(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let peer_scope = params
+            .peer_scope
+            .as_ref()
+            .map(|p| self.absolute(p))
+            .transpose()?;
+        let peer_limit =
+            params.peer_limit.unwrap_or(10).min(planning::MAX_PEERS);
+        // A normal connection hands over marks and Hello clears an intent.
+        // This independent State/Estimate exchange does neither and never
+        // adopts window marks or falls back to stale local trees on failure.
+        let report = if let Ok(mut link) = Link::connect_at(&self.socket) {
+            let state =
+                match link.call(&Request::State).map_err(|e| e.to_string())? {
+                    Response::State(state) => state,
+                    Response::Error { message } => return Err(message),
+                    other => return Err(unexpected(&other)),
+                };
+            if state.version != VERSION {
+                return Err(disktree_link::protocol_mismatch(
+                    state.version,
+                    VERSION,
+                ));
+            }
+            if let Some(host) = state.remote {
+                return Err(disktree_link::remote_refusal(&host));
+            }
+            match link
+                .call(&Request::Estimate {
+                    paths,
+                    peer_scope,
+                    peer_limit,
+                })
+                .map_err(|e| e.to_string())?
+            {
+                Response::Estimate(report) => report,
+                Response::Error { message } => return Err(message),
+                other => return Err(unexpected(&other)),
+            }
+        } else {
+            if self.link.is_some() || self.window.is_some() {
+                return Err("The linked window is unavailable; reconnect before estimating its tree.".into());
+            }
+            let scan = self
+                .scans
+                .iter()
+                .rev()
+                .find(|scan| {
+                    paths.iter().all(|path| path.starts_with(&scan.root))
+                })
+                .or_else(|| {
+                    self.scans
+                        .iter()
+                        .rev()
+                        .find(|scan| paths[0].starts_with(&scan.root))
+                })
+                .or_else(|| self.scans.last())
+                .ok_or_else(|| {
+                    "Nothing is scanned yet. Call pwrdisk_scan first."
+                        .to_string()
+                })?;
+            planning::estimate(
+                &scan.tree,
+                Context::of(
+                    &scan.root,
+                    &scan.options,
+                    scan.at,
+                    scan.unreadable,
+                ),
+                &paths,
+                peer_scope.as_deref(),
+                peer_limit,
+            )?
+        };
+        let json =
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Read-only hypothetical selection; marks, scan root, navigation and removal intents are unchanged. All byte values are bytes.\n{json}\nPeer rows are alternatives, not additive savings. Additional bounds subtract the original selection's opposite bound. with_all_returned_peers evaluates their union once. Peers are clone-holder directories to inspect, not removal recommendations. Clone IDs cannot enumerate all extent owners, particularly after modification. references_not_seen_in_scan counts unresolved references without owner paths, never known peers; filtered or truncated scans cannot establish that count. Peer candidates are direct children of peers.scope; widen peer_scope explicitly to inspect another part of this scan."
         ))
     }
 
@@ -2138,6 +2246,7 @@ fn unexpected(response: &Response) -> String {
             Response::Marked { .. } => "marked",
             Response::Listing(_) => "listing",
             Response::Found(_) => "found",
+            Response::Estimate(_) => "estimate",
             Response::RemovalPreview(_) => "removal_preview",
             Response::Ok => "ok",
             Response::Error { .. } => "error",
@@ -2576,6 +2685,131 @@ mod tests {
         assert!(review.contains("Nothing is marked"), "{review}");
     }
 
+    fn estimate_json(text: &str) -> disktree_core::planning::Report {
+        let (_, json) = text.split_once('\n').expect("JSON after introduction");
+        serde_json::Deserializer::from_str(json)
+            .into_iter()
+            .next()
+            .expect("report")
+            .expect("valid report")
+    }
+
+    #[test]
+    fn hypothetical_selection_preserves_the_offline_cart_and_scan() {
+        let temp = fixture();
+        let mut session = unlinked(temp.path());
+        scanned(&mut session, temp.path());
+        let kept = Target {
+            path: temp.path().join("notes"),
+            bytes: 123,
+            is_dir: true,
+            hidden: false,
+        };
+        session.marks.push(kept.clone());
+        let root = session.scans[0].root.clone();
+        let at = session.scans[0].at;
+        let text = session
+            .estimate_paths(&EstimateParams {
+                paths: vec![
+                    temp.path().join("Downloads"),
+                    temp.path().join("Downloads"),
+                ],
+                ..EstimateParams::default()
+            })
+            .expect("estimate");
+        let report = estimate_json(&text);
+        assert_eq!(report.accepted, [temp.path().join("Downloads")]);
+        assert_eq!(report.covered.len(), 1);
+        assert!(report.reclaim.is_none(), "apparent fixture");
+        assert_eq!(session.marks(), [kept]);
+        assert_eq!(session.scans.len(), 1);
+        assert_eq!(session.scans[0].root, root);
+        assert_eq!(session.scans[0].at, at);
+        assert!(session.link.is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hypothetical_selection_reads_the_window_without_greeting_or_handover() {
+        let temp = fixture();
+        let socket = endpoint(temp.path());
+        let window_root = temp.path().join("src");
+        let mut session = Session::detached(socket.clone(), None);
+        // A stale, broader local tree and offline cart must not be adopted.
+        scanned(&mut session, temp.path());
+        let window = FakeWindow::open(&socket, &window_root);
+        let kept = Target {
+            path: temp.path().join("Downloads"),
+            bytes: 1,
+            is_dir: true,
+            hidden: false,
+        };
+        session.marks.push(kept.clone());
+        let text = session
+            .estimate_paths(&EstimateParams {
+                paths: vec![
+                    window_root.join("app"),
+                    temp.path().join("Downloads"),
+                ],
+                ..EstimateParams::default()
+            })
+            .expect("window estimate");
+        let report = estimate_json(&text);
+        assert_eq!(report.context.root, window_root);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(session.marks(), [kept]);
+        assert!(window.marks().is_empty());
+        assert!(session.link.is_none());
+        assert!(session.window.is_none());
+        assert!(matches!(
+            window.asked().as_slice(),
+            [Request::State, Request::Estimate { .. }]
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hypothetical_selection_refuses_remote_or_old_peers_without_local_fallback()
+     {
+        for remote in [true, false] {
+            let temp = fixture();
+            let scan =
+                run_scan(temp.path().to_path_buf(), apparent()).expect("scan");
+            let socket = endpoint(temp.path());
+            let window = FakeWindow::with_tree(
+                &socket,
+                FakeTree {
+                    protocol: if remote { VERSION } else { VERSION - 1 },
+                    root: scan.root.clone(),
+                    tree: Arc::clone(&scan.tree),
+                    marks: vec![],
+                    remote: remote.then(|| "contrived-host".into()),
+                    busy: false,
+                    options: scan.options.clone(),
+                    unreadable: 0,
+                },
+            );
+            let mut session = Session::detached(socket, None);
+            session.store_scan(scan);
+            let error = session
+                .estimate_paths(&EstimateParams {
+                    paths: vec![temp.path().join("Downloads")],
+                    ..EstimateParams::default()
+                })
+                .expect_err("cannot substitute local tree");
+            assert!(
+                error.contains(if remote {
+                    "SSH host"
+                } else {
+                    "restart/reconnect"
+                }),
+                "{error}"
+            );
+            assert!(matches!(window.asked().as_slice(), [Request::State]));
+        }
+    }
+
     /// A stand-in for the window: holds a real tree of the fixture, answers
     /// over the real socket the way the app does, and records what it was
     /// asked.
@@ -2712,6 +2946,28 @@ mod tests {
                         request.limit,
                     );
                     Response::Found(FoundList::of(&found))
+                }
+                Request::Estimate {
+                    paths,
+                    peer_scope,
+                    peer_limit,
+                } => {
+                    let context = disktree_core::planning::Context::of(
+                        &self.root,
+                        &self.options,
+                        1,
+                        self.unreadable,
+                    );
+                    match disktree_core::planning::estimate(
+                        &self.tree,
+                        context,
+                        paths,
+                        peer_scope.as_deref(),
+                        *peer_limit,
+                    ) {
+                        Ok(report) => Response::Estimate(report),
+                        Err(message) => Response::error(message),
+                    }
                 }
                 Request::Mark { targets, .. } => {
                     let mut refused = Vec::new();

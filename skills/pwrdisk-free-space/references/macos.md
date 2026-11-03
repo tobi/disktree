@@ -128,3 +128,47 @@ never approve its buttons or confirmation keys through computer use.
 
 Capacity checks charge a symbolic link to its containing volume, not its
 destination.
+
+## Read-only APFS path-set planning
+
+Use `pwrdisk_estimate` with the complete hypothetical `paths` list before
+marking. It leaves the cart, scan root, displayed directory and pending
+removal previews unchanged. Do not temporarily mark worktrees to measure a
+set, and do not add individual directory reclaim estimates: clone groups
+and hardlink names can span directories.
+
+`listed_bytes` counts directory allocation, even repeated clone blocks.
+`shared_allocation` includes copies shared inside the selection and clone
+allocation whose private size is unknown. `internal_duplicate_allocation`
+reports repetitions within that whole set; neither is unique physical
+usage or necessarily space retained outside it. Private allocation can
+remain held by hardlink names outside the set. Reclaim bounds evaluate the
+accepted union with existing guards; covered paths do not count twice.
+Unavailable values are null, not measured zero. Apparent scans, disabled or
+unsupported clone collection cannot supply physical bounds. Check metadata
+and scan completeness, hidden filtering, depth, unreadable entries and
+volume attribution. Cross-volume directory totals are not projected onto
+the scanned volume's meter.
+
+For four full 12 GB clones, selecting three can reclaim almost nothing.
+Selecting all four can unlock the shared 12 GB once. The tool returns
+bounded retained clone-holder **directories** and bounds for adding each,
+plus a single estimate for adding all returned peers. Individual peer
+savings are alternatives, not additive. `additional` uses interval
+subtraction, so modified clones can have wide additional bounds. A peer is
+an inspection lead, never permission or a recommendation to remove it.
+Establish ownership, uncommitted work and the user's intent before proposing
+any worktree for removal.
+
+`peer_scope` groups peers by its direct child directories. Its default is
+the selected paths' common parent; widen it within the current scan to look
+elsewhere, then narrow it with another call if results are too broad. The
+response bounds peer count and metadata visits and reports truncation.
+Known unselected clone files are observations within the scan. Unresolved
+reference counts have no owner paths; `references_not_seen_in_scan` is only
+available when the relevant metadata walk and scan coverage are complete.
+It does not identify external owners. Clone IDs cannot discover every
+shared extent owner, especially after clones are modified. Snapshots, open
+files, compression and changes after scanning can alter actual freed space;
+never present these bounds as exact predictions. Trash usually frees space
+only after the user empties it.
