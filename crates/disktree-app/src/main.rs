@@ -25,6 +25,7 @@ mod doc_window;
 mod dock_icon;
 mod file_list;
 mod git;
+mod git_store;
 mod github_releases;
 mod help;
 mod ledger;

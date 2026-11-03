@@ -34,9 +34,9 @@ use gpui_kit::{
     ScrollDelta, ScrollWheelEvent, Size, Window, px, size,
 };
 use gpui_omarchy::{ActiveTheme as _, Status};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
-use crate::git::GitState;
+use crate::git_store::{self, Ask, GitProbe, GitStore, Wanted};
 
 use crate::marks::{Marks, is_hidden};
 use crate::treemap_view::{Mosaic, TileDeco};
@@ -538,10 +538,17 @@ pub struct Disktree {
     pub color_mode: ColorMode,
     /// The largest things worth clearing, recomputed when a scan lands.
     pub insights: Vec<Candidate>,
-    /// What git knows about each checkout that has been selected; `None`
-    /// once asked and found not to be one.
-    pub git: FxHashMap<PathBuf, Option<GitState>>,
-    git_pending: FxHashSet<PathBuf>,
+    /// What git knows about the checkouts looked at, and which to ask
+    /// next: see `git_store`.
+    pub git: GitStore,
+    /// Runs one probe, off the UI thread. Tests count calls with a fake.
+    pub git_probe: GitProbe,
+    /// Draws again when a dwell, a token or a stale answer comes due, so
+    /// a pointer resting still is still answered.
+    git_wake: Option<(Instant, gpui_kit::Task<()>)>,
+    /// When the pointer came to the tile it is on: a hover asks git only
+    /// once it has stayed `git_store::DWELL`.
+    hover_since: Option<Instant>,
     /// Whether the directory the panel describes is a checkout, by path.
     /// Finding out is a `stat`, and the panel draws on every frame, so it
     /// is asked again only when the selection or the tree changes.
@@ -759,8 +766,16 @@ impl Disktree {
             crumb_menu: None,
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
-            git: FxHashMap::default(),
-            git_pending: FxHashSet::default(),
+            git: GitStore::new(cx.background_executor().now()),
+            git_probe: Arc::new(|path, cancel| {
+                let limit = crate::git::Limit::new(
+                    git_store::PROBE_LIMIT,
+                    cancel.clone(),
+                );
+                crate::git::probe(path, &limit)
+            }),
+            git_wake: None,
+            hover_since: None,
             checkout: None,
             device: None,
             full_disk_access: None,
@@ -1222,7 +1237,6 @@ impl Disktree {
             self.remote_identity = None;
             self.remote_platform.clear();
             self.git.clear();
-            self.git_pending.clear();
             self.checkout = None;
             self.space = None;
             self.space_baseline = None;
@@ -1356,33 +1370,75 @@ impl Disktree {
         matches!(&self.checkout, Some((known, true)) if known == path)
     }
 
-    /// Ask git about `path` once, off the UI thread, if it is a checkout.
-    pub fn ensure_git(&mut self, path: &Path, cx: &Context<'_, Self>) {
-        if self.remote.is_some()
-            || self.git.contains_key(path)
-            || self.git_pending.contains(path)
-        {
+    /// The panel shows the checkout at `path`: say so to the git store,
+    /// and start what it lets run. A selection asks at once; a hover only
+    /// once the pointer has rested on it for `git_store::DWELL`.
+    pub fn want_git(&mut self, path: &Path, cx: &Context<'_, Self>) {
+        if self.remote.is_some() {
             return;
         }
-        let path = path.to_path_buf();
-        self.git_pending.insert(path.clone());
-        let epoch = self.scan_epoch;
-        let task = cx.background_executor().spawn({
-            let path = path.clone();
-            async move { crate::git::state(&path) }
-        });
-        cx.spawn(async move |this, cx| {
-            let state = task.await;
+        let now = cx.background_executor().now();
+        let hovering = self.pointer_active
+            && self.hovered.is_some()
+            && self.hovered != self.selected;
+        let ask = if hovering {
+            let settled = self.hover_since.unwrap_or(now) + git_store::DWELL;
+            if now < settled {
+                self.wake_git(settled, cx);
+                return;
+            }
+            Ask::Dwell
+        } else {
+            Ask::Direct
+        };
+        match self.git.want(path, ask, now) {
+            Wanted::Refused { retry_at } => self.wake_git(retry_at, cx),
+            // Only the selection refreshes, so only it wakes for that.
+            Wanted::Answered { stale_at } if ask == Ask::Direct => {
+                self.wake_git(stale_at, cx);
+            }
+            Wanted::Answered { .. } | Wanted::Pending => {}
+        }
+        self.run_git(cx);
+    }
+
+    /// Start every probe the store lets run now.
+    fn run_git(&mut self, cx: &Context<'_, Self>) {
+        let now = cx.background_executor().now();
+        for job in self.git.next_jobs(now) {
+            let probe = self.git_probe.clone();
+            let task = cx.background_executor().spawn({
+                let job = job.clone();
+                async move { probe(&job.path, &job.cancel) }
+            });
+            cx.spawn(async move |this, cx| {
+                let answer = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    let now = cx.background_executor().now();
+                    if this.git.finish(&job, answer, now) {
+                        cx.notify();
+                    }
+                    this.run_git(cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Draw again at `at`, unless a wake already comes sooner.
+    fn wake_git(&mut self, at: Instant, cx: &Context<'_, Self>) {
+        if self.git_wake.as_ref().is_some_and(|(due, _)| *due <= at) {
+            return;
+        }
+        let wait = at.saturating_duration_since(cx.background_executor().now());
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
             let _ = this.update(cx, |this, cx| {
-                if this.scan_epoch != epoch || this.remote.is_some() {
-                    return;
-                }
-                this.git_pending.remove(&path);
-                this.git.insert(path, state);
+                this.git_wake = None;
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.git_wake = Some((at, task));
     }
 
     /// Select the largest entry of the current root, so the selection line, the
@@ -1638,7 +1694,6 @@ impl Disktree {
         self.cache = None;
         self.insights.clear();
         self.git.clear();
-        self.git_pending.clear();
         // Every new tree arrives through here, removal's rescan included.
         self.checkout = None;
         self.clear_filter();
@@ -4335,6 +4390,9 @@ impl Disktree {
         self.pointer_active = true;
         let previous = self.hovered.clone();
         self.hovered = self.tile_at(local.x.as_f32(), local.y.as_f32());
+        if self.hovered != previous {
+            self.hover_since = Some(cx.background_executor().now());
+        }
         // The cursor tooltip is positioned from `pointer`, so a move *within*
         // one tile still has to repaint — otherwise the tooltip sticks where
         // the tile was first entered until the hover target changes.

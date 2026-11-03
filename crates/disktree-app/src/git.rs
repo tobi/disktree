@@ -1,12 +1,19 @@
 //! What git knows about a checkout, for the selection panel.
 //!
 //! Before deleting an agent worktree the question is "would anything be
-//! lost": uncommitted changes, stashes, commits nobody pushed. That is three
-//! cheap git calls, run off the UI thread when a checkout is selected and
-//! remembered per path.
+//! lost": uncommitted changes, stashes, commits nobody pushed. That is a
+//! few git calls, run off the UI thread when [`crate::git_store`] says so,
+//! each inside the probe's time limit: `git status` walks the worktree, and
+//! a big enough one would otherwise keep a process busy for minutes.
 
+use std::io::Read as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::git_store::Probe;
 
 /// A checkout's state, as far as losing work is concerned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -65,19 +72,59 @@ pub fn is_checkout(path: &Path) -> bool {
     std::fs::symlink_metadata(path.join(".git")).is_ok()
 }
 
-/// Ask git. `None` when `path` is not a checkout or git is not installed.
-pub fn state(path: &Path) -> Option<GitState> {
-    if !is_checkout(path) || !git_installed() {
-        return None;
+/// When a probe has to stop: its time is up, or nobody wants it any more.
+pub struct Limit {
+    deadline: Instant,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Limit {
+    pub fn new(within: Duration, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: Instant::now() + within,
+            cancel,
+        }
     }
-    let changed = if names_its_own_filters(path) {
+
+    fn reached(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+/// A probe stopped at its [`Limit`] before git finished.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Cut;
+
+/// Ask git about the checkout at `path`, within `limit`.
+pub fn probe(path: &Path, limit: &Limit) -> Probe {
+    match state(path, limit) {
+        Ok(Some(state)) => Probe::Known(state),
+        Ok(None) => Probe::Unreadable,
+        Err(Cut) => Probe::TimedOut,
+    }
+}
+
+/// `None` when `path` is not a checkout or git is not installed.
+fn state(path: &Path, limit: &Limit) -> Result<Option<GitState>, Cut> {
+    if !is_checkout(path) || !git_installed() {
+        return Ok(None);
+    }
+    let changed = if names_its_own_filters(path, limit)? {
         None
     } else {
         // Submodules are other checkouts with configs of their own.
-        let status = run(
+        let Some(status) = run(
             path,
             &["status", "--porcelain=v1", "-z", "--ignore-submodules=all"],
-        )?;
+            limit,
+        )?
+        else {
+            return Ok(None);
+        };
         Some(status.split('\0').filter(|line| !line.is_empty()).count())
     };
     // Counted from the reflog, not listed: `stash list` is `git log`, which
@@ -86,16 +133,18 @@ pub fn state(path: &Path) -> Option<GitState> {
     let stashes = run(
         path,
         &["rev-list", "--walk-reflogs", "--count", "refs/stash"],
-    )
+        limit,
+    )?
     .and_then(|count| count.trim().parse().ok())
     .unwrap_or(0);
-    let unpushed = run(path, &["rev-list", "--count", "@{upstream}..HEAD"])
-        .and_then(|count| count.trim().parse().ok());
-    Some(GitState {
+    let unpushed =
+        run(path, &["rev-list", "--count", "@{upstream}..HEAD"], limit)?
+            .and_then(|count| count.trim().parse().ok());
+    Ok(Some(GitState {
         changed,
         stashes,
         unpushed,
-    })
+    }))
 }
 
 /// Whether running `git` runs git. On macOS `/usr/bin/git` is there even
@@ -132,7 +181,7 @@ fn git_installed() -> bool {
 /// not asked for its status at all. Filters from the user's own config, such
 /// as git-lfs, are theirs and still run. Reading config runs nothing; if it
 /// cannot be read, the answer is the cautious one.
-fn names_its_own_filters(path: &Path) -> bool {
+fn names_its_own_filters(path: &Path, limit: &Limit) -> Result<bool, Cut> {
     let Some(output) = git(
         path,
         &[
@@ -142,10 +191,12 @@ fn names_its_own_filters(path: &Path) -> bool {
             "--get-regexp",
             r"^filter\.",
         ],
-    ) else {
-        return true;
+        limit,
+    )?
+    else {
+        return Ok(true);
     };
-    match output.status.code() {
+    Ok(match output.status.code() {
         // No filter anywhere.
         Some(1) => false,
         Some(0) => {
@@ -154,18 +205,27 @@ fn names_its_own_filters(path: &Path) -> bool {
             })
         }
         _ => true,
-    }
+    })
 }
 
-fn run(path: &Path, args: &[&str]) -> Option<String> {
-    let output = git(path, args)?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+fn run(
+    path: &Path,
+    args: &[&str],
+    limit: &Limit,
+) -> Result<Option<String>, Cut> {
+    Ok(git(path, args, limit)?.and_then(|output| {
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }))
 }
 
-fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
+fn git(
+    path: &Path,
+    args: &[&str],
+    limit: &Limit,
+) -> Result<Option<Output>, Cut> {
     let mut command = Command::new("git");
     // disktree is a GUI program on Windows, with no console to lend: without
     // this, every probe flashes a console window of its own.
@@ -210,14 +270,142 @@ fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
+        .stderr(Stdio::null());
+    output_within(&mut command, limit)
+}
+
+/// How often a probe looks at whether git exited or its limit is up. Small
+/// against the limit, large against what a check costs.
+const POLL: Duration = Duration::from_millis(5);
+
+/// Run `command` to the end, or kill it at `limit`. `Ok(None)` when it
+/// could not be started.
+fn output_within(
+    command: &mut Command,
+    limit: &Limit,
+) -> Result<Option<Output>, Cut> {
+    // A probe whose time is up, or that nobody wants, starts nothing more.
+    if limit.reached() {
+        return Err(Cut);
+    }
+    let Ok(mut child) = command.stdout(Stdio::piped()).spawn() else {
+        return Ok(None);
+    };
+    // Read as it is written: a `status` listing more than a pipe holds
+    // would otherwise wait on us while we wait on it. The reader is never
+    // joined: anything git started that kept the pipe open would keep it
+    // reading past the limit, so the output is waited for on a channel
+    // instead, within what is left of the limit.
+    let (sender, read) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = stdout.read_to_end(&mut out);
+            let _ = sender.send(out);
+        });
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if limit.reached() => break None,
+            Ok(None) => std::thread::sleep(POLL),
+            Err(_) => break None,
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return if limit.reached() { Err(Cut) } else { Ok(None) };
+    };
+    let stdout = match read.recv_timeout(limit.remaining()) {
+        Ok(out) => out,
+        // Git exited but something it started still holds its output.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(Cut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+    Ok(Some(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ask with time to spare, as the tests of what git says do.
+    fn ask(path: &Path) -> Option<GitState> {
+        let limit = Limit::new(Duration::from_mins(1), Arc::default());
+        state(path, &limit).ok().flatten()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_past_its_limit_is_killed_and_says_so() {
+        let limit = Limit::new(Duration::from_millis(50), Arc::default());
+        let started = Instant::now();
+        let ran = output_within(Command::new("sleep").arg("30"), &limit);
+        assert_eq!(ran.map(|output| output.is_some()), Err(Cut));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it did not wait for the command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_command_stops() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let limit = Limit::new(Duration::from_mins(1), cancel);
+        let ran = output_within(Command::new("sleep").arg("30"), &limit);
+        assert_eq!(ran.map(|output| output.is_some()), Err(Cut));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_held_open_after_exit_is_cut_at_the_limit() {
+        // The shell exits at once, leaving a child that keeps stdout open.
+        let limit = Limit::new(Duration::from_millis(200), Arc::default());
+        let started = Instant::now();
+        let ran = output_within(
+            Command::new("sh").args(["-c", "sleep 30 & echo started"]),
+            &limit,
+        );
+        assert_eq!(ran.map(|output| output.is_some()), Err(Cut));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it did not wait for the child holding the pipe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_larger_than_a_pipe_is_read_while_it_runs() {
+        let limit = Limit::new(Duration::from_secs(30), Arc::default());
+        let output = output_within(
+            Command::new("sh").args(["-c", "head -c 1000000 /dev/zero"]),
+            &limit,
+        )
+        .expect("within the limit")
+        .expect("it ran");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1_000_000);
+    }
+
+    #[test]
+    fn a_probe_that_runs_out_of_time_reports_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".git"), "gitdir: elsewhere")
+            .expect("write");
+        let runs = Command::new("git").arg("--version").output();
+        if !git_installed() || runs.is_err() {
+            return; // no git on this machine
+        }
+        // Already past its limit: whatever git is asked first is cut.
+        let limit = Limit::new(Duration::ZERO, Arc::default());
+        assert_eq!(probe(dir.path(), &limit), Probe::TimedOut);
+    }
 
     #[test]
     fn summaries_say_what_would_be_lost() {
@@ -252,7 +440,7 @@ mod tests {
     #[test]
     fn reads_a_real_checkout() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(state(dir.path()), None, "not a checkout");
+        assert_eq!(ask(dir.path()), None, "not a checkout");
         let git = |args: &[&str]| {
             Command::new("git")
                 .arg("-C")
@@ -265,7 +453,7 @@ mod tests {
             return; // no git on this machine
         }
         std::fs::write(dir.path().join("a.txt"), "hi").expect("write");
-        let state = state(dir.path()).expect("a checkout");
+        let state = ask(dir.path()).expect("a checkout");
         assert_eq!(state.changed, Some(1), "one untracked file");
         assert_eq!(state.stashes, 0);
     }
@@ -298,7 +486,7 @@ mod tests {
         }
         let hook = hook.to_string_lossy();
         assert!(git(&["config", "core.fsmonitor", &hook]));
-        assert!(state(dir.path()).is_some());
+        assert!(ask(dir.path()).is_some());
         assert!(!marker.exists(), "the checkout's fsmonitor ran");
     }
 
@@ -359,7 +547,7 @@ mod tests {
         assert!(git(&["config", "log.showSignature", "true"], None).is_some());
         assert!(git(&["config", "gpg.program", &gpg], None).is_some());
 
-        let state = state(dir.path()).expect("a checkout");
+        let state = ask(dir.path()).expect("a checkout");
         assert!(!marker.exists(), "the checkout's gpg.program ran");
         assert_eq!(state.stashes, 1, "the stash is still counted");
     }
@@ -409,7 +597,7 @@ mod tests {
         // the filter, to know whether it changed.
         std::fs::write(dir.path().join("file.txt"), "x").expect("rewrite");
 
-        let state = state(dir.path()).expect("a checkout");
+        let state = ask(dir.path()).expect("a checkout");
         assert_eq!(state.changed, None, "not asked");
         assert!(!marker.exists(), "the checkout's filter ran");
     }

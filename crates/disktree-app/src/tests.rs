@@ -1922,6 +1922,192 @@ fn settings_safety_reads_the_limit_once_and_shows_a_saved_pick(
     );
 }
 
+/// Three checkouts side by side: each a worktree's `.git` file and some
+/// data, largest first, so the first is selected when the window opens.
+fn checkouts() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    for (name, bytes) in
+        [("alpha", 300_000), ("beta", 200_000), ("gamma", 100_000)]
+    {
+        let dir = temp.path().join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(".git"), "gitdir: elsewhere").expect("write");
+        std::fs::write(dir.join("data.bin"), vec![b'x'; bytes]).expect("write");
+    }
+    temp
+}
+
+/// Give the window a probe that counts its runs and gives `answer` for
+/// every checkout, in place of git. Anything the real one started is
+/// forgotten.
+fn count_probes(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+    answer: crate::git_store::Probe,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    update(view, cx, |app, _| {
+        let counter = runs.clone();
+        app.git_probe = Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            answer.clone()
+        });
+        app.git.clear();
+    });
+    cx.run_until_parked();
+    runs
+}
+
+fn clean_checkout() -> crate::git::GitState {
+    crate::git::GitState {
+        changed: Some(0),
+        unpushed: Some(0),
+        ..crate::git::GitState::default()
+    }
+}
+
+/// Move the pointer onto the drawn tile for the directory `path`: onto its
+/// name band when it has children, where no child tile is.
+fn hover_on(view: &Entity<Disktree>, cx: &mut Window, path: &Path) {
+    let at = update(view, cx, |app, _| {
+        let crumbs = app.crumbs_for_path(path).expect("a path in the tree");
+        let tile = app
+            .layout()
+            .and_then(|tiles| {
+                tiles.iter().find(|tile| tile.crumbs() == crumbs).cloned()
+            })
+            .expect("the tile is drawn");
+        let screen = app.view.project(tile.header.unwrap_or(tile.rect));
+        let (x, y) = (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0);
+        assert_eq!(app.tile_at(x, y), Some(crumbs), "the pointer is on it");
+        let origin = app.treemap_origin.get();
+        Point::new(origin.x + px(x), origin.y + px(y))
+    });
+    cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::default());
+    draw(cx);
+}
+
+fn probe_runs(runs: &std::sync::atomic::AtomicUsize) -> usize {
+    runs.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Sweeping the pointer across checkouts runs no git; resting on one runs
+/// it once, and the panel shows the answer.
+#[gpui_kit::test]
+fn a_sweep_over_checkouts_asks_nothing_and_a_rest_asks_once(
+    cx: &mut TestAppContext,
+) {
+    use crate::git_store::{DWELL, Probe, Shown};
+
+    cx.update(init);
+    let temp = checkouts();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    // Nothing selected, so only the pointer chooses what the panel shows.
+    press(cx, "escape");
+    assert_eq!(read(&view, cx, |app| app.selected.clone()), None);
+    let runs = count_probes(&view, cx, Probe::Known(clean_checkout()));
+
+    for name in ["alpha", "beta", "gamma", "alpha", "beta"] {
+        hover_on(&view, cx, &temp.path().join(name));
+        cx.run_until_parked();
+    }
+    assert_eq!(probe_runs(&runs), 0, "a sweep asks nothing");
+
+    // The pointer stays on beta.
+    cx.executor().advance_clock(DWELL);
+    cx.run_until_parked();
+    draw(cx);
+    cx.run_until_parked();
+    assert_eq!(probe_runs(&runs), 1, "resting asks once");
+    let beta = temp.path().join("beta");
+    assert!(read(&view, cx, |app| {
+        app.git.shown(&beta) == Shown::Answer(&Probe::Known(clean_checkout()))
+    }));
+
+    // Resting longer asks nothing more.
+    for _ in 0..3 {
+        cx.executor().advance_clock(DWELL);
+        cx.run_until_parked();
+        draw(cx);
+        cx.run_until_parked();
+    }
+    assert_eq!(probe_runs(&runs), 1);
+}
+
+/// Selecting a checkout runs git once at once; selecting it again reads
+/// the answer instead.
+#[gpui_kit::test]
+fn selecting_a_checkout_asks_once_and_then_reads_the_answer(
+    cx: &mut TestAppContext,
+) {
+    use crate::git_store::Probe;
+
+    cx.update(init);
+    let temp = checkouts();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    let runs = count_probes(&view, cx, Probe::Known(clean_checkout()));
+    let alpha = temp.path().join("alpha");
+    let beta = temp.path().join("beta");
+    let crumbs = |path: &Path| {
+        read(&view, cx, |app| app.crumbs_for_path(path)).expect("in the tree")
+    };
+    let (alpha_at, beta_at) = (crumbs(&alpha), crumbs(&beta));
+    assert_eq!(
+        read(&view, cx, |app| app.selected.clone()),
+        Some(alpha_at.clone()),
+        "the largest is selected"
+    );
+
+    for _ in 0..5 {
+        draw(cx);
+        cx.run_until_parked();
+    }
+    assert_eq!(probe_runs(&runs), 1, "five frames, one probe");
+
+    let select = |at: &Vec<usize>, cx: &mut Window| {
+        let at = at.clone();
+        update(&view, cx, move |app, cx| {
+            app.selected = Some(at);
+            cx.notify();
+        });
+        draw(cx);
+        cx.run_until_parked();
+    };
+    select(&beta_at, cx);
+    assert_eq!(probe_runs(&runs), 2, "another checkout, another probe");
+    select(&alpha_at, cx);
+    draw(cx);
+    cx.run_until_parked();
+    assert_eq!(probe_runs(&runs), 2, "alpha's answer is remembered");
+}
+
+/// A checkout git could not read within its limit is drawn as such, and
+/// not asked again on the frames that follow.
+#[gpui_kit::test]
+fn a_timed_out_checkout_is_drawn_and_not_asked_again(cx: &mut TestAppContext) {
+    use crate::git_store::{Probe, Shown};
+
+    cx.update(init);
+    let temp = checkouts();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    let runs = count_probes(&view, cx, Probe::TimedOut);
+    for _ in 0..5 {
+        draw(cx);
+        cx.run_until_parked();
+    }
+    assert_eq!(probe_runs(&runs), 1);
+    let alpha = temp.path().join("alpha");
+    assert!(read(&view, cx, |app| {
+        app.git.shown(&alpha) == Shown::Answer(&Probe::TimedOut)
+    }));
+}
+
 /// The side panel asks whether the selection is a checkout once per
 /// selection, not on every frame it draws.
 #[gpui_kit::test]
@@ -1968,7 +2154,13 @@ fn the_panel_checks_for_a_checkout_once_per_selection(cx: &mut TestAppContext) {
     assert_eq!(crate::git::CHECKS.get(), 2, "the root is not checked");
     // `git` fills only when a background ask finishes; let any finish.
     cx.run_until_parked();
-    assert!(read(&view, cx, |app| app.git.is_empty()), "no git status");
+    let root = temp.path().to_path_buf();
+    assert!(
+        read(&view, cx, |app| {
+            app.git.shown(&root) == crate::git_store::Shown::Asking
+        }),
+        "no git status"
+    );
 }
 
 /// Shift-U, which opened the Updates panel, opens Settings › Updates in

@@ -33,6 +33,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::chrome::{self, Frame};
+use crate::git_store::{Probe, Shown};
 use crate::ledger::Cohort;
 use crate::palette;
 use crate::state::{
@@ -999,7 +1000,7 @@ fn explore(
     let panel = (app.show_selection || app.is_indexing())
         && width_rems >= PANEL_SHOWN_REMS;
     if panel && let Some(path) = panel_checkout(app) {
-        app.ensure_git(&path, cx);
+        app.want_git(&path, cx);
     }
 
     let viewport = if app.tree().is_none() {
@@ -2963,13 +2964,15 @@ fn selection_section(
         && git_target(app).is_some()
         && app.known_checkout(path)
     {
-        let value = match app.git.get(path) {
-            Some(Some(state)) => state.summary(),
-            Some(None) => "not readable".to_string(),
-            None => "asking\u{2026}".to_string(),
+        let shown = app.git.shown(path);
+        let value = match shown {
+            Shown::Answer(probe) => probe.summary(),
+            Shown::Asking => "asking\u{2026}".to_string(),
         };
-        let clean =
-            matches!(app.git.get(path), Some(Some(state)) if state.is_clean());
+        let clean = matches!(
+            shown,
+            Shown::Answer(Probe::Known(state)) if state.is_clean()
+        );
         widgets::figure(
             "Git",
             value,

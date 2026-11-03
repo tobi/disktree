@@ -259,6 +259,7 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
 | APFS clone hints and private-size system calls | `crates/disktree-core/src/macos.rs` — isolated `unsafe` |
 | clone sharing totals and conservative savings | `crates/disktree-core/src/sharing.rs` |
+| what git is asked about a checkout, when, and how many at once | `crates/disktree-app/src/git.rs` (the probe and its time limit), `crates/disktree-app/src/git_store.rs` (the queue, the bucket, the cache) |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | what the explore bar folds into ⋮ at each width, and ⋮'s keys | `crates/disktree-app/src/toolbar.rs` |
 | the legend as a filter: its chips and what they keep | `crates/disktree-app/src/legend.rs`, the rule in `crates/disktree-core/src/filter.rs` |
