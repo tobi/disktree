@@ -542,6 +542,10 @@ pub struct Disktree {
     /// once asked and found not to be one.
     pub git: FxHashMap<PathBuf, Option<GitState>>,
     git_pending: FxHashSet<PathBuf>,
+    /// Whether the directory the panel describes is a checkout, by path.
+    /// Finding out is a `stat`, and the panel draws on every frame, so it
+    /// is asked again only when the selection or the tree changes.
+    checkout: Option<(PathBuf, bool)>,
     /// The device the scanned volume is mounted from.
     pub device: Option<String>,
     /// Whether macOS lets this process read everything: asked once, since a
@@ -757,6 +761,7 @@ impl Disktree {
             insights: Vec::new(),
             git: FxHashMap::default(),
             git_pending: FxHashSet::default(),
+            checkout: None,
             device: None,
             full_disk_access: None,
             administrator: disktree_core::access::administrator(),
@@ -1218,6 +1223,7 @@ impl Disktree {
             self.remote_platform.clear();
             self.git.clear();
             self.git_pending.clear();
+            self.checkout = None;
             self.space = None;
             self.space_baseline = None;
             self.disk_root = None;
@@ -1329,6 +1335,25 @@ impl Disktree {
             candidate.bytes > 0
         });
         self.insights = insights;
+    }
+
+    /// Whether `path` is the top of a checkout, going to the disk only
+    /// when it is not the path asked about last.
+    pub fn checkout_at(&mut self, path: &Path) -> bool {
+        if let Some((known, checkout)) = &self.checkout
+            && known == path
+        {
+            return *checkout;
+        }
+        let checkout = crate::git::is_checkout(path);
+        self.checkout = Some((path.to_path_buf(), checkout));
+        checkout
+    }
+
+    /// What [`Self::checkout_at`] last found for `path`, without asking:
+    /// for drawing code, which only reads the window's state.
+    pub fn known_checkout(&self, path: &Path) -> bool {
+        matches!(&self.checkout, Some((known, true)) if known == path)
     }
 
     /// Ask git about `path` once, off the UI thread, if it is a checkout.
@@ -1614,6 +1639,8 @@ impl Disktree {
         self.insights.clear();
         self.git.clear();
         self.git_pending.clear();
+        // Every new tree arrives through here, removal's rescan included.
+        self.checkout = None;
         self.clear_filter();
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;

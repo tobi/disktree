@@ -50,9 +50,18 @@ impl GitState {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`is_checkout`], for the test that holds the panel to one
+    /// per selection.
+    pub static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether `path` is the top of a checkout: it has a `.git` directory, or the
 /// `.git` file a worktree gets.
 pub fn is_checkout(path: &Path) -> bool {
+    #[cfg(test)]
+    CHECKS.set(CHECKS.get() + 1);
     std::fs::symlink_metadata(path.join(".git")).is_ok()
 }
 

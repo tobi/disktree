@@ -1859,6 +1859,118 @@ fn settings_updates_picks_a_channel_and_keeps_the_keys(
     let _ = crate::updater::set_selection(UpdateSettings::default(), None);
 }
 
+/// Settings › Safety reads the saved limit when the pane opens and after
+/// a pick is saved, not on every frame, and shows the pick once saved.
+#[gpui_kit::test]
+fn settings_safety_reads_the_limit_once_and_shows_a_saved_pick(
+    cx: &mut TestAppContext,
+) {
+    use crate::settings::{Pane, SettingsWindow, work};
+    use disktree_core::removal_limit::Limit;
+
+    cx.update(init);
+    let saved_in = tempfile::TempDir::new().expect("tempdir");
+    crate::safety::save(
+        Some(saved_in.path()),
+        Limit::new(25).expect("a limit"),
+    )
+    .expect("save the starting limit");
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let view = SettingsWindow::new(Pane::Updates, cx);
+        window.focus(&cx.focus_handle(), cx);
+        view
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.updates_dir = Some(saved_in.path().to_path_buf());
+        });
+    });
+    let shown = |cx: &mut Window| {
+        view.read_with(cx, |view, _| {
+            view.safety.as_ref().map(|limit| limit.percent()).ok()
+        })
+    };
+    draw(cx);
+    work::SAFETY_LOADS.set(0);
+    click_on(cx, Pane::Safety.nav_id());
+    assert_eq!(view.read_with(cx, |view, _| view.pane), Pane::Safety);
+    for _ in 0..5 {
+        draw(cx);
+    }
+    assert_eq!(shown(cx), Some(25));
+    assert_eq!(work::SAFETY_LOADS.get(), 1, "opening the pane reads it");
+
+    // 1 5 10 25 50 100: 10% is the third segment.
+    let limits = cx.debug_bounds("safety-limit").expect("the limit control");
+    cx.simulate_click(
+        gpui_kit::point(
+            limits.origin.x + limits.size.width * 2.5 / 6.,
+            limits.center().y,
+        ),
+        gpui_kit::Modifiers::none(),
+    );
+    for _ in 0..5 {
+        draw(cx);
+    }
+    assert_eq!(shown(cx), Some(10), "the pane shows the pick once saved");
+    assert_eq!(work::SAFETY_LOADS.get(), 2, "and read it back once");
+    assert_eq!(
+        crate::safety::load(Some(saved_in.path()))
+            .expect("saved limit")
+            .percent(),
+        10
+    );
+}
+
+/// The side panel asks whether the selection is a checkout once per
+/// selection, not on every frame it draws.
+#[gpui_kit::test]
+fn the_panel_checks_for_a_checkout_once_per_selection(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    // Opening the window draws its first frame, so count from before it.
+    crate::git::CHECKS.set(0);
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    for _ in 0..5 {
+        draw(cx);
+    }
+    assert!(
+        cx.debug_bounds("side-panel-scroll").is_some(),
+        "the panel is shown"
+    );
+    assert_eq!(read(&view, cx, |app| app.selected.clone()), Some(vec![0]));
+    assert_eq!(crate::git::CHECKS.get(), 1, "five frames, one check");
+
+    // Another directory is another question, asked once.
+    update(&view, cx, |app, cx| {
+        app.selected = Some(vec![1]);
+        cx.notify();
+    });
+    for _ in 0..5 {
+        draw(cx);
+    }
+    let next_is_dir = read(&view, cx, |app| {
+        app.node_at(&[1])
+            .is_some_and(disktree_core::index::Node::is_dir)
+    });
+    assert!(next_is_dir, "the fixture's second entry is a directory");
+    assert_eq!(crate::git::CHECKS.get(), 2);
+
+    // With nothing selected the panel describes the scan root, which is
+    // never asked about: not even its `.git`, let alone `git status`.
+    std::fs::create_dir(temp.path().join(".git")).expect("mkdir .git");
+    press(cx, "escape");
+    for _ in 0..5 {
+        draw(cx);
+    }
+    assert_eq!(read(&view, cx, |app| app.selected.clone()), None);
+    assert_eq!(crate::git::CHECKS.get(), 2, "the root is not checked");
+    // `git` fills only when a background ask finishes; let any finish.
+    cx.run_until_parked();
+    assert!(read(&view, cx, |app| app.git.is_empty()), "no git status");
+}
+
 /// Shift-U, which opened the Updates panel, opens Settings › Updates in
 /// its own window now; the main window is left as it was.
 #[gpui_kit::test]
