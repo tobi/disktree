@@ -298,6 +298,23 @@ pub struct Entry {
     /// APFS clone sharing beneath it; absent when no file there is a clone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clones: Option<Clones>,
+    /// Removed since the scan, itself or with a directory holding it. The
+    /// window keeps the scanned tree until a rescan, so `bytes` is still
+    /// what the scan measured. Only a window sets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+    /// Scanned bytes of what was removed beneath it since the scan, when it
+    /// is not wholly removed; already inside `bytes`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub removed_bytes: u64,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+const fn is_zero(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// How an entry's listed bytes split once APFS clones are accounted for.
@@ -368,6 +385,8 @@ impl Entry {
             modified: node.modified,
             read_error: node.read_error,
             clones: Clones::of(node),
+            removed: false,
+            removed_bytes: 0,
         }
     }
 }
@@ -834,6 +853,33 @@ mod tests {
         )
         .expect("decode");
         assert_eq!(estimate.shared, 0);
+    }
+
+    #[test]
+    fn removed_status_round_trips_and_is_absent_when_nothing_went() {
+        let root = clones(1, 2, Some(0));
+        let plain = Entry::of(root.root().children().at(1));
+        assert!(!plain.removed && plain.removed_bytes == 0);
+        let line = serde_json::to_string(&plain).expect("encode");
+        assert!(!line.contains("removed"), "older peers see no new keys");
+        let old: Entry = serde_json::from_str(&line).expect("decode");
+        assert!(!old.removed && old.removed_bytes == 0);
+        for entry in [
+            Entry {
+                removed: true,
+                ..plain.clone()
+            },
+            Entry {
+                removed_bytes: 4096,
+                ..plain
+            },
+        ] {
+            let back: Entry = serde_json::from_str(
+                &serde_json::to_string(&entry).expect("encode"),
+            )
+            .expect("decode");
+            assert_eq!(back, entry);
+        }
     }
 
     #[test]

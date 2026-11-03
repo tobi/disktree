@@ -6255,6 +6255,123 @@ fn removing_a_directory_after_part_of_it_counts_only_the_rest(
 }
 
 #[gpui_kit::test]
+fn an_agent_listing_says_what_was_removed_since_the_scan(
+    cx: &mut TestAppContext,
+) {
+    use disktree_link::{FindRequest, Request, Response};
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let root = temp.path().to_path_buf();
+    let ask = |request: Request, cx: &mut Window| {
+        update(&view, cx, |app, cx| app.answer_agent(&request, cx))
+    };
+    // Before any removal, nothing says removed.
+    let Response::Listing(before) = ask(
+        Request::Ls {
+            path: root.clone(),
+            limit: 10,
+        },
+        cx,
+    ) else {
+        panic!("a listing");
+    };
+    assert!(
+        before
+            .children
+            .iter()
+            .all(|child| !child.removed && child.removed_bytes == 0)
+    );
+
+    remove_now(&view, cx, &["junk/deeper"]);
+    let Response::Listing(listing) = ask(
+        Request::Ls {
+            path: root.clone(),
+            limit: 10,
+        },
+        cx,
+    ) else {
+        panic!("a listing");
+    };
+    let junk = listing
+        .children
+        .iter()
+        .find(|child| child.name == "junk")
+        .expect("junk is still listed");
+    assert!(!junk.removed);
+    assert_eq!(junk.removed_bytes, 100_000, "part of it went");
+    assert_eq!(listing.entry.removed_bytes, 100_000, "and so of the root");
+    let keep = listing.children.iter().find(|c| c.name == "keep").unwrap();
+    assert!(
+        !keep.removed && keep.removed_bytes == 0,
+        "neighbours say nothing"
+    );
+
+    let Response::Listing(inside) = ask(
+        Request::Ls {
+            path: root.join("junk"),
+            limit: 10,
+        },
+        cx,
+    ) else {
+        panic!("a listing");
+    };
+    let deeper = inside.children.iter().find(|c| c.name == "deeper").unwrap();
+    assert!(deeper.removed, "it went whole");
+    assert_eq!(deeper.removed_bytes, 0);
+
+    let Response::Found(found) = ask(
+        Request::Find(FindRequest {
+            kind: "any".into(),
+            name: Some("deeper".into()),
+            limit: 5,
+            ..FindRequest::default()
+        }),
+        cx,
+    ) else {
+        panic!("matches");
+    };
+    let hit = found
+        .matches
+        .iter()
+        .find(|hit| hit.path == root.join("junk/deeper"))
+        .expect("still found");
+    assert!(hit.entry.removed);
+
+    // An estimate over what went, or around it, would price space already
+    // gone: it asks for a rescan instead.
+    for path in [root.join("junk/deeper"), root.join("junk")] {
+        let answer = ask(
+            Request::Estimate {
+                paths: vec![path],
+                peer_scope: None,
+                peer_limit: 0,
+            },
+            cx,
+        );
+        assert!(
+            matches!(&answer, Response::Error { message } if message.contains("rescan")),
+            "{answer:?}"
+        );
+    }
+
+    // A rescan sees the disk as it is, and nothing is flagged.
+    update(&view, cx, Disktree::start_scan);
+    finish_scan(&view, cx);
+    let Response::Listing(after) = ask(
+        Request::Ls {
+            path: root.join("junk"),
+            limit: 10,
+        },
+        cx,
+    ) else {
+        panic!("a listing");
+    };
+    assert!(after.children.iter().all(|c| c.name != "deeper"));
+    assert_eq!(after.entry.removed_bytes, 0);
+}
+
+#[gpui_kit::test]
 fn what_was_removed_stays_removed_across_a_metric_change(
     cx: &mut TestAppContext,
 ) {

@@ -481,9 +481,11 @@ the agent's tools measure this computer, and PwrDisk does not remove files
 over SSH.
 
 `pwrdisk_remove` does not rescan unless asked (`rescan: true`), so the
-agent can find and mark the next batch at once. Removed paths are still
-listed by `pwrdisk_ls` and `pwrdisk_find`, with the scan's sizes, until a
-rescan; marking one is refused. `pwrdisk_status` lists every removal since the scan,
+agent can find and mark the next batch at once. Until a rescan,
+`pwrdisk_ls` and `pwrdisk_find` still list removed paths with the scan's
+sizes, but say **removed since the scan** on each, and on a directory that
+lost part of itself, how much of it went; marking a removed path is
+refused. `pwrdisk_status` lists every removal since the scan,
 reported, private and observed, with their total.
 
 The tools: `pwrdisk_status`, `pwrdisk_scan`, `pwrdisk_ls`,

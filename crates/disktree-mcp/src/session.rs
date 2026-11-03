@@ -2802,6 +2802,7 @@ mod tests {
                     busy: false,
                     options: scan.options.clone(),
                     unreadable: 0,
+                    removed: Vec::new(),
                 },
             );
             let mut session = Session::detached(socket, None);
@@ -2847,10 +2848,26 @@ mod tests {
         busy: bool,
         options: ScanOptions,
         unreadable: u64,
+        /// What a removal since the scan took, with its scanned bytes: the
+        /// window keeps it in the tree and flags it, as the app does.
+        removed: Vec<(PathBuf, u64)>,
     }
 
     #[cfg(any(unix, windows))]
     impl FakeTree {
+        fn note_removal(&self, entry: &mut disktree_link::Entry, path: &Path) {
+            entry.removed =
+                self.removed.iter().any(|(gone, _)| path.starts_with(gone));
+            if !entry.removed {
+                entry.removed_bytes = self
+                    .removed
+                    .iter()
+                    .filter(|(gone, _)| gone.starts_with(path))
+                    .map(|(_, bytes)| bytes)
+                    .sum();
+            }
+        }
+
         fn state(&self, screen: &str) -> State {
             let targets: Vec<_> = self
                 .marks
@@ -2955,13 +2972,18 @@ mod tests {
                     else {
                         return Response::error("not in the window's tree");
                     };
-                    Response::Listing(Listing::of(
+                    let mut listing = Listing::of(
                         &self.root,
                         self.tree.root().bytes,
                         path,
                         node,
                         *limit,
-                    ))
+                    );
+                    self.note_removal(&mut listing.entry, path);
+                    for child in &mut listing.children {
+                        self.note_removal(child, &path.join(&child.name));
+                    }
+                    Response::Listing(listing)
                 }
                 Request::Find(request) => {
                     let filter = match request.filter() {
@@ -2974,7 +2996,11 @@ mod tests {
                         &filter,
                         request.limit,
                     );
-                    Response::Found(FoundList::of(&found))
+                    let mut found = FoundList::of(&found);
+                    for item in &mut found.matches {
+                        self.note_removal(&mut item.entry, &item.path);
+                    }
+                    Response::Found(found)
                 }
                 Request::Estimate {
                     paths,
@@ -3077,6 +3103,7 @@ mod tests {
                 busy,
                 options: apparent(),
                 unreadable: 0,
+                removed: Vec::new(),
             };
             Self::with_tree(socket, fake)
         }
@@ -3152,6 +3179,7 @@ mod tests {
                 busy: false,
                 options: ScanOptions::default(),
                 unreadable: 0,
+                removed: Vec::new(),
             },
         );
         let paths: Vec<_> = scan
@@ -3260,6 +3288,7 @@ mod tests {
                 busy: false,
                 options: apparent(),
                 unreadable: 0,
+                removed: Vec::new(),
             },
         );
         let mut session = Session::detached(socket, None);
@@ -3316,6 +3345,7 @@ mod tests {
                         ..ScanOptions::default()
                     },
                     unreadable,
+                    removed: Vec::new(),
                 },
             );
             let mut session = Session::detached(socket, None);
@@ -3393,6 +3423,7 @@ mod tests {
                         busy: false,
                         options: apparent(),
                         unreadable: 0,
+                        removed: Vec::new(),
                     },
                 )
             });
@@ -3909,6 +3940,68 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn listings_say_what_the_window_removed_since_its_scan() {
+        let temp = fixture();
+        let socket = endpoint(temp.path());
+        let mut fake = FakeTree {
+            protocol: VERSION,
+            root: temp.path().to_path_buf(),
+            tree: Arc::new(
+                disktree_core::scan::scan(temp.path(), apparent())
+                    .expect("scan"),
+            ),
+            marks: Vec::new(),
+            remote: None,
+            busy: false,
+            options: apparent(),
+            unreadable: 0,
+            removed: Vec::new(),
+        };
+        fake.removed = vec![(temp.path().join(".cache/pip"), 400_000)];
+        let _window = FakeWindow::with_tree(&socket, fake);
+        let mut session = Session::detached(socket, None);
+        session.set_client("claude-code");
+
+        let root = session
+            .ls(&LsParams {
+                path: temp.path().to_path_buf(),
+                limit: Some(10),
+                show: false,
+            })
+            .expect("ls");
+        let cache = root
+            .lines()
+            .find(|line| line.contains(".cache/"))
+            .expect("still listed");
+        assert!(
+            cache.contains("of it removed since the scan"),
+            "part of it went: {root}"
+        );
+        let notes = root.lines().find(|l| l.contains("notes/")).unwrap();
+        assert!(!notes.contains("removed"), "neighbours unchanged: {root}");
+
+        let inside = session
+            .ls(&LsParams {
+                path: temp.path().join(".cache"),
+                limit: Some(10),
+                show: false,
+            })
+            .expect("ls");
+        let pip = inside.lines().find(|l| l.contains("pip/")).unwrap();
+        assert!(pip.contains("removed since the scan"), "{inside}");
+        assert!(!pip.contains("of it removed"), "it went whole: {inside}");
+
+        let found = session
+            .find(&FindParams {
+                name: Some("blob".into()),
+                ..FindParams::default()
+            })
+            .expect("find");
+        assert!(found.contains("removed since the scan"), "{found}");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
     fn with_a_window_open_marks_live_there_and_review_opens_it() {
         let temp = fixture();
         let socket = endpoint(temp.path());

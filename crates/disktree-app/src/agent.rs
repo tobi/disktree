@@ -358,6 +358,23 @@ impl Disktree {
         let Some(tree) = self.tree.as_deref() else {
             return Response::error("The window has no completed scan.");
         };
+        // The tree still holds what was removed since the scan, at the
+        // scan's sizes: an estimate over it would price space already
+        // gone.
+        if let Some(path) = paths.iter().find(|path| {
+            self.was_removed(path)
+                || self.removed.below(path, PathStyle::Native) > 0
+        }) {
+            return Response::error(format!(
+                "{} {} since the scan; rescan before estimating it.",
+                display_path(path, self.home.as_deref(), PathStyle::Native),
+                if self.was_removed(path) {
+                    "was removed"
+                } else {
+                    "lost part of itself to a removal"
+                },
+            ));
+        }
         let summary = self.agent_state().tree;
         let context = disktree_core::planning::Context::of(
             &self.root_path,
@@ -375,7 +392,7 @@ impl Disktree {
 
     /// What is in a directory of the tree on screen.
     fn agent_ls(&mut self, path: &Path, limit: usize) -> Response {
-        let listing = match self.agent_node(path) {
+        let mut listing = match self.agent_node(path) {
             Ok(node) => Listing::of(
                 &self.root_path,
                 self.tree.as_ref().map_or(0, |tree| tree.root().bytes),
@@ -385,6 +402,11 @@ impl Disktree {
             ),
             Err(message) => return Response::error(message),
         };
+        self.note_removal(&mut listing.entry, path);
+        for child in &mut listing.children {
+            let path = path.join(&child.name);
+            self.note_removal(child, &path);
+        }
         self.note_agent(
             None,
             format!(
@@ -405,14 +427,29 @@ impl Disktree {
             .path
             .clone()
             .unwrap_or_else(|| self.root_path.clone());
-        let found = match self.agent_node(&from) {
+        let mut found = match self.agent_node(&from) {
             Ok(node) => {
                 FoundList::of(&query::find(&from, node, &filter, request.limit))
             }
             Err(message) => return Response::error(message),
         };
+        for item in &mut found.matches {
+            self.note_removal(&mut item.entry, &item.path);
+        }
         self.note_agent(None, "searching the tree".to_string());
         Response::Found(found)
+    }
+
+    /// Say what a removal since the scan took of `path`: the tree keeps
+    /// it until a rescan, and its size is still the scan's.
+    fn note_removal(&self, entry: &mut disktree_link::Entry, path: &Path) {
+        if self.removed.is_empty() {
+            return;
+        }
+        entry.removed = self.was_removed(path);
+        if !entry.removed {
+            entry.removed_bytes = self.removed.below(path, PathStyle::Native);
+        }
     }
 
     /// Mark what the agent asks, measured from the tree on screen. A path

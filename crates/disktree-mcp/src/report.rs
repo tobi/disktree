@@ -93,6 +93,15 @@ pub fn age(now: i64, then: i64) -> String {
 /// What an entry is, in one phrase after its name.
 pub fn describe(entry: &Entry, now: i64) -> String {
     let mut parts = Vec::new();
+    // First, since it changes what the rest means: the size is the scan's.
+    if entry.removed {
+        parts.push("removed since the scan".to_string());
+    } else if entry.removed_bytes > 0 {
+        parts.push(format!(
+            "{} of it removed since the scan",
+            human_bytes(entry.removed_bytes)
+        ));
+    }
     if entry.is_dir {
         parts.push(format!("{} files", human_count(entry.files)));
     }
@@ -247,7 +256,30 @@ mod tests {
             modified: 0,
             read_error: false,
             clones,
+            removed: false,
+            removed_bytes: 0,
         }
+    }
+
+    #[test]
+    fn removed_entries_say_so_first() {
+        let gone = Entry {
+            removed: true,
+            ..entry(None)
+        };
+        assert_eq!(
+            describe(&gone, 0),
+            "removed since the scan \u{00b7} 12 files \u{00b7} age unknown"
+        );
+        let part = Entry {
+            removed_bytes: 4 * 1024 * 1024,
+            ..entry(None)
+        };
+        assert_eq!(
+            describe(&part, 0),
+            "4.0 MiB of it removed since the scan \u{00b7} 12 files \u{00b7} \
+             age unknown"
+        );
     }
 
     #[test]
