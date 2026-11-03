@@ -482,6 +482,10 @@ fn follow_pill(
             div()
                 .id("follow-removal")
                 .debug_selector(|| "follow-removal".into())
+                // It floats over the list: without this the row beneath
+                // raised its path tooltip over the pill. A scroll still
+                // reaches the list, as it would anywhere over it.
+                .block_mouse_except_scroll()
                 .role(gpui_kit::Role::Button)
                 .aria_label(label.clone())
                 .px(space::LG)

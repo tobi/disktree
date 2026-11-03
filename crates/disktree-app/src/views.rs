@@ -2526,6 +2526,9 @@ fn legend_empty(
         .child(
             div()
                 .debug_selector(|| "legend-empty".into())
+                // It sits over the mosaic; without this a press on it
+                // selected the tile beneath.
+                .occlude()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -5113,6 +5116,10 @@ fn export_menu(
         div()
             .id("export-menu")
             .debug_selector(|| "export-menu".into())
+            // It opens over the marked list; without this the hit test
+            // reaches through it, and the row beneath raised its path
+            // tooltip over the menu.
+            .occlude()
             .absolute()
             // Above the button: the footer is the window's bottom edge.
             .bottom_full()
@@ -6086,6 +6093,10 @@ fn app_menu_dropdown(
         .tab_group()
         .tab_stop(false)
         .debug_selector(|| "app-menu".into())
+        // It drops over the toolbar and the mosaic; without this a press
+        // on a heading selected the tile beneath and a scroll zoomed it.
+        // The list's own scroll still works: it is the hit element.
+        .occlude()
         .flex()
         .flex_col()
         .w(size::APP_MENU)

@@ -1348,6 +1348,10 @@ impl LogsWindow {
         let menu = CONTEXT_CHOICES.into_iter().fold(
             div()
                 .id("logs-context-menu")
+                .debug_selector(|| "logs-context-menu".into())
+                // It drops over the lines; without this a scroll on it
+                // moved them, and the line beneath took the hover.
+                .occlude()
                 .absolute()
                 .top_full()
                 .left_0()
@@ -1786,6 +1790,9 @@ impl LogsWindow {
                 div()
                     .id(PILL_ID)
                     .debug_selector(|| PILL_ID.into())
+                    // Over the lines, as the selection bar is: it takes the
+                    // pointer but lets a scroll through.
+                    .block_mouse_except_scroll()
                     .px(space::LG)
                     .py(space::XS)
                     .border_1()
@@ -1847,6 +1854,12 @@ impl LogsWindow {
             .justify_center()
             .child(
                 div()
+                    .id("logs-selection-bar")
+                    .debug_selector(|| "logs-selection-bar".into())
+                    // It floats over the lines: a press on it must not pick
+                    // the line number beneath, though a scroll still moves
+                    // the lines, as it would anywhere over them.
+                    .block_mouse_except_scroll()
                     .flex()
                     .flex_row()
                     .items_center()

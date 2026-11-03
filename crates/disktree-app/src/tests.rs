@@ -7985,6 +7985,331 @@ fn a_toast_hides_the_treemap_under_it(cx: &mut TestAppContext) {
     );
 }
 
+/// Review's export menu opens over the marked list and takes the pointer:
+/// resting on it never raises the path tooltip of the row underneath, and
+/// a press on its padding reaches no row.
+#[gpui_kit::test]
+fn the_export_menu_hides_the_list_under_it(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    const TIP: &str = "omarchy-tooltip-surface";
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx, _tree) = review_with_tree(temp.path(), cx);
+    // Short enough that the menu, which opens upward from the footer,
+    // reaches the first row.
+    cx.simulate_resize(gpui_kit::size(px(900.), px(300.)));
+    draw(cx);
+    let row = cx.debug_bounds("review-row-0").expect("the marked row");
+
+    // The row's own tooltip, so its absence below means something.
+    rest_at(cx, row.center());
+    assert!(cx.debug_bounds(TIP).is_some(), "the row names its path");
+    let back = cx.debug_bounds("back").expect("Back");
+    rest_at(cx, back.center());
+
+    click_on(cx, "export");
+    let menu = cx.debug_bounds("export-menu").expect("the menu");
+    // In the menu's top padding, above its first item, and over the row.
+    let on_menu = menu.origin + Point::new(px(24.), px(2.));
+    assert!(row.contains(&on_menu), "{menu:?} over {row:?}");
+
+    rest_at(cx, on_menu);
+    assert!(
+        cx.debug_bounds(TIP).is_none(),
+        "the pointer is on the menu, not the row under it"
+    );
+
+    let marks = read(&view, cx, |app| app.marks.len());
+    cx.simulate_click(on_menu, Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.marks.len()), marks, "no row hit");
+    assert!(
+        cx.debug_bounds("export-menu").is_some(),
+        "a press inside the menu leaves it open"
+    );
+}
+
+/// Rest the pointer at `at` past a tooltip's delay, and draw what shows.
+fn rest_at(cx: &mut Window, at: Point<Pixels>) {
+    cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::none());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(600));
+    cx.run_until_parked();
+    draw(cx);
+}
+
+/// The first log line drawn, by its number: it moves when the list scrolls.
+fn first_log_row(cx: &mut Window) -> Option<usize> {
+    (1..=400).find(|number| {
+        cx.debug_bounds(Box::leak(format!("log-row-{number}").into_boxed_str()))
+            .is_some()
+    })
+}
+
+fn scroll_at(cx: &mut Window, at: Point<Pixels>, dy: f32) {
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: at,
+        delta: gpui_kit::ScrollDelta::Pixels(Point::new(px(0.), px(dy))),
+        ..Default::default()
+    });
+    draw(cx);
+}
+
+/// Logs' context menu drops over the lines and takes the pointer: a scroll
+/// on it moves nothing. The selection bar floats over the lines too: a
+/// press on it never picks the line number beneath, though a scroll there
+/// still moves the lines, as it does over the new-lines pill.
+#[gpui_kit::test]
+fn logs_overlays_hide_the_lines_under_them(cx: &mut TestAppContext) {
+    use crate::logs_window::{CONTEXT_ID, LIVE_ID, PILL_ID};
+    use gpui_kit::Modifiers;
+    let line = |number: usize| {
+        format!("2026-10-31T12:00:00.000-04:00 INFO  pwrdisk: line {number}\n")
+    };
+    let text: String = (1..=200).map(line).collect();
+    let (_dir, path, view, cx) = logs_over(cx, &text);
+    let viewport = cx.debug_bounds("logs-viewport").expect("the lines");
+
+    // The context menu: a search in Filter mode offers it.
+    let search = cx.update(|_, cx| view.read(cx).search_state());
+    cx.update(|window, cx| {
+        search.update(cx, |search, cx| search.focus(window, cx));
+    });
+    cx.simulate_input("line");
+    draw(cx);
+    click_on(cx, CONTEXT_ID);
+    let menu = cx.debug_bounds("logs-context-menu").expect("the menu");
+    let on_menu = Point::new(menu.left() + px(24.), menu.bottom() - px(2.));
+    assert!(viewport.contains(&on_menu), "{menu:?} over {viewport:?}");
+    let first = first_log_row(cx);
+    scroll_at(cx, on_menu, -400.);
+    assert_eq!(first_log_row(cx), first, "the lines stay put");
+    assert!(cx.debug_bounds("logs-context-menu").is_some(), "still open");
+    cx.update(|window, cx| {
+        search.update(cx, |search, cx| search.focus(window, cx));
+    });
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+
+    // The selection bar, at double text size in a narrow window, where it
+    // reaches the line numbers; tall enough that lines show beneath it.
+    cx.update(|window, _| window.set_rem_size(px(32.)));
+    cx.simulate_resize(gpui_kit::size(px(640.), px(1000.)));
+    draw(cx);
+    let first = first_log_row(cx).expect("a line");
+    let picked: &'static str =
+        Box::leak(format!("log-number-{first}").into_boxed_str());
+    click_on(cx, picked);
+    let selection = cx.update(|_, cx| view.read(cx).selection);
+    assert!(selection.is_some(), "a line is picked");
+    let bar = cx.debug_bounds("logs-selection-bar").expect("the bar");
+    // The line number that lies most under the bar, within the lines'
+    // visible frame: a row's part outside it is clipped and takes no press.
+    let lines = cx.debug_bounds("logs-viewport").expect("the lines");
+    let clear = bar.intersect(&lines);
+    let under = (first..first + 60)
+        .filter_map(|number| {
+            cx.debug_bounds(Box::leak(
+                format!("log-number-{number}").into_boxed_str(),
+            ))
+        })
+        .max_by(|a, b| {
+            let tall = |g: &Bounds<Pixels>| g.intersect(&clear).size.height;
+            tall(a).as_f32().total_cmp(&tall(b).as_f32())
+        })
+        .filter(|gutter| gutter.intersect(&clear).size.height > px(8.))
+        .unwrap_or_else(|| panic!("a line number under {bar:?}"));
+    // In the middle of where the two overlap: the bar's label there is
+    // only text, so the press is the bar's.
+    let on_bar = under.intersect(&clear).center();
+    assert!(bar.contains(&on_bar), "{bar:?} at {on_bar:?}");
+    assert!(under.contains(&on_bar), "{bar:?} over {under:?}");
+    cx.simulate_click(on_bar, Modifiers::none());
+    draw(cx);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).selection),
+        selection,
+        "a press on the bar picks no line"
+    );
+    let top = first_log_row(cx);
+    scroll_at(cx, on_bar, -400.);
+    assert_ne!(first_log_row(cx), top, "a scroll there moves the lines");
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+
+    // The pill: paused, new lines count on it, and a scroll over it still
+    // reaches the lines.
+    cx.update(|window, _| window.set_rem_size(px(16.)));
+    cx.simulate_resize(gpui_kit::size(px(1120.), px(720.)));
+    draw(cx);
+    if cx.update(|_, cx| view.read(cx).live) {
+        click_on(cx, LIVE_ID);
+    }
+    append_log(&path, &line(201));
+    poll_logs(cx);
+    let pill = cx.debug_bounds(PILL_ID).expect("the pill");
+    let top = first_log_row(cx);
+    scroll_at(cx, pill.center(), 400.);
+    assert_ne!(first_log_row(cx), top, "a scroll over the pill moves them");
+}
+
+/// The note that nothing passes the legend's filter sits over the mosaic:
+/// the pointer on it raises no tile's card and a press selects no tile.
+#[gpui_kit::test]
+fn the_empty_filter_note_hides_the_treemap_under_it(cx: &mut TestAppContext) {
+    use crate::legend::ChipId;
+    use gpui_kit::Modifiers;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.cycle_legend(ChipId::Reclaimable, cx);
+        app.cycle_legend(ChipId::Kind(2), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    let note = cx.debug_bounds("legend-empty").expect("the note");
+    let on_note = note.origin + Point::new(px(4.), px(4.));
+    cx.simulate_mouse_move(on_note, None, Modifiers::none());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("cursor-tooltip").is_none(),
+        "the pointer is on the note"
+    );
+    let selected = read(&view, cx, |app| app.selected.clone());
+    cx.simulate_click(on_note, Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.selected.clone()), selected);
+}
+
+/// Removing's Follow pill floats over the list: resting on it raises no
+/// row's path, though a scroll over it still scrolls the list.
+#[gpui_kit::test]
+fn the_follow_pill_hides_the_row_under_it(cx: &mut TestAppContext) {
+    use crate::run_list::{Item, RunList, Status};
+    const TIP: &str = "omarchy-tooltip-surface";
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let path = |index: usize| temp.path().join(format!("dir-{index:03}"));
+    update(&view, cx, |app, cx| {
+        app.run_list = RunList::new(
+            (0..80)
+                .map(|index| Item {
+                    target: disktree_core::removal::Target {
+                        path: path(index),
+                        bytes: 1_000,
+                        is_dir: true,
+                        hidden: false,
+                    },
+                    category: disktree_core::classify::Category::Other,
+                    reclaim: None,
+                    private: None,
+                    status: Status::Waiting,
+                })
+                .collect(),
+        );
+        app.screen = Screen::Running;
+        cx.notify();
+    });
+    draw(cx);
+    let settle = |cx: &mut Window, view: &Entity<Disktree>, upto| {
+        update(view, cx, |app, cx| {
+            app.update_follow();
+            for index in 0..upto {
+                if app.run_list.settle(&path(index), &Ok(())).is_some() {
+                    app.scroll_to_focus();
+                }
+            }
+            cx.notify();
+        });
+        draw(cx);
+        draw(cx);
+    };
+    settle(cx, &view, 60);
+    let list = cx.debug_bounds("run-list").expect("the list");
+    scroll_at(cx, list.center(), 100_000.);
+    settle(cx, &view, 65);
+    let pill = cx.debug_bounds("follow-removal").expect("the pill");
+
+    // A row's own tooltip, so its absence below means something.
+    rest_at(cx, Point::new(list.left() + px(40.), pill.center().y));
+    assert!(cx.debug_bounds(TIP).is_some(), "the row names its path");
+    rest_at(cx, list.origin - Point::new(px(4.), px(4.)));
+    rest_at(cx, pill.origin + Point::new(px(4.), px(4.)));
+    assert!(
+        cx.debug_bounds(TIP).is_none(),
+        "the pointer is on the pill, not the row under it"
+    );
+
+    update(&view, cx, |app, _| app.run_list.scrolled_by_hand = false);
+    scroll_at(cx, pill.center(), -200.);
+    assert!(
+        read(&view, cx, |app| app.run_list.scrolled_by_hand),
+        "a scroll over the pill still scrolls the list"
+    );
+}
+
+/// The strip's menu drops over the treemap and takes the pointer: a press
+/// on its padding selects no tile, and a scroll there zooms nothing.
+#[gpui_kit::test]
+fn the_app_menu_hides_the_treemap_under_it(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, Disktree::toggle_app_menu);
+    draw(cx);
+    let menu = cx.debug_bounds("app-menu").expect("the menu");
+    let treemap = cx.debug_bounds("treemap").expect("the mosaic");
+    // On a group's heading, which is only text: just above the group's
+    // first row, in the first group drawn over the mosaic.
+    let on_menu = (1..8)
+        .filter_map(|group| {
+            let first = (0..8).find_map(|index| {
+                cx.debug_bounds(Box::leak(
+                    format!("app-menu-{group}-{index}").into_boxed_str(),
+                ))
+            })?;
+            Some(Point::new(menu.origin.x + px(24.), first.top() - px(4.)))
+        })
+        .find(|at| treemap.contains(at))
+        .unwrap_or_else(|| panic!("a heading over {treemap:?} in {menu:?}"));
+
+    let (selected, zoom) =
+        read(&view, cx, |app| (app.selected.clone(), app.view));
+    cx.simulate_click(on_menu, Modifiers::none());
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: on_menu,
+        delta: gpui_kit::ScrollDelta::Lines(Point::new(0., 3.)),
+        modifiers: Modifiers::none(),
+        touch_phase: gpui_kit::TouchPhase::Moved,
+    });
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| (app.selected.clone(), app.view)),
+        (selected, zoom),
+        "a press or a scroll on the menu leaves the mosaic alone"
+    );
+    assert!(read(&view, cx, |app| app.app_menu_open), "still open");
+
+    // The menu is taller than its cap, and still scrolls itself.
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: on_menu,
+        delta: gpui_kit::ScrollDelta::Lines(Point::new(0., -3.)),
+        modifiers: Modifiers::none(),
+        touch_phase: gpui_kit::TouchPhase::Moved,
+    });
+    draw(cx);
+    assert!(
+        read(&view, cx, |app| app.menu_scroll.offset().y) < px(0.),
+        "the list scrolled"
+    );
+    assert_eq!(read(&view, cx, |app| app.view), zoom, "the mosaic did not");
+}
+
 /// The ready card gives way while a removal runs (Restart would wait for
 /// it anyway); the strip's chip still offers the release. The pointer that
 /// rested on the card is forgotten with it, so the next answer still runs
