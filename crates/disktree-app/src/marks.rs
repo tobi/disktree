@@ -190,6 +190,41 @@ impl Marks {
         &self.items
     }
 
+    /// Bytes of the items strictly below `path`, as they were recorded.
+    pub fn below(&self, path: &Path, style: PathStyle) -> u64 {
+        // Descendants sort right after `path`: walk only them.
+        let mut below = self
+            .index
+            .range::<PathKey, _>((
+                Excluded(PathKey::new(path, style)),
+                Unbounded,
+            ))
+            .take_while(|next| style.is_below(&next.path, path))
+            .map(|next| next.path.as_path())
+            .peekable();
+        if below.peek().is_none() {
+            return 0;
+        }
+        let below: FxHashSet<&Path> = below.collect();
+        self.items
+            .iter()
+            .filter(|item| below.contains(item.path.as_path()))
+            .map(|item| item.bytes)
+            .sum()
+    }
+
+    /// Take `gone`'s bytes out of every item that holds some of it: a
+    /// directory marked after part of it was removed frees only the rest.
+    pub fn discount(&mut self, gone: &Self, style: PathStyle) {
+        if gone.is_empty() {
+            return;
+        }
+        for item in &mut self.items {
+            item.bytes =
+                item.bytes.saturating_sub(gone.below(&item.path, style));
+        }
+    }
+
     pub const fn len(&self) -> usize {
         self.items.len()
     }
@@ -410,6 +445,24 @@ mod tests {
         let mut root = Tree::from(draft());
         aggregate(&mut root, Metric::Bytes);
         root
+    }
+
+    #[test]
+    fn below_sums_only_descendants_and_discount_leaves_the_rest() {
+        let mut gone = Marks::default();
+        gone.toggle(target("/home/tobi/a/b", 30), PathStyle::Native);
+        gone.toggle(target("/home/tobi/a/c/d", 20), PathStyle::Native);
+        gone.toggle(target("/home/tobi/ab", 7), PathStyle::Native);
+        let a = Path::new("/home/tobi/a");
+        assert_eq!(gone.below(a, PathStyle::Native), 50, "not the sibling ab");
+        assert_eq!(
+            gone.below(Path::new("/home/tobi/a/b"), PathStyle::Native),
+            0
+        );
+        let mut marks = Marks::default();
+        marks.toggle(target("/home/tobi/a", 100), PathStyle::Native);
+        marks.discount(&gone, PathStyle::Native);
+        assert_eq!(marks.items()[0].bytes, 50);
     }
 
     fn target(path: &str, bytes: u64) -> Target {

@@ -225,6 +225,12 @@ pub struct ConfirmedRemoval {
     pub mode: RemovalChoice,
     pub paths: Vec<PathBuf>,
     pub confirmation: String,
+    /// Rescan once the removal finishes. Without it the window keeps its
+    /// tree, with the removed paths shown as removed until a scan, which is
+    /// what an agent removing several batches wants: a rescan can take
+    /// minutes.
+    #[serde(default)]
+    pub rescan: bool,
 }
 
 /// What the agent asks of the window.
@@ -563,6 +569,34 @@ pub struct Removal {
     pub at: i64,
 }
 
+/// One removal since the last scan, three ways.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalCohort {
+    /// `trash` or `permanent`.
+    pub mode: String,
+    pub removed: u64,
+    pub failed: usize,
+    /// Listed bytes of what was removed; a clone counts in every place.
+    pub reported: u64,
+    /// What the scan saw as only theirs; `None` when it could not say.
+    pub private: Option<u64>,
+    /// Free space after minus before, which other programs move too.
+    pub observed: Option<i64>,
+    /// Unix seconds.
+    pub started: i64,
+    pub finished: i64,
+}
+
+/// Every removal since the last scan, and their totals: `observed` runs
+/// from the first one's start to the last one's finish.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalLedger {
+    pub cohorts: Vec<RemovalCohort>,
+    pub reported: u64,
+    pub private: Option<u64>,
+    pub observed: Option<i64>,
+}
+
 /// What the window shows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
@@ -586,6 +620,10 @@ pub struct State {
     pub estimate: Option<SelectionEstimate>,
     pub space: Option<Space>,
     pub removal: Option<Removal>,
+    /// The removals since the scan on screen, which the tree already
+    /// leaves out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removals: Option<RemovalLedger>,
     /// The tree on screen, when there is one.
     pub tree: Option<TreeSummary>,
     /// The biggest things that could plausibly go, as the panel lists them.

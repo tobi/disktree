@@ -47,36 +47,6 @@ pub fn short_share(
     }
 }
 
-/// A dim label above a number, for the header strip.
-pub fn stat(
-    label: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    cx: &App,
-) -> Div {
-    let theme = cx.omarchy();
-    div()
-        .flex()
-        .flex_col()
-        .gap(space::XXS)
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(crate::palette::ink_on(
-                    theme.secondary,
-                    theme.background,
-                    4.5,
-                ))
-                .child(label.into()),
-        )
-        .child(
-            div()
-                .text_size(text::TITLE)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.bright)
-                .child(value.into()),
-        )
-}
-
 /// A value with a status colour rather than the neutral one.
 pub fn stat_colored(
     label: impl Into<SharedString>,

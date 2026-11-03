@@ -434,9 +434,25 @@ impl Disktree {
         for target in targets {
             // Without a tree yet, the agent's own measurement stands in;
             // `Marks::refresh` corrects it when the scan lands.
+            if self.was_removed(&target.path) {
+                refused.push(Refused {
+                    path: target.path.clone(),
+                    reason: "removed since the scan; it is still listed \
+                             until a rescan"
+                        .into(),
+                });
+                continue;
+            }
             let measured = if self.tree.is_some() {
                 match self.agent_node(&target.path) {
-                    Ok(node) => (node.bytes, node.is_dir()),
+                    // A directory part of which was removed frees only
+                    // the rest.
+                    Ok(node) => (
+                        node.bytes.saturating_sub(
+                            self.removed.below(&target.path, PathStyle::Native),
+                        ),
+                        node.is_dir(),
+                    ),
                     Err(reason) => {
                         refused.push(Refused {
                             path: target.path.clone(),
@@ -607,6 +623,38 @@ impl Disktree {
         });
     }
 
+    /// The removals since the scan on screen, for the agent: what it needs
+    /// to say how much a run of batches freed without a rescan.
+    fn agent_ledger(&self) -> Option<disktree_link::RemovalLedger> {
+        let cohorts = self.ledger.since(self.scans_done);
+        let totals = crate::ledger::Ledger::totals(cohorts)?;
+        let seconds = |at: std::time::SystemTime| {
+            at.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs().cast_signed())
+        };
+        Some(disktree_link::RemovalLedger {
+            cohorts: cohorts
+                .iter()
+                .map(|cohort| disktree_link::RemovalCohort {
+                    mode: match cohort.mode {
+                        RemovalMode::Trash => "trash".to_string(),
+                        RemovalMode::Permanent => "permanent".to_string(),
+                    },
+                    removed: cohort.removed,
+                    failed: cohort.failed,
+                    reported: cohort.reported,
+                    private: cohort.private,
+                    observed: cohort.observed(),
+                    started: seconds(cohort.started),
+                    finished: seconds(cohort.finished),
+                })
+                .collect(),
+            reported: totals.reported,
+            private: totals.private,
+            observed: totals.observed,
+        })
+    }
+
     /// What the window shows, for the agent.
     pub fn agent_state(&self) -> State {
         State {
@@ -640,6 +688,7 @@ impl Disktree {
                 .agent
                 .as_ref()
                 .and_then(|agent| agent.last_removal.clone()),
+            removals: self.agent_ledger(),
             tree: self.tree.as_deref().map(|tree| TreeSummary {
                 bytes: tree.root().bytes,
                 files: tree.root().files,

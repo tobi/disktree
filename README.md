@@ -119,8 +119,10 @@ does not update itself; download the next release.
 4. **Review.** Press **c** to see the list. Unmark anything you are unsure
    of, then **Enter** moves the rest to the Trash or Recycle Bin. **p**
    deletes permanently instead, after asking.
-5. **See the result.** PwrDisk scans again and shows how much space you
-   actually got back.
+5. **See the result.** PwrDisk shows how much space you actually got
+   back, without scanning again: what went stays in the treemap, greyed
+   out, until you rescan. **Move & rescan** (shift-Enter) scans afterwards
+   instead.
 
 | key | does |
 | --- | --- |

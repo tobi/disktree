@@ -121,6 +121,14 @@ machine; see `crates/disktree-core/src/classify.rs`.
 Space, X, Enter and the arrows act on the tile under the mouse if the mouse
 moved last, and on the keyboard selection after you use an arrow or n.
 
+A click selects the tile under the pointer. A second click on the
+selection, slow or as a double-click, opens one level toward it: the
+directory on screen's child that holds it, however deep the tile is
+drawn, with the tile still selected so the next click opens the next
+level. One double- or triple-click never opens more than one level. The
+pointer turns into a hand over a selection a click would open, and the
+tile's hover card names the directory a click or a double-click opens.
+
 A marked tile takes the danger colour, and so does everything inside it:
 removing a directory takes its contents with it. Marking a directory absorbs
 any marks already inside it, and something inside a marked directory cannot be
@@ -151,12 +159,27 @@ there, then choose:
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
 
-The commit is the footer's right-hand button, beside **Back**; **Export**
-and **Unmark all** sit on its left. While a removal runs, **Stop after this
-item** (or `esc`) ends it once the item in hand is done.
+The commit is the footer's right-hand button; beside it, **Move & rescan**
+(**Delete & rescan…** in permanent mode, `shift enter`) does the same and
+then scans again. **Back** is beside them; **Export** and **Unmark all** sit
+on the left. While a removal runs, **Stop after this item** (or `esc`) ends
+it once the item in hand is done.
 
-When it finishes, PwrDisk scans again so the numbers on screen match the disk,
-and shows how much free space was actually gained.
+Without a rescan, the tree stays as the scan found it, so the next batch
+can be marked straight away; a rescan of a whole disk takes minutes. What
+was removed stays where it was, greyed out, with its hover card saying
+**Removed since the scan**, and cannot be marked again. Every size on
+screen is still the scan's; a directory marked around something already
+removed counts only what is left in it. The next scan clears all of it.
+
+The Done screen lists every removal since the last scan three ways:
+**reported**, the listed size of what went, a clone counted in every place
+it appears; **private**, what the scan saw as theirs alone; and
+**observed**, the volume's free space after minus before, which other
+programs change too. With more than one removal, a total row adds the
+first two and measures the third from the first removal's start to the
+last one's end. The Disk section keeps the total as **Freed since scan**
+until the next scan.
 
 ## Keys
 
@@ -164,6 +187,7 @@ and shows how much free space was actually gained.
 | --- | --- |
 | `space` / `x` | mark or unmark the tile you point at |
 | `ctrl`-click (`⌘`-click on macOS) | mark without moving the selection |
+| click, then click again (or double-click) | select a tile, then open one level toward it |
 | `enter` | open that directory, at any depth |
 | `⌫` / `esc` | go up one directory |
 | `alt ←` `alt →` | back and forward through where you have been |
@@ -455,6 +479,12 @@ home directory, and can open a window for the review. Without a display it
 works headless and says so. A window showing an SSH server is not followed:
 the agent's tools measure this computer, and PwrDisk does not remove files
 over SSH.
+
+`pwrdisk_remove` does not rescan unless asked (`rescan: true`), so the
+agent can find and mark the next batch at once. Removed paths are still
+listed by `pwrdisk_ls` and `pwrdisk_find`, with the scan's sizes, until a
+rescan; marking one is refused. `pwrdisk_status` lists every removal since the scan,
+reported, private and observed, with their total.
 
 The tools: `pwrdisk_status`, `pwrdisk_scan`, `pwrdisk_ls`,
 `pwrdisk_find`, `pwrdisk_show`, `pwrdisk_mark`, `pwrdisk_unmark` and

@@ -12,6 +12,7 @@
 use std::rc::Rc;
 
 use disktree_core::treemap::Rect;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, Bounds, ContentMask, Context, Corners, Edges, Font, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, MouseDownEvent, MouseMoveEvent,
@@ -47,6 +48,8 @@ pub struct TileDeco {
     pub marked: bool,
     /// Inside another marked directory, so it goes with its parent.
     pub covered: bool,
+    /// Removed since the scan: kept in place, drawn as gone.
+    pub removed: bool,
     pub hovered: bool,
     pub selected: bool,
 }
@@ -120,6 +123,7 @@ pub fn preview(
             unreadable: false,
             marked: false,
             covered: false,
+            removed: false,
             hovered: false,
             selected: false,
         };
@@ -163,6 +167,8 @@ fn mosaic_inner(
     } = mosaic;
     let canvas_origin = Rc::clone(&origin);
     let canvas_measured = Rc::clone(&measured);
+    // A hand over a tile a click would open: the selection, clicked again.
+    let opens = interactive && app.click_opens_hovered();
 
     div()
         .id("disktree-treemap")
@@ -173,6 +179,7 @@ fn mosaic_inner(
         .min_w_0()
         .overflow_hidden()
         .bg(theme.inset)
+        .when(opens, Styled::cursor_pointer)
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if interactive && !hovered {
                 this.on_mouse_leave(cx);
@@ -236,6 +243,7 @@ struct Colors {
     /// Fills per age bucket, then per depth.
     age: Vec<[Hsla; DEPTHS]>,
     marked_fill: Hsla,
+    removed_fill: Hsla,
     /// The surface a filtered-out fill steps back toward.
     inset: Hsla,
 }
@@ -300,11 +308,17 @@ impl Colors {
                 })
                 .collect(),
             marked_fill: palette::mix(theme.inset, theme.danger, 0.16),
+            // Almost the surface itself: the space is still drawn where
+            // the scan found it, but nothing is left there to act on.
+            removed_fill: palette::mix(theme.inset, theme.secondary, 0.12),
             inset: theme.inset,
         }
     }
 
     fn fill(&self, tile: &TileDeco) -> Hsla {
+        if tile.removed {
+            return self.removed_fill;
+        }
         // Marked, or inside something marked: it all goes together.
         if tile.marked || tile.covered {
             return self.marked_fill;
@@ -389,6 +403,7 @@ fn paint_tiles(
         if tile.reclaimable
             && !tile.marked
             && !tile.covered
+            && !tile.removed
             && tile.filtered == Filtered::Shown
         {
             window.paint_quad(quad(
@@ -406,6 +421,7 @@ fn paint_tiles(
         if tile.depth == 0
             && tile.age_bucket.is_none()
             && tile.filtered != Filtered::Out
+            && !tile.removed
         {
             let strip = Bounds::new(
                 quad_bounds.origin,
@@ -723,9 +739,12 @@ mod tests {
                         for filtered in
                             [Filtered::Shown, Filtered::Holds, Filtered::Out]
                         {
-                            for (marked, covered) in
-                                [(false, false), (true, false), (false, true)]
-                            {
+                            for (marked, covered, removed) in [
+                                (false, false, false),
+                                (true, false, false),
+                                (false, true, false),
+                                (false, false, true),
+                            ] {
                                 let tile = TileDeco {
                                     rect: Rect::new(0., 0., 300., 200.),
                                     depth,
@@ -736,12 +755,13 @@ mod tests {
                                     unreadable: true,
                                     marked,
                                     covered,
+                                    removed,
                                     hovered: true,
                                     selected: true,
                                 };
                                 let (fill, name, value) = colors.label_inks(
                                     &tile,
-                                    filtered == Filtered::Out,
+                                    filtered == Filtered::Out || removed,
                                     marked || covered,
                                 );
                                 for ink in [name, value] {
@@ -749,7 +769,8 @@ mod tests {
                                         palette::contrast(ink, fill) >= 4.5,
                                         "{category:?} age {age_bucket:?} \
                                          depth {depth} {filtered:?} marked \
-                                         {marked} covered {covered}"
+                                         {marked} covered {covered} removed \
+                                         {removed}"
                                     );
                                     assert!(
                                         (ink.a - 1.0).abs() < f32::EPSILON,

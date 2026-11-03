@@ -33,6 +33,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::chrome::{self, Frame};
+use crate::ledger::Cohort;
 use crate::palette;
 use crate::state::{
     ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
@@ -857,6 +858,11 @@ fn delete_dialog(
         "Estimated to free ≈ {}. Shared blocks and snapshots may retain space. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
         savings(plan.reclaimable_bytes(), plan.possible_bytes())
     );
+    let body = if app.rescan_after_removal {
+        format!("{body} PwrDisk rescans afterwards.")
+    } else {
+        body
+    };
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
     let cancel_button =
@@ -872,19 +878,28 @@ fn delete_dialog(
                     cx,
                 )
             });
-    let delete_button =
-        dialog_button("delete-confirm", "Delete", ButtonVariant::Danger, cx)
-            .debug_selector(|| "delete-confirm".into())
-            .map(|button| {
-                modal_action(
-                    button,
-                    |this, window, cx| {
-                        this.confirm_delete(cx);
-                        this.apply_focus(window, cx);
-                    },
-                    cx,
-                )
-            });
+    let delete_label = if app.rescan_after_removal {
+        "Delete & rescan"
+    } else {
+        "Delete"
+    };
+    let delete_button = dialog_button(
+        "delete-confirm",
+        delete_label,
+        ButtonVariant::Danger,
+        cx,
+    )
+    .debug_selector(|| "delete-confirm".into())
+    .map(|button| {
+        modal_action(
+            button,
+            |this, window, cx| {
+                this.confirm_delete(cx);
+                this.apply_focus(window, cx);
+            },
+            cx,
+        )
+    });
     let popup = dialog_popup(cx)
         .child(dialog_title(title.clone(), cx))
         .child(dialog_description(body.clone(), cx))
@@ -2985,6 +3000,15 @@ fn selection_section(
 
     // Only states that change the decision earn a badge.
     let mut chips = Vec::new();
+    // Gone from the disk, still in the scan: nothing to mark until a rescan.
+    let removed = path.as_deref().is_some_and(|path| app.was_removed(path));
+    if removed {
+        chips.push(widgets::chip(
+            "Removed since the scan",
+            theme.secondary,
+            cx,
+        ));
+    }
     if marked {
         chips.push(widgets::chip("Marked", theme.danger, cx));
     }
@@ -3010,20 +3034,20 @@ fn selection_section(
     // Open is secondary: Enter already does it. Marking is the action this
     // tool exists for, so it takes the highlight.
     let mut actions = div().flex().flex_row().gap(space::SM);
-    if !is_current_root {
-        if node.is_dir() {
-            let crumbs = target.clone();
-            actions = actions.child(
-                button("open", "Open", ButtonVariant::Outline, cx)
-                    .tab_stop(true)
-                    .flex_1()
-                    .justify_center()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.go_to(crumbs.clone(), cx);
-                        window.focus(&this.focus, cx);
-                    })),
-            );
-        }
+    if !is_current_root && node.is_dir() {
+        let crumbs = target.clone();
+        actions = actions.child(
+            button("open", "Open", ButtonVariant::Outline, cx)
+                .tab_stop(true)
+                .flex_1()
+                .justify_center()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.go_to(crumbs.clone(), cx);
+                    window.focus(&this.focus, cx);
+                })),
+        );
+    }
+    if !is_current_root && !removed {
         // Inside a marked directory there is nothing to mark on its own: it
         // goes with that directory, so the button offers to keep it by
         // unmarking the directory instead.
@@ -3038,6 +3062,7 @@ fn selection_section(
             _ => "Mark for removal".to_string(),
         };
         let mark = button("mark", label, ButtonVariant::Primary, cx)
+            .debug_selector(|| "inspector-mark".into())
             .tab_stop(true)
             .flex_1()
             .justify_center()
@@ -3629,6 +3654,57 @@ fn administrator_line(
     )
 }
 
+/// What the removals since the scan freed, measured, with the estimates
+/// beside it: removing no longer rescans, so the tree on screen is the
+/// last scan's minus what went, and this is the running account.
+fn freed_since_scan(app: &Disktree, theme: &Theme) -> Option<Div> {
+    let totals =
+        crate::ledger::Ledger::totals(app.ledger.since(app.scans_done))?;
+    let noun = if totals.count == 1 {
+        "removal"
+    } else {
+        "removals"
+    };
+    let estimates = match totals.private {
+        Some(private) => format!(
+            "{} reported \u{b7} {} private",
+            human_bytes(totals.reported),
+            human_bytes(private)
+        ),
+        None => format!("{} reported", human_bytes(totals.reported)),
+    };
+    Some(
+        div()
+            .debug_selector(|| "freed-since-scan".into())
+            .flex()
+            .flex_col()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(space::SM)
+                    .child(format!(
+                        "Freed since scan \u{b7} {} {noun}",
+                        totals.count
+                    ))
+                    .child(div().flex_1())
+                    .children(totals.observed.map(|delta| {
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if delta >= 0 {
+                                theme.success
+                            } else {
+                                theme.warning
+                            })
+                            .child(signed_bytes(delta))
+                    })),
+            )
+            .child(estimates),
+    )
+}
+
 /// Free space on the volume now, and after the marks go.
 fn disk_section(
     app: &Disktree,
@@ -3755,16 +3831,18 @@ fn disk_section(
                 .child(format!("not counted here: {left_out}")),
         );
     }
-    section.child(
-        div()
-            .flex()
-            .flex_row()
-            .text_size(text::CAPTION)
-            .text_color(theme.secondary)
-            .child(format!("{} used", human_bytes(space_info.used())))
-            .child(div().flex_1())
-            .child(format!("{} total", human_bytes(space_info.total))),
-    )
+    section
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!("{} used", human_bytes(space_info.used())))
+                .child(div().flex_1())
+                .child(format!("{} total", human_bytes(space_info.total))),
+        )
+        .children(freed_since_scan(app, theme))
 }
 
 /// The marks taken together, pinned above Disk so it never scrolls away:
@@ -5040,6 +5118,9 @@ fn review_actions(
             cx.notify();
             window.focus(&this.focus, cx);
         }));
+    let unavailable = plan.is_empty()
+        || (app.removal_mode == RemovalMode::Trash
+            && !app.trash_backend.is_available());
     let commit = app.remote.is_none().then(|| {
         let count = plan.targets.len();
         let noun = if count == 1 { "item" } else { "items" };
@@ -5053,24 +5134,46 @@ fn review_actions(
                 ButtonVariant::Danger,
             ),
         };
-        let unavailable = plan.is_empty()
-            || (app.removal_mode == RemovalMode::Trash
-                && !app.trash_backend.is_available());
         button("commit", label, variant, cx)
             .debug_selector(|| "commit".into())
             .semantic_disabled(unavailable)
             .on_click(cx.listener(|this, _, window, cx| {
-                this.commit(cx);
+                this.commit(false, cx);
                 this.apply_focus(window, cx);
             }))
             .into_any_element()
     });
+    // The same removal, then a full rescan, for exact figures afterwards.
+    // Secondary: a rescan of a whole disk takes minutes, and the tree is
+    // already right without one.
+    let rescan = app.remote.is_none().then(|| {
+        let label = match app.removal_mode {
+            RemovalMode::Trash => "Move & rescan",
+            RemovalMode::Permanent => "Delete & rescan\u{2026}",
+        };
+        button("commit-rescan", label, ButtonVariant::Outline, cx)
+            .debug_selector(|| "commit-rescan".into())
+            .semantic_disabled(unavailable)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.commit(true, cx);
+                this.apply_focus(window, cx);
+            }))
+            .into_any_element()
+    });
+    let trailing = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(space::SM)
+        .child(back)
+        .children(rescan)
+        .into_any_element();
     dialog_footer(
         [
             export_menu(app, plan, cx).into_any_element(),
             unmark.into_any_element(),
         ],
-        Some(back.into_any_element()),
+        Some(trailing),
         commit,
     )
 }
@@ -5094,6 +5197,7 @@ fn review_hints(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .border_t_1()
         .border_color(theme.divider())
         .children(local.then(|| widgets::hint("enter", commit, cx)))
+        .children(local.then(|| widgets::hint("shift enter", "& rescan", cx)))
         .children(local.then(|| widgets::hint("m", "trash", cx)))
         .children(local.then(|| widgets::hint("p", "permanent", cx)))
         .child(widgets::hint("!", "unmark all", cx))
@@ -5251,15 +5355,8 @@ fn running(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
 fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
     let theme = cx.omarchy().clone();
     let summary = app.run_summary.clone();
-    let measured = match (app.space_baseline, app.space) {
-        (Some(before), Some(after)) => Some(
-            after
-                .available
-                .cast_signed()
-                .saturating_sub(before.available.cast_signed()),
-        ),
-        _ => None,
-    };
+    let cohorts = app.ledger.cohorts();
+    let latest = cohorts.last();
 
     let mut failures = div().flex().flex_col().gap(space::XXS);
     for (path, outcome) in app
@@ -5285,6 +5382,12 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         );
     }
 
+    let note = if app.scan.is_some() {
+        "Rescanning so the numbers on screen match the disk again."
+    } else {
+        "What was removed stays in the treemap, greyed out, until you \
+         rescan; it cannot be marked again."
+    };
     let mut body = div()
         .flex()
         .flex_col()
@@ -5303,7 +5406,6 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                     theme.success,
                     cx,
                 ))
-                .child(widgets::stat("bytes claimed", human_bytes(summary.bytes), cx))
                 .child(widgets::stat_colored(
                     "failed",
                     format!("{}", summary.failed),
@@ -5314,24 +5416,38 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
                     },
                     cx,
                 ))
-                .children(measured.map(|delta| {
+                .children(latest.and_then(Cohort::observed).map(|delta| {
                     widgets::stat_colored(
                         "volume freed",
+                        signed_bytes(delta),
                         if delta >= 0 {
-                            format!("+{}", human_bytes(delta.unsigned_abs()))
+                            theme.success
                         } else {
-                            format!("-{}", human_bytes(delta.unsigned_abs()))
+                            theme.warning
                         },
-                        if delta >= 0 { theme.success } else { theme.warning },
                         cx,
                     )
                 })),
+        )
+        .children(
+            (!cohorts.is_empty()).then(|| ledger_table(cohorts, &theme, cx)),
         )
         .child(
             div()
                 .text_size(text::CAPTION)
                 .text_color(theme.secondary)
-                .child("The treemap is being re-scanned so the numbers on screen match the disk again."),
+                .child(
+                    "Reported counts a clone in every place it appears; \
+                     private is what the scan saw as theirs alone; observed \
+                     is the volume\u{2019}s free space, which other apps \
+                     change too.",
+                ),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(note),
         );
 
     if let Some(space) = app.space {
@@ -5353,6 +5469,18 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
             .child(failures);
     }
 
+    // Rescan is offered while none runs: it is how the sharing figures
+    // catch up, and nothing else on this screen starts one.
+    let rescan = (app.scan.is_none()).then(|| {
+        button("done-rescan", "Rescan", ButtonVariant::Outline, cx)
+            .debug_selector(|| "done-rescan".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.screen = Screen::Explore;
+                this.start_scan(cx);
+                window.focus(&this.focus, cx);
+            }))
+            .into_any_element()
+    });
     div()
         .flex()
         .flex_col()
@@ -5363,7 +5491,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         .child(screen_footer(
             dialog_footer(
                 [],
-                None,
+                rescan,
                 // An acknowledgement, the default: Enter and Escape press it.
                 Some(
                     button("continue", "Done", ButtonVariant::Primary, cx)
@@ -5378,6 +5506,147 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
             ),
             &theme,
         ))
+}
+
+/// `+1.2 GB` or `-300 MB`: a change in free space.
+fn signed_bytes(delta: i64) -> String {
+    let sign = if delta >= 0 { '+' } else { '-' };
+    format!("{sign}{}", human_bytes(delta.unsigned_abs()))
+}
+
+/// A wall-clock time, for the ledger's rows.
+fn clock(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(at)
+        .format("%H:%M")
+        .to_string()
+}
+
+/// Every removal since the scan, three ways, and their total: the last
+/// row's observed figure runs from the first removal's start to the last
+/// one's end, so it is measured rather than added up.
+fn ledger_table(cohorts: &[Cohort], theme: &Theme, cx: &gpui_kit::App) -> Div {
+    let figure = |text: String, color: gpui_kit::Hsla| {
+        div()
+            .w(size::LEDGER_FIGURE)
+            .flex_shrink_0()
+            .flex()
+            .justify_end()
+            .text_color(color)
+            .child(text)
+    };
+    let row = |label: Div,
+               reported: String,
+               private: String,
+               observed: Option<i64>,
+               color: gpui_kit::Hsla| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::SM)
+            .py(space::XXS)
+            .border_b_1()
+            .border_color(theme.divider())
+            .child(label.flex_1().min_w_0())
+            .child(figure(reported, color))
+            .child(figure(private, color))
+            .child(figure(
+                observed.map_or_else(|| "\u{2014}".into(), signed_bytes),
+                match observed {
+                    Some(delta) if delta < 0 => theme.warning,
+                    Some(_) => theme.success,
+                    None => theme.secondary,
+                },
+            ))
+    };
+    let private = |bytes: Option<u64>| {
+        bytes.map_or_else(|| "unknown".into(), human_bytes)
+    };
+    let label = |name: String, detail: String| {
+        div()
+            .flex()
+            .flex_row()
+            .gap(space::SM)
+            .overflow_hidden()
+            .child(div().flex_shrink_0().child(name))
+            .child(div().text_color(theme.secondary).truncate().child(detail))
+    };
+    let heading = |text: &'static str| {
+        div()
+            .w(size::LEDGER_FIGURE)
+            .flex_shrink_0()
+            .flex()
+            .justify_end()
+            .child(text)
+    };
+    let mut table = div()
+        .debug_selector(|| "removal-ledger".into())
+        .flex()
+        .flex_col()
+        .text_size(text::CAPTION)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(space::SM)
+                .pb(space::XXS)
+                .border_b_1()
+                .border_color(theme.divider())
+                .text_color(theme.secondary)
+                .child(div().flex_1().child("Since the last scan"))
+                .child(heading("reported"))
+                .child(heading("private"))
+                .child(heading("observed")),
+        );
+    for (index, cohort) in cohorts.iter().enumerate() {
+        let noun = if cohort.removed == 1 { "item" } else { "items" };
+        let mode = match cohort.mode {
+            RemovalMode::Trash => "trash",
+            RemovalMode::Permanent => "permanent",
+        };
+        let latest = index + 1 == cohorts.len();
+        table = table.child(row(
+            label(
+                format!("Removal {}", index + 1),
+                format!(
+                    "{} \u{b7} {} {noun} \u{b7} {mode}",
+                    clock(cohort.finished),
+                    cohort.removed
+                ),
+            ),
+            human_bytes(cohort.reported),
+            private(cohort.private),
+            cohort.observed(),
+            if latest {
+                theme.bright
+            } else {
+                theme.foreground
+            },
+        ));
+    }
+    if let Some(totals) =
+        crate::ledger::Ledger::totals(cohorts).filter(|totals| totals.count > 1)
+    {
+        table = table.child(
+            row(
+                label(
+                    "Total".into(),
+                    format!(
+                        "{} \u{2192} {}",
+                        clock(totals.started),
+                        clock(totals.finished)
+                    ),
+                ),
+                human_bytes(totals.reported),
+                private(totals.private),
+                totals.observed,
+                theme.bright,
+            )
+            .font_weight(FontWeight::SEMIBOLD),
+        );
+    }
+    let _ = cx;
+    table
 }
 
 // ── shared ──────────────────────────────────────────────────────────────
@@ -5521,13 +5790,28 @@ fn history_card(app: &Disktree, back: bool, cx: &gpui_kit::App) -> Div {
 /// The tooltip content for the hovered tile: everything the tile cannot show.
 pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
     let crumbs = app.hovered.as_deref()?;
-    let is_dir = app.node_at(crumbs)?.is_dir();
-    let keys = if is_dir {
-        "space mark · enter open"
+    // Say what a click does here, naming what it opens: a click on a
+    // tile that is not selected only selects it, which looked like a
+    // click that failed to open.
+    let opens = app
+        .click_target(crumbs)
+        .and_then(|target| app.node_at(&target))
+        .map(|node| node.name().to_string());
+    let selected = app.selected.as_deref() == Some(crumbs);
+    // What was removed since the scan cannot be marked again.
+    let mark = if app.path_at(crumbs).is_some_and(|p| app.was_removed(&p)) {
+        "rescan to update"
     } else {
         "space mark"
     };
-    node_card(app, crumbs, keys, cx)
+    let keys = match opens {
+        Some(name) if selected => format!("click opens {name} · {mark}"),
+        Some(name) => {
+            format!("click select · double-click opens {name} · {mark}")
+        }
+        None => format!("click select · {mark}"),
+    };
+    node_card(app, crumbs, &keys, cx)
 }
 
 /// What is known about the node at `crumbs`, as a card: name, path, size and
@@ -5548,6 +5832,7 @@ fn node_card(
         .is_some_and(|path| app.marks.contains(path, app.path_style()));
     let hidden = node.name().starts_with('.');
     let covered = marks_ancestor(app, path.as_deref());
+    let removed = path.as_deref().is_some_and(|path| app.was_removed(path));
 
     let mut tip =
         div()
@@ -5639,6 +5924,13 @@ fn node_card(
     if hidden {
         badges = badges.child(widgets::chip("Hidden", theme.secondary, cx));
     }
+    if removed {
+        badges = badges.child(widgets::chip(
+            "Removed since the scan",
+            theme.secondary,
+            cx,
+        ));
+    }
     if marked {
         badges =
             badges.child(widgets::chip("Marked for removal", theme.danger, cx));
@@ -5692,6 +5984,10 @@ fn help_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Stateful<Div> {
     let rows = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
+        (
+            "double-click",
+            "Open one level toward a tile; so does a click on the selection",
+        ),
         ("enter", "Open that directory, at any depth"),
         ("\u{232b} / esc", "Go up one directory"),
         (

@@ -891,7 +891,7 @@ fn remote_review_never_deletes_even_through_direct_actions(
     press(cx, "p");
     press(cx, "m");
     update(&view, cx, |app, cx| {
-        app.commit(cx);
+        app.commit(false, cx);
         app.confirm_delete(cx);
         app.begin_removal(cx);
         assert!(!app.confirm_open);
@@ -1209,6 +1209,151 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 
     let hovered = read(&view, cx, |app| app.hovered.clone());
     assert_eq!(hovered.as_deref(), Some(biggest.as_slice()));
+}
+
+/// Press the left button over the drawn tile for `path`, as the
+/// `count`th press of a click sequence, and draw the frame after it.
+fn press_on(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+    path: &Path,
+    count: usize,
+) {
+    let at = update(view, cx, |app, _| {
+        let crumbs = app.crumbs_for_path(path).expect("a path in the tree");
+        let rect = app.tile_rect(&crumbs).expect("the tile is drawn");
+        let screen = app.view.project(rect);
+        let (x, y) = (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0);
+        assert_eq!(
+            app.tile_at(x, y),
+            Some(crumbs),
+            "the press lands on that tile"
+        );
+        let origin = app.treemap_origin.get();
+        Point::new(origin.x + px(x), origin.y + px(y))
+    });
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        button: gpui_kit::MouseButton::Left,
+        position: at,
+        modifiers: gpui_kit::Modifiers::none(),
+        click_count: count,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui_kit::MouseUpEvent {
+        button: gpui_kit::MouseButton::Left,
+        position: at,
+        modifiers: gpui_kit::Modifiers::none(),
+        click_count: count,
+    });
+    draw(cx);
+}
+
+/// Where the window is and what is selected, as paths.
+fn place(view: &Entity<Disktree>, cx: &Window) -> (PathBuf, Option<PathBuf>) {
+    read(view, cx, |app| {
+        (
+            app.current_path(),
+            app.selected
+                .as_deref()
+                .and_then(|crumbs| app.path_at(crumbs)),
+        )
+    })
+}
+
+#[gpui_kit::test]
+fn a_double_click_on_a_nested_tile_opens_one_level(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let more = temp.path().join("junk/deeper/more.bin");
+
+    // Press 1 selects the deepest tile under the pointer and opens nothing.
+    press_on(&view, cx, &more, 1);
+    assert_eq!(
+        place(&view, cx),
+        (temp.path().to_path_buf(), Some(more.clone()))
+    );
+
+    // Press 2 opens one level toward it, not the three it is drawn down.
+    press_on(&view, cx, &more, 2);
+    assert_eq!(
+        place(&view, cx),
+        (temp.path().join("junk"), Some(more.clone())),
+        "one level, with the tile still selected"
+    );
+
+    // A triple click is still the same gesture.
+    press_on(&view, cx, &more, 3);
+    assert_eq!(place(&view, cx).0, temp.path().join("junk"));
+
+    // A new click on the selection opens the next level.
+    press_on(&view, cx, &more, 1);
+    assert_eq!(
+        place(&view, cx),
+        (temp.path().join("junk/deeper"), Some(more))
+    );
+}
+
+#[gpui_kit::test]
+fn a_double_click_on_the_selection_opens_one_level(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let more = temp.path().join("junk/deeper/more.bin");
+
+    // Click once: it is selected, and the hover card says what a second
+    // click does.
+    press_on(&view, cx, &more, 1);
+    let opens = update(&view, cx, |app, _| {
+        app.hovered = app.selected.clone();
+        app.click_opens_hovered()
+    });
+    assert!(opens, "a click on the selection opens");
+
+    // Then double-click it. Press 1 opens a level; press 2 lands on the
+    // level press 1 opened and used to open whatever was under it there.
+    press_on(&view, cx, &more, 1);
+    assert_eq!(place(&view, cx).0, temp.path().join("junk"));
+    let at_junk = read(&view, cx, |app| app.crumbs.clone());
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        button: gpui_kit::MouseButton::Left,
+        position: read(&view, cx, |app| {
+            let origin = app.treemap_origin.get();
+            let size = app.treemap_size.get();
+            Point::new(
+                origin.x + size.width / 2.0,
+                origin.y + size.height / 2.0,
+            )
+        }),
+        modifiers: gpui_kit::Modifiers::none(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        at_junk,
+        "the second press of the gesture is ignored"
+    );
+}
+
+#[gpui_kit::test]
+fn a_click_on_a_file_at_the_top_selects_it_and_opens_nothing(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    std::fs::write(temp.path().join("top.bin"), vec![b'x'; 150_000])
+        .expect("write");
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let top = temp.path().join("top.bin");
+    press_on(&view, cx, &top, 1);
+    press_on(&view, cx, &top, 2);
+    press_on(&view, cx, &top, 1);
+    assert_eq!(place(&view, cx), (temp.path().to_path_buf(), Some(top)));
 }
 
 #[gpui_kit::test]
@@ -5290,6 +5435,7 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
         .is_some()));
     let confirmed = |preview: &disktree_link::RemovalPreview| {
         disktree_link::ConfirmedRemoval {
+            rescan: false,
             preview_id: preview.preview_id.clone(),
             mode: preview.mode,
             paths: preview.paths.clone(),
@@ -5909,6 +6055,8 @@ fn status_review_removal_completion_survives_its_background_rescan(
         let notes = child_crumbs(app, &keep, "notes.txt");
         app.toggle_mark(&notes, cx);
         app.removal_mode = RemovalMode::Permanent;
+        // Remove & rescan.
+        app.rescan_after_removal = true;
         app.begin_removal(cx);
         assert_eq!(app.screen, Screen::Running, "{:?}", app.notice);
         app.run_epoch
@@ -5935,6 +6083,204 @@ fn status_review_removal_completion_survives_its_background_rescan(
     draw(cx);
     assert!(!temp.path().join("keep/notes.txt").exists());
     assert!(temp.path().join("junk/blob.bin").exists());
+}
+
+/// Run a contrived permanent removal of `names`, each under the root, to
+/// its Done screen.
+fn remove_now(view: &Entity<Disktree>, cx: &mut Window, names: &[&str]) {
+    let epoch = update(view, cx, |app, cx| {
+        for name in names {
+            let crumbs = app
+                .crumbs_for_path(&app.root_path.join(name))
+                .expect("in the tree");
+            app.toggle_mark(&crumbs, cx);
+        }
+        app.removal_mode = RemovalMode::Permanent;
+        app.begin_removal(cx);
+        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice);
+        app.run_epoch
+    });
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let done = update(view, cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if done {
+            return;
+        }
+    }
+    panic!("the removal did not finish");
+}
+
+#[gpui_kit::test]
+fn a_removal_leaves_what_went_in_the_tree_as_removed_and_counts_it(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Stand in the directory that is about to lose a child.
+    update(&view, cx, |app, cx| {
+        let junk = app
+            .crumbs_for_path(&temp.path().join("junk"))
+            .expect("junk");
+        app.go_to(junk, cx);
+    });
+    let (scan, before) = read(&view, cx, |app| {
+        (
+            app.scan_epoch,
+            app.tree.as_ref().expect("a tree").root().bytes,
+        )
+    });
+
+    remove_now(&view, cx, &["junk/deeper"]);
+    assert!(read(&view, cx, |app| app.scan.is_none()), "no rescan");
+    draw(cx);
+    let deeper = temp.path().join("junk/deeper");
+    update(&view, cx, |app, _| {
+        let root = app.tree.as_ref().expect("a tree").root();
+        assert_eq!(root.bytes, before, "the scan's figures stay");
+        assert!(app.crumbs_for_path(&deeper).is_some(), "and so does it");
+        assert!(app.was_removed(&deeper));
+        assert_eq!(app.current_path(), temp.path().join("junk"));
+        assert!(
+            app.prepare().tiles.iter().any(|tile| tile.removed),
+            "it is drawn as removed"
+        );
+        let cohorts = app.ledger.since(app.scans_done);
+        assert_eq!(app.scan_epoch, scan);
+        assert_eq!(cohorts.len(), 1);
+        assert_eq!(cohorts[0].removed, 1);
+        assert_eq!(cohorts[0].reported, 100_000);
+        assert!(cohorts[0].observed().is_some(), "free space is measured");
+    });
+    assert!(cx.debug_bounds("removal-ledger").is_some(), "Done lists it");
+
+    // The inspector offers no mark for it, and says why.
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Explore;
+        app.selected = app.crumbs_for_path(&deeper);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("inspector-mark").is_none());
+    update(&view, cx, |app, cx| {
+        app.selected = app.crumbs_for_path(&temp.path().join("junk/blob.bin"));
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("inspector-mark").is_some(), "its neighbour");
+
+    update(&view, cx, |app, cx| {
+        // What went cannot be marked again.
+        let crumbs = app.crumbs_for_path(&deeper).expect("still drawn");
+        app.toggle_mark(&crumbs, cx);
+        assert!(app.marks.is_empty());
+        let notice = app.notice.as_ref().map(|(text, _)| text.as_str());
+        assert!(notice.is_some_and(|text| text.contains("was removed")));
+        // Its directory can, for what is left in it.
+        let junk = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        let listed = app.node_at(&junk).unwrap().bytes;
+        app.toggle_mark(&junk, cx);
+        assert_eq!(app.marks.items()[0].bytes, listed - 100_000);
+        app.toggle_mark(&junk, cx);
+        assert!(app.marks.is_empty());
+    });
+
+    // A second batch, still without a scan: two rows and a total.
+    remove_now(&view, cx, &["keep"]);
+    draw(cx);
+    let totals = read(&view, cx, |app| {
+        assert!(app.was_removed(&temp.path().join("keep/notes.txt")));
+        crate::ledger::Ledger::totals(app.ledger.since(app.scans_done))
+    })
+    .expect("totals");
+    assert_eq!(totals.count, 2);
+    assert_eq!(totals.reported, 101_000);
+    assert!(
+        temp.path().join("junk/blob.bin").exists(),
+        "neighbours stay"
+    );
+
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Explore;
+        // A scan started and stopped keeps the tree, and so the account.
+        app.scan_epoch += 1;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(
+        cx.debug_bounds("freed-since-scan").is_some(),
+        "the Disk section keeps the account"
+    );
+
+    // A rescan starts a new account and forgets what was removed.
+    update(&view, cx, Disktree::start_scan);
+    finish_scan(&view, cx);
+    draw(cx);
+    read(&view, cx, |app| {
+        assert!(app.ledger.since(app.scans_done).is_empty());
+        assert!(app.removed.is_empty());
+        assert!(app.crumbs_for_path(&deeper).is_none(), "the disk now");
+    });
+    assert!(cx.debug_bounds("freed-since-scan").is_none());
+}
+
+#[gpui_kit::test]
+fn removing_a_directory_after_part_of_it_counts_only_the_rest(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    remove_now(&view, cx, &["junk/deeper"]);
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Explore;
+        cx.notify();
+    });
+    remove_now(&view, cx, &["junk"]);
+    read(&view, cx, |app| {
+        let cohorts = app.ledger.since(app.scans_done);
+        assert_eq!(cohorts.len(), 2);
+        let rest = cohorts[1].reported;
+        assert!(
+            cohorts[1].private.is_none_or(|private| private <= rest),
+            "{:?} private of {rest} reported",
+            cohorts[1].private
+        );
+        let totals = crate::ledger::Ledger::totals(cohorts).unwrap();
+        assert!(totals.private.is_none_or(|p| p <= totals.reported));
+    });
+}
+
+#[gpui_kit::test]
+fn what_was_removed_stays_removed_across_a_metric_change(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    remove_now(&view, cx, &["junk/deeper"]);
+    let junk = temp.path().join("junk");
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Explore;
+        let crumbs = app.crumbs_for_path(&junk).unwrap();
+        app.toggle_mark(&crumbs, cx);
+        // Size | Files reorders the tree and re-reads every mark's size.
+        app.toggle_metric(cx);
+        app.toggle_metric(cx);
+    });
+    read(&view, cx, |app| {
+        assert!(app.was_removed(&junk.join("deeper")));
+        let crumbs = app.crumbs_for_path(&junk).unwrap();
+        let listed = app.node_at(&crumbs).unwrap().bytes;
+        assert_eq!(
+            app.marks.items()[0].bytes,
+            listed - 100_000,
+            "a mark around it still leaves it out"
+        );
+    });
 }
 
 #[gpui_kit::test]
@@ -6214,7 +6560,12 @@ fn focus_review_delete_cancel_enter_preserves_the_fixture(
     assert!(finished, "focused Delete completes the contrived removal");
     assert!(!temp.path().join("junk").exists());
     assert!(temp.path().join("keep/notes.txt").exists());
-    finish_scan(&view, cx);
+    read(&view, cx, |app| {
+        assert!(app.scan.is_none(), "Delete alone does not rescan");
+        let root = app.tree.as_ref().expect("a tree").root();
+        assert!(root.child_named("junk").is_some(), "the tree keeps it");
+        assert!(app.was_removed(&temp.path().join("junk")), "as removed");
+    });
 }
 
 #[gpui_kit::test]

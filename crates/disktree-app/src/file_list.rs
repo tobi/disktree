@@ -223,6 +223,7 @@ pub fn list(
         let selected = app.selected.as_ref() == Some(&crumbs);
         let marked = app.marks.contains(&path, app.path_style());
         let covered = app.marks.ancestor(&path, app.path_style()).is_some();
+        let removed = app.was_removed(&path);
         let filtered = app
             .matches
             .as_ref()
@@ -246,7 +247,9 @@ pub fn list(
             spoken,
             node.category.label(),
             crate::widgets::ago(crate::state::now_seconds(), node.modified),
-            if marked {
+            if removed {
+                "removed since the scan"
+            } else if marked {
                 "marked"
             } else if covered {
                 "inside a marked directory"
@@ -277,7 +280,9 @@ pub fn list(
                 if node.is_dir() { "▸ " } else { "" },
                 node.name(),
                 size,
-                if marked {
+                if removed {
+                    "Removed since the scan"
+                } else if marked {
                     "Marked"
                 } else {
                     node.category.label()

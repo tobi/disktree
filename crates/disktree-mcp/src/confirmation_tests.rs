@@ -57,6 +57,7 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                 }],
                 space: None,
                 removal: None,
+                removals: None,
                 tree: None,
                 insights: vec![],
                 remote: None,

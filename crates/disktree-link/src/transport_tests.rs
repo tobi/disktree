@@ -78,6 +78,7 @@ fn a_request_reaches_the_queue_and_its_reply_reaches_the_client() {
         }],
         space: None,
         removal: None,
+        removals: None,
         tree: None,
         insights: Vec::new(),
         remote: None,

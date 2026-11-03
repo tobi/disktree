@@ -402,6 +402,10 @@ pub struct Disktree {
     /// tile under the pointer is what Space, X and Enter act on; after an
     /// arrow or n it is the keyboard selection again.
     pub pointer_active: bool,
+    /// A press of the click sequence under way (a double or triple click)
+    /// already opened a level. Its later presses land on the level it
+    /// opened, so they are ignored rather than opening another.
+    click_opened: bool,
     pub view: View,
     /// The in-flight layout transition, if a level was just entered or left.
     pub transition: Option<LayoutTransition>,
@@ -416,6 +420,9 @@ pub struct Disktree {
     pub treemap_size: Rc<Cell<Size<Pixels>>>,
 
     pub marks: Marks,
+    /// Paths removed since the scan. They stay in the tree, drawn as
+    /// removed, until the next scan, and cannot be marked again.
+    pub removed: Marks,
     /// What Unmark all took, so one key or ⌘Z can put it back. Dropped
     /// wherever the marks stop meaning this machine's paths.
     pub unmarked: Option<Vec<Target>>,
@@ -468,6 +475,16 @@ pub struct Disktree {
     /// Free space before the removal, for the honest "what did it actually
     /// free" number rather than the sum of what was marked.
     pub space_baseline: Option<SpaceInfo>,
+    /// Rescan once the running removal finishes: Remove & rescan.
+    pub rescan_after_removal: bool,
+    /// What each removal since the last scan freed.
+    pub ledger: crate::ledger::Ledger,
+    /// Scans that finished and replaced the tree. What the ledger is
+    /// counted against: `scan_epoch` also moves when a scan starts or is
+    /// cancelled, and a cancelled widening keeps the tree it had.
+    pub scans_done: u64,
+    /// The running removal as it started.
+    run_start: Option<crate::ledger::Start>,
     pub notice: Option<(String, Status)>,
     /// Toasts over the window's bottom right: the updater's answers.
     pub toasts: crate::toasts::Toasts,
@@ -655,6 +672,7 @@ impl Disktree {
             history: History::default(),
             history_hover: None,
             pointer_active: false,
+            click_opened: false,
             view: View::default(),
             transition: None,
             file_list: false,
@@ -675,6 +693,7 @@ impl Disktree {
             treemap_origin: Rc::new(Cell::new(Point::new(px(0.), px(0.)))),
             treemap_size: Rc::new(Cell::new(size(px(0.), px(0.)))),
             marks: Marks::default(),
+            removed: Marks::default(),
             unmarked: None,
             export_menu_open: false,
             export_menu_was_open: false,
@@ -706,6 +725,10 @@ impl Disktree {
             run_log: Vec::new(),
             space,
             space_baseline: None,
+            rescan_after_removal: false,
+            ledger: crate::ledger::Ledger::default(),
+            scans_done: 0,
+            run_start: None,
             notice: None,
             toasts: crate::toasts::Toasts::default(),
             toast_timer: None,
@@ -1186,6 +1209,7 @@ impl Disktree {
         if self.remote != self.volumes_source {
             // Absolute paths only identify marks within one machine.
             self.marks.clear();
+            self.removed.clear();
             self.unmarked = None;
             self.history = History::default();
             self.remote_identity = None;
@@ -1279,6 +1303,30 @@ impl Disktree {
         self.insights = self.tree.as_deref().map_or_else(Vec::new, |tree| {
             worth_a_look(tree.root(), self.scanned_at, INSIGHT_LIMIT)
         });
+        self.forget_removed_insights();
+    }
+
+    /// Drop suggestions a removal since the scan already took, and take
+    /// what went out of those it took part of.
+    fn forget_removed_insights(&mut self) {
+        if self.removed.is_empty() {
+            return;
+        }
+        let style = self.path_style();
+        let mut insights = std::mem::take(&mut self.insights);
+        insights.retain_mut(|candidate| {
+            let Some(path) = self.path_at(&candidate.crumbs) else {
+                return false;
+            };
+            if self.was_removed(&path) {
+                return false;
+            }
+            candidate.bytes = candidate
+                .bytes
+                .saturating_sub(self.removed.below(&path, style));
+            candidate.bytes > 0
+        });
+        self.insights = insights;
     }
 
     /// Ask git about `path` once, off the UI thread, if it is a checkout.
@@ -1620,6 +1668,7 @@ impl Disktree {
         // Old marks must not acquire that machine's freshly captured guard.
         if self.remote_identity != identity {
             self.unmarked = None;
+            self.removed.clear();
         }
         if self.remote_identity != identity && !self.marks.is_empty() {
             self.marks.clear();
@@ -1673,6 +1722,8 @@ impl Disktree {
                         self.path_style(),
                     );
                     self.tree = Some(Arc::new(node));
+                    self.scans_done += 1;
+                    self.removed.clear();
                     self.refresh_insights();
                     self.refresh_legend(cx);
                     self.select_largest(cx);
@@ -1728,6 +1779,8 @@ impl Disktree {
                     self.path_style(),
                 );
                 discard(self.tree.replace(Arc::new(node)));
+                self.scans_done += 1;
+                self.removed.clear();
                 self.cache = None;
                 self.refresh_insights();
                 self.refresh_legend(cx);
@@ -2063,6 +2116,50 @@ impl Disktree {
         };
         let from = self.tile_body(&target).map(|rect| self.view.project(rect));
         self.enter(target, from, cx);
+    }
+
+    /// What a click on `crumbs` opens: the child of the directory on screen
+    /// that holds it, one level down however deep the tile is drawn. A
+    /// click aims at a tile, and a tile can be several levels down; going
+    /// straight there skipped the levels between.
+    pub fn click_target(&self, crumbs: &[usize]) -> Option<Vec<usize>> {
+        let depth = self.crumbs.len();
+        if crumbs.len() <= depth || !crumbs.starts_with(&self.crumbs) {
+            return None;
+        }
+        let target = crumbs[..=depth].to_vec();
+        self.node_at(&target)
+            .is_some_and(|node| node.is_dir() && !node.children().is_empty())
+            .then_some(target)
+    }
+
+    /// Whether a click on the hovered tile would open a level: it is the
+    /// selection, and something holds it. The pointer says so.
+    pub fn click_opens_hovered(&self) -> bool {
+        self.hovered.as_deref().is_some_and(|hovered| {
+            self.selected.as_deref() == Some(hovered)
+                && self.click_target(hovered).is_some()
+        })
+    }
+
+    /// Open one level toward `crumbs`, keeping it selected when it lies
+    /// deeper, so the next click on it opens the next level. Returns whether
+    /// a level opened.
+    fn open_toward(
+        &mut self,
+        crumbs: &[usize],
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(target) = self.click_target(crumbs) else {
+            return false;
+        };
+        let from = self.tile_body(&target).map(|rect| self.view.project(rect));
+        self.enter(target, from, cx);
+        if crumbs.len() > self.crumbs.len() && crumbs.starts_with(&self.crumbs)
+        {
+            self.selected = Some(crumbs.to_vec());
+        }
+        true
     }
 
     /// Go inside one child of the current root, so that it fills the viewport.
@@ -2508,6 +2605,17 @@ impl Disktree {
             return;
         };
         self.notice = None;
+        if self.was_removed(&target.path) {
+            self.notice = Some((
+                format!(
+                    "{} was removed; rescan to see the disk as it is now",
+                    self.display_path(&target.path)
+                ),
+                Status::Warning,
+            ));
+            cx.notify();
+            return;
+        }
         if !self.marks.contains(&target.path, self.path_style())
             && let Some(ancestor) = self.marked_ancestor(&target.path)
         {
@@ -2552,10 +2660,14 @@ impl Disktree {
     pub fn target_at(&self, crumbs: &[usize]) -> Option<Target> {
         let node = self.node_at(crumbs)?;
         let path = self.path_at(crumbs)?;
+        // A directory part of which was removed frees only the rest.
+        let bytes = node
+            .bytes
+            .saturating_sub(self.removed.below(&path, self.path_style()));
         Some(Target {
             hidden: is_hidden(&path, self.path_style()),
             path,
-            bytes: node.bytes,
+            bytes,
             is_dir: node.is_dir(),
         })
     }
@@ -2731,6 +2843,10 @@ impl Disktree {
             || Arc::new(FxHashSet::default()),
             |tree| self.marks.crumbs(&self.root_path, tree, metric, style),
         );
+        let removed = self.tree.as_ref().map_or_else(
+            || Arc::new(FxHashSet::default()),
+            |tree| self.removed.crumbs(&self.root_path, tree, metric, style),
+        );
 
         let Some(tiles) = self.layout().map(<[Tile]>::to_vec) else {
             return Mosaic {
@@ -2792,6 +2908,10 @@ impl Disktree {
             let is_covered = !marked.is_empty()
                 && (1..crumbs.len())
                     .any(|length| marked.contains(&crumbs[..length]));
+            // Removed since the scan, itself or with a directory holding it.
+            let is_removed = !removed.is_empty()
+                && (1..=crumbs.len())
+                    .any(|length| removed.contains(&crumbs[..length]));
             let decoration = TileDeco {
                 rect: self.animated_rect(tile.rect),
                 depth: tile.depth,
@@ -2802,6 +2922,7 @@ impl Disktree {
                 unreadable: node.is_some_and(|n| n.read_error),
                 marked: is_marked,
                 covered: is_covered,
+                removed: is_removed,
                 hovered: hovered.as_deref() == Some(crumbs),
                 selected: selected.as_deref() == Some(crumbs),
             };
@@ -2853,7 +2974,7 @@ impl Disktree {
                             .header
                             .map(|header| self.animated_rect(header)),
                         depth: tile.depth,
-                        dim: filtered == Filtered::Out,
+                        dim: filtered == Filtered::Out || is_removed,
                         marked: is_marked || is_covered,
                         size_text: partial.map_or_else(
                             || crate::widgets::short_value(node, metric),
@@ -3104,6 +3225,7 @@ impl Disktree {
                 metric,
                 style,
             );
+            self.marks.discount(&self.removed, style);
         }
         self.crumbs = self.crumbs_for_path(&directory).unwrap_or_default();
         self.selected = selected.and_then(|path| self.crumbs_for_path(&path));
@@ -3148,11 +3270,13 @@ impl Disktree {
     // ── removal ─────────────────────────────────────────────────────────
 
     /// The review screen's commit: move to the trash at once, or ask first for
-    /// a permanent deletion, which cannot be undone.
-    pub fn commit(&mut self, cx: &mut Context<'_, Self>) {
+    /// a permanent deletion, which cannot be undone. `rescan` is Remove &
+    /// rescan; without it the tree drops what went and stays.
+    pub fn commit(&mut self, rescan: bool, cx: &mut Context<'_, Self>) {
         if self.remote.is_some() || self.plan().is_empty() {
             return;
         }
+        self.rescan_after_removal = rescan;
         match self.removal_mode {
             RemovalMode::Trash => self.begin_removal(cx),
             RemovalMode::Permanent => {
@@ -3273,7 +3397,17 @@ impl Disktree {
             cx.notify();
             return;
         }
-        self.space_baseline = self.space.or(self.space_baseline);
+        // Measured now rather than read from the ticker, which can be a
+        // second old: the observed figure is only as good as its baseline.
+        let before = space_info(&self.root_path).ok().or(self.space);
+        self.space_baseline = before.or(self.space_baseline);
+        self.ledger.begin(self.scans_done);
+        self.run_start = Some(crate::ledger::Start {
+            targets: plan.targets.clone(),
+            mode: self.removal_mode,
+            before: before.map(|space| space.available),
+            started: std::time::SystemTime::now(),
+        });
         self.run_epoch += 1;
         let epoch = self.run_epoch;
         self.run_summary = RunSummary {
@@ -3361,15 +3495,104 @@ impl Disktree {
         if finished {
             self.run = None;
             self.record_removal();
+            let removed = self.record_cohort();
             self.marks.clear();
             self.unmarked = None;
             self.screen = Screen::Done;
-            // The tree on screen is now wrong; start over rather than leaving
-            // numbers that include what was just removed.
-            self.start_scan(cx);
+            // What went stays drawn, as removed, until a scan: a rescan
+            // of a whole disk takes minutes and is asked for, never implied.
+            self.note_removed(removed);
+            if std::mem::take(&mut self.rescan_after_removal) {
+                self.start_scan(cx);
+            }
         }
         cx.notify();
         !finished
+    }
+
+    /// Add the run that just finished to the ledger. Returns what it
+    /// removed.
+    fn record_cohort(&mut self) -> Vec<disktree_core::removal::Target> {
+        let Some(start) = self.run_start.take() else {
+            return Vec::new();
+        };
+        let removed = crate::ledger::removed(&start, &self.run_log);
+        let private = self.private_estimate(&removed);
+        self.ledger.push(crate::ledger::Cohort {
+            mode: start.mode,
+            removed: removed.len() as u64,
+            failed: self.run_summary.failed,
+            reported: removed.iter().map(|target| target.bytes).sum(),
+            private,
+            before: start.before,
+            after: space_info(&self.root_path)
+                .ok()
+                .map(|space| space.available),
+            started: start.started,
+            finished: std::time::SystemTime::now(),
+        });
+        removed
+    }
+
+    /// Keep what a removal took, so the tree shows it as gone and it is
+    /// never marked again before a scan.
+    fn note_removed(&mut self, removed: Vec<disktree_core::removal::Target>) {
+        let style = self.path_style();
+        for target in removed {
+            if self.was_removed(&target.path) {
+                continue;
+            }
+            let path = target.path.clone();
+            self.removed.toggle(target, style);
+            self.removed.absorb(&path, style);
+        }
+        self.forget_removed_insights();
+    }
+
+    /// Whether `path` was removed since the scan, itself or with a
+    /// directory holding it.
+    pub fn was_removed(&self, path: &Path) -> bool {
+        let style = self.path_style();
+        self.removed.contains(path, style)
+            || self.removed.ancestor(path, style).is_some()
+    }
+
+    /// What the scan saw as only these targets', estimated as review does,
+    /// from the tree they were removed from. Unknown where review's is.
+    fn private_estimate(
+        &self,
+        targets: &[disktree_core::removal::Target],
+    ) -> Option<u64> {
+        if self.options.apparent_size
+            || (cfg!(target_os = "macos") && !self.options.apfs_clone_metadata)
+        {
+            return None;
+        }
+        let tree = self.tree.as_ref()?;
+        let mut resolver = crate::marks::Resolver::new(
+            &self.root_path,
+            tree.root(),
+            PathStyle::Native,
+        );
+        let nodes: Vec<_> = targets
+            .iter()
+            .filter_map(|target| {
+                resolver.resolve(&target.path).map(|(_, node)| node)
+            })
+            .collect();
+        let estimate = match nodes.as_slice() {
+            [] => 0,
+            [node] => node
+                .sharing()
+                .estimate
+                .map_or(node.bytes, |estimate| estimate.lower),
+            _ => disktree_core::sharing::estimate(nodes).lower,
+        };
+        // The scan's figures still hold what an earlier removal took from
+        // inside these targets; their reported bytes already leave it out,
+        // and nothing private can exceed what is reported.
+        let reported = targets.iter().map(|target| target.bytes).sum();
+        Some(estimate.min(reported))
     }
 
     /// Descend to a path found by the search field.
@@ -3833,7 +4056,7 @@ impl Disktree {
             Screen::Explore => self.on_explore_key(key, control, shift, cx),
             // No review key is a Ctrl chord, and Edit's rows replay those
             // (Select All is ctrl-a), so a chord must not act as its letter.
-            Screen::Review if !control => self.on_review_key(key, cx),
+            Screen::Review if !control => self.on_review_key(key, shift, cx),
             Screen::Review => {}
             Screen::Running => {
                 if key == "escape" {
@@ -3993,7 +4216,12 @@ impl Disktree {
         }
     }
 
-    fn on_review_key(&mut self, key: &str, cx: &mut Context<'_, Self>) {
+    fn on_review_key(
+        &mut self,
+        key: &str,
+        shift: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.remote.is_some() && matches!(key, "m" | "p" | "enter") {
             return;
         }
@@ -4020,7 +4248,7 @@ impl Disktree {
                 self.focus_request = Some(FocusTarget::Root);
                 cx.notify();
             }
-            "enter" => self.commit(cx),
+            "enter" => self.commit(shift, cx),
             "!" => self.clear_marks(cx),
             "u" => self.undo_unmark(cx),
             "p" => {
@@ -4107,10 +4335,17 @@ impl Disktree {
         let crumbs = self.tile_at(x, y);
 
         match event.button {
+            // A later press of a double or triple click. One gesture opens
+            // at most one level: once a press of it has opened, the view
+            // has changed under the pointer, and acting on what is there
+            // now would open a second level nobody aimed at.
             MouseButton::Left if event.click_count >= 2 => {
+                if self.click_opened {
+                    return;
+                }
                 if let Some(crumbs) = crumbs {
-                    self.select(Some(crumbs), cx);
-                    self.descend(cx);
+                    self.select(Some(crumbs.clone()), cx);
+                    self.click_opened = self.open_toward(&crumbs, cx);
                 }
             }
             MouseButton::Left
@@ -4121,15 +4356,18 @@ impl Disktree {
                 }
             }
             MouseButton::Left => {
-                let activate = crumbs.as_ref().is_some_and(|crumbs| {
-                    self.selected.as_ref() == Some(crumbs)
-                        && self.node_at(crumbs).is_some_and(Node::is_dir)
-                });
-                if activate {
-                    // A second click on the selection opens it, like a file
-                    // manager, without needing a double click.
-                    self.descend(cx);
-                    return;
+                self.click_opened = false;
+                // A second click on the selection opens it, like a file
+                // manager, without needing a double click.
+                if let Some(crumbs) = crumbs
+                    .as_ref()
+                    .filter(|crumbs| self.selected.as_ref() == Some(*crumbs))
+                {
+                    let crumbs = crumbs.clone();
+                    self.click_opened = self.open_toward(&crumbs, cx);
+                    if self.click_opened {
+                        return;
+                    }
                 }
                 self.select(crumbs, cx);
             }

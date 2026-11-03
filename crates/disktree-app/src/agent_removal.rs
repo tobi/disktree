@@ -168,6 +168,7 @@ impl Disktree {
         }
         self.removal_mode = request.mode.mode();
         self.confirm_open = false;
+        self.rescan_after_removal = request.rescan;
         self.begin_removal(cx);
         if self.screen != Screen::Running {
             return Response::error(
@@ -203,6 +204,7 @@ mod tests {
             created: Instant::now(),
         };
         let request = ConfirmedRemoval {
+            rescan: false,
             preview_id: "fixture-id".into(),
             mode: RemovalChoice::Permanent,
             paths: vec!["/fixture/junk".into()],

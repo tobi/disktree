@@ -292,6 +292,12 @@ pub struct RemoveParams {
     /// Only after explicit user confirmation: MOVE TO TRASH or PERMANENTLY DELETE,
     /// matching the preview. Approval to mark is not approval to remove.
     pub confirmation: String,
+    /// Rescan once the removal finishes. Default false, so the next batch
+    /// can be found and marked at once; a rescan of a large volume takes
+    /// minutes. Until one, removed paths are still listed, and the window
+    /// refuses to mark them.
+    #[serde(default)]
+    pub rescan: bool,
 }
 
 /// What `pwrdisk_find` takes.
@@ -1514,6 +1520,7 @@ impl Session {
             mode,
             paths: params.paths.clone(),
             confirmation: params.confirmation.clone(),
+            rescan: params.rescan,
         }))? {
             Response::State(_) => Ok(format!(
                 "{}\nConfirmed removal started. pwrdisk_status reports completion and failures. Never repeat this call automatically.",
@@ -1998,6 +2005,13 @@ impl Session {
                 ),
                 age(now, removal.at),
             );
+        }
+        if let Some(ledger) = self
+            .window
+            .as_ref()
+            .and_then(|state| state.removals.as_ref())
+        {
+            out.push_str(&crate::report::ledger(ledger, now));
         }
         if self.marks.is_empty() {
             out.push_str("Marked: nothing.\n");
@@ -2877,6 +2891,21 @@ mod tests {
                     bytes: 700_000,
                     freed: Some(690_000),
                     at: now() - 120,
+                }),
+                removals: Some(disktree_link::RemovalLedger {
+                    cohorts: vec![disktree_link::RemovalCohort {
+                        mode: "trash".into(),
+                        removed: 2,
+                        failed: 0,
+                        reported: 700_000,
+                        private: Some(650_000),
+                        observed: Some(690_000),
+                        started: now() - 125,
+                        finished: now() - 120,
+                    }],
+                    reported: 700_000,
+                    private: Some(650_000),
+                    observed: Some(690_000),
                 }),
                 tree: Some(TreeSummary {
                     bytes: self.tree.root().bytes,
@@ -3855,6 +3884,8 @@ mod tests {
         let status = session.status();
         assert!(status.contains("Claude Code"), "{status}");
         assert!(status.contains("Last removal: trash"), "{status}");
+        assert!(status.contains("Removed since the scan"), "{status}");
+        assert!(status.contains("Total: 684 KiB reported"), "{status}");
         assert!(status.contains("scanned "), "{status}");
         assert!(!status.contains("Scans: none yet"), "{status}");
 
