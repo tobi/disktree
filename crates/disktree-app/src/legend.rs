@@ -2,8 +2,8 @@
 //! moves it to the next: nothing set shows everything, a chip set to only
 //! shows just that, and a hidden chip takes its bytes out.
 //!
-//! Kinds combine with OR and Reclaimable with AND: "Code" and "Cache" show
-//! both, and Reclaimable narrows that to their reclaimable part. The age
+//! Kinds combine with OR and Suggested with AND: "Code" and "Cache" show
+//! both, and Suggested narrows that to their cleanup suggestions. The age
 //! chips filter the same way, and both sets apply in every mode, so "old
 //! code" is one click in each.
 
@@ -58,7 +58,9 @@ pub enum ChipId {
 impl ChipId {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Reclaimable => "Reclaimable",
+            // Suggested, not reclaimable: a hatch is a heuristic for review,
+            // never a promise that the space can be had back.
+            Self::Reclaimable => "Suggested",
             Self::Kind(index) => Category::LEGEND[index].label(),
             Self::Age(index) => AGE_BUCKETS[index].1,
         }
@@ -196,19 +198,19 @@ impl LegendFilter {
         summary(&labels(Chip::Only), &labels(Chip::Hidden))
     }
 
-    /// Everything the legend keeps, for the totals line: "reclaimable
+    /// Everything the legend keeps, for the totals line: "suggested
     /// Code, Cache · Older".
     pub fn summary(&self) -> String {
         let kinds = self.kinds_summary();
         let mut parts = Vec::new();
         match (self.reclaimable, kinds) {
             (Chip::Only, Some(kinds)) => {
-                parts.push(format!("reclaimable {kinds}"));
+                parts.push(format!("suggested {kinds}"));
             }
-            (Chip::Only, None) => parts.push("reclaimable".to_owned()),
+            (Chip::Only, None) => parts.push("suggested".to_owned()),
             (Chip::Hidden, kinds) => {
                 parts.extend(kinds);
-                parts.push("reclaimable hidden".to_owned());
+                parts.push("suggested hidden".to_owned());
             }
             (Chip::Shown, kinds) => parts.extend(kinds),
         }
@@ -368,7 +370,7 @@ mod tests {
 
         legend.cycle(ChipId::Reclaimable);
         assert_eq!(legend.rule(0).reclaimable, Some(true));
-        assert_eq!(legend.summary(), "reclaimable Code, Cache");
+        assert_eq!(legend.summary(), "suggested Code, Cache");
 
         let mut legend = LegendFilter::default();
         legend.cycle(ChipId::Kind(5));

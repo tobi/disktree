@@ -6,6 +6,7 @@
 //! be built and tested without GPUI, a display, or a GPU.
 
 pub mod access;
+pub mod artifact;
 pub mod classify;
 #[cfg(any(target_os = "macos", test))]
 mod clone_cache;

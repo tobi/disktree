@@ -32,6 +32,7 @@ const fn hue(category: Category) -> (f32, f32) {
         Category::FilesystemEvents => (0.31, 0.6),
         Category::Spotlight => (0.855, 0.6),
         Category::Documents => (0.6, 0.18),
+        Category::VirtualMachine => (0.69, 0.7),
         Category::Other => (0.6, 0.08),
     }
 }

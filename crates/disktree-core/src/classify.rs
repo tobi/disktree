@@ -1,19 +1,20 @@
-//! What a directory *is*, and whether its space can be had back.
+//! What a directory is, and whether it is a cleanup candidate to review.
 //!
-//! Colour in the treemap means a kind of data, and a hatch means reclaimable
-//! space, so the two questions a cleanup tool exists to answer — "what is it"
-//! and "can I delete it" — can be read off a tile at a glance.
+//! Colour identifies a kind of data; a hatch suggests review of potentially
+//! regenerable contents. Neither names nor layouts prove that data is safe
+//! to lose or that removing it will recover its listed bytes. Structural
+//! developer-artifact rules live in [`crate::artifact`].
 //!
-//! Both come from names. A short lookup of well-known directory names covers
-//! most of a home directory; anything unmatched takes its parent's kind,
-//! without guessing from unrelated descendants. Reclaimable space is the
-//! same idea, plus a sibling check where a name alone is too
-//! common to trust: `target` is only a build directory beside a `Cargo.toml`.
+//! Unmatched names inherit their parent's kind without guessing from
+//! unrelated descendants. VM and Git ownership override cleanup heuristics.
 
 use std::borrow::Cow;
+use std::path::Path;
 
 use rayon::prelude::*;
 
+use crate::artifact::Roots;
+use crate::path_style::PathStyle;
 use crate::tree::{Block, Node, Tree};
 
 /// A kind of data, for colour.
@@ -39,6 +40,8 @@ pub enum Category {
     FilesystemEvents,
     /// macOS's on-volume search database.
     Spotlight,
+    /// VM/container disks and state; detection never suggests raw removal.
+    VirtualMachine,
     /// Nothing recognisable.
     #[default]
     Other,
@@ -46,7 +49,7 @@ pub enum Category {
 
 impl Category {
     /// The categories the legend lists, in its order.
-    pub const LEGEND: [Self; 10] = [
+    pub const LEGEND: [Self; 11] = [
         Self::Code,
         Self::AgentScratch,
         Self::Toolchain,
@@ -57,6 +60,7 @@ impl Category {
         Self::Cache,
         Self::FilesystemEvents,
         Self::Spotlight,
+        Self::VirtualMachine,
     ];
 
     /// The label lowercased, as an agent reads and writes it.
@@ -72,6 +76,7 @@ impl Category {
             Self::Cache => "cache",
             Self::FilesystemEvents => "fsevents",
             Self::Spotlight => "spotlight",
+            Self::VirtualMachine => "virtual machines",
             Self::Other => "other",
         }
     }
@@ -97,12 +102,14 @@ impl Category {
             Self::Cache => "Cache",
             Self::FilesystemEvents => "FSEvents history",
             Self::Spotlight => "Spotlight index",
+            Self::VirtualMachine => "Virtual machines",
             Self::Other => "Other",
         }
     }
 }
 
-/// Why a directory's space can be had back.
+/// Why contents may be a relatively lower-risk cleanup candidate.
+/// This is a heuristic assessment, independent of removal authorization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Reclaim {
     /// A cache: whatever wrote it will write it again.
@@ -115,10 +122,6 @@ pub enum Reclaim {
     BuildOutput,
     /// Installed dependencies beside their manifest.
     Reinstallable,
-    /// Container or sandbox image layers.
-    SandboxLayers,
-    /// Sandbox or VM snapshots.
-    Snapshots,
     /// Already deleted, still on disk.
     Trash,
     /// Scratch space meant to be thrown away.
@@ -134,8 +137,6 @@ impl Reclaim {
             Self::PackageStore => "package store",
             Self::BuildOutput => "build output",
             Self::Reinstallable => "reinstallable",
-            Self::SandboxLayers => "sandbox layers",
-            Self::Snapshots => "snapshots",
             Self::Trash => "trash",
             Self::Temporary => "temporary",
         }
@@ -222,11 +223,11 @@ pub fn category_of_name(name: &str) -> Option<Category> {
     Some(category)
 }
 
-/// Whether a directory's space can be had back, judged from its name, the
+/// Whether a directory is a cleanup candidate, judged from its name, the
 /// kind of the directory holding it, and its siblings' names.
 pub fn reclaim_of(
     name: &str,
-    parent: Category,
+    _parent: Category,
     has_sibling: impl Fn(&str) -> bool,
 ) -> Option<Reclaim> {
     let mut buffer = [0; LOWERED];
@@ -248,12 +249,7 @@ pub fn reclaim_of(
         | "deriveddata" => Reclaim::BuildOutput,
         // ~/Library/Logs, told apart from a project's logs by its neighbour.
         "logs" if has_sibling("Application Support") => Reclaim::Temporary,
-        // Too common to trust alone: only a build directory beside a manifest.
-        "target" if has_sibling("Cargo.toml") => Reclaim::BuildOutput,
         "node_modules" if has_sibling("package.json") => Reclaim::Reinstallable,
-        // Layers and snapshots are only disposable inside sandbox state.
-        "layers" if parent == Category::AgentScratch => Reclaim::SandboxLayers,
-        "snapshots" if parent == Category::AgentScratch => Reclaim::Snapshots,
         "trash" | ".trash" | "$recycle.bin" => Reclaim::Trash,
         // `Temp` is where Windows puts temporary files, in AppData\Local;
         // `CrashDumps` beside it holds dumps of programs that crashed.
@@ -272,15 +268,30 @@ pub fn reclaim_of(
 /// one directory's children at a time, but a git or pnpm store shows what
 /// it is two levels down, so a pass that only reads finds those first.
 pub fn classify(tree: &mut Tree) {
-    let stores = Stores::find(tree);
+    let name = tree.root().name().to_owned();
+    classify_at(tree, Path::new(&name), PathStyle::Native);
+}
+
+/// Classify using the scan root's full path, including tool ownership above
+/// that root. SSH callers pass POSIX rules even on Windows.
+pub fn classify_at(tree: &mut Tree, path: &Path, style: PathStyle) {
+    let artifacts = Roots::find(tree, path, style);
+    let stores = Stores::find(tree, artifacts);
     let root = tree.root();
-    // A root that is a macOS store, or a pnpm store, gives its kind to
-    // everything beneath, as any such directory does in `kind_of`.
+    // Protected stores win over any cache identity inferred from a parent
+    // above this scan root. Narrow scans retain the same ownership rules.
     let own = category_of_name(root.name())
         .filter(|category| {
             matches!(category, Category::FilesystemEvents | Category::Spotlight)
         })
         .map(|category| (category, None))
+        .or_else(|| stores.is_git(root.id()).then_some((Category::Git, None)))
+        .or_else(|| {
+            stores
+                .artifacts
+                .get(root.id())
+                .map(|d| (d.category(), d.reclaim()))
+        })
         .or_else(|| {
             is_pnpm_store(root)
                 .then_some((Category::Toolchain, Some(Reclaim::PackageStore)))
@@ -301,6 +312,18 @@ pub fn classify(tree: &mut Tree) {
             decide(&mut block, facts.category, facts.reclaim, &stores);
         },
     );
+    // A generic cache can contain protected data. Never suggest the whole
+    // parent when a descendant overrides its inherited cleanup assessment.
+    tree.par_bottom_up(
+        |_| {},
+        |facts, block| {
+            if facts.reclaim.is_some()
+                && block.iter().any(|child| child.reclaim.is_none())
+            {
+                facts.reclaim = None;
+            }
+        },
+    );
 }
 
 /// The children of a root that is nothing in particular: each takes only
@@ -309,14 +332,17 @@ pub fn classify(tree: &mut Tree) {
 fn decide_top(block: &mut Block<'_>, stores: &Stores) {
     for index in 0..block.len() {
         let child = block.at(index);
-        let (category, reclaim) = if child.kind.is_dir() {
-            kind_of(block, index, Category::Other, None, stores)
-        } else {
-            (
-                category_of_name(child.name).unwrap_or(Category::Other),
-                None,
-            )
-        };
+        let (category, reclaim) =
+            if let Some(d) = stores.artifacts.get(block.id(index)) {
+                (d.category(), d.reclaim())
+            } else if child.kind.is_dir() {
+                kind_of(block, index, Category::Other, None, stores)
+            } else {
+                (
+                    category_of_name(child.name).unwrap_or(Category::Other),
+                    None,
+                )
+            };
         let facts = block.facts_mut(index);
         facts.category = category;
         facts.reclaim = reclaim;
@@ -332,7 +358,9 @@ fn decide(
 ) {
     // Most directories hold only files, which take this one's kind as
     // they are: no call per file.
-    if !block.iter().any(|child| child.kind.is_dir()) {
+    if !block.iter().enumerate().any(|(index, child)| {
+        child.kind.is_dir() || stores.artifacts.get(block.id(index)).is_some()
+    }) {
         block.for_each_facts_mut(|facts| {
             facts.category = category;
             facts.reclaim = reclaim;
@@ -360,12 +388,25 @@ fn kind_of(
     let child = siblings.at(index);
     // These stores belong to macOS even when an internal folder is named
     // `cache` or `tmp`; raw deletion is not an appropriate cleanup method.
-    if !child.kind.is_dir()
-        || matches!(category, Category::FilesystemEvents | Category::Spotlight)
-    {
-        return (category, reclaim);
+    if matches!(
+        category,
+        Category::FilesystemEvents
+            | Category::Spotlight
+            | Category::VirtualMachine
+            | Category::Git
+    ) {
+        return (category, None);
     }
     let id = siblings.id(index);
+    if stores.is_git(id) {
+        return (Category::Git, None);
+    }
+    if let Some(detection) = stores.artifacts.get(id) {
+        return (detection.category(), detection.reclaim());
+    }
+    if !child.kind.is_dir() {
+        return (category, reclaim);
+    }
     let has_sibling =
         |wanted: &str| siblings.iter().any(|sibling| sibling.name == wanted);
     let child_category = category_of_name(child.name)
@@ -373,7 +414,10 @@ fn kind_of(
         .unwrap_or(category);
     let child_reclaim = if matches!(
         child_category,
-        Category::FilesystemEvents | Category::Spotlight
+        Category::FilesystemEvents
+            | Category::Spotlight
+            | Category::Git
+            | Category::VirtualMachine
     ) {
         None
     } else {
@@ -386,7 +430,10 @@ fn kind_of(
 
 /// The directories whose kind is in their shape rather than their name,
 /// by [`Node::id`], in order. There are few: a store per repository.
-struct Stores(Vec<Shape>);
+struct Stores {
+    shapes: Vec<Shape>,
+    artifacts: Roots,
+}
 
 #[derive(Clone, Copy)]
 struct Shape {
@@ -396,10 +443,12 @@ struct Shape {
 }
 
 impl Stores {
-    fn find(tree: &Tree) -> Self {
+    fn find(tree: &Tree, artifacts: Roots) -> Self {
         // An ordered parallel collect keeps the ids ascending.
-        Self(
-            tree.par_nodes()
+        Self {
+            artifacts,
+            shapes: tree
+                .par_nodes()
                 .filter(|node| node.is_dir())
                 .filter_map(|node| {
                     let git = is_git_store(node);
@@ -411,12 +460,15 @@ impl Stores {
                     })
                 })
                 .collect(),
-        )
+        }
     }
 
     fn get(&self, id: u32) -> Option<Shape> {
-        let found = self.0.binary_search_by_key(&id, |shape| shape.id).ok()?;
-        Some(self.0[found])
+        let found = self
+            .shapes
+            .binary_search_by_key(&id, |shape| shape.id)
+            .ok()?;
+        Some(self.shapes[found])
     }
 
     fn is_git(&self, id: u32) -> bool {
@@ -431,7 +483,7 @@ impl Stores {
 /// pnpm's versioned content-addressable store, not its installation prefix.
 /// `pnpm` also holds its executable, global tools and `.tools`; only a
 /// store with a version directory containing `files` is a cleanup candidate.
-fn is_pnpm_store(node: Node<'_>) -> bool {
+pub(crate) fn is_pnpm_store(node: Node<'_>) -> bool {
     node.is_dir()
         && matches!(node.name(), "store" | ".pnpm-store")
         && node.children().iter().any(|version| {
@@ -650,6 +702,7 @@ mod tests {
                     ],
                 ),
                 dir(".pnpm-store", vec![file("unverified", 4)]),
+                dir(".PNPM-STORE", vec![file("unverified", 4)]),
             ],
         );
         let mut root = Tree::from(root);
@@ -660,6 +713,7 @@ mod tests {
             vec!["pnpm", "global", "tool"],
             vec!["pnpm", ".tools", "pnpm"],
             vec![".pnpm-store", "unverified"],
+            vec![".PNPM-STORE", "unverified"],
         ] {
             assert_eq!(named(root.root(), &path).reclaim, None, "{path:?}");
         }
@@ -801,17 +855,14 @@ mod tests {
     }
 
     #[test]
-    fn target_is_build_output_only_beside_a_cargo_manifest() {
+    fn a_manifest_does_not_promote_a_whole_target_directory() {
         let home = home();
-        assert_eq!(
-            named(home.root(), &["rust-thing", "target"]).reclaim,
-            Some(Reclaim::BuildOutput)
-        );
+        assert_eq!(named(home.root(), &["rust-thing", "target"]).reclaim, None);
         assert_eq!(named(home.root(), &["js-thing", "target"]).reclaim, None);
     }
 
     #[test]
-    fn sandbox_layers_and_snapshots_are_reclaimable_only_in_sandbox_state() {
+    fn snapshots_are_not_suggested_from_agent_scratch_ancestry() {
         let home = home();
         // .microsandbox/cache is already a regenerable cache, so its layers
         // inherit that; the snapshots are judged on their own.
@@ -822,7 +873,7 @@ mod tests {
         );
         assert_eq!(
             named(home.root(), &[".microsandbox", "snapshots"]).reclaim,
-            Some(Reclaim::Snapshots)
+            None
         );
         assert_eq!(
             reclaim_of("snapshots", Category::Documents, |_| false),

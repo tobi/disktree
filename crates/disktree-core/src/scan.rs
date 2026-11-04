@@ -1061,7 +1061,7 @@ fn scan_on_pool(
                 return Err(crate::mft::cancelled());
             }
             progress.finalizing.store(true, Ordering::Relaxed);
-            let node = finish_tree(node, &context.options, pool);
+            let node = finish_tree(node, canonical, &context.options, pool);
             // The reader counted every file on the volume; the tree may
             // hold fewer.
             let root = node.root();
@@ -1100,7 +1100,7 @@ fn scan_on_pool(
         })
     })?;
     context.progress.finalizing.store(true, Ordering::Relaxed);
-    Ok(finish_tree(tree, &context.options, pool))
+    Ok(finish_tree(tree, canonical, &context.options, pool))
 }
 
 /// Walk from `root` on `pool`, leaving the finished root in `sink`.
@@ -1423,6 +1423,7 @@ fn signal_done<'h>(dir: &Arc<PendingDir<'h>>, sink: &Sink<'h>) {
 /// must not queue behind a scan finishing.
 fn finish_tree(
     mut tree: Tree,
+    root: &Path,
     options: &ScanOptions,
     pool: &rayon::ThreadPool,
 ) -> Tree {
@@ -1432,7 +1433,11 @@ fn finish_tree(
         } else {
             aggregate(&mut tree, options.metric);
         }
-        crate::classify::classify(&mut tree);
+        crate::classify::classify_at(
+            &mut tree,
+            root,
+            crate::path_style::PathStyle::Native,
+        );
     });
     tree
 }

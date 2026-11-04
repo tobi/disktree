@@ -112,7 +112,15 @@ pub fn describe(entry: &Entry, now: i64) -> String {
     if entry.category != "other" {
         parts.push(entry.category.clone());
     }
-    if let Some(reclaim) = &entry.reclaim {
+    if let Some(artifact) = entry.artifact {
+        parts.push(format!(
+            "{}: {} ({} evidence)",
+            artifact.status(),
+            artifact.kind.label(),
+            artifact.evidence_label()
+        ));
+        parts.push(artifact.guidance().to_string());
+    } else if let Some(reclaim) = &entry.reclaim {
         parts.push(format!("cleanup candidate: {reclaim}"));
     }
     if entry.read_error {
@@ -246,6 +254,21 @@ mod tests {
         assert_eq!(age(now, now - 800 * 86_400), "2 y ago");
     }
 
+    #[test]
+    fn vm_state_reports_detection_and_its_owner_workflow() {
+        let mut entry = entry(None);
+        entry.artifact = disktree_core::artifact::detect(
+            Path::new("/VM/guest.vmss"),
+            disktree_core::path_style::PathStyle::Posix,
+            false,
+        );
+        let report = describe(&entry, 0);
+        assert!(report.contains("Detected: VM saved memory"), "{report}");
+        assert!(report.contains("name convention evidence"), "{report}");
+        assert!(report.contains("shut it down normally"), "{report}");
+        assert!(!report.contains("cleanup candidate"), "{report}");
+    }
+
     fn entry(clones: Option<Clones>) -> Entry {
         Entry {
             name: "w".into(),
@@ -253,6 +276,7 @@ mod tests {
             bytes: 12 * 1024 * 1024,
             files: 12,
             category: "other".into(),
+            artifact: None,
             reclaim: None,
             modified: 0,
             read_error: false,

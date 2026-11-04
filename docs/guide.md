@@ -83,16 +83,17 @@ a root. Explicit command-line paths and `--disk` still start directly;
   its own row the legend, which wraps onto another line rather than hide
   an entry.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
-  toolchains, synced files, git, media, documents, caches — at one muted
-  level, lighter with depth. A diagonal hatch is space that can be had back
-  (caches, sync history, package stores, build output), independent of
-  colour. Top-level directories carry a strip of their colour and a name
-  band; deeper open directories a slim label row. In **Age** mode colour is
-  the last write instead, from this week to older.
+  toolchains, synced files, git, media, documents, caches, virtual
+  machines — at one muted level, lighter with depth. A diagonal hatch is
+  a cleanup suggestion to review (caches, sync history, package stores,
+  build output), independent of colour; it never says the contents are
+  safe to lose. Top-level directories carry a strip of their colour and a
+  name band; deeper open directories a slim label row. In **Age** mode
+  colour is the last write instead, from this week to older.
 - **Legend:** each entry is also a filter. Click it once to show only that
   kind (or age), again to hide it, and a third time to show it again.
   Kinds set to only add up ("Code" and "Cache" show both), while
-  **Reclaimable** narrows them to their reclaimable part. The mosaic lays
+  **Suggested** narrows them to their cleanup suggestions. The mosaic lays
   out only what passes, at its own size, and a folder that only partly
   passes says so: `48G of 196G`. Kind and age filters apply together, so
   "old code" is a click in each mode. **Show all** or `esc` clears them.
@@ -102,19 +103,24 @@ a root. Explicit command-line paths and `--disk` still start directly;
   folder that is only partly shown marks all of it, and the panel says so.
 - **Panel:** the selection (its size set large, share of the scan, files,
   last write, and for a checkout what git says — changes, stashes, unpushed
-  commits); what is marked; *Worth a look*, the largest things that could
-  plausibly go; then, pinned above the disk, the marks taken together —
+  commits); for a recognized artifact, whether it is only *Detected* or
+  *Suggested for review*, how it was identified and what to do first, as
+  [the classification notes](artifact-classification.md) describe; what
+  is marked; *Worth a look*, the largest cleanup suggestions and agent
+  findings to review; then, pinned above the disk, the marks taken together —
   how much is marked, what removing all of it frees, and the way to the
   review screen; and the disk, free now and after the marks. On a short
-  window *Worth a look* is what scrolls. Drag its left edge to resize it;
-  double-click the edge to reset.
+  window the selection and the lists scroll; the disk stays in view. Drag
+  its left edge to resize it; double-click the edge to reset.
 
 One colour is kept apart: amber marks the selection, the main action, and
-what can be had back.
+cleanup suggestions.
 
 The kinds come from directory names and a few shapes (a bare git repository,
-`target` beside a `Cargo.toml`). Some of the names are specific to one
-machine; see `crates/disktree-core/src/classify.rs`.
+a pnpm store, and the tool layouts in
+[the classification notes](artifact-classification.md), such as
+`target/debug/deps`). Some of the names are specific to one machine; see
+`crates/disktree-core/src/classify.rs`.
 
 ## Marking
 

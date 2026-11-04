@@ -95,6 +95,155 @@ fn fixture() -> tempfile::TempDir {
     temp
 }
 
+#[gpui_kit::test]
+fn artifact_assessments_render_and_vm_data_stays_out_of_cleanup_filters(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    for path in [
+        "target/debug/deps/libapp.rlib",
+        "guest.utm/cache/state",
+        "guest.vmss",
+    ] {
+        let path = temp.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        std::fs::write(path, vec![b'x'; 200_000]).unwrap();
+    }
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    for (path, shown, absent) in [
+        (
+            "target/debug/deps",
+            "artifact-suggested",
+            "artifact-detected",
+        ),
+        ("guest.utm", "artifact-detected", "artifact-suggested"),
+        ("guest.vmss", "artifact-detected", "artifact-suggested"),
+    ] {
+        update(&view, cx, |app, cx| {
+            let (crumbs, _) =
+                app.tree().unwrap().descend(Path::new(path)).unwrap();
+            app.selected = Some(crumbs);
+            app.hovered = None;
+            app.pointer_active = false;
+            app.show_selection = true;
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds(shown).is_some(), "{path}");
+        assert!(cx.debug_bounds(absent).is_none(), "{path}");
+        // The status is a chip of its own, not a run of caption text.
+        let status: &'static str =
+            Box::leak(format!("{shown}-status").into_boxed_str());
+        assert!(cx.debug_bounds(status).is_some(), "{path}");
+    }
+    click_on(cx, "legend-reclaimable");
+    cx.run_until_parked();
+    let drawn = laid_out(&view, cx);
+    assert!(drawn.iter().any(|name| name == "deps"), "{drawn:?}");
+    assert!(
+        !drawn.iter().any(|name| name.starts_with("guest")),
+        "{drawn:?}"
+    );
+    assert!(read(&view, cx, |app| app.marks.is_empty()));
+}
+
+/// Review repeats the VM caution where removal is approved, and only on
+/// VM data: a suggested build cache carries its kind alone.
+#[gpui_kit::test]
+fn review_cautions_on_marked_vm_data_only(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    for path in ["target/debug/deps/libapp.rlib", "guest.vmss"] {
+        let path = temp.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        std::fs::write(path, vec![b'x'; 200_000]).unwrap();
+    }
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    let vm = temp.path().join("guest.vmss");
+    mark_paths(
+        &view,
+        cx,
+        &[temp.path().join("target/debug/deps"), vm.clone()],
+    );
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    let at = read(&view, cx, |app| {
+        app.marks.items().iter().position(|item| item.path == vm)
+    })
+    .expect("the VM file is marked");
+    let caution = |index: usize| -> &'static str {
+        Box::leak(format!("review-caution-{index}").into_boxed_str())
+    };
+    assert!(cx.debug_bounds(caution(at)).is_some(), "VM row cautions");
+    assert!(cx.debug_bounds(caution(1 - at)).is_none(), "cache row");
+    // A reminder, not a gate: both stay in the plan.
+    assert_eq!(read(&view, cx, |app| app.plan().targets.len()), 2);
+}
+
+#[gpui_kit::test]
+fn artifact_guidance_scrolls_above_the_pinned_free_space_meter(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let output = temp.path().join("target/debug/deps");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("libapp.rlib"), vec![b'x'; 200_000]).unwrap();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let (crumbs, _) = app
+            .tree()
+            .unwrap()
+            .descend(Path::new("target/debug/deps"))
+            .unwrap();
+        app.selected = Some(crumbs);
+        app.hovered = None;
+        app.pointer_active = false;
+        app.show_selection = true;
+        app.space = Some(SpaceInfo {
+            total: 1000,
+            free: 350,
+            available: 350,
+        });
+        cx.notify();
+    });
+    for (width, height, rem) in
+        [(1200., 600., 16.), (1400., 600., 24.), (1440., 900., 16.)]
+    {
+        cx.simulate_resize(gpui_kit::size(px(width), px(height)));
+        cx.update(|window, _| window.set_rem_size(px(rem)));
+        draw(cx);
+        draw(cx);
+        let disk = cx.debug_bounds("disk-section").unwrap();
+        assert!(disk.bottom() <= px(height), "{disk:?}");
+        assert!(disk.size.height >= px(rem * 4.0), "{disk:?}");
+        let scroll = cx.debug_bounds("side-panel-scroll").unwrap();
+        assert!(scroll.size.height > px(0.), "{scroll:?}");
+        assert!(scroll.bottom() <= disk.origin.y, "{scroll:?}, {disk:?}");
+        let guidance = cx.debug_bounds("artifact-suggested").unwrap();
+        // Scroll just far enough to read the final guidance line without
+        // moving the meter, even when the selection exceeds the viewport.
+        let distance = (guidance.bottom() - scroll.bottom()).max(px(0.));
+        cx.simulate_event(gpui_kit::ScrollWheelEvent {
+            position: scroll.center(),
+            delta: gpui_kit::ScrollDelta::Pixels(Point::new(px(0.), -distance)),
+            modifiers: gpui_kit::Modifiers::none(),
+            touch_phase: gpui_kit::TouchPhase::Moved,
+        });
+        draw(cx);
+        let scrolled = cx.debug_bounds("artifact-suggested").unwrap();
+        assert!(scrolled.bottom() <= scroll.bottom(), "{scrolled:?}");
+        assert!(scrolled.bottom() > scroll.origin.y, "{scrolled:?}");
+        assert_eq!(disk, cx.debug_bounds("disk-section").unwrap());
+    }
+}
+
 /// Apparent sizes, so the assertions are about the tree and not about how the
 /// filesystem rounds a small file up to a block.
 fn options() -> ScanOptions {
@@ -7259,7 +7408,13 @@ fn tab_reaches_file_navigation_without_changing_selection(
     let navigation = read(&view, cx, |app| app.file_focus.clone());
     let selected = read(&view, cx, |app| app.selected.clone());
     let mut reached = false;
-    for _ in 0..20 {
+    // Each legend chip adds a tab stop alongside the platform's chrome
+    // and navigation controls. Growing the inventory must not make this
+    // reachability check depend on a fixed number of categories.
+    let tab_budget = 16
+        + disktree_core::classify::Category::LEGEND.len()
+        + crate::palette::AGE_BUCKETS.len();
+    for _ in 0..tab_budget {
         press(cx, "tab");
         if cx.update(|window, _| navigation.is_focused(window)) {
             reached = true;
@@ -9532,7 +9687,7 @@ fn a_legend_filter_that_keeps_nothing_says_so(cx: &mut TestAppContext) {
     );
     // Compact List view draws no legend, so its header says what filters.
     let note = read(&view, cx, Disktree::list_filter_note);
-    assert!(note.contains("reclaimable Toolchains"), "{note}");
+    assert!(note.contains("suggested Toolchains"), "{note}");
     click_on(cx, "legend-empty-clear");
     cx.run_until_parked();
     draw(cx);
@@ -9689,9 +9844,21 @@ fn panel_headers_stay_in_sight_while_their_list_scrolls(
 ) {
     cx.update(init);
     let temp = fixture();
+    // Suggestions to scroll under the headers: the selection leads the
+    // lists, so the fixture's own are too few to reach the top.
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        let file = temp.path().join(name).join(".cache/blob.bin");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // Sparse: the scan measures apparent size, and a suggestion has to
+        // pass `insights::MIN_BYTES`.
+        std::fs::File::create(file)
+            .unwrap()
+            .set_len(65 << 20)
+            .unwrap();
+    }
     let (view, cx) = view_over(temp.path(), cx);
     // Short enough that the lists scroll.
-    cx.simulate_resize(gpui_kit::size(px(1100.), px(640.)));
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(520.)));
     draw(cx);
     draw(cx);
     let scroll_to = |cx: &mut Window, y: f32| {
@@ -9702,14 +9869,21 @@ fn panel_headers_stay_in_sight_while_their_list_scrolls(
         draw(cx);
     };
     let list = cx.debug_bounds("side-panel-scroll").expect("the lists");
+    // The selection leads the lists without a header of its own, so the
+    // offsets below count from where Marked starts.
+    let marked = cx.debug_bounds("marked-section").expect("marked");
+    let start = f32::from(marked.top() - list.top());
+    // Marked's last line just in sight: its header is pushed up by the
+    // section's end, with Worth a look coming up below.
+    let push = f32::from(marked.bottom() - list.top()) - 2.;
     assert!(
-        read(&view, cx, |app| app.panel_scroll.max_offset().y) > px(40.),
+        read(&view, cx, |app| app.panel_scroll.max_offset().y) > px(push),
         "the lists must scroll for this test"
     );
     assert!(cx.debug_bounds("pinned-head").is_none(), "nothing at rest");
 
     // Marked's header leaves the top: its copy pins there.
-    scroll_to(cx, 10.);
+    scroll_to(cx, start + 10.);
     let pinned = cx.debug_bounds("pinned-head").expect("pinned");
     assert_eq!(pinned.top(), list.top(), "{pinned:?} {list:?}");
 
@@ -9721,12 +9895,12 @@ fn panel_headers_stay_in_sight_while_their_list_scrolls(
     });
     draw(cx);
     assert!(
-        read(&view, cx, |app| app.panel_scroll.offset().y) < px(-10.),
+        read(&view, cx, |app| app.panel_scroll.offset().y) < px(-(start + 10.)),
         "the wheel reached the list"
     );
 
     // Worth a look comes up under it and pushes it off, never under it.
-    scroll_to(cx, 40.);
+    scroll_to(cx, push);
     let pinned = cx.debug_bounds("pinned-head").expect("still pinned");
     let worth = cx.debug_bounds("worth-section").expect("worth a look");
     assert!(pinned.top() < list.top(), "pushed up: {pinned:?}");

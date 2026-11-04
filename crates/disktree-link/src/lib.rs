@@ -292,6 +292,10 @@ pub struct Entry {
     pub category: String,
     /// Why its space can be had back, if it can.
     pub reclaim: Option<String>,
+    /// Artifact identity and cleanup assessment are independent. Missing
+    /// on older peers; neither detection nor suggestion approves removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<disktree_core::artifact::Detection>,
     /// Newest write at or beneath it, Unix seconds; `0` when unknown.
     pub modified: i64,
     pub read_error: bool,
@@ -374,6 +378,16 @@ impl Clones {
 }
 
 impl Entry {
+    pub fn at(node: Node<'_>, path: &Path) -> Self {
+        let mut entry = Self::of(node);
+        entry.artifact = disktree_core::artifact::assess(
+            path,
+            disktree_core::path_style::PathStyle::Native,
+            node,
+        );
+        entry
+    }
+
     pub fn of(node: Node<'_>) -> Self {
         Self {
             name: node.name().to_string(),
@@ -382,6 +396,7 @@ impl Entry {
             files: node.files,
             category: node.category.name().to_string(),
             reclaim: node.reclaim.map(|reclaim| reclaim.label().to_string()),
+            artifact: None,
             modified: node.modified,
             read_error: node.read_error,
             clones: Clones::of(node),
@@ -417,8 +432,12 @@ impl Listing {
         node: Node<'_>,
         limit: usize,
     ) -> Self {
-        let children: Vec<Entry> =
-            node.children().iter().take(limit).map(Entry::of).collect();
+        let children: Vec<Entry> = node
+            .children()
+            .iter()
+            .take(limit)
+            .map(|child| Entry::at(child, &path.join(child.name())))
+            .collect();
         let more = node.children().len().saturating_sub(limit);
         let more_bytes = node
             .children()
@@ -428,7 +447,7 @@ impl Listing {
             .sum();
         Self {
             path: path.to_path_buf(),
-            entry: Entry::of(node),
+            entry: Entry::at(node, path),
             root_bytes,
             root: root.to_path_buf(),
             children,
@@ -461,7 +480,7 @@ impl FoundList {
                 .iter()
                 .map(|(path, node)| Found {
                     path: path.clone(),
-                    entry: Entry::of(*node),
+                    entry: Entry::at(*node, path),
                 })
                 .collect(),
             count: found.count,
@@ -871,6 +890,53 @@ mod tests {
         )
         .expect("decode");
         assert_eq!(estimate.shared, 0);
+    }
+
+    #[test]
+    fn listings_keep_vm_detection_separate_from_cleanup_suggestions() {
+        use disktree_core::artifact::{Artifact, Disposition};
+        use disktree_core::classify::classify_at;
+        use disktree_core::path_style::PathStyle;
+        use disktree_core::tree::{Draft, NodeKind, Tree};
+        let mut root = Draft::directory("project");
+        let mut dependencies = Draft::directory("node_modules");
+        dependencies.children.push(Draft::entry(
+            "package.js",
+            NodeKind::File,
+            10,
+        ));
+        root.children =
+            vec![dependencies, Draft::entry("guest.vmss", NodeKind::File, 20)];
+        let mut tree = Tree::from(root);
+        classify_at(&mut tree, Path::new("/project"), PathStyle::Posix);
+        let listing = Listing::of(
+            Path::new("/project"),
+            30,
+            Path::new("/project"),
+            tree.root(),
+            10,
+        );
+        let vm = listing
+            .children
+            .iter()
+            .find(|e| e.name == "guest.vmss")
+            .unwrap();
+        assert_eq!(vm.reclaim, None);
+        let d = vm.artifact.unwrap();
+        assert_eq!(d.kind, Artifact::VmSuspend);
+        assert_eq!(d.disposition, Disposition::Detected);
+        let dependencies = listing
+            .children
+            .iter()
+            .find(|e| e.name == "node_modules")
+            .unwrap();
+        assert_eq!(
+            dependencies.artifact.unwrap().disposition,
+            Disposition::Suggested
+        );
+        let encoded = serde_json::to_string(&listing).unwrap();
+        assert!(encoded.contains("\"disposition\":\"detected\""));
+        assert_eq!(serde_json::from_str::<Listing>(&encoded).unwrap(), listing);
     }
 
     #[test]

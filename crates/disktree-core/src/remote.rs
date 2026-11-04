@@ -525,7 +525,7 @@ fn read_snapshot_with_progress(
         Ok(stack.pop().expect("one root checked above"))
     })?;
     aggregate(&mut tree, crate::tree::Metric::Bytes);
-    crate::classify::classify(&mut tree);
+    crate::classify::classify_at(&mut tree, &header.root, PathStyle::Posix);
     Ok(Snapshot { header, tree })
 }
 

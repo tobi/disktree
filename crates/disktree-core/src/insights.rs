@@ -33,7 +33,7 @@ impl Finding {
     pub fn describe(&self) -> String {
         match self {
             Self::Reclaimable(reclaim) => {
-                format!("reclaimable: {}", reclaim.label())
+                format!("cleanup candidate: {}", reclaim.label())
             }
             Self::Worktrees { count, oldest_days } => format!(
                 "{count} agent worktree{}, the oldest {oldest_days} d old",
@@ -204,7 +204,16 @@ mod tests {
                                 "fresh",
                                 vec![
                                     file("Cargo.toml", 1, 1),
-                                    dir("target", vec![file("o", GIB, 1)]),
+                                    dir(
+                                        "target",
+                                        vec![dir(
+                                            "debug",
+                                            vec![dir(
+                                                "deps",
+                                                vec![file("o", GIB, 1)],
+                                            )],
+                                        )],
+                                    ),
                                 ],
                             ),
                         ],

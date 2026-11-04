@@ -69,7 +69,7 @@ would read it.
 | pacman packages | `/var/cache/pacman/pkg` | `paccache -dk1`, then `paccache -rk1` (root) |
 | apt and dnf packages | `/var/cache/apt`, `/var/cache/dnf` | `apt clean`, `dnf clean all` (root) |
 | unused Flatpak runtimes | `/var/lib/flatpak`, `~/.local/share/flatpak` | `flatpak uninstall --unused` |
-| language caches | `~/.npm`, `~/.cargo/registry`, `~/.cache/pip`, `~/.gradle/caches` | the tool's clean command |
+| language caches | `~/.npm/_cacache`, `~/.cargo/registry`, `~/.cache/pip`, `~/.gradle/caches` | the tool's clean command |
 | pnpm store | `~/.local/share/pnpm/store` | `pnpm store prune` |
 | build output | `target/`, `node_modules/`, `build/`, `dist/` | check the checkout first (see the skill) |
 | Steam games | `~/.local/share/Steam/steamapps` | uninstall in Steam |
@@ -104,3 +104,21 @@ never approve its buttons or confirmation keys through computer use.
 
 Capacity checks charge a symbolic link to its containing volume, not its
 destination.
+
+## Developer artifacts and virtual machines
+
+Artifact identity and evidence are separate from cleanup suitability.
+`detected` is inventory only. `suggested` means a plausible, relatively
+lower-risk candidate to review, with local edits, active tools and the
+cost of reinstalling or rebuilding still to check. Name conventions are
+weaker evidence than recognized tool layouts. Whole tool homes and generic
+`target`, `build`, `dist`, `bin` or `obj` names do not establish disposability;
+review the specific detected subtree instead.
+
+VM/container disk images can contain unique work. Manage snapshots in the
+owner app, never by removing individual files in a snapshot chain. Saved
+memory or suspend state can usually be released by resuming the VM and
+shutting it down normally; checkpoints may retain it. VM data stays a
+detection even inside a directory named like a cache, and its displayed
+size is not a promise of recovered space. Do not run an owner's destructive
+cleanup command without explicit approval for that operation.

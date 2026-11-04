@@ -123,7 +123,7 @@ running program may still use. Do not bypass the guard.
 | Homebrew downloads | `~/Library/Caches/Homebrew` | `brew cleanup --dry-run`, then `brew cleanup` |
 | Docker Desktop | `~/Library/Containers/com.docker.docker/.../Docker.raw` | never mark the disk image; `docker system df`, then prune |
 | pnpm package store | `~/Library/pnpm/store/v*/files` (also older `.pnpm-store/v*/files`) | `pnpm store path` to confirm the location; `pnpm store prune` first; never treat the `pnpm` installation, executable, `global` or `.tools` as a disposable store |
-| language caches | `~/.npm`, `~/.cargo/registry`, `~/Library/Caches/pip`, `~/.gradle/caches` | the tool's clean command |
+| language caches | `~/.npm/_cacache`, `~/.cargo/registry`, `~/Library/Caches/pip`, `~/.gradle/caches` | the tool's clean command |
 
 ## Trash
 
@@ -195,3 +195,21 @@ shared extent owner, especially after clones are modified. Snapshots, open
 files, compression and changes after scanning can alter actual freed space;
 never present these bounds as exact predictions. Trash usually frees space
 only after the user empties it.
+
+## Developer artifacts and virtual machines
+
+Artifact identity and evidence are separate from cleanup suitability.
+`detected` is inventory only. `suggested` means a plausible, relatively
+lower-risk candidate to review, with local edits, active tools and the
+cost of reinstalling or rebuilding still to check. Name conventions are
+weaker evidence than recognized tool layouts. Whole tool homes and generic
+`target`, `build`, `dist`, `bin` or `obj` names do not establish disposability;
+review the specific detected subtree instead.
+
+VM/container disk images can contain unique work. Manage snapshots in the
+owner app, never by removing individual files in a snapshot chain. Saved
+memory or suspend state can usually be released by resuming the VM and
+shutting it down normally; checkpoints may retain it. VM data stays a
+detection even inside a directory named like a cache, and its displayed
+size is not a promise of recovered space. Do not run an owner's destructive
+cleanup command without explicit approval for that operation.

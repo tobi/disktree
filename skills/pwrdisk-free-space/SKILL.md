@@ -90,6 +90,20 @@ Looking is free; acting is the user's call.
 
 ## Ground rules
 
+- **Separate detection from cleanup advice.** An artifact's `kind` names
+  what was recognized; `evidence` describes a name convention or tool
+  layout. `disposition: detected` is inventory, not a suggestion to remove
+  it. `suggested` means a relatively lower-risk candidate for review,
+  still subject to local edits, active owners, rebuild/reinstall costs and
+  the user's confirmation. Neither size nor age makes data disposable.
+  Use only the recognized subtree: a Cargo manifest does not establish
+  that all of `target`, `build` or `dist` is generated output.
+- **VM data belongs to its owner app.** Disk images can contain unique
+  work. Review and consolidate snapshots through the VM app; never offer
+  individual snapshot-chain files as generic cache cleanup. For saved
+  memory or suspend state, suggest resuming the VM and shutting it down
+  normally so its owner releases the state. Checkpoints may retain memory.
+  These are detections, and listed bytes are not guaranteed savings.
 - **Check retention before promising recovery.** On macOS call
   `pwrdisk_retention` for a path on each selected volume before proposing
   a recovery amount. It lists local Time Machine snapshots without changing

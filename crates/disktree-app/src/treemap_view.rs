@@ -252,7 +252,7 @@ struct Colors {
 const DEPTHS: usize = 5;
 
 /// Every category, in the order [`category_index`] numbers them.
-const CATEGORIES: [Category; 11] = [
+const CATEGORIES: [Category; 12] = [
     Category::Code,
     Category::AgentScratch,
     Category::Toolchain,
@@ -263,6 +263,7 @@ const CATEGORIES: [Category; 11] = [
     Category::Cache,
     Category::FilesystemEvents,
     Category::Spotlight,
+    Category::VirtualMachine,
     Category::Other,
 ];
 
