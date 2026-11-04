@@ -2,7 +2,7 @@
 //! the default browser; Changelog, the license, the notices and the log
 //! open in PwrDisk's own windows (`doc_window`, `logs_window`) and work
 //! offline. Copy Diagnostics Info writes Settings › Diagnostics' report
-//! (`diagnostics`) and says so in the main window's notice line.
+//! (`diagnostics`) and says so in a toast in the main window.
 
 use gpui_kit::{App, ClipboardItem};
 
@@ -97,11 +97,11 @@ pub fn copy_diagnostics(cx: &mut App) {
     if let Some(main) = main {
         cx.defer(move |cx| {
             let _ = main.update(cx, |app, _, cx| {
-                app.notice = Some((
-                    "Diagnostics copied \u{b7} paste them into an issue".into(),
+                app.say(
+                    "Diagnostics copied \u{b7} paste them into an issue",
                     gpui_omarchy::Status::Success,
-                ));
-                cx.notify();
+                    cx,
+                );
             });
         });
     }

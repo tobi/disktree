@@ -235,8 +235,7 @@ fn private_service_stores_draw_unavailable_and_partial_figures(
     press(cx, "space");
     assert!(read(&view, cx, |app| app.marks.is_empty()));
     assert!(read(&view, cx, |app| {
-        app.notice
-            .as_ref()
+        app.notice()
             .is_some_and(|(notice, _)| notice.contains("macOS manages"))
     }));
 }
@@ -856,22 +855,23 @@ fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
             machine_id: Some("machine-a".into()),
         };
         app.remote = Some("stable-alias".into());
-        app.update_remote_identity(Some(old.clone()));
+        app.update_remote_identity(Some(old.clone()), cx);
         let crumbs = app.crumbs_for_path(&junk).unwrap();
         app.select(Some(crumbs), cx);
         app.toggle_mark_selected(cx);
-        app.update_remote_identity(Some(old.clone()));
+        app.update_remote_identity(Some(old.clone()), cx);
         assert!(!app.marks.is_empty(), "same machine keeps its marks");
-        app.update_remote_identity(Some(
-            disktree_core::identity::HostIdentity {
+        app.update_remote_identity(
+            Some(disktree_core::identity::HostIdentity {
                 hostname: old.hostname,
                 machine_id: Some("machine-b".into()),
-            },
-        ));
+            }),
+            cx,
+        );
         assert!(app.marks.is_empty(), "same alias is not proof of identity");
         app.toggle_mark_selected(cx);
         assert!(!app.marks.is_empty());
-        app.update_remote_identity(None);
+        app.update_remote_identity(None, cx);
         assert!(app.marks.is_empty(), "lost identity also fails closed");
     });
 }
@@ -1411,10 +1411,7 @@ fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
     draw(cx);
 
     let (selected, notice) = read(&view, cx, |app| {
-        (
-            app.selected.clone(),
-            app.notice.as_ref().map(|(text, _)| text.clone()),
-        )
+        (app.selected.clone(), app.notice().map(|(text, _)| text))
     });
     assert_eq!(selected, Some(target), "the clicked tile is selected");
     assert!(
@@ -1617,20 +1614,26 @@ fn the_tooltip_hides_under_an_overlay(cx: &mut TestAppContext) {
     }
 }
 
-/// The menu opens one overlay at a time: the other one closes.
+/// Help › Connect an AI Agent (MCP)… opens Settings › Agents (MCP), and
+/// leaves the main window as it was.
 #[gpui_kit::test]
-fn the_menu_shows_one_overlay_at_a_time(cx: &mut TestAppContext) {
+fn the_menu_opens_settings_agents(cx: &mut TestAppContext) {
     cx.update(init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
     cx.dispatch_action(crate::app_menu::ConnectAgent);
-    cx.dispatch_action(crate::app_menu::ShowKeyboardShortcuts);
-    draw(cx);
-    assert!(read(&view, cx, |app| app.show_help && !app.show_agent));
-    cx.dispatch_action(crate::app_menu::ConnectAgent);
-    draw(cx);
-    assert!(read(&view, cx, |app| app.show_agent && !app.show_help));
+    cx.run_until_parked();
+    assert_eq!(settings_pane(cx), Some(crate::settings::Pane::Agents));
+    assert!(read(&view, cx, |app| !app.has_modal()));
+}
+
+/// The pane Settings shows, if it is open.
+fn settings_pane(cx: &mut VisualTestContext) -> Option<crate::settings::Pane> {
+    cx.update(|_, cx| {
+        crate::aux_window::find::<crate::settings::SettingsWindow>(cx, |_| true)
+            .and_then(|handle| handle.read(cx).ok().map(|view| view.pane))
+    })
 }
 
 /// Opens one overlay, for the cases of `overlays_fit_a_short_window`.
@@ -1644,14 +1647,11 @@ fn overlays_fit_a_short_window(cx: &mut TestAppContext) {
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     cx.simulate_resize(gpui_kit::size(px(900.), px(420.)));
-    let cases: [(&str, OpenOverlay); 2] = [
-        ("help-overlay", |app| app.show_help = true),
-        ("agent-overlay", |app| app.show_agent = true),
-    ];
+    let cases: [(&str, OpenOverlay); 1] =
+        [("help-overlay", |app| app.show_help = true)];
     for (card, open) in cases {
         update(&view, cx, |app, cx| {
             app.show_help = false;
-            app.show_agent = false;
             open(app);
             cx.notify();
         });
@@ -1835,6 +1835,12 @@ fn settings_updates_picks_a_channel_and_keeps_the_keys(
             .percent(),
         10
     );
+    press(cx, "ctrl-pagedown");
+    assert_eq!(
+        view.read_with(cx, |settings, _| settings.pane),
+        Pane::Agents
+    );
+    assert!(cx.debug_bounds("agents-status").is_some());
     press(cx, "ctrl-pagedown");
     assert!(
         cx.debug_bounds(crate::settings::COPY_DIAGNOSTICS_ID)
@@ -2514,7 +2520,7 @@ fn restart_to_update_waits_for_a_removal(cx: &mut TestAppContext) {
         assert!(!app.can_restart_to_update());
         app.restart_to_update(cx);
     });
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     assert!(
         notice.is_some_and(|(text, _)| text.contains("removal")),
         "restart refused while removing"
@@ -2555,7 +2561,7 @@ fn the_strip_menu_lists_the_menus_off_macos(cx: &mut TestAppContext) {
 }
 
 /// Copy Diagnostics Info writes the report, with the main window's
-/// session and no path it scanned, and says so in the notice line.
+/// session and no path it scanned, and says so in a toast.
 #[gpui_kit::test]
 fn copy_diagnostics_info_names_no_scanned_path(cx: &mut TestAppContext) {
     cx.update(init);
@@ -2576,7 +2582,7 @@ fn copy_diagnostics_info_names_no_scanned_path(cx: &mut TestAppContext) {
     assert!(report.contains("\n[Session]\nScan: local"), "{report}");
     let root = temp.path().display().to_string();
     assert!(!report.contains(&root), "{report}");
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     assert!(
         notice.is_some_and(|(text, _)| text.starts_with("Diagnostics copied")),
         "the main window says it copied"
@@ -2705,7 +2711,7 @@ fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
     // The selection is .cache, the largest; take it away behind the tree.
     std::fs::remove_dir_all(temp.path().join(".cache")).expect("remove");
     press(cx, "o");
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     let (message, _) = notice.expect("a notice");
     assert!(message.contains("no longer on disk"), "{message}");
 }
@@ -2927,7 +2933,7 @@ fn unmark_all_can_be_undone(cx: &mut TestAppContext) {
     });
     click_on(cx, "unmark-all");
     assert!(marked(&view, cx).is_empty());
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     assert!(
         notice.is_some_and(|(message, _)| message.contains("to undo")),
         "the way back is said"
@@ -2958,7 +2964,7 @@ fn unmark_all_can_be_undone(cx: &mut TestAppContext) {
     mark_paths(&view, cx, &[temp.path().to_path_buf()]);
     press(cx, "u");
     assert_eq!(marked(&view, cx), vec![temp.path().to_path_buf()]);
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     assert!(
         notice.is_some_and(|(message, _)| message.contains("Nothing to put")),
         "no count of nothing"
@@ -3184,7 +3190,7 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
         "{copied}"
     );
     assert!(junk.exists(), "nothing was removed");
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     assert!(
         notice.is_some_and(|(message, _)| message.contains("copied")),
         "the copy is confirmed"
@@ -4001,10 +4007,7 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     // Marking something inside it is refused, and says why.
     update(&view, cx, |app, cx| app.toggle_mark(&deeper, cx));
     let (count, notice) = read(&view, cx, |app| {
-        (
-            app.marks.len(),
-            app.notice.as_ref().map(|(text, _)| text.clone()),
-        )
+        (app.marks.len(), app.notice().map(|(text, _)| text))
     });
     assert_eq!(count, 1);
     assert!(notice.is_some_and(|text| text.contains("goes with the marked")));
@@ -4595,7 +4598,7 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
         app.power_settings_path = Some(config.path().to_owned());
         app.set_power_efficiency(Power::Miser, cx);
     });
-    assert!(read(&view, cx, |app| app.notice.as_ref().is_some_and(
+    assert!(read(&view, cx, |app| app.notice().as_ref().is_some_and(
         |(message, _)| message.contains("could not be saved")
     )));
     update(&view, cx, Disktree::start_scan);
@@ -4642,7 +4645,7 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     read(&view, cx, |app| {
         assert_eq!(app.power_choice, Some(Power::Balanced));
-        assert!(app.notice.is_none());
+        assert!(app.notice().is_none());
     });
 
     // The arrows step over what is not offered, and Enter chooses.
@@ -5967,74 +5970,68 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("agent-pill").is_none(), "pill gone");
 }
 
-/// The agent overlay opens from the panel line, lists a command for each
-/// client with the binary's own path, and closes on Escape.
+/// The panel's agent line opens Settings › Agents (MCP), which lists a
+/// command for each client with the binary's own path, the bare command
+/// line first, and says who is connected.
 #[gpui_kit::test]
-fn the_agent_overlay_opens_and_closes(cx: &mut TestAppContext) {
+fn the_agent_line_opens_settings_agents(cx: &mut TestAppContext) {
+    use crate::settings::{Pane, SettingsWindow};
+
     cx.update(init);
     let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
+    let (_, cx) = view_over(temp.path(), cx);
     draw(cx);
     assert!(cx.debug_bounds("agent-line").is_some());
-    assert!(cx.debug_bounds("agent-overlay").is_none());
-
-    update(&view, cx, |app, cx| {
-        app.show_agent = true;
-        cx.notify();
-    });
-    draw(cx);
-    assert!(cx.debug_bounds("agent-overlay").is_some());
-
-    press(cx, "escape");
-    assert!(!read(&view, cx, |app| app.show_agent));
-    assert!(cx.debug_bounds("agent-overlay").is_none());
-
-    // Done closes it, and so does a click outside the card; a click on the
-    // card itself does not.
-    update(&view, cx, |app, cx| {
-        app.show_agent = true;
-        cx.notify();
-    });
-    draw(cx);
-    click_on(cx, "overlay-done");
-    draw(cx);
-    assert!(!read(&view, cx, |app| app.show_agent), "Done closes");
-
-    update(&view, cx, |app, cx| {
-        app.show_agent = true;
-        cx.notify();
-    });
-    draw(cx);
-    click_on(cx, "agent-overlay");
-    draw(cx);
-    assert!(read(&view, cx, |app| app.show_agent), "card click stays");
-    let card = cx.debug_bounds("agent-overlay").expect("card");
-    let outside = card.origin - gpui_kit::point(px(8.), px(8.));
-    cx.simulate_click(outside, gpui_kit::Modifiers::none());
-    draw(cx);
-    assert!(!read(&view, cx, |app| app.show_agent), "outside closes");
-
-    // The Help menu opens the same overlay.
-    cx.dispatch_action(crate::app_menu::ConnectAgent);
-    draw(cx);
-    assert!(read(&view, cx, |app| app.show_agent));
-    assert!(cx.debug_bounds("agent-overlay").is_some());
-    press(cx, "escape");
+    click_on(cx, "agent-line");
+    cx.run_until_parked();
+    assert_eq!(settings_pane(cx), Some(Pane::Agents));
 
     let commands =
         crate::agent::connect_commands(Path::new("/opt/disktree/disktree"));
-    assert_eq!(commands.len(), 3);
+    let labels: Vec<_> = commands.iter().map(|way| way.label).collect();
+    assert_eq!(
+        labels,
+        [
+            "Command line",
+            "Claude Code",
+            "Codex",
+            "Other MCP clients (JSON)"
+        ]
+    );
+    assert_eq!(commands[0].text, "\"/opt/disktree/disktree\" mcp");
     assert!(
-        commands[0]
-            .1
+        commands[1]
+            .text
             .starts_with("claude mcp add --scope user pwrdisk")
     );
     assert!(
         commands
             .iter()
-            .all(|(_, command)| command.contains("/opt/disktree/disktree"))
+            .all(|way| way.text.contains("/opt/disktree/disktree"))
     );
-    assert!(commands[2].1.contains("\"args\": [\"mcp\"]"));
+    assert!(commands[3].text.contains("\"args\": [\"mcp\"]"));
+
+    // The pane draws every row, each with its own Copy, and the status.
+    let (view, cx) =
+        cx.add_window_view(|_, cx| SettingsWindow::new(Pane::Agents, cx));
+    draw(cx);
+    assert!(cx.debug_bounds("settings-nav-agents").is_some());
+    assert!(cx.debug_bounds("agents-status").is_some());
+    for way in &commands {
+        assert!(cx.debug_bounds(way.id).is_some(), "{} has Copy", way.label);
+    }
+    // Copy answers on its own button, for a moment, never with a toast.
+    click_on(cx, "agents-copy-command");
+    let copied = clipboard(cx);
+    assert!(copied.ends_with("\" mcp"), "{copied}");
+    assert!(copied.starts_with('"'), "{copied}");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.copied()),
+        Some("agents-copy-command")
+    );
+    cx.executor().advance_clock(crate::settings::COPY_FEEDBACK);
+    cx.run_until_parked();
+    assert_eq!(view.read_with(cx, |view, _| view.copied()), None);
 }
 
 /// A window showing an SSH host answers an agent with where it is and
@@ -6140,7 +6137,7 @@ fn removal_capacity_limit_blocks_the_entire_ui_selection(
         assert_eq!(app.screen, Screen::Review);
         assert!(app.run.is_none());
         assert!(
-            app.notice
+            app.notice()
                 .as_ref()
                 .is_some_and(|(text, _)| text.contains("limit"))
         );
@@ -6469,7 +6466,7 @@ fn status_review_removal_completion_survives_its_background_rescan(
         // Remove & rescan.
         app.rescan_after_removal = true;
         app.begin_removal(cx);
-        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice);
+        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice());
         app.run_epoch
     });
     let mut status = None;
@@ -6508,7 +6505,7 @@ fn remove_now(view: &Entity<Disktree>, cx: &mut Window, names: &[&str]) {
         }
         app.removal_mode = RemovalMode::Permanent;
         app.begin_removal(cx);
-        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice);
+        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice());
         app.run_epoch
     });
     for _ in 0..400 {
@@ -6544,7 +6541,7 @@ fn the_removal_list_stays_on_screen_from_start_to_done(
         }
         app.removal_mode = RemovalMode::Permanent;
         app.begin_removal(cx);
-        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice);
+        assert_eq!(app.screen, Screen::Running, "{:?}", app.notice());
         app.run_epoch
     });
     draw(cx);
@@ -6820,7 +6817,7 @@ fn a_removal_leaves_what_went_in_the_tree_as_removed_and_counts_it(
         let crumbs = app.crumbs_for_path(&deeper).expect("still drawn");
         app.toggle_mark(&crumbs, cx);
         assert!(app.marks.is_empty());
-        let notice = app.notice.as_ref().map(|(text, _)| text.as_str());
+        let notice = app.notice().map(|(text, _)| text);
         assert!(notice.is_some_and(|text| text.contains("was removed")));
         // Its directory can, for what is left in it.
         let junk = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
@@ -7389,7 +7386,7 @@ fn focus_review_escape_cancels_removal_before_background_scan(
     read(&view, cx, |app| {
         assert!(app.scan.is_some(), "foreground Escape preserves the scan");
         assert!(
-            app.notice.as_ref().is_some_and(
+            app.notice().as_ref().is_some_and(
                 |(text, _)| text == "stopping after the current item"
             )
         );
@@ -7879,7 +7876,7 @@ fn restarting_waits_and_a_failure_is_offered_again(cx: &mut TestAppContext) {
     });
     draw(cx);
     assert!(cx.debug_bounds("toast-update-problem").is_some());
-    let notice = read(&view, cx, |app| app.notice.clone());
+    let notice = read(&view, cx, Disktree::notice);
     assert!(notice.is_some_and(|(text, _)| text.contains("did not start")));
 }
 
@@ -9665,6 +9662,143 @@ fn the_marked_total_is_pinned_above_the_disk_with_the_review(
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
 }
 
+/// A side panel list's header stays at the top of the list while its rows
+/// scroll under it, and the next section pushes it up rather than covering
+/// it, as PwrGit's and PwrAgnt's sidebars do.
+#[gpui_kit::test]
+fn panel_headers_stay_in_sight_while_their_list_scrolls(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Short enough that the lists scroll.
+    cx.simulate_resize(gpui_kit::size(px(1100.), px(640.)));
+    draw(cx);
+    draw(cx);
+    let scroll_to = |cx: &mut Window, y: f32| {
+        update(&view, cx, |app, cx| {
+            app.panel_scroll.set_offset(gpui_kit::point(px(0.), px(-y)));
+            cx.notify();
+        });
+        draw(cx);
+    };
+    let list = cx.debug_bounds("side-panel-scroll").expect("the lists");
+    assert!(
+        read(&view, cx, |app| app.panel_scroll.max_offset().y) > px(40.),
+        "the lists must scroll for this test"
+    );
+    assert!(cx.debug_bounds("pinned-head").is_none(), "nothing at rest");
+
+    // Marked's header leaves the top: its copy pins there.
+    scroll_to(cx, 10.);
+    let pinned = cx.debug_bounds("pinned-head").expect("pinned");
+    assert_eq!(pinned.top(), list.top(), "{pinned:?} {list:?}");
+
+    // A wheel over the pinned header still scrolls the list it heads.
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: pinned.center(),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-10.))),
+        ..Default::default()
+    });
+    draw(cx);
+    assert!(
+        read(&view, cx, |app| app.panel_scroll.offset().y) < px(-10.),
+        "the wheel reached the list"
+    );
+
+    // Worth a look comes up under it and pushes it off, never under it.
+    scroll_to(cx, 40.);
+    let pinned = cx.debug_bounds("pinned-head").expect("still pinned");
+    let worth = cx.debug_bounds("worth-section").expect("worth a look");
+    assert!(pinned.top() < list.top(), "pushed up: {pinned:?}");
+    assert!(pinned.bottom() < worth.top(), "{pinned:?} {worth:?}");
+
+    // Back at the top, nothing is pinned.
+    scroll_to(cx, 0.);
+    assert!(cx.debug_bounds("pinned-head").is_none());
+}
+
+/// What just happened is a toast that runs out, not a line in the panel
+/// that stays for hours. A newer notice replaces it with a fresh
+/// countdown; an error stays until closed.
+#[gpui_kit::test]
+fn notices_are_toasts_that_run_out(cx: &mut TestAppContext) {
+    use gpui_omarchy::Status;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.say("copied a thing", Status::Success, cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("toast-notice").is_some(), "a toast");
+    assert!(cx.debug_bounds("toast-notice-timer").is_some(), "it drains");
+
+    // Half its time later a newer one takes its place, and its full time.
+    let half = crate::toasts::ANSWER / 2;
+    cx.executor().advance_clock(half);
+    update(&view, cx, |app, cx| {
+        app.say("nothing to copy", Status::Warning, cx);
+    });
+    cx.executor().advance_clock(half + half / 2);
+    cx.run_until_parked();
+    assert_eq!(
+        read(&view, cx, Disktree::notice),
+        Some(("nothing to copy".to_owned(), Status::Warning))
+    );
+    cx.executor().advance_clock(crate::toasts::ANSWER);
+    cx.run_until_parked();
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::notice), None, "gone");
+    assert!(cx.debug_bounds("toast-notice").is_none());
+
+    // An error stays, with no countdown, until × closes it.
+    update(&view, cx, |app, cx| {
+        app.say("could not save /x: denied", Status::Error, cx);
+    });
+    cx.executor().advance_clock(crate::toasts::ANSWER * 4);
+    cx.run_until_parked();
+    draw(cx);
+    assert!(cx.debug_bounds("toast-notice").is_some(), "an error stays");
+    assert!(cx.debug_bounds("toast-notice-timer").is_none());
+    click_on(cx, "toast-close-notice");
+    draw(cx);
+    assert_eq!(read(&view, cx, Disktree::notice), None);
+
+    // So does a warning that something failed on the person's behalf.
+    update(&view, cx, |app, cx| {
+        app.say_until_closed(
+            "Remote identity changed; previous marks were cleared.",
+            Status::Warning,
+            cx,
+        );
+    });
+    cx.executor().advance_clock(crate::toasts::ANSWER * 4);
+    cx.run_until_parked();
+    assert!(read(&view, cx, Disktree::notice).is_some(), "it stays");
+}
+
+/// Unmark all's notice carries Undo, which puts the marks back.
+#[gpui_kit::test]
+fn unmark_all_offers_undo_on_its_toast(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        app.toggle_mark(&junk, cx);
+        app.clear_marks(cx);
+    });
+    draw(cx);
+    assert!(read(&view, cx, |app| app.marks.is_empty()));
+    click_on(cx, "toast-undo");
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
+}
+
 /// The fixture on a pretend 1 MB disk, with `junk` (300 kB, 30% of it)
 /// selected: past the default 5% limit.
 fn over_limit_view<'a>(
@@ -9704,7 +9838,7 @@ fn past_the_limit_marking_needs_mark_anyway_and_review_the_phrase(
     press(cx, "space");
     read(&view, cx, |app| {
         assert!(app.marks.is_empty());
-        assert!(app.notice.as_ref().is_some_and(|(notice, _)| {
+        assert!(app.notice().is_some_and(|(notice, _)| {
             notice.contains("30%") && notice.contains("5% limit")
         }));
     });
@@ -9730,7 +9864,7 @@ fn past_the_limit_marking_needs_mark_anyway_and_review_the_phrase(
     read(&view, cx, |app| {
         assert!(!app.confirm_open);
         assert!(app.run.is_none());
-        assert!(app.notice.as_ref().is_some_and(|(notice, _)| {
+        assert!(app.notice().is_some_and(|(notice, _)| {
             notice.contains("delete 30% of my disk")
         }));
     });

@@ -1,9 +1,10 @@
 //! The Settings window: its own window, one at a time, as in PwrRoute,
 //! PwrGit and PwrSnap. A nav on the left and panes of cards: Updates,
-//! Diagnostics and About. No General pane until there is something to put
-//! in it: Power Efficiency and the view settings stay in the strip, where
-//! they are used. Design: "Menus and Help Windows" in the PwrDisk Claude
-//! Design project, turn 3.
+//! Safety, Agents (MCP), Diagnostics and About. No General pane until
+//! there is something to put in it: Power Efficiency and the view settings
+//! stay in the strip, where they are used. Design: "Menus and Help
+//! Windows" in the PwrDisk Claude Design project, turn 3; Agents (MCP) in
+//! "Notices, Sticky Headers and Agents (MCP)", as PwrSnap's Local Agents.
 //!
 //! Updates is the panel the main window used to draw, moved here with its
 //! rows, its names and its keys (↑↓ and Enter pick a channel, C checks, R
@@ -62,6 +63,10 @@ pub const CHECK_ID: &str = "updates-check";
 pub const RESTART_ID: &str = "updates-restart";
 pub const COPY_DIAGNOSTICS_ID: &str = "diagnostics-copy";
 pub const COPY_BUILD_ID: &str = "about-copy-build";
+pub const COPY_PROMPT_ID: &str = "agents-copy-prompt";
+/// How long a copy button says "Copied": PwrSnap's and PwrAgnt's 1.5 s.
+pub const COPY_FEEDBACK: std::time::Duration =
+    std::time::Duration::from_millis(1500);
 /// About's header: the icon, the name and version, the build line.
 pub const ABOUT_HEADER_ID: &str = "about-header";
 pub const ABOUT_BUILD_LINE_ID: &str = "about-build-line";
@@ -79,18 +84,25 @@ pub enum Pane {
     Updates,
     Diagnostics,
     Safety,
+    Agents,
     About,
 }
 
 impl Pane {
-    pub const ALL: [Self; 4] =
-        [Self::Updates, Self::Safety, Self::Diagnostics, Self::About];
+    pub const ALL: [Self; 5] = [
+        Self::Updates,
+        Self::Safety,
+        Self::Agents,
+        Self::Diagnostics,
+        Self::About,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Updates => "Updates",
             Self::Diagnostics => "Diagnostics",
             Self::Safety => "Safety",
+            Self::Agents => "Agents (MCP)",
             Self::About => "About",
         }
     }
@@ -99,7 +111,7 @@ impl Pane {
     /// them: what PwrDisk does, then help with it.
     pub const fn group(self) -> &'static str {
         match self {
-            Self::Updates | Self::Safety => "App",
+            Self::Updates | Self::Safety | Self::Agents => "App",
             Self::Diagnostics | Self::About => "Support",
         }
     }
@@ -110,6 +122,7 @@ impl Pane {
             Self::Updates => "settings-nav-updates",
             Self::Diagnostics => "settings-nav-diagnostics",
             Self::Safety => "settings-nav-safety",
+            Self::Agents => "settings-nav-agents",
             Self::About => "settings-nav-about",
         }
     }
@@ -152,6 +165,18 @@ pub fn open_window(
     })
 }
 
+/// Redraws Settings › Agents (MCP) when the agent connected to the main
+/// window changes. Only that pane: nothing else there follows the agent.
+pub fn agents_changed(cx: &mut App) {
+    if let Some(handle) = aux_window::find::<SettingsWindow>(cx, |_| true) {
+        let _ = handle.update(cx, |view, _, cx| {
+            if view.pane == Pane::Agents {
+                cx.notify();
+            }
+        });
+    }
+}
+
 /// Redraws Settings when the updater's state moves (`updater::install`).
 /// Never for a download's percent, which Settings does not show: this
 /// collects the diagnostics again.
@@ -183,8 +208,15 @@ pub struct SettingsWindow {
     /// it at a temporary one.
     pub updates_dir: Option<PathBuf>,
     pub diagnostics: Diagnostics,
-    /// The copy button that last copied, which says "Copied".
+    /// The copy button that last copied, which says "Copied" for
+    /// [`COPY_FEEDBACK`].
     copied: Option<&'static str>,
+    /// Puts "Copied" back to "Copy"; a newer copy replaces it, so an older
+    /// click cannot cut the newer one's short.
+    copied_reset: Option<gpui_kit::Task<()>>,
+    /// Agents (MCP)'s commands: the executable does not move while it
+    /// runs, so they are built once rather than on every redraw.
+    connect: Vec<crate::agent::Connect>,
     /// Why the last pick could not be saved.
     pub note: Option<String>,
     /// The saved removal limit, as Safety shows it: read when the window
@@ -213,6 +245,11 @@ impl SettingsWindow {
             updates_dir,
             diagnostics: diagnostics::collect(cx),
             copied: None,
+            copied_reset: None,
+            connect: crate::agent::connect_commands(
+                &std::env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("pwrdisk")),
+            ),
             note: None,
             focus: cx.focus_handle(),
             pane_scroll: gpui_kit::ScrollHandle::new(),
@@ -230,6 +267,12 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// The copy button that says "Copied" now, if any.
+    #[cfg(test)]
+    pub const fn copied(&self) -> Option<&'static str> {
+        self.copied
+    }
+
     /// Read the saved removal limit again.
     fn reload_safety(&mut self) {
         self.safety = crate::safety::load_policy(self.updates_dir.as_deref());
@@ -245,6 +288,13 @@ impl SettingsWindow {
     ) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.copied = Some(id);
+        self.copied_reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPY_FEEDBACK).await;
+            let _ = this.update(cx, |this, cx| {
+                this.copied = None;
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -273,7 +323,7 @@ impl SettingsWindow {
     }
 
     /// Restart into the download, through the main window: it refuses
-    /// while a removal runs, and says so in its notice line.
+    /// while a removal runs, and says so in a toast.
     fn restart(cx: &mut App) {
         let main = cx
             .windows()
@@ -451,6 +501,7 @@ impl Render for SettingsWindow {
             Pane::Updates => self.updates(&theme, cx),
             Pane::Diagnostics => self.diagnostics_pane(&theme, cx),
             Pane::Safety => self.safety_pane(&theme, window, cx),
+            Pane::Agents => self.agents_pane(&theme, cx),
             Pane::About => self.about(&theme, cx),
         };
         let body = div()
@@ -705,6 +756,105 @@ impl SettingsWindow {
             body = body.child(alert_note(note, theme));
         }
         body
+    }
+
+    /// How to connect an agent over MCP, who is connected, and what an
+    /// agent may do. The main window's link answers the agent; this pane
+    /// only reads who it is.
+    fn agents_pane(&self, theme: &Theme, cx: &Context<'_, Self>) -> Div {
+        let (connected, status) = cx
+            .windows()
+            .into_iter()
+            .filter_map(|window| window.downcast::<Disktree>())
+            .find_map(|main| main.read(cx).ok().map(Disktree::agent_status))
+            .unwrap_or_else(|| {
+                (false, "No PwrDisk window is open.".to_owned())
+            });
+        let mut connect = card("Connect", None, theme);
+        for way in &self.connect {
+            connect = connect.child(field(
+                way.label,
+                None,
+                vec![self.copy_row(way.id, &way.text, theme, cx)],
+                theme,
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::LG)
+            .child(head(
+                "App",
+                "Agents (MCP)",
+                "Let Claude Code, Codex or any MCP client scan, explore and \
+                 mark with PwrDisk, and this window follows along. Removing \
+                 stays yours.",
+                None,
+                theme,
+            ))
+            .child(card("Connection", None, theme).child(field(
+                "Status",
+                None,
+                vec![
+                        readable("agents-status", status.clone())
+                            .debug_selector(|| "agents-status".into())
+                            .flex()
+                            .flex_row()
+                            .gap(space::XS)
+                            .child(
+                                div()
+                                    .text_color(if connected {
+                                        theme.success
+                                    } else {
+                                        theme.secondary
+                                    })
+                                    .child("\u{25cf}"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme.foreground)
+                                    .child(status),
+                            )
+                            .into_any_element(),
+                    ],
+                theme,
+            )))
+            .child(connect)
+            .child(card("First prompt", None, theme).child(field(
+                "Ask it",
+                Some("A proposal first: it marks only once you agree."),
+                vec![self.copy_row(
+                    COPY_PROMPT_ID,
+                    crate::agent::FIRST_PROMPT,
+                    theme,
+                    cx,
+                )],
+                theme,
+            )))
+            .child(
+                card("What an agent may do", None, theme)
+                    .child(field(
+                        "Look and mark",
+                        None,
+                        vec![value_text(
+                            "Scan, walk the tree, mark what could go, and \
+                             open the review screen."
+                                .to_owned(),
+                        )],
+                        theme,
+                    ))
+                    .child(field(
+                        "Remove",
+                        None,
+                        vec![value_text(
+                            "Only after you confirm the exact paths and \
+                             mode, within the limit in Safety. Removing \
+                             from the review screen stays yours."
+                                .to_owned(),
+                        )],
+                        theme,
+                    )),
+            )
     }
 
     fn updates(&self, theme: &Theme, cx: &Context<'_, Self>) -> Div {
@@ -1327,6 +1477,11 @@ impl SettingsWindow {
             "about-copy-checkout" => "Copy checkout path",
             "about-copy-branch" => "Copy branch or tag",
             "about-copy-commit" => "Copy commit",
+            "agents-copy-command" => "Copy the command line",
+            "agents-copy-claude" => "Copy the Claude Code command",
+            "agents-copy-codex" => "Copy the Codex command",
+            "agents-copy-json" => "Copy the MCP client JSON",
+            COPY_PROMPT_ID => "Copy the first prompt",
             _ => label,
         };
         let name = if self.copied == Some(id) {

@@ -102,9 +102,8 @@ impl crate::state::Disktree {
             } else {
                 ""
             },
-            self.notice
-                .as_ref()
-                .map_or("", |(message, _)| message.as_str())
+            self.notice()
+                .map_or_else(String::new, |(message, _)| message)
         )
     }
 

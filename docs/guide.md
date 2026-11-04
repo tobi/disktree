@@ -462,9 +462,11 @@ claude mcp add --scope user pwrdisk -- pwrdisk mcp
 (Codex: `codex mcp add pwrdisk -- pwrdisk mcp`. Any other client: a
 server named `pwrdisk` with the command `pwrdisk` and the argument `mcp`.
 On macOS the command lives inside the app, at
-`PwrDisk.app/Contents/MacOS/pwrdisk`. The window's **Work with an AI
-agent** line, under the disk, and **Help › Work with an AI Agent…** on
-macOS, show each command with the binary's full path and a Copy button.)
+`PwrDisk.app/Contents/MacOS/pwrdisk`. **Settings › Agents (MCP)** shows
+the bare command line and each client's command with the binary's full
+path and a Copy button, and who is connected. **Help › Connect an AI
+Agent (MCP)…** and the **Connect an AI agent (MCP)** line under the disk
+open it.)
 
 Then ask it what is eating your disk. The agent walks the tree largest
 first, lists every cache, build directory and package store at once, and

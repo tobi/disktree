@@ -1,10 +1,21 @@
 //! Toasts in the main window: short notices that answer something the
-//! person asked for, or offer the one thing worth acting on. Today that is
-//! the updater. Design: "Update Notices" in the PwrDisk Claude Design
-//! project, after PwrSnap's update banner and PwrRoute's toast.
+//! person asked for, or offer the one thing worth acting on. Design:
+//! "Update Notices" in the PwrDisk Claude Design project, after PwrSnap's
+//! update banner and PwrRoute's toast, and "Notices, Sticky Headers and
+//! Agents (MCP)" for the window's own notices.
 //!
-//! Two kinds of news, kept apart as PwrSnap does:
+//! Three kinds of news, kept apart as PwrSnap and PwrAgnt do:
 //!
+//! - **What just happened**: a list saved, marks taken away, a key that
+//!   had nothing to act on ([`notice`]). These used to sit in a box above
+//!   the disk until something else replaced them, which could be hours.
+//!   Now they share one slot, [`NOTICE`]: a newer one takes the older's
+//!   place with a fresh countdown of [`ANSWER`]. An error stays until it
+//!   is closed, as PwrAgnt's do, since it may need reading twice, and so
+//!   does a warning that something failed or was undone on the person's
+//!   behalf ([`Disktree::say_until_closed`]). A copy
+//!   button answers on itself ("Copied"), never here; only a copy with no
+//!   button in sight, such as Help › Copy Diagnostics Info, says so here.
 //! - **The answer to Help › Check for Updates….** Only that menu item
 //!   asks; the startup, timer and Settings checks never raise a toast
 //!   (Settings answers its own button inline). While the check runs the
@@ -36,7 +47,7 @@ use gpui_kit::{
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Window, div, relative,
 };
-use gpui_omarchy::{ActiveTheme as _, ButtonVariant, button};
+use gpui_omarchy::{ActiveTheme as _, ButtonVariant, Status, button};
 
 use crate::semantics::AccessibleButton as _;
 use crate::state::Disktree;
@@ -49,6 +60,8 @@ pub const STACK_ID: &str = "toast-stack";
 /// The one key the updater's cards share, so a second check replaces the
 /// first card rather than stacking another.
 pub const UPDATE: &str = "update";
+/// The one key the window's notices share: a newer one replaces the older.
+pub const NOTICE: &str = "notice";
 /// The most toasts on screen; an older one gives way to a newer one.
 const MAX: usize = 3;
 /// How long an answer stays: PwrSnap's and PwrRoute's 8 s.
@@ -61,6 +74,45 @@ pub enum Tone {
     Accent,
     /// Something went wrong.
     Danger,
+    /// A notice: done as asked.
+    Success,
+    /// A notice: nothing was done, and why.
+    Warning,
+    /// A notice that is neither.
+    Neutral,
+}
+
+impl Tone {
+    /// The status a notice of this tone was raised with.
+    pub const fn status(self) -> Status {
+        match self {
+            Self::Danger => Status::Error,
+            Self::Success => Status::Success,
+            Self::Warning => Status::Warning,
+            Self::Accent | Self::Neutral => Status::Neutral,
+        }
+    }
+
+    const fn color(self, theme: &gpui_omarchy::Theme) -> Hsla {
+        match self {
+            Self::Accent => theme.accent,
+            Self::Danger => theme.danger,
+            Self::Success => theme.success,
+            Self::Warning => theme.warning,
+            Self::Neutral => theme.secondary,
+        }
+    }
+}
+
+impl From<Status> for Tone {
+    fn from(status: Status) -> Self {
+        match status {
+            Status::Neutral => Self::Neutral,
+            Status::Success => Self::Success,
+            Status::Warning => Self::Warning,
+            Status::Error => Self::Danger,
+        }
+    }
 }
 
 /// What runs under a live card's sentence.
@@ -91,6 +143,8 @@ pub enum Action {
     },
     /// Put away the ready release until a newer one, or until asked.
     Later,
+    /// Put back the marks Unmark all took.
+    Undo,
 }
 
 /// One notice.
@@ -523,6 +577,26 @@ fn sentence(text: &str) -> String {
     out
 }
 
+// ── the window's own notices ────────────────────────────────────────────
+
+/// A notice: one line, in the [`NOTICE`] slot. It runs out after
+/// [`ANSWER`] unless it is an error, which stays until closed.
+pub fn notice(message: impl Into<String>, status: Status) -> Toast {
+    Toast {
+        key: NOTICE,
+        timeout: (status != Status::Error).then_some(ANSWER),
+        ..Toast::new(status.into(), String::new(), message.into())
+    }
+}
+
+/// A notice that stays until it is closed, whatever its status.
+pub fn lasting_notice(message: impl Into<String>, status: Status) -> Toast {
+    Toast {
+        timeout: None,
+        ..notice(message, status)
+    }
+}
+
 // ── the main window's side ──────────────────────────────────────────────
 
 /// Follows the updater (`updater::install`): the main window on every
@@ -598,15 +672,49 @@ impl Disktree {
         {
             self.show_toast(toast, cx);
         }
-        // A failed restart also reaches the notice line, for a release
-        // whose card was put away: the chip said nothing.
+        // A failed restart also says so as a notice, for a release whose
+        // card was put away: the chip said nothing.
         if let Some(why) = failed_now.filter(|_| failed_before.is_none()) {
-            self.notice = Some((
+            self.say_until_closed(
                 format!("Cannot update: {why}"),
-                gpui_omarchy::Status::Warning,
-            ));
+                Status::Warning,
+                cx,
+            );
         }
         cx.notify();
+    }
+
+    /// Says what just happened, in the notice slot.
+    pub fn say(
+        &mut self,
+        message: impl Into<String>,
+        status: Status,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.show_toast(notice(message, status), cx);
+    }
+
+    /// Says something that went wrong, or was undone on the person's
+    /// behalf, where it stays until closed: it may be read after the fact.
+    pub fn say_until_closed(
+        &mut self,
+        message: impl Into<String>,
+        status: Status,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.show_toast(lasting_notice(message, status), cx);
+    }
+
+    /// Takes the notice down: what it said no longer holds.
+    pub fn clear_notice(&mut self, cx: &mut Context<'_, Self>) {
+        self.dismiss_toast(NOTICE, cx);
+    }
+
+    /// The notice on screen, and the status it was raised with.
+    pub fn notice(&self) -> Option<(String, Status)> {
+        self.toasts
+            .get(NOTICE)
+            .map(|toast| (toast.body.clone(), toast.tone.status()))
     }
 
     pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<'_, Self>) {
@@ -673,6 +781,7 @@ impl Disktree {
             Action::CheckAgain => self.check_for_updates(cx),
             Action::Restart { .. } => self.restart_to_update(cx),
             Action::Later => self.later(cx),
+            Action::Undo => self.undo_unmark(cx),
         }
     }
 
@@ -750,6 +859,7 @@ pub const fn action_id(action: &Action) -> &'static str {
         Action::CheckAgain => "toast-check-again",
         Action::Restart { .. } => "toast-restart",
         Action::Later => "toast-later",
+        Action::Undo => "toast-undo",
     }
 }
 
@@ -845,10 +955,7 @@ fn card(
     cx: &Context<'_, Disktree>,
 ) -> gpui_kit::Stateful<Div> {
     let theme = cx.omarchy();
-    let edge: Hsla = match toast.tone {
-        Tone::Accent => theme.accent,
-        Tone::Danger => theme.danger,
-    };
+    let edge: Hsla = toast.tone.color(theme);
     let key = toast.key;
     // A live card reports work still running: it has nothing to close.
     let close = toast.track.is_none().then(|| {
@@ -859,6 +966,7 @@ fn card(
             ButtonVariant::Secondary,
             cx,
         )
+        .debug_selector(move || format!("toast-close-{key}"))
         .on_click(cx.listener(move |this, _, _, cx| {
             if derived {
                 this.later(cx);
@@ -885,9 +993,10 @@ fn card(
     // left out of it: "42%... 44%..." would bury the phase changes.
     let spoken = match toast.track {
         Some(Track::Percent(_)) => toast.title.clone(),
+        _ if toast.title.is_empty() => toast.body.clone(),
         _ => format!("{}: {}", toast.title, toast.body),
     };
-    crate::semantics::status(key, spoken)
+    let shell = crate::semantics::status(key, spoken)
         .debug_selector(move || format!("toast-{key}"))
         .relative()
         .overflow_hidden()
@@ -901,7 +1010,35 @@ fn card(
         .shadow_lg()
         .when_some(left, |card, left| {
             card.child(countdown(key, if still { 1.0 } else { left }, edge))
-        })
+        });
+    // A notice is one line: a dot in its tone, what happened, its button
+    // if it has one, and ×. No title: the sentence is the whole of it.
+    if toast.title.is_empty() {
+        return shell.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .child(div().text_color(edge).child("\u{25cf}"))
+                .child(
+                    div()
+                        .debug_selector(move || format!("toast-{key}-body"))
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.bright)
+                        .child(toast.body.clone()),
+                )
+                .children(
+                    toast
+                        .actions
+                        .iter()
+                        .map(|action| action_button(app, action, cx)),
+                )
+                .children(close),
+        );
+    }
+    shell
         .child(
             div()
                 .flex()
@@ -1017,6 +1154,7 @@ fn action_button(
         } => ("Restart to switch", ButtonVariant::Primary),
         Action::Restart { .. } => ("Restart to update", ButtonVariant::Primary),
         Action::Later => ("Later", ButtonVariant::Outline),
+        Action::Undo => ("Undo", ButtonVariant::Outline),
     };
     let disabled = matches!(
         action,

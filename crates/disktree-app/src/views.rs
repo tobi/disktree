@@ -230,7 +230,6 @@ pub fn root(
         ))
         .on_action(cx.listener(
             |this, _: &crate::app_menu::ShowKeyboardShortcuts, _, cx| {
-                this.show_agent = false;
                 this.open_help(cx);
             },
         ))
@@ -242,13 +241,8 @@ pub fn root(
             },
         ))
         .on_action(cx.listener(
-            |this, _: &crate::app_menu::ConnectAgent, window, cx| {
-                if this.confirm_open || this.volumes_open { return; }
-                this.show_help = false;
-                this.show_agent = true;
-                this.focus_request = Some(crate::state::FocusTarget::Dialog);
-                this.apply_focus(window, cx);
-                cx.notify();
+            |_, _: &crate::app_menu::ConnectAgent, _, cx| {
+                open_agents_settings(cx);
             },
         ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -308,9 +302,6 @@ pub fn root(
     }
     if app.app_menu_open {
         root = root.child(app_menu_dropdown(app, cx));
-    }
-    if app.show_agent {
-        root = root.child(agent_overlay(app, cx));
     }
     if app.volumes_open {
         root = root.child(volumes_dialog(app, window, cx));
@@ -1196,7 +1187,7 @@ fn title_strip(
                     .min_w(space::XXL)
                     .self_stretch(),
             )
-            .children(agent_pill(app, &theme, cx))
+            .children(agent_pill(app, &theme))
             .children(update_chip(app, &theme, cx))
             .child(view_settings(app, window, cx))
     } else {
@@ -2774,34 +2765,189 @@ fn side_panel(
         .children((!indexing).then(rule))
         // Progress can exceed a short, zoomed window. Let it scroll with the
         // lists while the volume's free space stays visible below them.
-        .child(
-            div()
-                .id("panel-lists")
-                .debug_selector(|| "side-panel-scroll".into())
-                .flex()
-                .flex_col()
-                .gap(space::LG)
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .children(indexing.then(|| {
-                    indexing_progress(app, theme, cx).flex_shrink_0()
-                }))
-                .children(indexing.then(|| rule().flex_shrink_0()))
-                // The marked list leads: the pinned total below takes room
-                // from this scroll, and on a short window what comes last
-                // scrolls out of sight. Suggestions can; the cart cannot.
-                .child(marked_section(app, &plan, theme, cx))
-                .child(rule())
-                .child(worth_section(app, theme, cx))
-                .children(macos_services_section(app, theme, cx)),
-        )
-        .children(notice_line(app, theme, cx))
+        .child(panel_lists(app, &plan, theme, cx))
+        .children(scan_error_line(app, theme))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
         .children(marked_total(app, &plan, theme, cx))
         .child(disk_section(app, &plan, theme, cx).flex_shrink_0())
-        .child(agent_line(app, theme, cx))
+        .child(agent_line(app, theme))
+}
+
+/// The panel's scrolling lists, each under a header that stays in sight
+/// while its list scrolls ([`pinned_head`]).
+fn panel_lists(
+    app: &Disktree,
+    plan: &Plan,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let rule = || div().h(px(1.)).bg(theme.divider()).into_any_element();
+    // Each child of the scroll, with the header it starts with, if any: the
+    // index is what the scroll handle measures by.
+    let mut lists: Vec<(AnyElement, Option<Div>)> = Vec::new();
+    if app.is_indexing() {
+        lists.push((
+            indexing_progress(app, theme, cx)
+                .flex_shrink_0()
+                .into_any_element(),
+            Some(section_head(widgets::eyebrow("Indexing", cx))),
+        ));
+        lists.push((rule(), None));
+    }
+    // The marked list leads: the pinned total below takes room from this
+    // scroll, and on a short window what comes last scrolls out of sight.
+    // Suggestions can; the cart cannot.
+    lists.push((
+        marked_section(app, plan, theme, cx).into_any_element(),
+        Some(marked_head(app, cx)),
+    ));
+    lists.push((rule(), None));
+    lists.push((
+        worth_section(app, theme, cx).into_any_element(),
+        Some(worth_head(app, theme, cx)),
+    ));
+    if let Some(services) = macos_services_section(app, theme, cx) {
+        lists.push((rule(), None));
+        lists.push((
+            services.into_any_element(),
+            Some(section_head(widgets::eyebrow("macOS service stores", cx))),
+        ));
+    }
+    let pinned = pinned_head(
+        &app.panel_scroll,
+        lists.iter().map(|(_, head)| head.is_some()),
+        px(size::SECTION_HEAD.0 * app.rem),
+    );
+    // `pinned_head` measures the last layout. When the lists change without
+    // a scroll (a mark, the insights, the end of indexing) that layout is
+    // a frame old, so draw again once it settles; an unchanged layout asks
+    // for nothing, so this never loops.
+    let scroll_handle = app.panel_scroll.clone();
+    let seen = app.panel_layout.clone();
+    let mut scroll = div()
+        .on_children_prepainted(move |_, window, _| {
+            let now: Vec<_> = (0..)
+                .map_while(|index| scroll_handle.bounds_for_item(index))
+                .collect();
+            if *seen.borrow() != now {
+                *seen.borrow_mut() = now;
+                window.refresh();
+            }
+        })
+        .id("panel-lists")
+        .debug_selector(|| "side-panel-scroll".into())
+        .track_scroll(&app.panel_scroll)
+        .flex()
+        .flex_col()
+        .gap(space::LG)
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll();
+    let mut heads = Vec::new();
+    for (list, head) in lists {
+        scroll = scroll.child(list);
+        heads.push(head);
+    }
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(scroll)
+        .children(pinned.and_then(|(index, top)| {
+            let head = heads.get_mut(index)?.take()?;
+            Some(
+                div()
+                    .id("pinned-head")
+                    .debug_selector(|| "pinned-head".into())
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(top)
+                    // Opaque, with a hairline and never a shadow, as
+                    // PwrGit's and PwrAgnt's pinned headers are; the rows
+                    // slide under it, and a click must not reach them
+                    // through it, though a wheel over it still scrolls
+                    // the list it heads.
+                    .bg(theme.surface)
+                    .border_b_1()
+                    .border_color(theme.divider())
+                    .block_mouse_except_scroll()
+                    // A copy of the header in the list: read once.
+                    .a11y_synthetic_children(|b| b.parent_node().set_hidden())
+                    .child(head),
+            )
+        }))
+}
+
+/// Which header to pin over the panel's lists, and how far up the next
+/// section has pushed it: the section whose top has scrolled past the top
+/// of the list while some of it is still in sight. `heads` says which of
+/// the scroll's children start with a header of height `head`. Measured
+/// from the last layout, which only a change of content moves, against the
+/// current offset, which every wheel tick moves and redraws.
+fn pinned_head(
+    scroll: &gpui_kit::ScrollHandle,
+    heads: impl Iterator<Item = bool>,
+    head: gpui_kit::Pixels,
+) -> Option<(usize, gpui_kit::Pixels)> {
+    let viewport = scroll.bounds();
+    let offset = scroll.offset().y;
+    heads
+        .enumerate()
+        .filter(|(_, has_head)| *has_head)
+        .find_map(|(index, _)| {
+            let bounds = scroll.bounds_for_item(index)?;
+            let top = bounds.top() - viewport.top() + offset;
+            let bottom = bounds.bottom() - viewport.top() + offset;
+            // Pinned once its own header starts to leave; gone once the
+            // section has. Before then the next one pushes it up: the
+            // pinned header never overlaps the section after it.
+            (top < px(0.) && bottom > px(0.))
+                .then(|| (index, (bottom - head).min(px(0.))))
+        })
+}
+
+/// A section's header row, at the one height [`pinned_head`] pushes by.
+fn section_head(content: Div) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .h(size::SECTION_HEAD)
+        .child(content)
+}
+
+fn marked_head(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+    let count = app.marks.len();
+    section_head(widgets::eyebrow(
+        if count == 0 {
+            "Marked".to_string()
+        } else {
+            format!("Marked · {count}")
+        },
+        cx,
+    ))
+}
+
+fn worth_head(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let total: u64 = app.insights.iter().map(|candidate| candidate.bytes).sum();
+    section_head(widgets::eyebrow("Worth a look", cx)).when(total > 0, |head| {
+        head.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(palette::highlight(theme))
+                .child(human_bytes(total)),
+        )
+    })
 }
 
 /// What the keys act on: its name and place, its size set large with its
@@ -3443,15 +3589,13 @@ fn macos_services_section(
     }) {
         return None;
     }
-    let rule = || div().h(px(1.)).bg(theme.divider());
     let mut section = div()
         .id("macos-services")
         .debug_selector(|| "macos-services".into())
         .flex()
         .flex_col()
         .gap(space::SM)
-        .child(rule())
-        .child(widgets::eyebrow("macOS service stores", cx));
+        .child(section_head(widgets::eyebrow("macOS service stores", cx)));
     let mut incomplete = false;
     for (service, path, state) in stores {
         let measured = match state {
@@ -3521,31 +3665,13 @@ fn worth_section(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
-    let total: u64 = app.insights.iter().map(|candidate| candidate.bytes).sum();
     let largest = app.insights.first().map_or(1, |candidate| candidate.bytes);
-    let highlight = palette::highlight(theme);
     let mut section = div()
         .debug_selector(|| "worth-section".into())
         .flex()
         .flex_col()
         .gap(space::XS)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .pb(space::XS)
-                .child(widgets::eyebrow("Worth a look", cx))
-                .when(total > 0, |this| {
-                    this.child(
-                        div()
-                            .text_size(text::CAPTION)
-                            .text_color(highlight)
-                            .child(human_bytes(total)),
-                    )
-                }),
-        );
+        .child(worth_head(app, theme, cx));
     if app.insights.is_empty() {
         return section.child(
             div()
@@ -3669,23 +3795,12 @@ fn marked_section(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let count = app.marks.len();
-    let header = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .child(widgets::eyebrow(
-            if count == 0 {
-                "Marked".to_string()
-            } else {
-                format!("Marked · {count}")
-            },
-            cx,
-        ));
+    // The header leads, so it is the section's top edge: that is where
+    // `pinned_head` takes over from it.
     let mut section = div().flex().flex_col().gap(space::XS)
+        .child(marked_head(app, cx))
         .child(crate::semantics::status("marked-summary", format!("{} marked paths; {} listed bytes; {} included, {} blocked, {} covered. Estimated reclaimable: {}. Projections use only the measured volume.",
-            count, plan.bytes(), plan.targets.len(), plan.blocked.len(), plan.covered.len(), savings(plan.reclaimable_bytes(), plan.possible_bytes()))))
-        .child(header);
+            count, plan.bytes(), plan.targets.len(), plan.blocked.len(), plan.covered.len(), savings(plan.reclaimable_bytes(), plan.possible_bytes()))));
     if count == 0 {
         return section.child(
             div()
@@ -3776,14 +3891,12 @@ fn marked_section(
 /// Marked rows the panel lists before pointing at the review screen.
 const MARKED_ROWS: usize = 6;
 
-/// The last thing that happened, or a scan error, above the disk.
-fn notice_line(app: &Disktree, theme: &Theme, cx: &App) -> Option<Div> {
-    let (message, color) = if let Some(error) = &app.scan_error {
-        (error.clone(), theme.danger)
-    } else {
-        let (message, status) = app.notice.as_ref()?;
-        (message.clone(), widgets::alert_color(*status, cx))
-    };
+/// Why the scan failed, above the disk. It stays while it holds: it
+/// describes the scan, not something that just happened, which a toast
+/// says (`toasts::notice`).
+fn scan_error_line(app: &Disktree, theme: &Theme) -> Option<Div> {
+    let message = app.scan_error.clone()?;
+    let color = theme.danger;
     Some(
         div()
             .px(space::SM)
@@ -4571,7 +4684,7 @@ fn indexing_progress(
         .gap(space::XS)
         .text_size(text::BODY)
         .text_color(theme.foreground)
-        .child(widgets::eyebrow("Indexing", cx))
+        .child(section_head(widgets::eyebrow("Indexing", cx)))
         .child(
             div()
                 .debug_selector(|| "indexing-percent".into())
@@ -5333,7 +5446,7 @@ fn review_summary(
         // Named for the test that scrolls to the panel's end: with no
         // notice, nothing comes after it.
         .child(div().flex_1().debug_selector(|| "review-summary-end".into()))
-        .children(notice_line(app, theme, cx))
+        .children(scan_error_line(app, theme))
 }
 
 /// The list handed on instead of acted on: saved as paths, or copied as a
@@ -6707,11 +6820,7 @@ fn update_chip(
     ))
 }
 
-fn agent_pill(
-    app: &Disktree,
-    theme: &Theme,
-    cx: &Context<'_, Disktree>,
-) -> Option<Stateful<Div>> {
+fn agent_pill(app: &Disktree, theme: &Theme) -> Option<Stateful<Div>> {
     let presence = app.agent.as_ref()?.presence.as_ref()?;
     Some(
         div()
@@ -6728,12 +6837,7 @@ fn agent_pill(
             .text_size(text::CAPTION)
             .cursor_pointer()
             .hover(|style| style.bg(theme.success.opacity(0.1)))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.show_agent = true;
-                this.focus_request = Some(crate::state::FocusTarget::Dialog);
-                this.apply_focus(window, cx);
-                cx.notify();
-            }))
+            .on_click(|_, _, cx| open_agents_settings(cx))
             .child(div().text_color(theme.success).child("\u{25cf}"))
             .child(
                 div()
@@ -6755,11 +6859,7 @@ fn agent_pill(
 
 /// The way to an agent, under the disk: who is connected, or how to
 /// connect one. Quiet, since most sessions never need it.
-fn agent_line(
-    app: &Disktree,
-    theme: &Theme,
-    cx: &Context<'_, Disktree>,
-) -> Stateful<Div> {
+fn agent_line(app: &Disktree, theme: &Theme) -> Stateful<Div> {
     let presence = app.agent.as_ref().and_then(|agent| agent.presence.clone());
     let mut line = div()
         .id("agent-line")
@@ -6770,12 +6870,7 @@ fn agent_line(
         .gap(space::XS)
         .text_size(text::CAPTION)
         .cursor_pointer()
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.show_agent = true;
-            this.focus_request = Some(crate::state::FocusTarget::Dialog);
-            this.apply_focus(window, cx);
-            cx.notify();
-        }));
+        .on_click(|_, _, cx| open_agents_settings(cx));
     match presence {
         Some(presence) => {
             line = line
@@ -6799,171 +6894,16 @@ fn agent_line(
             line = line
                 .text_color(theme.secondary)
                 .hover(|style| style.text_color(theme.foreground))
-                .child("Work with an AI agent \u{203a}");
+                .child("Connect an AI agent (MCP) \u{203a}");
         }
     }
     line
 }
 
-/// How to connect an agent, and what it may do once it is: look, mark,
-/// and open the review screen. Removing stays with the person.
-fn agent_overlay(app: &Disktree, cx: &Context<'_, Disktree>) -> Stateful<Div> {
-    let theme = cx.omarchy().clone();
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("pwrdisk"));
-    // Scrolls inside the card when the window is too short for it.
-    let mut body = div()
-        .id("agent-body")
-        .flex()
-        .flex_col()
-        .gap(space::MD)
-        .min_h_0()
-        .overflow_y_scroll();
-    body = body.child(
-        div()
-            .text_size(text::BODY)
-            .text_color(theme.foreground)
-            .child(
-                "An agent such as Claude Code or Codex can run PwrDisk as \
-                 an MCP server: it scans, walks the tree and marks what \
-                 can go, and this window follows along. Removing stays \
-                 yours: the agent opens the review screen, and you press \
-                 Enter.",
-            ),
-    );
-    for (index, (label, command)) in
-        crate::agent::connect_commands(&exe).into_iter().enumerate()
-    {
-        let what = format!("the {label} command");
-        let text = command.clone();
-        body = body.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(space::XS)
-                .child(widgets::eyebrow(label, cx))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_start()
-                        .gap(space::SM)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .px(space::SM)
-                                .py(space::XS)
-                                .bg(theme.inset)
-                                .border_1()
-                                .border_color(theme.divider())
-                                .text_size(text::CAPTION)
-                                .text_color(theme.foreground)
-                                .child(command),
-                        )
-                        .child(
-                            button(
-                                ElementId::Name(
-                                    format!("copy-connect-{index}").into(),
-                                ),
-                                "Copy",
-                                ButtonVariant::Outline,
-                                cx,
-                            )
-                            .tab_stop(true)
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.copy_connect_text(
-                                        text.clone(),
-                                        &what,
-                                        cx,
-                                    );
-                                    window.focus(&this.confirm_focus, cx);
-                                },
-                            )),
-                        ),
-                ),
-        );
-    }
-    body = body.child(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(space::SM)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
-                    .child(format!(
-                        "Then ask it: \u{201c}{}\u{201d}",
-                        crate::agent::FIRST_PROMPT
-                    )),
-            )
-            .child(
-                button("copy-prompt", "Copy", ButtonVariant::Outline, cx)
-                    .tab_stop(true)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.copy_connect_text(
-                            crate::agent::FIRST_PROMPT.to_string(),
-                            "the prompt",
-                            cx,
-                        );
-                        window.focus(&this.confirm_focus, cx);
-                    })),
-            ),
-    );
-    let status = match &app.agent {
-        Some(agent) => match &agent.presence {
-            Some(presence) => format!(
-                "{} is connected \u{00b7} {}",
-                presence.client, presence.action
-            ),
-            None => "No agent is connected to this window yet.".to_string(),
-        },
-        None => "This window cannot be driven here; an agent still scans \
-                 and marks on its own."
-            .to_string(),
-    };
-    let close: CloseOverlay = |this| this.show_agent = false;
-    overlay_backdrop(
-        "agent-backdrop",
-        div()
-            .id("agent-overlay")
-            .debug_selector(|| "agent-overlay".into())
-            .flex()
-            .flex_col()
-            .gap(space::LG)
-            .w(size::HELP)
-            .min_h_0()
-            .p(space::XL)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.surface)
-            .child(
-                div()
-                    .text_size(text::TITLE)
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.bright)
-                    .child("Work with an AI agent"),
-            )
-            .child(body)
-            .child(overlay_footer(
-                format!("{status} \u{00b7} esc closes"),
-                close,
-                cx,
-            )),
-        close,
-        cx,
-    )
-    .role(gpui_kit::Role::Dialog)
-    .aria_label("Work with an AI agent")
-    .track_focus(&app.confirm_focus)
-    .tab_group()
-    .tab_stop(false)
-    .a11y_synthetic_children(|b| b.parent_node().set_modal())
+/// Settings › Agents (MCP): how to connect an agent, who is connected,
+/// and what it may do. Deferred, since Settings may open a window.
+fn open_agents_settings(cx: &mut App) {
+    cx.defer(|cx| crate::settings::open(crate::settings::Pane::Agents, cx));
 }
 
 fn app_menu_key(

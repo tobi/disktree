@@ -56,7 +56,7 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
-            /// Show how to connect an AI agent over MCP.
+            /// Settings › Agents (MCP): how to connect an AI agent.
             ConnectAgent,
             /// Put back the marks the review screen's Unmark all took.
             Undo,
@@ -415,7 +415,7 @@ fn help_items(platform: Platform) -> Vec<MenuItem> {
         MenuItem::action("Changelog", help::OpenChangelog),
         // Where a person looks for "how do I hook this up"; the same
         // overlay opens from the line under the disk meter.
-        MenuItem::action("Work with an AI Agent\u{2026}", ConnectAgent),
+        MenuItem::action("Connect an AI Agent (MCP)\u{2026}", ConnectAgent),
         MenuItem::separator(),
         MenuItem::action("Report an Issue\u{2026}", help::ReportIssue),
         MenuItem::action(
@@ -540,7 +540,7 @@ mod tests {
         let expected = [
             "PwrDisk Documentation",
             "Changelog",
-            "Work with an AI Agent\u{2026}",
+            "Connect an AI Agent (MCP)\u{2026}",
             "---",
             "Report an Issue…",
             "Report a Security Vulnerability…",

@@ -158,9 +158,10 @@ claude mcp add --scope user pwrdisk -- pwrdisk mcp   # Claude Code
 codex mcp add pwrdisk -- pwrdisk mcp                 # Codex
 ```
 
-On macOS the command lives inside the app. The window's **Work with an AI
-agent** line, under the disk, shows each command with the full path and a
-Copy button.
+On macOS the command lives inside the app. **Settings › Agents (MCP)**
+shows the command line and each client's command with the full path and a
+Copy button; **Help › Connect an AI Agent (MCP)…** and the line under the
+disk open it.
 
 The agent walks the tree, lists every cache and build directory, and
 proposes what can go. You can confirm in PwrDisk's review screen yourself,

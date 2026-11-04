@@ -26,7 +26,6 @@ use disktree_link::{
     SelectionEstimate, Space, State, TreeSummary, VERSION,
 };
 use gpui_kit::Context;
-use gpui_omarchy::Status;
 
 use crate::marks::{display_path, is_hidden};
 use crate::state::{Disktree, Screen, now_seconds};
@@ -81,24 +80,48 @@ const fn screen_name(screen: Screen) -> &'static str {
     }
 }
 
-/// The commands that connect each client, with the binary where it is.
-/// The executable's own path, so the command works from a bundle, a
-/// symlink on `PATH`, or a build directory alike.
-pub fn connect_commands(exe: &Path) -> Vec<(&'static str, String)> {
+/// One way to connect a client: an id for its Copy button, what it is
+/// called, and the text to paste.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Connect {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub text: String,
+}
+
+/// The ways to connect a client, with the binary where it is: the bare
+/// command line first, for any client that asks for a command, then the
+/// one-liners for the clients that have one. The executable's own path, so
+/// the command works from a bundle, a symlink on `PATH`, or a build
+/// directory alike.
+pub fn connect_commands(exe: &Path) -> Vec<Connect> {
     let exe = exe.display();
     vec![
-        (
-            "Claude Code",
-            format!("claude mcp add --scope user pwrdisk -- \"{exe}\" mcp"),
-        ),
-        ("Codex", format!("codex mcp add pwrdisk -- \"{exe}\" mcp")),
-        (
-            "Other MCP clients",
-            format!(
+        Connect {
+            id: "agents-copy-command",
+            label: "Command line",
+            text: format!("\"{exe}\" mcp"),
+        },
+        Connect {
+            id: "agents-copy-claude",
+            label: "Claude Code",
+            text: format!(
+                "claude mcp add --scope user pwrdisk -- \"{exe}\" mcp"
+            ),
+        },
+        Connect {
+            id: "agents-copy-codex",
+            label: "Codex",
+            text: format!("codex mcp add pwrdisk -- \"{exe}\" mcp"),
+        },
+        Connect {
+            id: "agents-copy-json",
+            label: "Other MCP clients (JSON)",
+            text: format!(
                 "{{\"mcpServers\": {{\"pwrdisk\": {{\"command\": \"{exe}\", \
                  \"args\": [\"mcp\"]}}}}}}"
             ),
-        ),
+        },
     ]
 }
 
@@ -107,6 +130,18 @@ pub fn connect_commands(exe: &Path) -> Vec<(&'static str, String)> {
 /// to.
 pub const FIRST_PROMPT: &str = "What is eating my disk? Use PwrDisk to \
 find out, and show me what could go before you mark anything.";
+
+fn presence_line(presence: Option<&Presence>) -> String {
+    presence.map_or_else(
+        || "No agent is connected to this window.".to_owned(),
+        |presence| {
+            format!(
+                "{} is connected \u{00b7} {}",
+                presence.client, presence.action
+            )
+        },
+    )
+}
 
 impl Disktree {
     /// Start answering agents on `listener`.
@@ -138,9 +173,13 @@ impl Disktree {
         let Some(agent) = &self.agent else {
             return false;
         };
+        // Every noted action stamps the presence, so its time says whether
+        // what Settings shows can have changed, without formatting it.
+        let before = agent.presence.as_ref().map(|presence| presence.at);
         let incoming = agent.listener.drain();
         if incoming.is_empty() {
             self.forget_departed_agent(cx);
+            self.tell_settings(before, cx);
             return true;
         }
         for item in incoming {
@@ -153,8 +192,43 @@ impl Disktree {
             }
         }
         self.forget_departed_agent(cx);
+        self.tell_settings(before, cx);
         cx.notify();
         true
+    }
+
+    /// Settings › Agents (MCP) shows who is connected: redraw it when that
+    /// line changes, and only then, since this runs every [`POLL`].
+    fn tell_settings(
+        &self,
+        before: Option<Instant>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let now = self
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.presence.as_ref())
+            .map(|presence| presence.at);
+        if now != before {
+            cx.defer(crate::settings::agents_changed);
+        }
+    }
+
+    /// Whether an agent is connected, and who it is and what it last did,
+    /// as Settings says it.
+    pub fn agent_status(&self) -> (bool, String) {
+        match &self.agent {
+            Some(agent) => (
+                agent.presence.is_some(),
+                presence_line(agent.presence.as_ref()),
+            ),
+            None => (
+                false,
+                "This window cannot be driven here; an agent still scans \
+                 and marks on its own."
+                    .to_owned(),
+            ),
+        }
     }
 
     /// Once the last connection is gone, so is the presence.
@@ -803,17 +877,5 @@ impl Disktree {
         estimate.partial |=
             self.progress.errors > 0 || self.options.max_depth.is_some();
         estimate
-    }
-
-    /// Copy a connect command, and say so.
-    pub fn copy_connect_text(
-        &mut self,
-        text: String,
-        what: &str,
-        cx: &mut Context<'_, Self>,
-    ) {
-        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
-        self.notice = Some((format!("copied {what}"), Status::Success));
-        cx.notify();
     }
 }

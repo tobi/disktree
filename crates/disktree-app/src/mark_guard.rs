@@ -284,8 +284,7 @@ impl Disktree {
 
     /// Show `notice` as a warning.
     pub fn warn(&mut self, notice: String, cx: &mut Context<'_, Self>) {
-        self.notice = Some((notice, Status::Warning));
-        cx.notify();
+        self.say(notice, Status::Warning, cx);
     }
 }
 

@@ -11,7 +11,7 @@ use gpui_kit::{
     App, Div, ElementId, FontWeight, Hsla, InteractiveElement as _,
     ParentElement, SharedString, Styled, div, relative,
 };
-use gpui_omarchy::{ActiveTheme, Status};
+use gpui_omarchy::ActiveTheme;
 
 use crate::ui::{space, text};
 
@@ -257,17 +257,6 @@ pub fn percent(part: u64, total: u64) -> String {
         format!("{value:.1}%")
     } else {
         format!("{value:.0}%")
-    }
-}
-
-/// The status colour for an alert.
-pub fn alert_color(status: Status, cx: &App) -> Hsla {
-    let theme = cx.omarchy();
-    match status {
-        Status::Neutral => theme.secondary,
-        Status::Success => theme.success,
-        Status::Warning => theme.warning,
-        Status::Error => theme.danger,
     }
 }
 

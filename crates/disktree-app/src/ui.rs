@@ -105,6 +105,9 @@ pub mod size {
     /// descent: `JetBrains Mono`, the usual Linux fallback, needs 1.32 em.
     pub const SCAN_STATUS: Rems = Rems(2.25);
     pub const PROGRESS_VALUE: Rems = Rems(9.0);
+    /// A side panel section's header: its caption eyebrow and total on one
+    /// line. Fixed, since a pinned header is pushed up by exactly this.
+    pub const SECTION_HEAD: Rems = Rems(1.25);
 
     // Checked at build time: the headless tests cannot see a clipped glyph.
     const _: () = assert!(SCAN_STATUS.0 >= super::text::FIGURE.0 * 1.32);
