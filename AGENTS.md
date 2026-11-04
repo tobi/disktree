@@ -164,7 +164,8 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
    root, the home directory, any directory holding it, and symlink targets are
    refused. So are the profiles folder and every directory directly in it:
    on Windows the one Windows reports (`FOLDERID_UserProfiles`, usually
-   `C:\Users`), on macOS `/Users`. What is inside a profile stays
+   `C:\Users`), on macOS `/Users`, on Linux `/home` (and its real path
+   when it is a link). What is inside a profile stays
    removable. The window asks the guards before a mark is made
    (`removal::refusal`), so a refused path is never offered for marking.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a

@@ -42,7 +42,9 @@ would read it.
 `/etc`, `/lib*`, `/proc`, `/run` (except removable media under it), `/sbin`,
 `/sys`, `/usr`, `/var/lib`, `/efi`, `/nix/store`, `/gnu/store`, Homebrew's
 `/home/linuxbrew/.linuxbrew`, the home directory and anything holding it,
-and mount points.
+`/home` and every account's folder in it (another user's home,
+`/home/linuxbrew`; what is inside one may be proposed), the same under
+`/var/home` where `/home` links there, and mount points.
 
 ## Never propose
 

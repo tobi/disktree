@@ -734,9 +734,10 @@ tested:
   macOS `/Users` is on the same volume as `/`, and `/opt` holds
   `/opt/homebrew`);
 - every account's folder is refused, and so is the folder holding them:
-  `/Users` and each folder in it on macOS, the profiles folder (usually
-  `C:\Users`) and each profile on Windows. What is inside one stays
-  removable;
+  `/Users` and each folder in it on macOS, `/home` and each folder in it
+  on Linux (by either name where `/home` links to `/var/home`, as on
+  Fedora's atomic editions), the profiles folder (usually `C:\Users`) and
+  each profile on Windows. What is inside one stays removable;
 - these are asked before a mark is made: the panel says why instead of
   offering **Mark for removal**, and Space marks nothing;
 - one removal may take only so much of a disk, 5% by default (see

@@ -602,8 +602,8 @@ fn refuse(
     {
         return Some("the home directory cannot be removed".into());
     }
-    // On Linux `/home` is usually a mount point of its own and refused as
-    // one; on macOS `/Users` is on the same volume as `/`, and removing it
+    // On Linux `/home` is often a mount point of its own and refused as
+    // one, though not always; on macOS `/Users` is on the same volume as `/`, and removing it
     // would empty the home directory before failing on `/Users` itself.
     if home_key.is_some_and(|home| home.starts_with(&key)) {
         return Some("it contains the home directory".into());
@@ -619,15 +619,12 @@ fn refuse(
     // folder (`C:\Users\tobi`, `Public`, `Default`) is refused, taken from
     // Windows and not from home, whose parent could be anything. What is
     // inside a profile stays removable, as under one's own home.
-    if let Some(profiles) = profiles_key() {
-        // The folder itself holds every account's home, the operator's
-        // included, wherever this process's own home happens to be.
-        if key == profiles {
-            return Some(format!("it holds every {PROFILE}"));
-        }
-        if is_profile(path, &key, profiles) {
-            return Some(format!("a {PROFILE} cannot be removed"));
-        }
+    //
+    // Linux keeps them in /home, which is often a volume of its own and so
+    // refused as a mount point, but just as often a folder on `/`, where
+    // another account's home is a folder like any other.
+    if let Some(reason) = profile_refusal(path, &key, profiles_keys()) {
+        return Some(reason);
     }
     // By spelling too: the Data volume's root keeps its name as a key, while
     // everything under it is keyed as under `/`.
@@ -932,44 +929,87 @@ const fn windows_mount_points() -> Vec<PathBuf> {
 /// The key of the folder every user profile is in, `C:\Users` as
 /// installed; asked of Windows once, since it does not move while running.
 #[cfg(windows)]
-fn profiles_key() -> Option<&'static Path> {
-    static PROFILES: std::sync::LazyLock<Option<PathBuf>> =
+fn profiles_keys() -> &'static [PathBuf] {
+    static PROFILES: std::sync::LazyLock<Vec<PathBuf>> =
         std::sync::LazyLock::new(|| {
-            crate::windows::user_profiles_dir().map(|dir| guard_key(&dir))
+            crate::windows::user_profiles_dir()
+                .map(|dir| guard_key(&dir))
+                .into_iter()
+                .collect()
         });
-    PROFILES.as_deref()
+    &PROFILES
 }
 
 /// `/Users`, by key. Fixed on macOS: the system and its installer put
 /// every account's home there, and a different home location is still a
 /// home only for its own account.
 #[cfg(target_os = "macos")]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "the same signature as Windows', where Windows may not answer"
-)]
-fn profiles_key() -> Option<&'static Path> {
-    static PROFILES: std::sync::LazyLock<PathBuf> =
-        std::sync::LazyLock::new(|| guard_key(Path::new(MACOS_PROFILES)));
-    Some(PROFILES.as_path())
+fn profiles_keys() -> &'static [PathBuf] {
+    static PROFILES: std::sync::LazyLock<[PathBuf; 1]> =
+        std::sync::LazyLock::new(|| [guard_key(Path::new("/Users"))]);
+    PROFILES.as_slice()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-const fn profiles_key() -> Option<&'static Path> {
-    None
+/// `/home`, and where it really is when it is a link: Fedora's atomic
+/// editions link it to `/var/home`, and a scan from either spelling shows
+/// the homes as folders directly in it. Taken from the filesystem layout
+/// rather than `/etc/passwd`, which lists service accounts whose homes are
+/// `/`, `/var/lib/...` or `/nonexistent`, misses accounts from LDAP or
+/// SSSD, and forgets a removed account whose files are still there.
+#[cfg(target_os = "linux")]
+fn profiles_keys() -> &'static [PathBuf] {
+    static PROFILES: std::sync::LazyLock<Vec<PathBuf>> =
+        std::sync::LazyLock::new(|| linux_profiles_keys(Path::new("/home")));
+    &PROFILES
 }
 
-#[cfg(target_os = "macos")]
-const MACOS_PROFILES: &str = "/Users";
+/// The keys of `home` as spelled and, if a link leads elsewhere, as it
+/// really is.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_profiles_keys(home: &Path) -> Vec<PathBuf> {
+    let mut keys = vec![guard_key(home)];
+    if let Ok(real) = fs::canonicalize(home) {
+        let real = guard_key(&real);
+        if !keys.contains(&real) {
+            keys.push(real);
+        }
+    }
+    keys
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+const fn profiles_keys() -> &'static [PathBuf] {
+    &[]
+}
 
 /// What one folder in the profiles folder is called where it is refused.
 #[cfg(windows)]
 const PROFILE: &str = "user profile";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PROFILE: &str = "user's home folder";
 /// Nowhere else has a profiles folder; never shown.
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 const PROFILE: &str = "";
+
+/// Why `path`, keyed `key`, is refused as a profiles folder or a profile
+/// in one, judged against every name the folder has.
+fn profile_refusal(
+    path: &Path,
+    key: &Path,
+    profiles: &[PathBuf],
+) -> Option<String> {
+    for profiles in profiles {
+        // The folder itself holds every account's home, the operator's
+        // included, wherever this process's own home happens to be.
+        if key == profiles {
+            return Some(format!("it holds every {PROFILE}"));
+        }
+        if is_profile(path, key, profiles) {
+            return Some(format!("a {PROFILE} cannot be removed"));
+        }
+    }
+    None
+}
 
 /// Whether `path`, keyed `key`, is a profile: a directory directly in
 /// `profiles`. A file or a link there is no profile and stays removable.
@@ -3041,6 +3081,70 @@ mod tests {
         // Inside a home folder stays removable, as under one's own home.
         assert_eq!(refused("/Users/Shared/old-installer.pkg", root), None);
         assert_eq!(refused("/Users/nobody-is-here", root), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_home_folders_are_refused() {
+        let root = Path::new("/");
+        let refused = |path: &Path| refuse(path, root, None, &[], &[]);
+        // Whatever this process's home is, /home holds every account's,
+        // however it is spelled.
+        for spelling in ["/home", "/home/", "/home/.", "/usr/../home"] {
+            assert!(
+                refused(Path::new(spelling))
+                    .is_some_and(|reason| reason.contains("every user")),
+                "{spelling} holds every home"
+            );
+        }
+        // Each directory there is an account's, whoever's it is; a bare
+        // container may have none.
+        let homes = fs::read_dir("/home").into_iter().flatten().flatten();
+        let dirs = homes
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()));
+        for entry in dirs {
+            let home = entry.path();
+            assert!(
+                refused(&home)
+                    .is_some_and(|reason| reason.contains("home folder")),
+                "{} is an account's folder",
+                home.display()
+            );
+            // Inside a home folder stays removable, as under one's own.
+            assert_eq!(refused(&home.join("old-installer.tar")), None);
+        }
+        // Nothing there is no home folder.
+        assert_eq!(refused(Path::new("/home/nobody-is-here")), None);
+    }
+
+    /// Fedora's atomic editions link /home to /var/home: a scan from
+    /// either spelling shows the homes as folders directly in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_home_folder_is_judged_by_both_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Its own real name, so the only link in play is the one made here.
+        let temp = fs::canonicalize(temp.path()).expect("canonical");
+        let real = temp.join("var/home");
+        fs::create_dir_all(real.join("guest")).expect("mkdir");
+        let link = temp.join("home");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let keys = linux_profiles_keys(&link);
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        let refused = |path: &Path| {
+            profile_refusal(path, &guard_key(path), &keys).unwrap_or_default()
+        };
+        for folder in [&link, &real] {
+            assert!(refused(folder).contains("every user"));
+            let path = folder.join("guest");
+            assert!(
+                refused(&path).contains("home folder"),
+                "{} is an account's folder",
+                path.display()
+            );
+        }
+        // A real folder has one name.
+        assert_eq!(linux_profiles_keys(&real).len(), 1);
     }
 
     #[test]

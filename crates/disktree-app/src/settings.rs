@@ -582,7 +582,11 @@ const PROTECTED: &str = "/Users and each folder in it, your home and any \
 const PROTECTED: &str = "The profiles folder and each profile in it, your \
      home and any folder holding it; Windows and Program Files; mount \
      points, drive roots and the scanned root.";
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+const PROTECTED: &str = "/home and each folder in it, your home and any \
+     folder holding it; /usr, /etc, /boot and the other system trees; \
+     mount points and the scanned root.";
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 const PROTECTED: &str = "Your home and any folder holding it; /usr, /etc, \
      /boot and the other system trees; mount points and the scanned root.";
 
