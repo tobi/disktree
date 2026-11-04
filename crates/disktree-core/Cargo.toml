@@ -41,6 +41,7 @@ libc = "0.2"
 trash = { version = "5.2.9", default-features = false }
 
 [dev-dependencies]
+proptest = "1.12"
 tempfile = "3"
 
 # CPU-only sampling; the GUI dependency graph already pins this version.

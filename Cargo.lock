@@ -1426,6 +1426,7 @@ version = "0.17.0"
 dependencies = [
  "chrono",
  "libc",
+ "proptest",
  "rayon",
  "rustc-hash 2.1.3",
  "rustix",

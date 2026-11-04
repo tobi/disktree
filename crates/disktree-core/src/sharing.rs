@@ -812,14 +812,19 @@ mod tests {
     /// hardlinks across directories and followed links. Every name of a
     /// hardlinked file reads as that one file does, and a file has no
     /// more names than its link count, as a scan of a tree that holds
-    /// still finds.
-    fn random_tree(rng: &mut crate::test_rng::Rng) -> Draft {
+    /// still finds. With `consistent_links` off, each name has independent
+    /// facts and names can exceed the link count, as in a changing tree.
+    fn random_tree(
+        rng: &mut crate::test_rng::Rng,
+        consistent_links: bool,
+    ) -> Draft {
         /// Each hardlinked file met so far, and the names it has left.
         type Linked = [Option<(Draft, u64)>; 4];
         fn file(
             rng: &mut crate::test_rng::Rng,
             linked: &mut Linked,
             name: String,
+            consistent_links: bool,
         ) -> Draft {
             let bytes = 80 * (rng.below(3) + 1);
             let mut node = Draft::entry(name, NodeKind::File, bytes);
@@ -849,15 +854,15 @@ mod tests {
                 let slot =
                     &mut linked[usize::try_from(inode - 1).expect("ino")];
                 match slot {
-                    Some((first, left)) if *left > 0 => {
+                    Some((first, left)) if consistent_links && *left > 0 => {
                         *left -= 1;
                         let mut name_of = first.clone();
                         name_of.name = node.name;
                         return name_of;
                     }
                     // Every name met: another file, of one name.
-                    Some(_) => {}
-                    None => {
+                    Some(_) if consistent_links => {}
+                    _ => {
                         node.inode = Some((
                             1,
                             std::num::NonZeroU64::new(inode).expect("ino"),
@@ -883,10 +888,16 @@ mod tests {
             linked: &mut Linked,
             name: String,
             depth: usize,
+            consistent_links: bool,
         ) -> Draft {
             let mut dir = Draft::directory(name);
             for index in 0..rng.below(4) {
-                dir.children.push(file(rng, linked, format!("f{index}")));
+                dir.children.push(file(
+                    rng,
+                    linked,
+                    format!("f{index}"),
+                    consistent_links,
+                ));
             }
             if depth < 6 {
                 for index in 0..rng.below(if depth < 2 { 4 } else { 3 }) {
@@ -895,6 +906,7 @@ mod tests {
                         linked,
                         format!("d{index}"),
                         depth + 1,
+                        consistent_links,
                     ));
                 }
             }
@@ -902,7 +914,13 @@ mod tests {
             rng.shuffle(&mut dir.children);
             dir
         }
-        directory(rng, &mut Linked::default(), "root".into(), 0)
+        directory(
+            rng,
+            &mut Linked::default(),
+            "root".into(),
+            0,
+            consistent_links,
+        )
     }
 
     /// A pool of `threads` workers, built once per test and shared by its
@@ -950,7 +968,7 @@ mod tests {
             .into_iter()
             .collect();
         for seed in 0..300 {
-            let draft = random_tree(&mut crate::test_rng::Rng::new(seed));
+            let draft = random_tree(&mut crate::test_rng::Rng::new(seed), true);
             let expected = on_workers(&draft, &one, false);
             for (threads, pool) in &many {
                 assert_eq!(
@@ -962,43 +980,82 @@ mod tests {
         }
     }
 
+    fn files(node: Node<'_>, into: &mut Vec<Draft>) {
+        for child in node.children() {
+            if child.is_dir() {
+                files(child, into);
+            } else {
+                into.push(child.to_draft());
+            }
+        }
+    }
+
+    fn check_flat(node: Node<'_>, seed: u64) {
+        if !node.is_dir() {
+            return;
+        }
+        let mut flat = Draft::directory("flat");
+        files(node, &mut flat.children);
+        let mut flat = Tree::from(flat);
+        aggregate(&mut flat, Metric::Bytes);
+        assert_eq!(
+            node.sharing(),
+            flat.root().sharing(),
+            "seed {seed}: {}",
+            node.name()
+        );
+        assert_eq!(
+            estimate([node]),
+            estimate([flat.root()]),
+            "seed {seed}: selected {}",
+            node.name()
+        );
+        for child in node.children() {
+            check_flat(child, seed);
+        }
+    }
+
     /// Every directory reads as one directory holding all of its files
     /// would: an answer that does not go through the merging of
     /// subdirectories, near the top or below it, at all.
     #[test]
     fn random_trees_read_as_their_files_would_side_by_side() {
-        fn files(node: Node<'_>, into: &mut Vec<Draft>) {
-            for child in node.children() {
-                if child.is_dir() {
-                    files(child, into);
-                } else {
-                    into.push(child.to_draft());
-                }
-            }
-        }
-        fn check(node: Node<'_>, seed: u64) {
-            if !node.is_dir() {
-                return;
-            }
-            let mut flat = Draft::directory("flat");
-            files(node, &mut flat.children);
-            let mut flat = Tree::from(flat);
-            aggregate(&mut flat, Metric::Bytes);
-            assert_eq!(
-                node.sharing(),
-                flat.root().sharing(),
-                "seed {seed}: {}",
-                node.name()
-            );
-            for child in node.children() {
-                check(child, seed);
-            }
-        }
         for seed in 0..300 {
-            let draft = random_tree(&mut crate::test_rng::Rng::new(seed));
+            let draft = random_tree(&mut crate::test_rng::Rng::new(seed), true);
             let mut tree = Tree::from(&draft);
             aggregate(&mut tree, Metric::Bytes);
-            check(tree.root(), seed);
+            check_flat(tree.root(), seed);
+        }
+    }
+
+    /// Live hardlink observations can disagree or outnumber the reported
+    /// links. Neither nesting nor a worker's finishing order changes the
+    /// evidence retained in the estimate.
+    #[test]
+    fn changing_hardlinks_read_the_same_flat_nested_and_on_any_workers() {
+        let workers = [1, 2, 4, 8].map(|threads| (threads, pool(threads)));
+        for seed in 0..300 {
+            let draft =
+                random_tree(&mut crate::test_rng::Rng::new(seed), false);
+            let mut expected = None;
+            for (threads, pool) in &workers {
+                let actual = pool.install(|| {
+                    let mut tree = Tree::from(&draft);
+                    [Metric::Bytes, Metric::Files].map(|metric| {
+                        aggregate(&mut tree, metric);
+                        check_flat(tree.root(), seed);
+                        figures(&tree)
+                    })
+                });
+                if let Some(expected) = &expected {
+                    assert_eq!(
+                        &actual, expected,
+                        "seed {seed} on {threads} workers"
+                    );
+                } else {
+                    expected = Some(actual);
+                }
+            }
         }
     }
 
@@ -1008,7 +1065,7 @@ mod tests {
         let workers = pool(4);
         let mut reused = 0;
         for seed in 0..300 {
-            let draft = random_tree(&mut crate::test_rng::Rng::new(seed));
+            let draft = random_tree(&mut crate::test_rng::Rng::new(seed), true);
             assert_eq!(
                 on_workers(&draft, &workers, false),
                 on_workers(&draft, &workers, true),

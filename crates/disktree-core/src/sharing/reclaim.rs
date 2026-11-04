@@ -11,6 +11,8 @@ use crate::tree::Node;
 pub struct Estimate {
     pub lower: u64,
     pub upper: u64,
+    /// Missing metadata, bounded accounting or inconsistent observations of
+    /// one file, including more names than its reported link count.
     pub partial: bool,
 }
 
@@ -257,6 +259,10 @@ impl Accumulator {
 
     fn join_links(&mut self, key: (u64, u64), links: Links) {
         if let Some(old) = self.links.remove(&key) {
+            // Disagreement is permanent evidence even if these names never
+            // become complete. Otherwise `bounds` would retain it only when
+            // an intermediate join happened to complete this file.
+            self.incomplete |= old.allocation != links.allocation;
             if old.complete() {
                 self.file(&old.allocation, false);
             }
@@ -271,6 +277,9 @@ impl Accumulator {
                 allocation,
                 names: old.names + links.names,
             };
+            // With matching facts, exceeding the link count cannot be
+            // undone; a later larger count is itself a disagreement.
+            self.incomplete |= joined.names > joined.allocation.links;
             if joined.complete() {
                 self.file(&joined.allocation, true);
             }
@@ -541,6 +550,71 @@ mod tests {
     }
 
     #[test]
+    fn changing_link_counts_are_partial_before_all_names_are_seen() {
+        // Two observations with link counts 2 and 3 disagree even though
+        // neither merge order completes the file's final set of names.
+        let trees = [
+            Tree::from(file("a", 1, 2, None)),
+            Tree::from(file("b", 1, 3, None)),
+        ];
+        assert!(estimate(trees.iter().map(Tree::root)).partial);
+        assert!(estimate(trees.iter().rev().map(Tree::root)).partial);
+    }
+
+    #[test]
+    fn a_third_name_cannot_hide_conflicting_clone_observations() {
+        // Reduced from the flat-directory oracle's seed 132: the flat
+        // order completes two conflicting names before the third arrives;
+        // nesting completes two matching names, then joins the conflict.
+        let a = file("a", 1, 2, None);
+        let b = file("b", 1, 2, Some(clone_info()));
+        let c = file("c", 1, 2, Some(clone_info()));
+        let mut flat = Draft::directory("flat");
+        flat.children = vec![a.clone(), b.clone(), c.clone()];
+        let mut pair = Draft::directory("pair");
+        pair.children = vec![b, c];
+        let mut nested = Draft::directory("nested");
+        nested.children = vec![a, pair];
+        let mut flat = Tree::from(flat);
+        let mut nested = Tree::from(nested);
+        crate::tree::aggregate(&mut flat, Metric::Bytes);
+        crate::tree::aggregate(&mut nested, Metric::Bytes);
+        let flat = estimate([flat.root()]);
+        let nested = estimate([nested.root()]);
+        assert!(flat.partial);
+        assert!(nested.partial);
+        assert_eq!(flat, nested);
+    }
+
+    #[test]
+    fn inconsistent_hardlinks_are_partial_without_completing_the_file() {
+        let mut smaller = file("smaller", 1, 3, None);
+        smaller.allocation.as_mut().expect("allocation").bytes = 2048;
+        for names in [
+            vec![file("a", 1, 3, None), file("b", 1, 3, Some(clone_info()))],
+            vec![file("a", 1, 3, None), smaller],
+            vec![
+                file("a", 1, 2, None),
+                file("b", 1, 2, None),
+                file("c", 1, 2, None),
+            ],
+        ] {
+            let trees: Vec<_> = names.into_iter().map(Tree::from).collect();
+            let expected = Estimate {
+                partial: true,
+                ..Estimate::default()
+            };
+            assert_eq!(estimate(trees.iter().map(Tree::root)), expected);
+            assert_eq!(estimate(trees.iter().rev().map(Tree::root)), expected);
+        }
+        // Unselected names alone are not inconsistent evidence.
+        assert_eq!(
+            estimate([Tree::from(file("a", 1, 3, None)).root()]),
+            Estimate::default()
+        );
+    }
+
+    #[test]
     fn missing_identity_and_private_metadata_never_prove_a_complete_group() {
         for missing in ["device", "id", "private", "references"] {
             let mut info = clone_info();
@@ -649,6 +723,108 @@ mod tests {
         eprintln!(
             "selected-set accounting operations 128->1024 groups: {counts:?}"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod observation_tests {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Path;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::tree::{Draft, NodeKind, Tree};
+
+    fn observe(path: &Path) -> Draft {
+        let metadata = fs::metadata(path).expect("the observed name exists");
+        let bytes = metadata.blocks() * 512;
+        let mut node = Draft::entry("observed", NodeKind::File, bytes);
+        node.allocation = Some(Box::new(Allocation {
+            bytes,
+            identity: Some((metadata.dev(), metadata.ino())),
+            links: metadata.nlink(),
+            followed: false,
+            clone: None,
+        }));
+        node
+    }
+
+    fn check_observations(
+        extra_names: &[u8],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let temp = tempfile::tempdir().expect("a temporary tree");
+        let canonical = temp.path().canonicalize().expect("real root");
+        let anchor = temp.path().join("anchor");
+        fs::write(&anchor, [0; 4096]).expect("a file to link");
+        let mut observations = Vec::new();
+        let mut trees = Vec::new();
+        for (index, extra) in extra_names.iter().copied().enumerate() {
+            let name = format!("observed-{index}");
+            let path = temp.path().join(&name);
+            fs::hard_link(&anchor, &path).expect("a name to observe");
+            let extras: Vec<_> = (0..extra)
+                .map(|at| {
+                    let path = temp.path().join(format!("extra-{at}"));
+                    fs::hard_link(&anchor, &path).expect("another name");
+                    path
+                })
+                .collect();
+            let observed = observe(&path);
+            let real = observe(&canonical.join(name));
+            // macOS temp roots can be spelled through /var or /private;
+            // both spellings must supply the same accounting evidence.
+            prop_assert_eq!(
+                observed.allocation.as_deref(),
+                real.allocation.as_deref()
+            );
+            observations
+                .push(*observed.allocation.as_deref().expect("retained facts"));
+            trees.push(Tree::from(observed));
+            // A scan retains a name already observed even if it is
+            // unlinked before the next listing. The anchor keeps the
+            // inode alive, so later observations are of the same file.
+            fs::remove_file(path).expect("remove the observed name");
+            for path in extras {
+                fs::remove_file(path).expect("remove an extra name");
+            }
+
+            // The final observations, with no intermediate sums: facts
+            // must agree and cannot describe more names than exist.
+            let first = observations[0];
+            let partial = observations.iter().any(|info| *info != first)
+                || observations.len() as u64 > first.links;
+            let forward = estimate(trees.iter().map(Tree::root));
+            let reverse = estimate(trees.iter().rev().map(Tree::root));
+            prop_assert_eq!(forward.partial, partial);
+            prop_assert_eq!(reverse.partial, partial);
+            prop_assert_eq!(forward, reverse);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_observations_of_a_changing_link_count_stay_partial() {
+        // Shrunk from the property on pre-fix main: one inode observed
+        // with 4 links, then 2, while only two names have been selected.
+        check_observations(&[2, 0]).expect("partial in either order");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn live_hardlink_observations_match_the_partial_model(
+            extra_names in prop::collection::vec(0_u8..4, 1..12),
+        ) {
+            check_observations(&extra_names)?;
+        }
     }
 }
 
