@@ -58,7 +58,25 @@ impl Row<'_> {
         matches!(self, Self::Waiting | Self::Skipped)
     }
 
-    const fn label(self, mode: RemovalMode) -> &'static str {
+    /// A cache cleanup's step says what it does, which can differ by row.
+    const fn label(
+        self,
+        mode: RemovalMode,
+        action: Option<disktree_core::cleanup::Action>,
+    ) -> &'static str {
+        use disktree_core::cleanup::Action;
+        match (self, action) {
+            (Self::Current, Some(Action::Owner)) => {
+                return "running command\u{2026}";
+            }
+            (Self::Current, Some(Action::Trash)) => return "moving\u{2026}",
+            (Self::Current, Some(Action::Permanent)) => {
+                return "removing\u{2026}";
+            }
+            (Self::Removed, Some(Action::Trash)) => return "in trash",
+            (Self::Removed, Some(Action::Permanent)) => return "deleted",
+            _ => {}
+        }
         match (self, mode) {
             (Self::Waiting, _) => "waiting",
             (Self::Current, RemovalMode::Trash) => "moving\u{2026}",
@@ -88,8 +106,8 @@ const fn mode_phrase(mode: RemovalMode, done: bool) -> &'static str {
         (RemovalMode::Trash, true) => "moved to trash",
         (RemovalMode::Permanent, false) => "deleting permanently",
         (RemovalMode::Permanent, true) => "deleted permanently",
-        (RemovalMode::OwnerCleanup, false) => "running owner cleanup",
-        (RemovalMode::OwnerCleanup, true) => "owner commands completed",
+        (RemovalMode::OwnerCleanup, false) => "running cache cleanup",
+        (RemovalMode::OwnerCleanup, true) => "cache cleanup finished",
     }
 }
 
@@ -180,7 +198,7 @@ pub fn done(
     let totals = app.run_list.totals();
     let owner_cleanup = app.removal_mode == RemovalMode::OwnerCleanup;
     let mut subtitle = if owner_cleanup {
-        format!("{} owner commands succeeded", totals.removed)
+        format!("{} cleanup steps succeeded", totals.removed)
     } else {
         format!("{} removed", totals.removed)
     };
@@ -190,6 +208,16 @@ pub fn done(
     let skipped = totals.total - totals.removed - totals.failed;
     if skipped > 0 {
         let _ = write!(subtitle, " \u{b7} {skipped} not reached");
+    }
+    let chose_skip = app
+        .cleanup_results
+        .iter()
+        .filter(|report| {
+            report.outcome == disktree_core::cleanup::Outcome::Skipped
+        })
+        .count();
+    if owner_cleanup && chose_skip > 0 {
+        let _ = write!(subtitle, " \u{b7} {chose_skip} skipped by you");
     }
     subtitle.push_str(" \u{b7} ");
     subtitle.push_str(mode_phrase(app.removal_mode, true));
@@ -317,7 +345,7 @@ fn list_column(
 ) -> Div {
     let note = if app.removal_mode == RemovalMode::OwnerCleanup {
         format!(
-            "Owner commands: {} succeeded, {} failed; scope allocation is not freed space",
+            "Cleanup steps: {} succeeded, {} failed; scope allocation is not freed space",
             totals.removed, totals.failed
         )
     } else {
@@ -380,7 +408,7 @@ fn list_column(
         .debug_selector(|| "run-list".into())
         .role(gpui_kit::Role::List)
         .aria_label(if app.removal_mode == RemovalMode::OwnerCleanup {
-            format!("{} owner commands; {} succeeded; {} failed", totals.total, totals.removed, totals.failed)
+            format!("{} cleanup steps; {} succeeded; {} failed", totals.total, totals.removed, totals.failed)
         } else { format!(
             "{} items to remove; {} removed; {} failed", totals.total, totals.removed, totals.failed
         ) })
@@ -553,7 +581,8 @@ fn row(
     let accent = palette::category_accent(theme, item.category);
     let kind = item.kind();
     let full = app.display_path(&item.target.path);
-    let label = state.label(app.removal_mode);
+    let label =
+        state.label(app.removal_mode, app.cleanup_actions.get(index).copied());
     let name = app
         .path_style()
         .file_name(&item.target.path)
@@ -887,13 +916,43 @@ fn sidebar(
             cx,
         ));
     }
+    // One line per marked path, the skipped ones included, so every path
+    // the person decided has a result.
     panel
         .children(
             app.cleanup_results
                 .iter()
-                .map(|report| caption(report.description(), theme)),
+                .map(|report| caption(result_line(app, report), theme)),
         )
         .child(caption(note(app, phase), theme))
+}
+
+/// One cleanup step's result: the path, how it ended and, when it did not
+/// succeed, why. A failed owner command says that nothing else was deleted.
+fn result_line(
+    app: &Disktree,
+    report: &disktree_core::cleanup::Report,
+) -> String {
+    use disktree_core::cleanup::{Action, Outcome};
+    let mut line = format!(
+        "{} \u{b7} {}",
+        app.display_path(&report.path),
+        report.outcome_label()
+    );
+    if let (Some(problem), Some(error)) = (report.problem, &report.error)
+        && report.outcome != Outcome::Succeeded
+    {
+        let _ = write!(line, " \u{b7} {}: {error}", problem.label());
+    }
+    if report.action == Action::Owner
+        && matches!(report.outcome, Outcome::Failed | Outcome::Cancelled)
+    {
+        line.push_str(
+            ". Nothing else was deleted; deleting these files instead \
+             needs its own choice in a new review",
+        );
+    }
+    line
 }
 
 /// What the mode means for the figures above it.
@@ -908,7 +967,7 @@ const fn note(app: &Disktree, phase: Phase) -> &'static str {
              finishes the item in hand first."
         }
         (Phase::Running, RemovalMode::OwnerCleanup) => {
-            "Running the approved owner commands. Stop cancels the current command; it may already have changed the cache. No raw deletion fallback."
+            "Running each chosen step in turn. Stop cancels the current owner command, which may already have changed its cache, and leaves the rest not reached. A failed step never deletes anything else."
         }
         (Phase::Done, _) if app.scan.is_some() => {
             "Rescanning so the numbers on screen match the disk again."
@@ -923,7 +982,7 @@ const fn note(app: &Disktree, phase: Phase) -> &'static str {
              rescan; it cannot be marked again."
         }
         (Phase::Done, RemovalMode::OwnerCleanup) => {
-            "Owner success means the command exited successfully, not that its entire scope was deleted. Reported is scope allocation; observed is measured free-space change. Open files, APFS clones and snapshots can retain blocks. Inspect failures before a new preview; no raw deletion fallback."
+            "A succeeded command exited successfully; it does not mean its whole scope is gone. Reported is scope allocation; observed is the measured free-space change. Open files, APFS clones and snapshots can retain blocks. A failed or cancelled owner command deleted nothing else: inspect it, then decide again in a new review."
         }
     }
 }

@@ -67,7 +67,7 @@ pub fn ledger(ledger: &disktree_link::RemovalLedger, now: i64) -> String {
             cohort.mode,
             cohort.removed,
             if cohort.mode == "owner_cleanup" {
-                "owner commands succeeded"
+                "cleanup steps succeeded"
             } else {
                 "removed"
             },

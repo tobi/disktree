@@ -108,14 +108,24 @@ destination.
 ## Owner-managed caches
 
 A cache name or regenerable classification is an inspection lead, never
-permission to recursively delete it. Request `owner_cleanup` through
-`pwrdisk_removal_preview` for supported owners. Show the resolved owner,
-version, executable, arguments, configured root, full actual scope (including
-unselected siblings), effects and limitations before explicit confirmation.
-The exact returned actual-scope paths and `RUN OWNER CLEANUP` are required.
-Unavailable commands do not establish absent software. Unsupported versions,
-unknown runtime/install caches and failed owner commands require inspection;
-never substitute raw deletion or a shell command.
+permission to delete it. Cache cleanup is decided path by path. Call
+`pwrdisk_removal_preview` with `owner_cleanup` and no decisions: it returns
+one proposal per marked path with its status and problem, resolved owner,
+version, executable, arguments, environment overrides, configured root, full
+actual scope (including unselected siblings), effects, limitations,
+recoverability, and whether Delete files is offered. Show every proposal and
+let the user choose for each path `skip`, `owner` (only where offered) or
+`delete_files`. Never choose for them and never suggest `delete_files`
+yourself; inspect unknown runtime/install caches first, since nothing says
+they are disposable. Then preview again with `decisions` naming every marked
+path once, and `delete_files_mode` (`trash` or `permanent`, as the user
+chose) when any path uses `delete_files`. Confirmation needs that preview's
+exact paths and its own text: `RUN OWNER CLEANUP`, `DELETE CACHE FILES`,
+`TRASH CACHE FILES`, or both intents joined with `AND`. Owner approval never
+approves deleting files. Unavailable commands do not establish absent
+software. An unsupported version, failed probe, or failed or cancelled owner
+command never falls back to deleting files, and never to a shell command;
+deleting them instead is a new preview the user decides.
 
 Cache tags and owner layouts on ancestors protect contained files and
 subtrees too. All removal modes may return a preparing response while
@@ -130,7 +140,9 @@ full command/configuration scopes are not supported. Windows command
 launchers have no execution adapter yet. Neither containers nor volumes are
 cleanup scopes.
 
-Cleanup success reports the owner's exit result, not guaranteed savings.
+Each path gets its own result: succeeded, failed with a reason, cancelled
+(possibly part done), skipped, or not reached after Stop. A command's
+success reports the owner's exit result, not guaranteed savings.
 Report allocation separately from observed volume availability before/after;
 other activity, hardlinks, open files, APFS clones and snapshots can retain
 blocks. PwrDisk always rescans after owner cleanup, even partial failure.

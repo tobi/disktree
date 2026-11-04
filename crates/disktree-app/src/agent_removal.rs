@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use disktree_core::removal::{Plan, Target, detect_trash_backend};
 use disktree_core::tree::Tree;
 use disktree_link::{
-    ConfirmedRemoval, RemovalChoice, RemovalPreview, Response,
+    ConfirmedRemoval, PathDecision, RemovalChoice, RemovalPreview, Response,
 };
 use gpui_kit::Context;
 
@@ -43,6 +43,8 @@ impl RawInspection {
 #[derive(Debug)]
 pub struct PreparedRemoval {
     preview: RemovalPreview,
+    /// A cache cleanup's confirmed decisions, run as they were previewed.
+    cleanup: Option<disktree_core::cleanup::Approved>,
     marks: Vec<Target>,
     tree: Weak<Tree>,
     created: Instant,
@@ -55,7 +57,8 @@ impl PreparedRemoval {
             && request.preview_id == preview.preview_id
             && request.mode == preview.mode
             && request.paths == preview.paths
-            && request.confirmation == preview.mode.confirmation()
+            && !preview.confirmation.is_empty()
+            && request.confirmation == preview.confirmation
     }
 }
 
@@ -112,6 +115,8 @@ impl Disktree {
     pub(crate) fn agent_prepare_removal(
         &mut self,
         mode: RemovalChoice,
+        decisions: Option<&[PathDecision]>,
+        files: Option<RemovalChoice>,
         cx: &mut Context<'_, Self>,
     ) -> Response {
         // A new preview revokes the previous one even if preparation fails.
@@ -120,20 +125,31 @@ impl Disktree {
         }
         if mode == RemovalChoice::OwnerCleanup && self.cleanup_ready().is_err()
         {
-            let reason = self.cleanup_description();
-            self.prepare_cleanup(cx);
-            return Response::error(reason);
+            // A failed check says why once; the next request checks again,
+            // rather than reporting "preparing" for good.
+            if let Some(reason) = self.cleanup_failed() {
+                self.cleanup_review = None;
+                return Response::error(reason);
+            }
+            if !self.cleanup_preparing() {
+                self.prepare_cleanup(cx);
+            }
+            return Response::error(self.cleanup_description());
         }
         if mode != RemovalChoice::OwnerCleanup {
             self.prepare_raw_inspection(cx);
         }
-        match self.prepare_removal_intent(mode) {
+        match self.prepare_removal_intent(mode, decisions, files) {
             Ok(prepared) => {
                 let preview = prepared.preview.clone();
                 let Some(agent) = &mut self.agent else {
                     return Response::error("No agent link is attached");
                 };
-                agent.removal_preview = Some(prepared);
+                // Proposals without decisions inform; they cannot be
+                // confirmed, so nothing is kept to confirm against.
+                if !preview.confirmation.is_empty() {
+                    agent.removal_preview = Some(prepared);
+                }
                 Response::RemovalPreview(preview)
             }
             Err(reason) => Response::error(reason),
@@ -214,6 +230,8 @@ impl Disktree {
     fn prepare_removal_intent(
         &self,
         mode: RemovalChoice,
+        decisions: Option<&[PathDecision]>,
+        files: Option<RemovalChoice>,
     ) -> Result<PreparedRemoval, String> {
         if self.remote.is_some()
             || self.scan.is_some()
@@ -228,9 +246,13 @@ impl Disktree {
             return Err("Trash is unavailable; permanent deletion requires a new preview and separate user confirmation".into());
         }
         let tree = self.tree.as_ref().ok_or("No complete scan is available")?;
-        let plan = if mode == RemovalChoice::OwnerCleanup {
-            self.cleanup_ready()?.plan.clone()
-        } else {
+        if mode == RemovalChoice::OwnerCleanup {
+            return self.prepare_cleanup_intent(decisions, files, tree);
+        }
+        if decisions.is_some() || files.is_some() {
+            return Err("Decisions apply only to owner_cleanup".into());
+        }
+        let plan = {
             // Do not let a previously selected UI mode change the meaning
             // of an MCP raw-removal request.
             disktree_core::removal::plan(self.marks.items(), &self.root_path)
@@ -252,9 +274,7 @@ impl Disktree {
         if plan.is_empty() {
             return Err("Nothing is marked".into());
         }
-        if mode != RemovalChoice::OwnerCleanup {
-            self.raw_inspection_ready(&plan)?;
-        }
+        self.raw_inspection_ready(&plan)?;
         let limit = crate::safety::load(self.removal_settings_dir.as_deref())?;
         let volumes = limit.check(&plan.targets)?;
         let nonce = SystemTime::now()
@@ -276,20 +296,124 @@ impl Disktree {
                     .map(|target| target.path.clone())
                     .collect(),
                 bytes: plan.bytes(),
-                estimate: if mode == RemovalChoice::OwnerCleanup {
-                    disktree_link::SelectionEstimate::unknown(&plan)
-                } else {
-                    self.agent_selection_estimate(&plan)
-                },
+                estimate: self.agent_selection_estimate(&plan),
                 limit_percent: limit.percent(),
                 volumes,
                 expires_in_seconds: LIFETIME.as_secs(),
-                cleanup: if mode == RemovalChoice::OwnerCleanup {
-                    self.cleanup_ready()?.operations.clone()
-                } else {
-                    vec![]
-                },
+                cleanup: vec![],
+                proposals: vec![],
+                decisions: vec![],
+                files: None,
+                confirmation: mode.confirmation().into(),
+                consent: String::new(),
             },
+            cleanup: None,
+            marks: self.marks.items().to_vec(),
+            tree: Arc::downgrade(tree),
+            created: Instant::now(),
+        })
+    }
+
+    /// A cache cleanup preview. Without decisions it lists what each path
+    /// offers and cannot be confirmed; with one decision per marked path it
+    /// is a single-use preview of exactly those steps and their phrase.
+    fn prepare_cleanup_intent(
+        &self,
+        decisions: Option<&[PathDecision]>,
+        files: Option<RemovalChoice>,
+        tree: &Arc<Tree>,
+    ) -> Result<PreparedRemoval, String> {
+        use disktree_core::cleanup::Action;
+        let prepared = self.cleanup_ready()?;
+        let limit = crate::safety::load(self.removal_settings_dir.as_deref())?;
+        let files_action = match files {
+            None => Action::Skip,
+            Some(RemovalChoice::Trash) => {
+                if !detect_trash_backend().is_available() {
+                    return Err("Trash is unavailable; choose permanent deletion for Delete files, which needs its own confirmation".into());
+                }
+                Action::Trash
+            }
+            Some(RemovalChoice::Permanent) => Action::Permanent,
+            Some(RemovalChoice::OwnerCleanup) => {
+                return Err("Delete files uses trash or permanent".into());
+            }
+        };
+        let approved = match decisions {
+            None => None,
+            Some(named) => {
+                let named: Vec<_> = named
+                    .iter()
+                    .map(|decision| (decision.path.clone(), decision.action))
+                    .collect();
+                let decisions = prepared.decisions_for(&named)?;
+                Some(prepared.approve(&decisions, files_action)?)
+            }
+        };
+        let (plan, volumes) = match &approved {
+            Some(approved) => {
+                (approved.plan.clone(), limit.check(&approved.plan.targets)?)
+            }
+            None => (disktree_core::removal::Plan::default(), vec![]),
+        };
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let preview = RemovalPreview {
+            preview_id: if approved.is_some() {
+                format!(
+                    "{}-{nonce:x}-{}",
+                    std::process::id(),
+                    NEXT_PREVIEW.fetch_add(1, Ordering::Relaxed)
+                )
+            } else {
+                String::new()
+            },
+            root: self.root_path.clone(),
+            mode: RemovalChoice::OwnerCleanup,
+            paths: plan
+                .targets
+                .iter()
+                .map(|target| target.path.clone())
+                .collect(),
+            bytes: plan.bytes(),
+            estimate: disktree_link::SelectionEstimate::unknown(&plan),
+            limit_percent: limit.percent(),
+            volumes,
+            expires_in_seconds: LIFETIME.as_secs(),
+            cleanup: approved.as_ref().map_or_else(Vec::new, |approved| {
+                approved
+                    .steps
+                    .iter()
+                    .filter_map(|step| match step {
+                        disktree_core::cleanup::Step::Owner(index) => {
+                            approved.prepared.operations.get(*index).cloned()
+                        }
+                        disktree_core::cleanup::Step::Files { .. } => None,
+                    })
+                    .collect()
+            }),
+            proposals: prepared.proposals.clone(),
+            decisions: approved
+                .as_ref()
+                .map_or_else(Vec::new, |approved| approved.decisions.clone()),
+            files: approved
+                .as_ref()
+                .filter(|approved| approved.file_steps() > 0)
+                .and(files),
+            confirmation: approved
+                .as_ref()
+                .map_or("", |approved| approved.confirmation())
+                .into(),
+            consent: approved.as_ref().map_or_else(
+                || prepared.description(),
+                disktree_core::cleanup::Approved::description,
+            ),
+        };
+        Ok(PreparedRemoval {
+            preview,
+            cleanup: approved,
             marks: self.marks.items().to_vec(),
             tree: Arc::downgrade(tree),
             created: Instant::now(),
@@ -339,7 +463,21 @@ impl Disktree {
                 "Scan or marked paths changed after preview; obtain a new preview and user confirmation",
             );
         }
-        let fresh = match self.prepare_removal_intent(request.mode) {
+        let decisions: Vec<PathDecision> = preview
+            .proposals
+            .iter()
+            .zip(&preview.decisions)
+            .map(|(proposal, action)| PathDecision {
+                path: proposal.selected.clone(),
+                action: *action,
+            })
+            .collect();
+        let fresh = match self.prepare_removal_intent(
+            request.mode,
+            (request.mode == RemovalChoice::OwnerCleanup)
+                .then_some(decisions.as_slice()),
+            preview.files,
+        ) {
             Ok(fresh) => fresh,
             Err(reason) => return Response::error(reason),
         };
@@ -353,6 +491,8 @@ impl Disktree {
             || fresh.preview.volumes != preview.volumes
             || fresh.preview.cleanup != preview.cleanup
             || fresh.preview.paths != preview.paths
+            || fresh.preview.decisions != preview.decisions
+            || fresh.preview.confirmation != preview.confirmation
         {
             return Response::error(
                 "Removal policy or volume capacity changed; obtain a new preview and user confirmation",
@@ -361,6 +501,7 @@ impl Disktree {
         self.removal_mode = request.mode.mode();
         self.confirm_open = false;
         self.rescan_after_removal = request.rescan;
+        let cleanup = prepared.cleanup.clone();
         // Starting a run associates both UI and MCP runs with this preview.
         if let Some(agent) = &mut self.agent {
             agent.removal_preview = Some(prepared);
@@ -368,7 +509,7 @@ impl Disktree {
         // Held to the agent limit, not the window's: with the window's Off
         // the preview was checked at the agent limit, and growth since must
         // be refused at the same limit.
-        self.begin_agent_removal(cx);
+        self.begin_agent_removal(cleanup, cx);
         if self.screen != Screen::Running {
             if let Some(agent) = &mut self.agent {
                 agent.removal_preview = None;
@@ -401,7 +542,13 @@ mod tests {
                 volumes: vec![],
                 expires_in_seconds: LIFETIME.as_secs(),
                 cleanup: vec![],
+                proposals: vec![],
+                decisions: vec![],
+                files: None,
+                confirmation: RemovalChoice::Permanent.confirmation().into(),
+                consent: String::new(),
             },
+            cleanup: None,
             marks: vec![],
             tree: Weak::new(),
             created: Instant::now(),

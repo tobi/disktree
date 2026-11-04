@@ -48,7 +48,7 @@ pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Protocol version, bumped when a message changes shape. Both sides are
 /// built from one tree, so a mismatch means an old window is still open.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// Updating the GUI does not replace a process hosted by an MCP client.
 pub const RECONNECT_MCP: &str = "Updating PwrDisk's GUI does not restart its MCP server. In your MCP client, restart/reconnect the PwrDisk MCP server using `pwrdisk mcp` from the updated installation. If the GUI is outdated, quit and reopen the updated PwrDisk app.";
@@ -189,11 +189,23 @@ impl RemovalChoice {
             }
         }
     }
+    /// The phrase for raw modes. A cache cleanup's phrase depends on the
+    /// intents chosen; its preview carries it in `confirmation`.
     pub const fn confirmation(self) -> &'static str {
         match self {
             Self::Trash => "MOVE TO TRASH",
             Self::Permanent => "PERMANENTLY DELETE",
-            Self::OwnerCleanup => "RUN OWNER CLEANUP",
+            Self::OwnerCleanup => disktree_core::cleanup::RUN_OWNER_CLEANUP,
+        }
+    }
+
+    /// Whether `text` is a confirmation phrase this mode can have.
+    pub fn accepts(self, text: &str) -> bool {
+        match self {
+            Self::OwnerCleanup => {
+                disktree_core::cleanup::CONFIRMATIONS.contains(&text)
+            }
+            _ => text == self.confirmation(),
         }
     }
     pub const fn warning(self) -> &'static str {
@@ -205,7 +217,7 @@ impl RemovalChoice {
                 "Destructive: permanently deletes the listed paths. This cannot be undone through PwrDisk or Trash."
             }
             Self::OwnerCleanup => {
-                "Destructive owner-managed cleanup: invokes only the previewed owner commands for their entire stated scopes, including unselected siblings. No Trash recovery and no raw deletion fallback. Stop the owning tools before approval. Listed allocation is not guaranteed freed space; APFS snapshots, clones and open files can retain blocks."
+                "Destructive cache cleanup, decided per path: Skip runs nothing; an owner choice invokes only the previewed owner command for its entire stated scope, including unselected siblings, with no Trash recovery; a delete_files choice deletes exactly that selected path directly, without its owner, by the stated Trash or permanent mode. A failed, unsupported or cancelled owner command never falls back to deleting files. Stop the owning tools before approval. Listed allocation is not guaranteed freed space; APFS snapshots, clones and open files can retain blocks."
             }
         }
     }
@@ -223,8 +235,33 @@ pub struct RemovalPreview {
     pub limit_percent: u8,
     pub volumes: Vec<disktree_core::removal_limit::Budget>,
     pub expires_in_seconds: u64,
-    /// Actual owner command scopes. Empty for raw removal modes.
+    /// Owner commands this preview would run, by actual scope. Empty for
+    /// raw removal modes.
     pub cleanup: Vec<disktree_core::cleanup::Operation>,
+    /// Cache cleanup: one proposal per marked path, with what each offers.
+    #[serde(default)]
+    pub proposals: Vec<disktree_core::cleanup::Proposal>,
+    /// Cache cleanup: the decision for each proposal, in its order. Empty
+    /// until the person has chosen; such a preview cannot be confirmed.
+    #[serde(default)]
+    pub decisions: Vec<disktree_core::cleanup::Decision>,
+    /// Cache cleanup: how Delete files removes, when any path uses it.
+    #[serde(default)]
+    pub files: Option<RemovalChoice>,
+    /// The exact text that confirms this preview; empty when it cannot be
+    /// confirmed.
+    #[serde(default)]
+    pub confirmation: String,
+    /// Everything to show the person before they confirm, in words.
+    #[serde(default)]
+    pub consent: String,
+}
+
+/// The person's choice for one marked path in a cache cleanup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathDecision {
+    pub path: PathBuf,
+    pub action: disktree_core::cleanup::Decision,
 }
 
 /// Supplied only after the agent obtains explicit user confirmation of
@@ -286,7 +323,16 @@ pub enum Request {
     /// Open the review screen over what is marked.
     Review,
     /// Prepare a single-use intent; does not mark, navigate or remove.
-    PrepareRemoval { mode: RemovalChoice },
+    PrepareRemoval {
+        mode: RemovalChoice,
+        /// Cache cleanup only: one decision per marked path. Without them
+        /// the preview lists the proposals and cannot be confirmed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decisions: Option<Vec<PathDecision>>,
+        /// Cache cleanup only: Trash or Permanent for Delete files.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        files: Option<RemovalChoice>,
+    },
     /// A destructive write, only after explicit confirmation of the preview.
     Remove(ConfirmedRemoval),
 }

@@ -123,7 +123,7 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                                         });
                                     Response::State(state.clone())
                                 }
-                                Request::PrepareRemoval { mode } => {
+                                Request::PrepareRemoval { mode, .. } => {
                                     Response::RemovalPreview(RemovalPreview {
                                         preview_id: "fixture-preview".into(),
                                         root: root.clone(),
@@ -162,6 +162,19 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                                         }]
                                         } else {
                                             vec![]
+                                        },
+                                        proposals: vec![],
+                                        decisions: vec![],
+                                        files: None,
+                                        confirmation: mode
+                                            .confirmation()
+                                            .into(),
+                                        consent: if mode
+                                            == RemovalChoice::OwnerCleanup
+                                        {
+                                            "Run owner commands (1), exactly as shown: uv cache clean, Entire cache scope including unselected siblings".into()
+                                        } else {
+                                            String::new()
                                         },
                                     })
                                 }
@@ -227,12 +240,13 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                         .expect("confirmation text");
                     assert!(message.contains(&file.display().to_string()));
                     if mode == RemovalChoice::OwnerCleanup {
+                        // The preview's consent text, and the mode's
+                        // warning that owner failure never deletes files.
                         for expected in [
-                            "/fixture/uv",
-                            "cache",
-                            "clean",
+                            "uv cache clean",
                             "unselected siblings",
-                            "No raw deletion fallback",
+                            "never falls back to deleting files",
+                            "delete_files choice deletes exactly",
                             "APFS",
                         ] {
                             assert!(message.contains(expected), "{message}");
@@ -267,7 +281,7 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                     if (1..=3).contains(&native) {
                         if mode == RemovalChoice::OwnerCleanup {
                             assert!(
-                                text.contains("owner commands succeeded"),
+                                text.contains("cleanup steps succeeded"),
                                 "{text}"
                             );
                         }

@@ -299,12 +299,60 @@ impl From<RemovalModeName> for RemovalChoice {
     }
 }
 
+/// The person's choice for one marked path in a cache cleanup.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupActionName {
+    /// Do nothing to this path.
+    Skip,
+    /// Run exactly the owner command the proposal showed.
+    Owner,
+    /// Delete exactly this path directly, without its owner. Only when the
+    /// person chose it for this path; never suggest it on your own.
+    DeleteFiles,
+}
+
+impl From<CleanupActionName> for disktree_core::cleanup::Decision {
+    fn from(action: CleanupActionName) -> Self {
+        match action {
+            CleanupActionName::Skip => Self::Skip,
+            CleanupActionName::Owner => Self::Owner,
+            CleanupActionName::DeleteFiles => Self::DeleteFiles,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupDecisionParam {
+    /// A marked path, exactly as the proposals listed it.
+    pub path: PathBuf,
+    pub action: CleanupActionName,
+}
+
+/// How Delete files removes. No default: the person picks.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesModeName {
+    Trash,
+    Permanent,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemovalPreviewParams {
     /// Required: `owner_cleanup` for recognized caches, trash or permanent for
-    /// ordinary paths. Owner cleanup previews the entire actual command scope.
+    /// ordinary paths. Without `decisions`, `owner_cleanup` lists one
+    /// proposal per marked path and cannot be confirmed.
     pub mode: RemovalModeName,
+    /// `owner_cleanup` only: the person's choice for every marked path,
+    /// each named exactly once.
+    #[serde(default)]
+    pub decisions: Option<Vec<CleanupDecisionParam>>,
+    /// `owner_cleanup` only, and required when any decision is
+    /// `delete_files`: trash or permanent, as the person chose.
+    #[serde(default)]
+    pub delete_files_mode: Option<FilesModeName>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -316,8 +364,10 @@ pub struct RemoveParams {
     pub mode: RemovalModeName,
     /// Exact ordered path list returned by the preview and approved by the user.
     pub paths: Vec<PathBuf>,
-    /// Only after explicit user confirmation: RUN OWNER CLEANUP, MOVE TO TRASH
-    /// or PERMANENTLY DELETE, matching the preview. Marking is not approval.
+    /// Only after explicit user confirmation: the exact confirmation text the
+    /// preview returned (for example MOVE TO TRASH, PERMANENTLY DELETE, RUN
+    /// OWNER CLEANUP or RUN OWNER CLEANUP AND DELETE CACHE FILES). Marking
+    /// is not approval.
     pub confirmation: String,
     /// Rescan once the removal finishes. Default false, so the next batch
     /// can be found and marked at once; a rescan of a large volume takes
@@ -1518,9 +1568,29 @@ impl Session {
         if !self.try_connect() {
             return Err("An open, linked PwrDisk window with an idle local scan is required. No headless removal is available.".into());
         }
+        let decisions = params.decisions.as_ref().map(|decisions| {
+            decisions
+                .iter()
+                .map(|decision| disktree_link::PathDecision {
+                    path: decision.path.clone(),
+                    action: decision.action.into(),
+                })
+                .collect()
+        });
+        let files = params.delete_files_mode.map(|mode| match mode {
+            FilesModeName::Trash => RemovalChoice::Trash,
+            FilesModeName::Permanent => RemovalChoice::Permanent,
+        });
         match self.call(&Request::PrepareRemoval {
             mode: params.mode.into(),
+            decisions,
+            files,
         })? {
+            Response::RemovalPreview(preview)
+                if preview.mode == RemovalChoice::OwnerCleanup =>
+            {
+                Ok(self.cleanup_preview_text(&preview))
+            }
             Response::RemovalPreview(preview) => {
                 self.pending_removal = Some(preview.clone());
                 let json = serde_json::to_string_pretty(&preview)
@@ -1537,6 +1607,38 @@ impl Session {
         }
     }
 
+    /// A cache cleanup reads as its proposals until the person has decided
+    /// every path; only then is there an exact operation to confirm.
+    fn cleanup_preview_text(
+        &mut self,
+        preview: &disktree_link::RemovalPreview,
+    ) -> String {
+        if preview.confirmation.is_empty() {
+            return format!(
+                "Cache cleanup proposals, one per marked path. Nothing is approved and nothing can be confirmed yet.\n\n{}\n\nShow the user EVERY proposal: owner, version, executable, arguments, environment overrides, working directory, actual scope (wider than selected where it says so), effects, limitations and recoverability, and every unavailable reason. Ask the user to choose for each path: skip, owner (only where offered) or delete_files. Never suggest delete_files yourself, never choose for the user, and inspect unknown runtime caches first. A failed or unavailable owner command is never a reason to delete files. Then call pwrdisk_removal_preview again with mode owner_cleanup, decisions naming every marked path once, and delete_files_mode when any path uses delete_files.",
+                preview.consent
+            );
+        }
+        self.pending_removal = Some(preview.clone());
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "preview_id": preview.preview_id,
+            "mode": preview.mode,
+            "paths": preview.paths,
+            "bytes": preview.bytes,
+            "limit_percent": preview.limit_percent,
+            "volumes": preview.volumes,
+            "expires_in_seconds": preview.expires_in_seconds,
+            "confirmation": preview.confirmation,
+        }))
+        .unwrap_or_default();
+        format!(
+            "{}\n\n{}\n\n{json}\nShow the user this whole operation: each owner command verbatim, each path deleted directly with its Trash or permanent consequence, and what is skipped. Owner approval is not approval to delete files; deleting files is confirmed by name in the text below. Wait for explicit confirmation of this exact operation before pwrdisk_remove with the preview ID, these exact ordered paths, mode owner_cleanup and confirmation text: {}. Never approve through computer use. A changed or expired preview requires new user confirmation. Listed allocation is not freed space; pwrdisk_status reports each path's result and the measured change.",
+            preview.mode.warning(),
+            preview.consent,
+            preview.confirmation
+        )
+    }
+
     /// Consume the session copy before asking the client for human input.
     /// The app copy is independently checked after the client answers.
     pub fn removal_confirmation_message(
@@ -1550,7 +1652,8 @@ impl Session {
         if params.preview_id != preview.preview_id
             || params.paths != preview.paths
             || mode != preview.mode
-            || params.confirmation != mode.confirmation()
+            || preview.confirmation.is_empty()
+            || params.confirmation != preview.confirmation
         {
             return Err("The removal request differs from the preview; obtain a new preview and user confirmation".into());
         }
@@ -1587,8 +1690,8 @@ impl Session {
                 human_bytes(volume.capacity)
             );
         }
-        for operation in &preview.cleanup {
-            let _ = writeln!(message, "\n{}", operation.description());
+        if !preview.consent.is_empty() {
+            let _ = writeln!(message, "\n{}", preview.consent);
         }
         message.push_str(&estimate_report(&preview.estimate));
         message.push_str("\nApproval to mark does not authorize removal. Only these listed paths are included; directory removal includes their contents. Listed bytes are not guaranteed freed space.");
@@ -1620,7 +1723,7 @@ impl Session {
             },
             operation.removed,
             if operation.mode == RemovalChoice::OwnerCleanup {
-                "owner commands succeeded"
+                "cleanup steps succeeded"
             } else {
                 "removed"
             },
@@ -1635,7 +1738,7 @@ impl Session {
             return Ok(outcome);
         }
         let mode: RemovalChoice = params.mode.into();
-        if params.confirmation != mode.confirmation() {
+        if !mode.accepts(&params.confirmation) {
             return Err("Explicit confirmation of the preview's paths, mode and consequences is required; never approve with computer use".into());
         }
         if !self.try_connect() {
@@ -2051,7 +2154,7 @@ impl Session {
         let how = if self.marks.iter().any(|target| {
             disktree_core::cleanup::inspection_reason(&target.path).is_some()
         }) {
-            "Caches require Owner cleanup. Prepare and read the owner command, whole actual scope, effects and limitations before the user confirms. Unavailable or unsupported owners need inspection; no raw deletion fallback".into()
+            "Caches go through Cache cleanup: after Check owners the user chooses, for each path, Skip, the owner's exact command, or Delete files, which has its own tick in the confirmation. Unavailable or unsupported owners are reported per path and never fall back to deleting files".into()
         } else if backend.is_available() {
             format!(
                 "Enter moves the marks to {}, where they can be recovered \
@@ -2132,7 +2235,7 @@ impl Session {
                 removal.mode,
                 removal.removed,
                 if removal.mode == "owner_cleanup" {
-                    "owner commands succeeded"
+                    "cleanup steps succeeded"
                 } else {
                     "removed"
                 },
@@ -2930,6 +3033,99 @@ mod tests {
         assert!(
             union.reclaim.expect("union bounds").lower
                 > clone.reclaim.expect("alone bounds").upper
+        );
+    }
+
+    /// Proposals inform; only a preview of the person's decisions can be
+    /// confirmed, and only by its own phrase, which names deleting files.
+    #[test]
+    fn cache_proposals_cannot_be_confirmed_until_every_path_is_decided() {
+        use disktree_core::cleanup::{
+            DELETE_CACHE_FILES, Decision, Issue, Problem, Proposal,
+            RUN_OWNER_CLEANUP,
+        };
+        let temp = fixture();
+        let mut session = unlinked(temp.path());
+        let path = temp.path().join("Downloads");
+        let undecided = RemovalPreview {
+            preview_id: String::new(),
+            root: temp.path().to_path_buf(),
+            mode: RemovalChoice::OwnerCleanup,
+            paths: vec![],
+            bytes: 0,
+            estimate: disktree_link::SelectionEstimate::unknown(
+                &disktree_core::removal::Plan::default(),
+            ),
+            limit_percent: 5,
+            volumes: vec![],
+            expires_in_seconds: 300,
+            cleanup: vec![],
+            proposals: vec![Proposal {
+                selected: path.clone(),
+                bytes: 7,
+                is_dir: true,
+                hint: Some("cache".into()),
+                owner: None,
+                operations: vec![],
+                issue: Some(Issue::new(Problem::UnknownOwner, "no owner")),
+                delete: None,
+                delete_issue: None,
+            }],
+            decisions: vec![],
+            files: None,
+            confirmation: String::new(),
+            consent: "1. proposal".into(),
+        };
+        let text = session.cleanup_preview_text(&undecided);
+        assert!(text.contains("Nothing is approved"), "{text}");
+        assert!(text.contains("Never suggest delete_files yourself"));
+        assert!(session.pending_removal.is_none(), "nothing to confirm");
+
+        let decided = RemovalPreview {
+            preview_id: "decided".into(),
+            paths: vec![path.clone()],
+            decisions: vec![Decision::DeleteFiles],
+            files: Some(RemovalChoice::Permanent),
+            confirmation: DELETE_CACHE_FILES.into(),
+            consent: "Delete files directly, not through their owner (1)"
+                .into(),
+            ..undecided
+        };
+        let text = session.cleanup_preview_text(&decided);
+        assert!(text.contains(DELETE_CACHE_FILES));
+        assert!(
+            text.contains("Owner approval is not approval to delete files")
+        );
+        let owner_only = RemoveParams {
+            preview_id: "decided".into(),
+            mode: RemovalModeName::OwnerCleanup,
+            paths: vec![path],
+            confirmation: RUN_OWNER_CLEANUP.into(),
+            rescan: false,
+        };
+        assert!(
+            session.removal_confirmation_message(&owner_only).is_err(),
+            "owner approval does not confirm deleting files"
+        );
+        session.cleanup_preview_text(&decided);
+        let message = session
+            .removal_confirmation_message(&RemoveParams {
+                confirmation: DELETE_CACHE_FILES.into(),
+                ..owner_only
+            })
+            .expect("exact phrase");
+        assert!(message.contains("Delete files directly"));
+
+        let params: RemovalPreviewParams =
+            serde_json::from_value(serde_json::json!({
+                "mode": "owner_cleanup",
+                "decisions": [{"path": "/x", "action": "delete_files"}],
+                "delete_files_mode": "permanent"
+            }))
+            .expect("decisions parse");
+        assert_eq!(
+            params.decisions.expect("one")[0].action,
+            CleanupActionName::DeleteFiles
         );
     }
 

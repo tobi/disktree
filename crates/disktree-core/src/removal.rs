@@ -1277,16 +1277,17 @@ fn spawn_checked(
     })
 }
 
-/// The confirmed owner preview travels intact to the existing removal worker.
+/// The confirmed cleanup decisions travel intact to the removal worker,
+/// which runs each step on its own and reports each one.
 pub fn spawn_cleanup(
-    prepared: crate::cleanup::Prepared,
+    approved: crate::cleanup::Approved,
     limit: crate::removal_limit::Ceilings,
 ) -> RemovalHandle {
     start(
-        prepared.plan.clone(),
+        approved.plan.clone(),
         RemovalMode::OwnerCleanup,
         Some(limit),
-        Some(prepared),
+        Some(approved),
         |work| {
             thread::Builder::new()
                 .name("disktree-cleanup".into())
@@ -1294,6 +1295,30 @@ pub fn spawn_cleanup(
                 .map(drop)
         },
     )
+}
+
+/// Trash is looked for only when something will go there: a Trash run, or
+/// a cache cleanup where the person chose to delete files by Trash.
+pub(crate) fn backend_for(
+    mode: RemovalMode,
+    cleanup: Option<&crate::cleanup::Approved>,
+) -> TrashBackend {
+    let trash_steps = cleanup.is_some_and(|approved| {
+        approved.steps.iter().any(|step| {
+            matches!(
+                step,
+                crate::cleanup::Step::Files {
+                    action: crate::cleanup::Action::Trash,
+                    ..
+                }
+            )
+        })
+    });
+    if mode == RemovalMode::Trash || trash_steps {
+        detect_trash_backend()
+    } else {
+        TrashBackend::Unavailable
+    }
 }
 
 /// The work a removal thread runs, boxed so a test can hand it to a
@@ -1306,17 +1331,13 @@ fn start(
     plan: Plan,
     mode: RemovalMode,
     limit: Option<crate::removal_limit::Ceilings>,
-    cleanup: Option<crate::cleanup::Prepared>,
+    cleanup: Option<crate::cleanup::Approved>,
     spawn: impl FnOnce(Work) -> io::Result<()>,
 ) -> RemovalHandle {
     let (sender, events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
-    let backend = if mode == RemovalMode::Trash {
-        detect_trash_backend()
-    } else {
-        TrashBackend::Unavailable
-    };
+    let backend = backend_for(mode, cleanup.as_ref());
     // Shared, not moved: a spawn that fails drops the work unrun, and the
     // targets are still needed to report that each one failed.
     let plan = Arc::new(plan);
@@ -1325,40 +1346,45 @@ fn start(
         let plan = Arc::clone(&plan);
         let sender = sender.clone();
         move || {
+            // Every path has a result, the skipped ones included.
+            if let Some(approved) = &cleanup {
+                for report in &approved.skipped {
+                    let _ = sender.send(RemovalEvent::Cleanup(report.clone()));
+                }
+            }
+            // A cleanup admits each step on its own measurement; only the
+            // capacity ceiling refuses the whole run.
             let checked = if mode == RemovalMode::OwnerCleanup {
                 cleanup
                     .as_ref()
                     .ok_or_else(|| {
-                        "Owner cleanup requires an approved owner preview"
-                            .to_string()
+                        "Cache cleanup requires approved decisions".to_string()
                     })
-                    .and_then(|prepared| {
+                    .and_then(|approved| {
                         let default = crate::removal_limit::Ceilings::default();
-                        prepared.preflight(limit.as_ref().unwrap_or(&default))
+                        approved.admit(limit.as_ref().unwrap_or(&default))
                     })
             } else {
-                crate::cleanup::check_raw(&plan.targets)
+                crate::cleanup::check_raw(&plan.targets).map(|()| vec![])
             };
-            if let Err(reason) = checked {
-                if let Some(cleanup) = &cleanup {
-                    for (operation, target) in
-                        cleanup.operations.iter().zip(&plan.targets)
-                    {
-                        let outcome = Err(reason.clone());
-                        let _ = sender.send(RemovalEvent::Cleanup(
-                            crate::cleanup::Report::of(
-                                operation,
-                                target.bytes,
-                                None,
-                                None,
-                                &outcome,
-                            ),
-                        ));
+            let refusals = match checked {
+                Ok(refusals) => refusals,
+                Err(reason) => {
+                    if let Some(approved) = &cleanup {
+                        let issue = crate::cleanup::Issue::new(
+                            crate::cleanup::Problem::OverLimit,
+                            reason.clone(),
+                        );
+                        for index in 0..plan.targets.len() {
+                            let _ = sender.send(RemovalEvent::Cleanup(
+                                approved.report(index, None, None, Err(&issue)),
+                            ));
+                        }
                     }
+                    fail_all(&plan.targets, &reason, &sender);
+                    return;
                 }
-                fail_all(&plan.targets, &reason, &sender);
-                return;
-            }
+            };
             if let Some(limit) =
                 limit.filter(|_| mode != RemovalMode::OwnerCleanup)
             {
@@ -1378,7 +1404,9 @@ fn start(
                 &plan,
                 mode,
                 backend,
-                cleanup.as_ref(),
+                cleanup
+                    .as_ref()
+                    .map(|approved| (approved, refusals.as_slice())),
                 &worker_cancel,
                 &sender,
             );
@@ -1425,10 +1453,14 @@ fn run(
     plan: &Plan,
     mode: RemovalMode,
     backend: TrashBackend,
-    cleanup: Option<&crate::cleanup::Prepared>,
+    cleanup: Option<(
+        &crate::cleanup::Approved,
+        &[Option<crate::cleanup::Issue>],
+    )>,
     cancel: &AtomicBool,
     sender: &mpsc::Sender<RemovalEvent>,
 ) {
+    use crate::cleanup::{Action, Issue, Problem};
     let _ = sender.send(RemovalEvent::Start {
         total: plan.targets.len(),
     });
@@ -1447,6 +1479,14 @@ fn run(
 
     for (index, target) in plan.targets.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
+            // Stopped: what was not started says so, step by step.
+            if let Some((approved, _)) = cleanup {
+                for rest in index..plan.targets.len() {
+                    let _ = sender.send(RemovalEvent::Cleanup(
+                        approved.not_reached(rest),
+                    ));
+                }
+            }
             break;
         }
         // The /run/media exception must still hold when removal starts;
@@ -1491,31 +1531,53 @@ fn run(
                     remove_permanently(&target.path, &plan.root)
                 }
                 RemovalMode::Trash => move_to_trash(&target.path, backend),
-                RemovalMode::OwnerCleanup => cleanup
-                    .ok_or_else(|| io::Error::other("Missing owner preview"))
-                    .and_then(|prepared| {
-                        prepared
-                            .execute(index, cancel)
-                            .map_err(io::Error::other)
-                    }),
+                RemovalMode::OwnerCleanup => Ok(()),
             }
         };
-        if let Some(operation) =
-            cleanup.and_then(|cleanup| cleanup.operations.get(index))
-        {
-            let outcome = match &outcome {
-                Ok(()) => Ok(()),
-                Err(error) => Err(error.to_string()),
-            };
-            let _ =
-                sender.send(RemovalEvent::Cleanup(crate::cleanup::Report::of(
-                    operation,
-                    target.bytes,
-                    before,
-                    sample(),
-                    &outcome,
-                )));
-        }
+        // A cleanup step: its own refusal, checks and action, with a typed
+        // reason. One step's failure never stops or changes the next.
+        let outcome = if let Some((approved, refusals)) = cleanup {
+            let step = outcome
+                .map_err(|error| {
+                    Issue::new(Problem::Refused, error.to_string())
+                })
+                .and_then(|()| {
+                    refusals.get(index).cloned().flatten().map_or(Ok(()), Err)
+                })
+                .and_then(|()| approved.preflight(index))
+                .and_then(|()| match approved.steps.get(index) {
+                    Some(crate::cleanup::Step::Owner(operation)) => {
+                        approved.prepared.execute(*operation, cancel)
+                    }
+                    Some(crate::cleanup::Step::Files { action, .. }) => {
+                        match action {
+                            Action::Trash => {
+                                move_to_trash(&target.path, backend)
+                            }
+                            _ => remove_permanently(&target.path, &plan.root),
+                        }
+                        .map_err(|error| {
+                            Issue::new(
+                                Problem::RemovalFailed,
+                                error.to_string(),
+                            )
+                        })
+                    }
+                    None => Err(Issue::new(
+                        Problem::Changed,
+                        "Missing cleanup step",
+                    )),
+                });
+            let _ = sender.send(RemovalEvent::Cleanup(approved.report(
+                index,
+                before,
+                sample(),
+                step.as_ref().copied(),
+            )));
+            step.map_err(|issue| io::Error::other(issue.description()))
+        } else {
+            outcome
+        };
         if outcome.is_ok() {
             removed += 1;
             bytes += target.bytes;

@@ -459,6 +459,11 @@ pub struct Disktree {
     pub removal_mode: RemovalMode,
     pub cleanup_review: Option<crate::cleanup::Review>,
     pub cleanup_results: Vec<disktree_core::cleanup::Report>,
+    /// What each step of the running cleanup does, in run-list order.
+    pub cleanup_actions: Vec<disktree_core::cleanup::Action>,
+    /// Where owners are looked for instead of PwrDisk's PATH. Only tests
+    /// set it, so their checks find fixture executables and nothing else.
+    pub cleanup_path: Option<String>,
     pub trash_backend: TrashBackend,
     /// The permanent-deletion alert dialog is open. Trash needs no dialog: it
     /// is reversible, so it commits directly.
@@ -789,6 +794,8 @@ impl Disktree {
             trash_backend,
             cleanup_review: None,
             cleanup_results: vec![],
+            cleanup_actions: vec![],
+            cleanup_path: None,
             confirm_open: false,
             confirm_focus: cx.focus_handle(),
             overlay_return: None,
@@ -2975,7 +2982,7 @@ impl Disktree {
         self.stop_requested = true;
         self.say(
             if self.removal_mode == RemovalMode::OwnerCleanup {
-                "cancelling owner command; partial cleanup may have occurred"
+                "cancelling the current step; an owner command may have partly cleaned its cache"
             } else {
                 "stopping after the current item"
             },
@@ -2989,9 +2996,9 @@ impl Disktree {
     pub fn plan(&self) -> Plan {
         if self.remote.is_none()
             && self.removal_mode == RemovalMode::OwnerCleanup
-            && let Ok(prepared) = self.cleanup_ready()
+            && let Ok(approved) = self.cleanup_approved()
         {
-            return prepared.plan.clone();
+            return approved.plan.clone();
         }
         self.selection_plan()
     }
@@ -3526,6 +3533,21 @@ impl Disktree {
     /// a permanent deletion, which cannot be undone. `rescan` is Remove &
     /// rescan; without it the tree drops what went and stays.
     pub fn commit(&mut self, rescan: bool, cx: &mut Context<'_, Self>) {
+        // A cleanup is checked, then decided, before anything else: until
+        // then there is nothing to confirm.
+        if self.removal_mode == RemovalMode::OwnerCleanup
+            && self.remote.is_none()
+        {
+            if self.cleanup_ready().is_err() {
+                self.prepare_cleanup(cx);
+                return;
+            }
+            if let Err(reason) = self.cleanup_approved() {
+                self.say(reason, Status::Warning, cx);
+                cx.notify();
+                return;
+            }
+        }
         let plan = self.plan();
         if self.remote.is_some() || plan.is_empty() {
             return;
@@ -3541,12 +3563,6 @@ impl Disktree {
         match self.removal_mode {
             RemovalMode::Trash => self.begin_removal(cx),
             RemovalMode::Permanent | RemovalMode::OwnerCleanup => {
-                if self.removal_mode == RemovalMode::OwnerCleanup
-                    && self.cleanup_ready().is_err()
-                {
-                    self.prepare_cleanup(cx);
-                    return;
-                }
                 self.confirm_open = true;
                 self.focus_request = Some(FocusTarget::Dialog);
                 cx.notify();
@@ -3636,20 +3652,66 @@ impl Disktree {
     /// Start the person's removal of what is marked, held to the window's
     /// limit or to the shares Review confirmed past it.
     pub fn begin_removal(&mut self, cx: &mut Context<'_, Self>) {
-        self.start_removal(Remover::Person, cx);
+        self.start_removal(Remover::Person, None, cx);
     }
 
     /// Start an agent's confirmed removal, held to the agent limit
-    /// whatever the window's limit and Review's confirmation say.
-    pub(crate) fn begin_agent_removal(&mut self, cx: &mut Context<'_, Self>) {
-        self.start_removal(Remover::Agent, cx);
+    /// whatever the window's limit and Review's confirmation say. A cache
+    /// cleanup runs the agent's confirmed decisions, never the window's.
+    pub(crate) fn begin_agent_removal(
+        &mut self,
+        cleanup: Option<disktree_core::cleanup::Approved>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.start_removal(Remover::Agent, cleanup, cx);
     }
 
-    fn start_removal(&mut self, by: Remover, cx: &mut Context<'_, Self>) {
+    fn start_removal(
+        &mut self,
+        by: Remover,
+        agent_cleanup: Option<disktree_core::cleanup::Approved>,
+        cx: &mut Context<'_, Self>,
+    ) {
         if self.remote.is_some() {
             return;
         }
-        let plan = self.plan();
+        let cleanup = if self.removal_mode == RemovalMode::OwnerCleanup {
+            let approved = match by {
+                Remover::Person => self.cleanup_approved().cloned(),
+                Remover::Agent => agent_cleanup.ok_or_else(|| {
+                    "Cache cleanup needs confirmed decisions".to_string()
+                }),
+            };
+            match approved {
+                Ok(approved) => Some(approved),
+                Err(reason) => {
+                    self.say(reason, Status::Warning, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // Deleting files directly is its own intent: in the window it needs
+        // its own tick in the confirmation, whatever else was confirmed.
+        if by == Remover::Person
+            && cleanup
+                .as_ref()
+                .is_some_and(|approved| approved.file_steps() > 0)
+            && !self.cleanup_files_ticked()
+        {
+            self.say(
+                "Tick \u{201c}Delete these files myself\u{201d} to delete files without their owner",
+                Status::Warning,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        let plan = cleanup
+            .as_ref()
+            .map_or_else(|| self.plan(), |approved| approved.plan.clone());
         if self.removal_mode != RemovalMode::OwnerCleanup
             && let Some((target, reason)) =
                 plan.targets.iter().find_map(|target| {
@@ -3659,7 +3721,7 @@ impl Disktree {
         {
             self.say(
                 format!(
-                    "{}: {reason}. Choose Owner cleanup and preview its actual scope.",
+                    "{}: {reason}. Choose Cache cleanup to decide what happens to it.",
                     target.path.display()
                 ),
                 Status::Warning,
@@ -3696,18 +3758,11 @@ impl Disktree {
             cx.notify();
             return;
         }
-        let cleanup = if self.removal_mode == RemovalMode::OwnerCleanup {
-            match self.take_cleanup() {
-                Ok(prepared) => Some(prepared),
-                Err(reason) => {
-                    self.say(reason, Status::Warning, cx);
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            None
-        };
+        // The window's decisions are consumed: a retry needs a new check
+        // and new consent, even when a command fails.
+        if by == Remover::Person && cleanup.is_some() {
+            self.cleanup_review = None;
+        }
         // Measured now rather than read from the ticker, which can be a
         // second old: the observed figure is only as good as its baseline.
         let before = space_info(&self.root_path).ok().or(self.space);
@@ -3726,16 +3781,20 @@ impl Disktree {
         self.run_scroll = gpui_kit::UniformListScrollHandle::new();
         self.run_free_before = before.map(|space| space.available);
         self.cleanup_results.clear();
+        self.cleanup_actions =
+            cleanup.as_ref().map_or_else(Vec::new, |approved| {
+                (0..approved.steps.len())
+                    .map(|index| approved.action(index))
+                    .collect()
+            });
         self.stop_requested = false;
         // A confirmation is for this removal only: the next one past the
         // limit asks again, even for the same share and mode.
         self.over_phrase = None;
         self.over_ticked = None;
         self.screen = Screen::Running;
-        self.run = Some(if let Some(prepared) = cleanup {
-            // Consume the exact preview before starting; a retry needs new
-            // preparation and consent even when the command fails.
-            disktree_core::removal::spawn_cleanup(prepared, limit)
+        self.run = Some(if let Some(approved) = cleanup {
+            disktree_core::removal::spawn_cleanup(approved, limit)
         } else {
             disktree_core::removal::spawn_limited(
                 plan,

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::{Command, Environment, Operation, Probe};
+use super::{Command, Environment, Issue, Operation, Owner, Probe, Problem};
 
 const OUTPUT_LIMIT: u64 = 64 * 1024;
 
@@ -40,7 +40,7 @@ impl Probe for SystemProbe {
         &mut self,
         name: &str,
         env: &Environment,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, Issue> {
         resolve_executable(name, env, 0)
     }
 
@@ -54,7 +54,8 @@ impl Probe for SystemProbe {
             env,
             &AtomicBool::new(false),
             Duration::from_secs(10),
-        )?;
+        )
+        .map_err(|issue| issue.detail)?;
         if output.len() as u64 >= OUTPUT_LIMIT {
             Err("Owner probe output exceeded its bound".into())
         } else {
@@ -71,14 +72,20 @@ fn resolve_executable(
     name: &str,
     env: &Environment,
     depth: usize,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, Issue> {
+    let launcher =
+        |detail: &str| Issue::new(Problem::UnsupportedLauncher, detail);
     if depth > 4 {
-        return Err("Unsupported recursive CLI interpreter; expose the installed executable directly".into());
+        return Err(launcher(
+            "Unsupported recursive CLI interpreter; expose the installed executable directly",
+        ));
     }
     // Windows .cmd launchers need a shell and have different quoting
     // rules. Do not quietly run them through cmd.exe.
     if cfg!(windows) {
-        return Err("Owner-command execution is currently supported on macOS and Linux; Windows launchers require a separate audited adapter".into());
+        return Err(launcher(
+            "Owner-command execution is currently supported on macOS and Linux; Windows launchers require a separate audited adapter",
+        ));
     }
     let candidates = if name == "pip" {
         vec!["pip", "pip3"]
@@ -95,10 +102,14 @@ fn resolve_executable(
             }
             let path = dir.join(candidate);
             if path.is_file() {
-                let resolved = std::fs::canonicalize(&path)
-                    .map_err(|error| error.to_string())?;
+                let resolved =
+                    std::fs::canonicalize(&path).map_err(|error| {
+                        Issue::new(Problem::NotFound, error.to_string())
+                    })?;
                 if is_shim(&path) || is_shim(&resolved) {
-                    return Err("Version-manager shim unavailable for cleanup; expose the installed executable directly on PATH. PwrDisk does not auto-install missing tools".into());
+                    return Err(launcher(
+                        "Version-manager shim unavailable for cleanup; expose the installed executable directly on PATH. PwrDisk does not auto-install missing tools",
+                    ));
                 }
                 // npm's distributed CLI resolves to npm-cli.js. A proxy
                 // such as Corepack can download npm even for --version.
@@ -107,21 +118,28 @@ fn resolve_executable(
                         .file_name()
                         .is_none_or(|name| name != "npm-cli.js")
                 {
-                    return Err("npm proxy/wrapper launchers are unsupported; expose the installed npm-cli.js through its npm symlink on PATH".into());
+                    return Err(launcher(
+                        "npm proxy/wrapper launchers are unsupported; expose the installed npm-cli.js through its npm symlink on PATH",
+                    ));
                 }
                 validate_interpreter(&resolved, env, depth)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
                     if std::fs::metadata(&path)
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| {
+                            Issue::new(Problem::NotFound, error.to_string())
+                        })?
                         .permissions()
                         .mode()
                         & 0o111
                         == 0
                     {
-                        return Err(format!(
-                            "Executable found but not executable: {path:?}"
+                        return Err(Issue::new(
+                            Problem::NotFound,
+                            format!(
+                                "Executable found but not executable: {path:?}"
+                            ),
                         ));
                     }
                 }
@@ -129,8 +147,11 @@ fn resolve_executable(
             }
         }
     }
-    Err(format!(
-        "{name} command unavailable on PwrDisk's PATH (software may still be installed)"
+    Err(Issue::new(
+        Problem::NotFound,
+        format!(
+            "{name} command unavailable on PwrDisk's PATH (software may still be installed)"
+        ),
     ))
 }
 
@@ -152,13 +173,15 @@ fn validate_interpreter(
     path: &Path,
     env: &Environment,
     depth: usize,
-) -> Result<(), String> {
+) -> Result<(), Issue> {
+    let launcher =
+        |detail: &str| Issue::new(Problem::UnsupportedLauncher, detail);
     // An npm or Cypress script can use env's node, which must not silently
     // dispatch through a version manager that installs a runtime on demand.
     let mut prefix = [0; 512];
     let length = std::fs::File::open(path)
         .and_then(|mut file| file.read(&mut prefix))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| Issue::new(Problem::NotFound, error.to_string()))?;
     let header = String::from_utf8_lossy(&prefix[..length]);
     let Some(shebang) = header
         .lines()
@@ -174,14 +197,18 @@ fn validate_interpreter(
             .is_some_and(|name| name == "env")
     }) {
         let [_, runtime] = words.as_slice() else {
-            return Err("Unsupported env interpreter arguments; expose a direct installed CLI".into());
+            return Err(launcher(
+                "Unsupported env interpreter arguments; expose a direct installed CLI",
+            ));
         };
         resolve_executable(runtime, env, depth + 1)?;
     } else if words
         .first()
         .is_some_and(|program| is_shim(Path::new(program)))
     {
-        return Err("CLI interpreter is a version-manager shim; expose the installed runtime directly".into());
+        return Err(launcher(
+            "CLI interpreter is a version-manager shim; expose the installed runtime directly",
+        ));
     }
     Ok(())
 }
@@ -191,9 +218,13 @@ pub(super) fn run(
     env: &Environment,
     cancel: &AtomicBool,
     timeout: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, Issue> {
+    let failed = |detail: String| Issue::new(Problem::CommandFailed, detail);
     if cancel.load(Ordering::Relaxed) {
-        return Err("Cancelled before command start".into());
+        return Err(Issue::new(
+            Problem::Cancelled,
+            "Cancelled before command start",
+        ));
     }
     let mut process = Process::new(&command.executable);
     process
@@ -212,11 +243,20 @@ pub(super) fn run(
         use std::os::unix::process::CommandExt as _;
         process.process_group(0);
     }
-    let mut child = process
-        .spawn()
-        .map_err(|error| format!("Owner command could not start: {error}"))?;
-    let stdout = child.stdout.take().ok_or("Missing owner stdout")?;
-    let stderr = child.stderr.take().ok_or("Missing owner stderr")?;
+    let mut child = process.spawn().map_err(|error| {
+        Issue::new(
+            Problem::NotFound,
+            format!("Owner command could not start: {error}"),
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| failed("Missing owner stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| failed("Missing owner stderr".into()))?;
     let read = |mut pipe: Box<dyn std::io::Read + Send>| {
         let mut bytes = Vec::new();
         let result = (&mut pipe).take(OUTPUT_LIMIT).read_to_end(&mut bytes);
@@ -238,16 +278,19 @@ pub(super) fn run(
     loop {
         if cancel.load(Ordering::Relaxed) || start.elapsed() >= timeout {
             terminate(&mut child);
-            return Err("Owner command cancelled or timed out; it may have partially cleaned the cache. No deletion fallback; inspect and preview again".into());
+            return Err(Issue::new(
+                Problem::Cancelled,
+                "Owner command cancelled or timed out; it may have partially cleaned the cache. Nothing else was deleted; inspect and preview again",
+            ));
         }
         if status.is_none() {
             match child.try_wait() {
                 Ok(value) => status = value,
                 Err(error) => {
                     terminate(&mut child);
-                    return Err(format!(
+                    return Err(failed(format!(
                         "Cannot observe owner command: {error}"
-                    ));
+                    )));
                 }
             }
         }
@@ -260,14 +303,16 @@ pub(super) fn run(
         if let (Some(status), Some(output), Some(errors)) =
             (status, output.as_ref(), errors.as_ref())
         {
-            let errors = errors.as_ref().map_err(ToString::to_string)?;
+            let errors =
+                errors.as_ref().map_err(|error| failed(error.to_string()))?;
             if !status.success() {
-                return Err(format!(
-                    "Owner command failed ({status}): {}. It may have partially cleaned the cache; no raw deletion fallback",
+                return Err(failed(format!(
+                    "Owner command failed ({status}): {}. It may have partially cleaned the cache. Nothing else was deleted",
                     String::from_utf8_lossy(errors).escape_debug()
-                ));
+                )));
             }
-            let output = output.as_ref().map_err(ToString::to_string)?;
+            let output =
+                output.as_ref().map_err(|error| failed(error.to_string()))?;
             return Ok(output.clone());
         }
         std::thread::sleep(Duration::from_millis(40));
@@ -345,7 +390,35 @@ pub(super) fn check_tree(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether [`check_in_use`] can look at running processes here.
+pub(super) const ACTIVE_USE_CHECKED: bool =
+    cfg!(any(target_os = "macos", target_os = "linux"));
+
 pub(super) fn check_active(operation: &Operation) -> Result<(), String> {
+    check_in_use(
+        &operation.scope,
+        &operation.cache_root,
+        Some(operation.owner),
+        Some(&operation.command.executable),
+    )
+}
+
+/// Deleting files directly has no owner command, but the same live writers
+/// matter: a process running from or inside the path, one naming it, and
+/// for a recognized cache any running instance of its owner.
+pub(super) fn check_path_active(
+    path: &Path,
+    owner: Option<Owner>,
+) -> Result<(), String> {
+    check_in_use(path, path, owner, None)
+}
+
+fn check_in_use(
+    scope: &Path,
+    cache: &Path,
+    owner: Option<Owner>,
+    executable: Option<&Path>,
+) -> Result<(), String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let mut system = sysinfo::System::new();
@@ -354,30 +427,28 @@ pub(super) fn check_active(operation: &Operation) -> Result<(), String> {
             sysinfo::ProcessRefreshKind::everything(),
         );
         if system.processes().is_empty() {
-            return Err("Cannot check active owner processes".into());
+            return Err("Cannot check active processes".into());
         }
-        let cache = operation
-            .cache_root
-            .to_str()
-            .ok_or("Unsupported cache path")?;
+        let cache = cache.to_str().ok_or("Unsupported cache path")?;
         for (pid, process) in system.processes() {
             if pid.as_u32() == std::process::id() {
                 continue;
             }
             let in_scope = process
                 .exe()
-                .is_some_and(|path| path.starts_with(&operation.scope))
-                || process
-                    .cwd()
-                    .is_some_and(|path| path.starts_with(&operation.scope));
+                .is_some_and(|path| path.starts_with(scope))
+                || process.cwd().is_some_and(|path| path.starts_with(scope));
             let using_cache = process.cmd().iter().any(|argument| {
                 let argument = argument.to_string_lossy();
-                argument.contains(cache) || owner_argument(operation, &argument)
+                argument.contains(cache)
+                    || owner.is_some_and(|owner| {
+                        owner_named(owner, executable, &argument)
+                    })
             });
             if in_scope || using_cache {
                 return Err(format!(
-                    "{} may be active (process {pid}); stop it and prepare a new preview",
-                    operation.owner.label()
+                    "{} may be in use (process {pid}); stop it and prepare a new preview",
+                    owner.map_or("This path", Owner::label)
                 ));
             }
         }
@@ -385,7 +456,7 @@ pub(super) fn check_active(operation: &Operation) -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = operation;
+        let _ = (scope, cache, owner, executable);
         Err("Active-use checking is unsupported on this platform".into())
     }
 }
@@ -393,21 +464,34 @@ pub(super) fn check_active(operation: &Operation) -> Result<(), String> {
 /// Node launchers appear as `node .../npm-cli.js`, and Python installations
 /// commonly expose pip3. Comparing only the friendly owner name misses
 /// those live writers even though their configured cache is the same.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(test)]
 pub(super) fn owner_argument(operation: &Operation, argument: &str) -> bool {
+    owner_named(
+        operation.owner,
+        Some(&operation.command.executable),
+        argument,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn owner_named(
+    owner: Owner,
+    executable: Option<&Path>,
+    argument: &str,
+) -> bool {
     let path = Path::new(argument);
     let name = path.file_name();
-    path == operation.command.executable
+    executable.is_some_and(|executable| path == executable)
         || name.is_some_and(|name| {
-            name == operation.owner.executable()
-                || Some(name) == operation.command.executable.file_name()
-                || (matches!(
-                    operation.owner,
-                    super::Owner::Npm | super::Owner::Npx
-                ) && matches!(
-                    name.to_str(),
-                    Some("npm" | "npx" | "npm-cli.js" | "npx-cli.js")
-                ))
-                || (operation.owner == super::Owner::Pip && name == "pip3")
+            name == owner.executable()
+                || executable.is_some_and(|executable| {
+                    Some(name) == executable.file_name()
+                })
+                || (matches!(owner, Owner::Npm | Owner::Npx)
+                    && matches!(
+                        name.to_str(),
+                        Some("npm" | "npx" | "npm-cli.js" | "npx-cli.js")
+                    ))
+                || (owner == Owner::Pip && name == "pip3")
         })
 }

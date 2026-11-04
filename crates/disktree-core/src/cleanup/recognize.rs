@@ -144,3 +144,91 @@ pub(super) fn inspection_with(
         })
     })
 }
+
+/// The owner a path most likely belongs to: a known or configured root
+/// containing it, or a recognizable layout a few levels up. A hint picks
+/// which owner to ask; only that owner's own query confirms a root.
+pub(super) fn hinted(
+    path: &Path,
+    env: &Environment,
+) -> Option<(Owner, PathBuf)> {
+    owner(path, env).or_else(|| {
+        path.ancestors().take(4).find_map(|root| {
+            shape_owner(root).map(|owner| (owner, root.to_owned()))
+        })
+    })
+}
+
+// Enough to name the caches inside a wrapper such as ~/.cache without
+// walking every file of every cache in it on the preview worker.
+const CONTAINED_DEPTH: usize = 3;
+const CONTAINED_DIRECTORIES: usize = 20_000;
+const CONTAINED_LISTED: usize = 8;
+
+/// Recognized caches strictly inside `path`, for the disclosure shown
+/// before deleting it directly: their owners are bypassed too. Bounded,
+/// and fails closed so a disclosure is never silently incomplete.
+pub(super) fn contained(
+    path: &Path,
+    env: &Environment,
+) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    let mut pending = vec![(path.to_owned(), 0)];
+    let mut visited = 0;
+    while let Some((directory, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if directory == path => {
+                // A file or a vanished path contains nothing.
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::NotADirectory
+                    || path.is_file()
+                {
+                    return Ok(found);
+                }
+                return Err(format!("Cannot inspect contents: {error}"));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot inspect {}: {error}",
+                    directory.display()
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let child = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            visited += 1;
+            if visited > CONTAINED_DIRECTORIES {
+                return Err("Too many folders to list the caches inside; inspect a smaller selection".into());
+            }
+            let label = owner(&child, env)
+                .filter(|(_, root)| *root == child)
+                .map(|(owner, _)| owner.label().to_owned())
+                .or_else(|| {
+                    shape_owner(&child).map(|owner| owner.label().to_owned())
+                })
+                .or_else(|| {
+                    child
+                        .join("CACHEDIR.TAG")
+                        .is_file()
+                        .then(|| "tagged cache".to_owned())
+                });
+            if let Some(label) = label {
+                if found.len() < CONTAINED_LISTED {
+                    found.push(format!("{label} at {}", child.display()));
+                }
+                // Its own contents belong to it; no need to look inside.
+                continue;
+            }
+            if depth + 1 < CONTAINED_DEPTH {
+                pending.push((child, depth + 1));
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}

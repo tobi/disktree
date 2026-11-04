@@ -289,9 +289,16 @@ impl Disktree {
                 Response::State(self.agent_state())
             }
             Request::State => Response::State(self.agent_state()),
-            Request::PrepareRemoval { mode } => {
-                self.agent_prepare_removal(*mode, cx)
-            }
+            Request::PrepareRemoval {
+                mode,
+                decisions,
+                files,
+            } => self.agent_prepare_removal(
+                *mode,
+                decisions.as_deref(),
+                *files,
+                cx,
+            ),
             Request::Remove(request) => self.agent_remove(request, cx),
             Request::Show { root, path } => self.agent_show(root, path, cx),
             Request::Scan { root, options } => {

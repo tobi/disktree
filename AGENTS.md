@@ -216,6 +216,10 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
     worker as at the preview: nothing the person confirms in Review
     raises an agent's removal. `mark_guard.rs` holds the rule.
     Trash never falls back to permanent deletion. No headless or SSH removal.
+    A cache cleanup is decided per marked path (Skip by default, the
+    owner's exact command, or Delete files); owner approval never approves
+    deleting files, which has its own consent, and a failed owner command
+    never falls back to it. See `docs/owner-cleanup.md`.
     A linked window's tree and marks remain the source of truth; `ls` and
     `find` read it without navigating. Only an explicit `show` request moves
     the view, and guidance requires the user to request that behavior.
@@ -284,6 +288,7 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 | what git is asked about a checkout, when, and how many at once | `crates/disktree-app/src/git.rs` (the probe and its time limit), `crates/disktree-app/src/git_store.rs` (the queue, the bucket, the cache) |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | what may be marked, Mark anyway, Review's over-limit confirmation | `crates/disktree-app/src/mark_guard.rs`, the settings in `safety.rs` |
+| cache cleanup: owners, proposals, decisions, per-path results | `crates/disktree-core/src/cleanup.rs` (model, allowlist), `crates/disktree-app/src/cleanup.rs` (window state), `cleanup_view.rs` (Review's proposals) |
 | Removing and Done: the run's list, its rows, following and running figures; the row anatomy Review shares | `crates/disktree-app/src/run_view.rs`, the model in `run_list.rs`, Review's `mark_row` in `views.rs` |
 | what the explore bar folds into ⋮ at each width, and ⋮'s keys | `crates/disktree-app/src/toolbar.rs` |
 | the legend as a filter: its chips and what they keep | `crates/disktree-app/src/legend.rs`, the rule in `crates/disktree-core/src/filter.rs` |

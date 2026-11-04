@@ -241,10 +241,16 @@ Looking is free; acting is the user's call.
 8. **Confirm removal or hand it over.** To let the person remove in the
    app, announce `pwrdisk_review`, open it, and stop; never approve through
    computer use. For requested MCP removal, call `pwrdisk_removal_preview`
-   with `owner_cleanup` for supported tool caches (otherwise explicit
-   `trash` or `permanent` for ordinary paths). Show every owner, version,
-   executable, argument list, environment override, selected path, actual
-   whole-cache scope, effects and limitations, including unselected siblings.
+   with `owner_cleanup` for caches (otherwise explicit `trash` or
+   `permanent` for ordinary paths). A cache cleanup is decided per path:
+   the first preview lists one proposal per marked path; show every owner,
+   version, executable, argument list, environment override, selected path,
+   actual whole-cache scope, effects, limitations and recoverability, and
+   every unavailable reason. The user chooses `skip`, `owner` or
+   `delete_files` for each path; never choose for them or suggest
+   `delete_files` yourself. Preview again with those `decisions` (and
+   `delete_files_mode` when any path deletes files); its confirmation text
+   names each intent, and owner approval never approves deleting files.
    Every mode may return preparing while inspection runs on a worker;
    retry only the read-only preview. Exports contain marked paths, never
    expanded owner scopes; a refused raw script is not a deletion fallback.
@@ -266,8 +272,9 @@ Looking is free; acting is the user's call.
 9. **Report.** `pwrdisk_status` reports completed and failed removals and
    measured freed space. Report that figure, not a projection. Trash is not
    guaranteed recoverable and does not guarantee an immediate space saving.
-   Owner cleanup always rescans and reports command success/failure separately
-   from scope allocation and observed free-space change. Success need not
+   Cache cleanup always rescans and reports each path's result (succeeded,
+   failed with a reason, cancelled, skipped, not reached) separately from
+   scope allocation and observed free-space change. Success need not
    remove the cache root or free its listed allocation; APFS snapshots/clones,
    hardlinks and open files can retain blocks. Never alter snapshots.
    Raw removal does not rescan unless `pwrdisk_remove` is given `rescan: true`,

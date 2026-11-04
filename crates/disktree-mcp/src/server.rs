@@ -60,15 +60,22 @@ marking. Approval to mark is never approval to remove. pwrdisk_review \
 only opens the marked list; announce it first and let the person approve. \
 NEVER use computer use, clicks, approval keys or accessibility actions to \
 approve a removal, even after the user approved marking or removal. \
-Recognized tool caches require owner_cleanup; a cache name or regenerable \
-classification never authorizes raw deletion. Unknown runtime/install \
-caches need inspection. No raw deletion fallback for unavailable, unsupported \
-or failed owners. For MCP removal: pwrdisk_removal_preview requires an \
-explicit owner_cleanup, trash or permanent mode and returns a five-minute, \
-single-use preview. Owner resolution may first report preparing; retry only \
-that read-only preview. Show every owner, executable, argument, environment \
-override, actual whole-cache scope (including unselected siblings), effects \
-and limitations. Obtain approval for that actual scope. Show the \
+Caches go through owner_cleanup; a cache name or regenerable \
+classification never authorizes deletion. owner_cleanup without decisions \
+lists one proposal per marked path and cannot be confirmed: show every \
+owner, version, executable, argument, environment override, actual \
+whole-cache scope (including unselected siblings), effects, limitations, \
+recoverability and unavailable reason, then let the user choose skip, owner \
+or delete_files for each path. Never choose for them or suggest \
+delete_files; inspect unknown runtime/install caches first. Preview again \
+with decisions for every path (and delete_files_mode when any deletes \
+files); its confirmation text names each intent, and owner approval never \
+approves deleting files. Unavailable, unsupported, failed or cancelled \
+owners never fall back to deleting files. For MCP removal: \
+pwrdisk_removal_preview requires an explicit owner_cleanup, trash or \
+permanent mode and returns a five-minute, single-use preview. Owner \
+resolution may first report preparing; retry only that read-only preview. \
+Show the \
 user ALL paths, mode, measured bytes and capacity limit. Trash moves data \
 to Trash or Recycle Bin; restoration may be possible until emptied but is \
 not guaranteed, and space usually returns only once emptied. Permanent \
