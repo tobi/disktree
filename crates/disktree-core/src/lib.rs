@@ -37,6 +37,8 @@ pub mod scan_threads;
 pub mod sharing;
 pub mod size;
 pub mod space;
+#[cfg(test)]
+mod test_rng;
 pub mod tree;
 pub mod treemap;
 #[cfg(windows)]

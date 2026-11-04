@@ -244,7 +244,9 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
     buffers instead of tens of millions of allocations. An allocation record
     keeps only what its node does not say (`index/records.rs`): a clone with
     one name reads its size from the node, so a placed leaf's `bytes` and
-    `inode` change only by hardlink de-duplication. A node is read
+    `inode` change only by hardlink de-duplication. A record is never
+    changed in place, which is what lets the files of a clone group share
+    one; a change that writes to a record must stop that. A node is read
     through a `Node<'_>` cursor from its tree and written through `NodeMut`
     or a whole-tree pass. Build with `Tree::build` (a `Draft` for tests and
     small trees); a subtree moves to another tree only as a copy. A

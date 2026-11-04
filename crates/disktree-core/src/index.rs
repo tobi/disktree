@@ -1229,6 +1229,7 @@ impl Tree {
         store.root = Store::index(store.nodes.len());
         store.nodes.push(root);
         store.relayout();
+        store.allocations.seal();
         Self { store }
     }
 

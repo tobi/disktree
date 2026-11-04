@@ -1,9 +1,10 @@
 //! A digest of a scanned tree, to compare two builds of the scanner:
 //! `cargo run --release -p disktree-core --example tree_digest -- PATH`
 //!
-//! Hashes every node's name, totals, category and reclaim reason depth
-//! first, in child order, then again after re-ranking by file count, so
-//! two trees agree only if their shape, figures and order all do.
+//! Hashes every node's name, totals, category, reclaim reason, sharing
+//! figures and allocation record depth first, in child order, then again
+//! after re-ranking by file count, so two trees agree only if their shape,
+//! figures and order all do.
 //!
 //! Which name of a hardlinked file is charged depends on which worker
 //! reaches it first, so set `NODEDUP=1` to compare two builds exactly.
@@ -26,8 +27,11 @@ fn digest(node: Node<'_>, hasher: &mut DefaultHasher) {
     )
         .hash(hasher);
     format!("{:?}{:?}", node.category, node.reclaim).hash(hasher);
+    // Every sharing figure and the file's allocation record, private
+    // sizes and estimate bounds included: APFS clone accounting must not
+    // move any of them.
     let sharing = node.sharing();
-    (sharing.files, sharing.bytes, sharing.duplicate_bytes).hash(hasher);
+    format!("{sharing:?}{:?}", node.allocation()).hash(hasher);
     if std::env::var_os("DUMP").is_some() {
         println!(
             "{} {} {} {} {} {} {:?} {:?} {} {} {}",

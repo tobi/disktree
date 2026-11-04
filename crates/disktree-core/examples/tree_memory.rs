@@ -1,5 +1,6 @@
 //! What a scanned tree costs to hold and to let go of, on macOS:
 //! `cargo run --release -p disktree-core --example tree_memory -- PATH`
+//! (`-- --no-clones PATH` scans without APFS clone metadata)
 //!
 //! Scans PATH, then reports the process's physical footprint (resident
 //! plus compressed, what Activity Monitor calls Memory) after the scan and
@@ -23,13 +24,20 @@ fn main() -> std::io::Result<()> {
     use disktree_core::scan::{ScanOptions, scan};
     use disktree_core::tree::{Metric, aggregate, reorder};
 
-    let root = std::env::args_os()
-        .nth(1)
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut options = ScanOptions::default();
+    if let Some(at) = args.iter().position(|arg| arg == "--no-clones") {
+        args.remove(at);
+        options.apfs_clone_metadata = false;
+    }
+    let root = args
+        .into_iter()
+        .next()
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
 
     let (before, _) = footprint_mib();
     let started = Instant::now();
-    let tree = scan(&root, ScanOptions::default())?;
+    let tree = scan(&root, options)?;
     let scanned = started.elapsed().as_secs_f64();
     let (now, peak) = footprint_mib();
     let storage = tree.storage_bytes();

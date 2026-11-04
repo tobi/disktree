@@ -40,6 +40,31 @@ impl Default for Cache {
 }
 
 impl Cache {
+    fn shard(&self, key: (u64, u64)) -> &Mutex<Shard> {
+        let mut hash = FxHasher::default();
+        key.hash(&mut hash);
+        let index = usize::try_from(hash.finish() % SHARDS as u64)
+            .expect("shard index fits");
+        &self.shards[index]
+    }
+
+    /// Whether another file of this group was found to share all its
+    /// blocks: only such a file is sampled. For a listing that leaves the
+    /// sharing flags out (`macos::Clones::Ids`), which every file of a
+    /// group shares. A group past the cache's room is not known here, and
+    /// its files read their own flags: that costs time, not accuracy.
+    pub fn shares_all(&self, device: u64, id: u64) -> bool {
+        let key = (device, id);
+        device != 0
+            && id != 0
+            && self
+                .shard(key)
+                .lock()
+                .expect("clone cache")
+                .groups
+                .contains_key(&key)
+    }
+
     /// A reference count is a reuse budget, not a permanent fact. A later
     /// member past that budget is measured again, catching clone growth.
     /// Modified clones and unknown physical volumes are never reused.
@@ -53,12 +78,8 @@ impl Cache {
         measure: impl FnOnce() -> CloneInfo,
     ) -> CloneInfo {
         let key = (device, id);
-        let mut hash = FxHasher::default();
-        key.hash(&mut hash);
-        let index = usize::try_from(hash.finish() % SHARDS as u64)
-            .expect("shard index fits");
         if device != 0 && id != 0 && inode != 0 {
-            let mut shard = self.shards[index].lock().expect("clone cache");
+            let mut shard = self.shard(key).lock().expect("clone cache");
             let alias_room = shard.aliases < self.alias_limit;
             if let Some(sample) = shard
                 .groups
@@ -92,7 +113,7 @@ impl Cache {
         {
             return info;
         }
-        let mut shard = self.shards[index].lock().expect("clone cache");
+        let mut shard = self.shard(key).lock().expect("clone cache");
         if let Some(old) = shard.groups.remove(&key) {
             shard.aliases -= old.aliases.len();
         }
@@ -163,6 +184,23 @@ mod tests {
             sample(1, 42, 3)
         });
         assert!(measured, "new scans must not reuse previous observations");
+    }
+
+    #[test]
+    fn only_a_sampled_group_is_known_to_share_all_its_blocks() {
+        let cache = Cache::default();
+        assert!(!cache.shares_all(1, 42));
+        cache.get(1, 42, 1, 1, 4096, || sample(1, 42, 2));
+        assert!(cache.shares_all(1, 42));
+        // A modified member is never a sample, nor is an unknown volume.
+        cache.get(1, 43, 2, 1, 4096, || {
+            let mut info = sample(1, 43, 2);
+            info.private_bytes = Some(4096);
+            info
+        });
+        assert!(!cache.shares_all(1, 43));
+        cache.get(0, 44, 3, 1, 4096, || sample(0, 44, 2));
+        assert!(!cache.shares_all(0, 44));
     }
 
     #[test]

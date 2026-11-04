@@ -852,6 +852,7 @@ fn list(
     path: &Path,
     _volume: Option<u64>,
     _clones: bool,
+    _clone_flags: bool,
 ) -> io::Result<impl Iterator<Item = io::Result<Named>>> {
     let entries = fs::read_dir(path)?;
     Ok(entries.map(|entry| {
@@ -870,8 +871,17 @@ fn list(
     path: &Path,
     _volume: Option<u64>,
     clones: bool,
+    clone_flags: bool,
 ) -> io::Result<crate::macos::ReadDir> {
-    crate::macos::read_dir(path, clones)
+    use crate::macos::Clones;
+    crate::macos::read_dir(
+        path,
+        match (clones, clone_flags) {
+            (false, _) => Clones::Off,
+            (true, false) => Clones::Ids,
+            (true, true) => Clones::Flags,
+        },
+    )
 }
 
 #[cfg(windows)]
@@ -879,6 +889,7 @@ fn list(
     path: &Path,
     volume: Option<u64>,
     _clones: bool,
+    _clone_flags: bool,
 ) -> io::Result<crate::windows::ReadDir> {
     crate::windows::read_dir(path, volume)
 }
@@ -914,6 +925,9 @@ struct PendingDir<'h> {
     read_error: AtomicBool,
     depth: usize,
     followed: bool,
+    /// Whether its listing asks for APFS sharing flags; see
+    /// [`subdirectory_flags`].
+    clone_flags: bool,
 }
 
 /// What a directory's node is made of before it is built: the name the
@@ -943,6 +957,7 @@ impl<'h> PendingDir<'h> {
             read_error: AtomicBool::new(false),
             depth,
             followed: false,
+            clone_flags: true,
         }
     }
 
@@ -1277,17 +1292,20 @@ fn walk<'h>(
         signal_done(dir, sink);
         return Vec::new();
     }
-    let mut subdirs: Vec<Arc<PendingDir<'h>>> = Vec::new();
+    let mut subdirs: Vec<PendingDir<'h>> = Vec::new();
     // Gathered first and added to the tree under one lock: every worker
     // appends to the same buffers.
     let mut found: Vec<Leaf> = Vec::new();
     let mut leaves: Vec<Built<'h>> = Vec::new();
     let mut tally = Tally::default();
 
+    let clones =
+        context.options.apfs_clone_metadata && !context.options.apparent_size;
     match list(
         &dir.path,
         context.volume.get().copied(),
-        context.options.apfs_clone_metadata && !context.options.apparent_size,
+        clones,
+        dir.clone_flags,
     ) {
         Ok(entries) => {
             for entry in entries {
@@ -1317,7 +1335,7 @@ fn walk<'h>(
                                     dir.depth + 1,
                                 );
                                 child.followed = followed;
-                                subdirs.push(Arc::new(child));
+                                subdirs.push(child);
                             }
                             Classified::Entry(leaf) => {
                                 tally.add(&leaf.facts);
@@ -1356,6 +1374,9 @@ fn walk<'h>(
         }
     }
     tally.flush(&context.progress, &dir.path);
+    let clone_flags = !clones
+        || always_flags()
+        || subdirectory_flags(dir.clone_flags, &found);
     leaves.extend(
         sink.builder.leaves(
             found
@@ -1386,17 +1407,66 @@ fn walk<'h>(
     }
     let mut children = Vec::new();
     if descend {
-        for subdir in subdirs {
+        for mut subdir in subdirs {
             if context.cancelled() {
                 break;
             }
             dir.pending.fetch_add(1, Ordering::AcqRel);
-            children.push(subdir);
+            subdir.clone_flags = clone_flags;
+            children.push(Arc::new(subdir));
         }
     }
 
     signal_done(dir, sink);
     children
+}
+
+/// Every listing asks for sharing flags while this is set, as before
+/// listings could leave them out: what tests compare the listing policy
+/// against. Only the cost differs, so other tests may run beside it.
+#[cfg(test)]
+pub(crate) static ALWAYS_FLAGS: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn always_flags() -> bool {
+    ALWAYS_FLAGS.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+const fn always_flags() -> bool {
+    false
+}
+
+/// Whether the subdirectories of a directory whose files are `found`
+/// list their files' APFS sharing flags. Without them a file whose clone
+/// group the scan has not met is read on its own, as most clones are
+/// anyway to measure their private size, and a file never cloned is read
+/// for nothing; per file that read cost about twice what the flags cost a
+/// clone in a listing (on a home Library, a folder of checkouts and agent
+/// worktrees). Folders resemble their parents, so a directory whose files
+/// are clones two to one or more lists its subdirectories without the
+/// flags, and others with. A directory of no files passes its own on.
+fn subdirectory_flags(own: bool, found: &[Leaf]) -> bool {
+    let (mut clones, mut plain) = (0_usize, 0_usize);
+    for leaf in found
+        .iter()
+        .filter(|leaf| leaf.facts.kind == NodeKind::File)
+    {
+        if leaf
+            .allocation
+            .as_ref()
+            .is_some_and(|allocation| allocation.clone.is_some())
+        {
+            clones += 1;
+        } else {
+            plain += 1;
+        }
+    }
+    if clones + plain == 0 {
+        own
+    } else {
+        2 * plain >= clones
+    }
 }
 
 /// Report that one task for `dir` is done: either its own scan, or one of its
@@ -1632,6 +1702,37 @@ mod tests {
     use crate::tree::{Metric, Node};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn subdirectories_list_sharing_flags_unless_clones_outnumber_files() {
+        let leaf = |kind, clone: bool| Leaf {
+            name: "leaf".into(),
+            facts: crate::tree::Facts::entry(kind, 4096),
+            allocation: clone.then(|| crate::sharing::Allocation {
+                bytes: 4096,
+                identity: None,
+                links: 1,
+                followed: false,
+                clone: Some(crate::sharing::CloneInfo::default()),
+            }),
+        };
+        let files = |clones: usize, plain: usize| {
+            let mut found: Vec<Leaf> = (0..clones)
+                .map(|_| leaf(NodeKind::File, true))
+                .chain((0..plain).map(|_| leaf(NodeKind::File, false)))
+                .collect();
+            found.push(leaf(NodeKind::Symlink, false));
+            found
+        };
+        // No files: as the directory itself was listed.
+        for own in [false, true] {
+            assert_eq!(subdirectory_flags(own, &files(0, 0)), own);
+        }
+        assert!(subdirectory_flags(false, &files(0, 1)));
+        assert!(subdirectory_flags(false, &files(2, 1)));
+        assert!(!subdirectory_flags(true, &files(3, 1)));
+        assert!(!subdirectory_flags(true, &files(5, 0)));
+    }
 
     #[test]
     fn optional_service_failures_remain_errors_without_requesting_access() {

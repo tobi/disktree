@@ -11,6 +11,8 @@
 //! facts: its identity is the node's inode. Anything else keeps the whole
 //! struct, so no figure is ever approximated to fit.
 
+use rustc_hash::FxHashMap;
+
 use super::Facts;
 use crate::sharing::{Allocation, CloneInfo};
 
@@ -56,8 +58,9 @@ impl Starts {
 }
 
 /// A clone with one name and no private blocks: what nearly every file
-/// of a directory of cloned worktrees is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// of a directory of cloned worktrees is. Every file of a clone group
+/// reads the same one, which is kept once: see [`Records::reuse`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct SharedClone {
     id: u64,
     /// APFS reports the real device as 32 bits.
@@ -74,6 +77,11 @@ pub(super) struct PartialClone {
     device: u32,
     references: u32,
 }
+
+/// Shared records [`Records::reuse`] remembers while a tree is built:
+/// a group a record, so room for this many groups. Past it a record is
+/// kept per file again, which costs memory, not accuracy.
+const REUSED: usize = 1 << 20;
 
 /// No file holds `u64::MAX` bytes, so it can stand for an unknown
 /// private size without an `Option`'s eight bytes of tag.
@@ -202,6 +210,12 @@ pub(super) struct Records {
     clones: Vec<PartialClone>,
     links: Vec<Linked>,
     full: Vec<Allocation>,
+    /// Where each shared record is, while the tree is built: files of a
+    /// group share a record, as no record is ever changed in place. On
+    /// 8.9 million files of agent worktrees 8.1 million kept one, in 129
+    /// thousand groups; one apiece was 124 MiB of a 1 GiB tree. Dropped
+    /// when the tree is finished.
+    reuse: FxHashMap<SharedClone, u32>,
 }
 
 impl Records {
@@ -214,8 +228,17 @@ impl Records {
     ) -> (u32, usize) {
         match Packed::of(allocation, facts) {
             Packed::SharedClone(record) => {
+                if let Some(&index) = self.reuse.get(&record) {
+                    return (SHARED, index as usize);
+                }
+                let index = self.shared.len();
                 self.shared.push(record);
-                (SHARED, self.shared.len() - 1)
+                if self.reuse.len() < REUSED
+                    && let Ok(at) = u32::try_from(index)
+                {
+                    self.reuse.insert(record, at);
+                }
+                (SHARED, index)
             }
             Packed::PartialClone(record) => {
                 self.clones.push(record);
@@ -296,6 +319,11 @@ impl Records {
         })
     }
 
+    /// Forget which records can be shared: the tree is finished.
+    pub(super) fn seal(&mut self) {
+        self.reuse = FxHashMap::default();
+    }
+
     /// Where each table of a store appended to this one will start.
     pub(super) const fn starts(&self) -> Starts {
         Starts {
@@ -325,6 +353,7 @@ impl Records {
             clones,
             links,
             full,
+            reuse: FxHashMap::default(),
         }
     }
 
@@ -426,6 +455,34 @@ mod tests {
                 "{private:?}"
             );
         }
+    }
+
+    #[test]
+    fn files_of_a_group_share_one_record_until_the_tree_is_sealed() {
+        let mut records = Records::default();
+        let small = file(4096);
+        let large = file(8192);
+        let mut larger = clone(Some(0));
+        larger.bytes = 8192;
+        larger.clone.as_mut().expect("clone").data_bytes = 8192;
+        let (tag, first) = records.push(clone(Some(0)), &small);
+        assert_eq!(tag, SHARED);
+        // Another member, another size: the size is the node's own.
+        assert_eq!(records.push(larger, &large), (SHARED, first));
+        assert_eq!(
+            records.get(SHARED, first, &large),
+            Some(Allocation {
+                identity: None,
+                ..larger
+            })
+        );
+        // Another reference count is another record.
+        let mut counted = clone(Some(0));
+        counted.clone.as_mut().expect("clone").references = 3;
+        assert_ne!(records.push(counted, &small), (SHARED, first));
+        assert_eq!(records.len(), 2);
+        records.seal();
+        assert_ne!(records.push(clone(Some(0)), &small), (SHARED, first));
     }
 
     #[test]
