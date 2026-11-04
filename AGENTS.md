@@ -254,6 +254,15 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
     lets `par_bottom_up` split it across workers without `unsafe`: only
     the order *within* a block may change after it is built.
 
+16. **A bug fix states the rule it broke as a property, model or oracle
+    test, and confirms that test fails on the pre-fix code.** Do the same
+    for new guard, limit, accounting and path logic, and for state that
+    changes over time. Example tests alone check only what their author
+    expected. Here they have asserted the bug as correct, and passed only
+    because of a bug.
+    [docs/property-model-oracle-testing.md](docs/property-model-oracle-testing.md)
+    says what each kind is and how to write one.
+
 ## Where changes belong
 
 | change | where |
