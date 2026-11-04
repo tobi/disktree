@@ -144,9 +144,11 @@ executable's identity and re-probes version and configured root against
 the captured environment, rechecks the scope, and checks whether the owner
 is running; before each deletion it checks for a process running from,
 inside or naming the path, or for a recognized cache any running instance
-of its owner. Detection is best effort; close owning tools first. uv's own
-lock adds coordination; known `UV_LINK_MODE=symlink` is refused because
-installed environments can depend on cache files.
+of its owner. An owner counts as running under any name it launches by:
+npm's and npx's node entry points, `pip3` and versioned names such as
+`pip3.12`, and uv's `uvx`. Detection is best effort; close owning tools
+first. uv's own lock adds coordination; known `UV_LINK_MODE=symlink` is
+refused because installed environments can depend on cache files.
 
 A failed step reports why and the run moves on to the next. Probes time
 out after ten seconds; commands after ten minutes. Stop kills the current

@@ -11064,6 +11064,148 @@ fn cache_cleanup_decides_each_path_and_deleting_files_needs_its_own_tick(
     assert!(temp.path().join("keep/notes.txt").exists());
 }
 
+/// Review's cache decisions against a model of them. After any command a
+/// person can give (an action for one path, Trash or permanent, the
+/// consent tick) the window shows the model's decisions, its kept
+/// approval equals a fresh one, a change to what is deleted clears the
+/// tick, and the export still lists exactly the marked paths.
+///
+/// Cases come from a seed, named when one breaks the rule; set
+/// `PWRDISK_SEED` to replay it.
+#[cfg(unix)]
+#[gpui_kit::test]
+fn cache_cleanup_decisions_follow_a_model_of_them(cx: &mut TestAppContext) {
+    use disktree_core::cleanup::{Action, Decision};
+
+    /// `SplitMix64`, as disktree-core's tests use, picking commands.
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    let _turn = MOCK_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx, _, _bin) = cache_cleanup_view(&temp, cx);
+    update(&view, cx, |app, cx| app.commit(false, cx));
+    await_owners(&view, cx);
+    let (marked, exported, trash) = read(&view, cx, |app| {
+        (
+            app.marks.len(),
+            app.export_text(false).expect("marked list").0,
+            app.trash_backend.is_available(),
+        )
+    });
+    assert_eq!(exported.lines().count(), marked);
+    let initial = read(&view, cx, Disktree::cleanup_files);
+    let first = std::env::var("PWRDISK_SEED")
+        .ok()
+        .and_then(|seed| seed.parse().ok())
+        .unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            now.as_secs().wrapping_mul(1_000_003)
+                ^ u64::from(now.subsec_nanos())
+        });
+    for seed in (0..8).map(|run| first.wrapping_add(run)) {
+        // Each seed starts from the same state, so it replays alone.
+        update(&view, cx, |app, cx| {
+            for index in 0..marked {
+                app.decide_cleanup(index, Decision::Skip, cx);
+            }
+            app.set_cleanup_files(initial, cx);
+        });
+        let mut decisions = vec![Decision::Skip; marked];
+        let mut files = initial;
+        let mut ticked = false;
+        let mut state = seed;
+        let mut history = vec![];
+        for _ in 0..30 {
+            let command = next(&mut state) % 3;
+            let index = usize::try_from(next(&mut state) % marked as u64)
+                .expect("index");
+            let decision =
+                [Decision::Skip, Decision::Owner, Decision::DeleteFiles]
+                    [usize::try_from(next(&mut state) % 3).expect("index")];
+            let action = if next(&mut state).is_multiple_of(2) {
+                Action::Trash
+            } else {
+                Action::Permanent
+            };
+            update(&view, cx, |app, cx| match command {
+                0 => {
+                    history.push(format!("decide {index} {decision:?}"));
+                    let offered =
+                        app.cleanup_ready().expect("checked").proposals[index]
+                            .allows(decision);
+                    if offered {
+                        decisions[index] = decision;
+                        ticked = false;
+                    }
+                    app.decide_cleanup(index, decision, cx);
+                }
+                1 => {
+                    history.push(format!("files {action:?}"));
+                    if action != Action::Trash || trash {
+                        files = action;
+                        ticked = false;
+                    }
+                    app.set_cleanup_files(action, cx);
+                }
+                _ => {
+                    history.push("tick".into());
+                    ticked = !ticked;
+                    app.tick_cleanup_files(cx);
+                }
+            });
+            let case = format!("seed {seed}: after {history:?}");
+            read(&view, cx, |app| {
+                let shown: Vec<_> = (0..marked)
+                    .map(|index| app.cleanup_decision(index))
+                    .collect();
+                assert_eq!(shown, decisions, "{case}");
+                assert_eq!(app.cleanup_files(), files, "{case}");
+                assert_eq!(app.cleanup_files_ticked(), ticked, "{case}");
+                let fresh = app
+                    .cleanup_ready()
+                    .expect("checked")
+                    .approve(&decisions, files);
+                match (app.cleanup_approved(), fresh) {
+                    (Ok(kept), Ok(fresh)) => {
+                        assert_eq!(kept.steps, fresh.steps, "{case}");
+                        assert_eq!(kept.decisions, fresh.decisions, "{case}");
+                        assert_eq!(kept.files, fresh.files, "{case}");
+                        assert_eq!(
+                            kept.confirmation(),
+                            fresh.confirmation(),
+                            "{case}"
+                        );
+                    }
+                    (Err(kept), Err(fresh)) => {
+                        assert_eq!(kept, fresh, "{case}");
+                    }
+                    (kept, fresh) => panic!(
+                        "{case}: kept {:?}, fresh {:?}",
+                        kept.map(|approved| &approved.steps),
+                        fresh.map(|approved| approved.steps)
+                    ),
+                }
+                assert_eq!(
+                    app.export_text(false).expect("marked list").0,
+                    exported,
+                    "{case}: decisions changed the export"
+                );
+            });
+        }
+    }
+}
+
 /// An agent relays the same proposals and the person's choices. Without
 /// decisions nothing can be confirmed; deleting files is named in the
 /// confirmation; and the window's own choices are never used for it.

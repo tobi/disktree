@@ -461,20 +461,12 @@ fn check_in_use(
     }
 }
 
-/// Node launchers appear as `node .../npm-cli.js`, and Python installations
-/// commonly expose pip3. Comparing only the friendly owner name misses
-/// those live writers even though their configured cache is the same.
-#[cfg(test)]
-pub(super) fn owner_argument(operation: &Operation, argument: &str) -> bool {
-    owner_named(
-        operation.owner,
-        Some(&operation.command.executable),
-        argument,
-    )
-}
-
+/// Node launchers appear as `node .../npm-cli.js`, Python installations
+/// commonly expose pip3 or pip3.12, and uv's tool runner is uvx. Comparing
+/// only the friendly owner name misses those live writers even though
+/// their configured cache is the same.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn owner_named(
+pub(super) fn owner_named(
     owner: Owner,
     executable: Option<&Path>,
     argument: &str,
@@ -492,6 +484,20 @@ fn owner_named(
                         name.to_str(),
                         Some("npm" | "npx" | "npm-cli.js" | "npx-cli.js")
                     ))
-                || (owner == Owner::Pip && name == "pip3")
+                || (owner == Owner::Uv && name == "uvx")
+                || (owner == Owner::Pip
+                    && name.to_str().is_some_and(versioned_pip))
         })
+}
+
+/// `pip3`, and the `pip3.12` beside it that python.org and Homebrew
+/// install: the same pip writing the same cache.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn versioned_pip(name: &str) -> bool {
+    name.strip_prefix("pip3").is_some_and(|rest| {
+        rest.is_empty()
+            || rest.strip_prefix('.').is_some_and(|minor| {
+                !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit())
+            })
+    })
 }
