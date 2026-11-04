@@ -6,6 +6,10 @@
 //! both, and Suggested narrows that to their cleanup suggestions. The age
 //! chips filter the same way, and both sets apply in every mode, so "old
 //! code" is one click in each.
+//!
+//! A click adds a kind; switching from one kind to another is the "only"
+//! pill a chip shows on hover once its set filters (see
+//! [`LegendFilter::offers_only`]), which makes it the set's one chip.
 
 use std::sync::Arc;
 
@@ -104,6 +108,34 @@ impl LegendFilter {
     pub const fn cycle(&mut self, id: ChipId) {
         let slot = self.slot(id);
         *slot = slot.next();
+    }
+
+    /// Make `id` its set's one only chip, every other chip of the set
+    /// shown again, hidden ones included. The other set and Suggested are
+    /// left alone: "only" is about the set the chip belongs to.
+    pub fn solo(&mut self, id: ChipId) {
+        match id {
+            ChipId::Reclaimable => {}
+            ChipId::Kind(_) => self.clear_kinds(),
+            ChipId::Age(_) => self.clear_ages(),
+        }
+        *self.slot(id) = Chip::Only;
+    }
+
+    /// Whether hovering `id` offers its "only" pill: when its set already
+    /// filters, so a click would add to or cycle the set rather than
+    /// narrow to this chip, and the pill would change something. With
+    /// nothing set a click already means only. Suggested is a set of its
+    /// own, where a click is the only there is.
+    pub fn offers_only(&self, id: ChipId) -> bool {
+        let set = match id {
+            ChipId::Reclaimable => return false,
+            ChipId::Kind(_) => self.kinds_active(),
+            ChipId::Age(_) => self.ages_active(),
+        };
+        let mut solo = self.clone();
+        solo.solo(id);
+        set && solo != *self
     }
 
     pub fn is_active(&self) -> bool {
@@ -218,13 +250,20 @@ impl LegendFilter {
         parts.join(" · ")
     }
 
-    /// What the next click on `id` does, for its tooltip.
+    /// What the next click on `id` does, for its tooltip, and what its
+    /// "only" pill does when it has one.
     pub fn hint(&self, id: ChipId) -> String {
         let label = id.label();
-        match self.get(id) {
+        let click = match self.get(id) {
+            Chip::Shown if self.narrowed(id) => format!("Click to add {label}"),
             Chip::Shown => format!("Click to show only {label}"),
-            Chip::Only => format!("Showing only {label} · click to hide it"),
+            Chip::Only => format!("Showing {label} · click to hide it"),
             Chip::Hidden => format!("{label} hidden · click to show it again"),
+        };
+        if self.offers_only(id) {
+            format!("{click} · Only shows just {label}")
+        } else {
+            click
         }
     }
 }
@@ -260,6 +299,12 @@ impl Disktree {
             Some(ChipId::Age(_)) => self.legend.clear_ages(),
             Some(ChipId::Reclaimable) => self.legend.reclaimable = Chip::Shown,
         }
+        self.legend_changed(cx);
+    }
+
+    /// The "only" pill on a chip, or `o` on a focused one.
+    pub fn solo_legend(&mut self, id: ChipId, cx: &mut Context<'_, Self>) {
+        self.legend.solo(id);
         self.legend_changed(cx);
     }
 
@@ -382,6 +427,37 @@ mod tests {
         assert!(!legend.narrowed(ChipId::Kind(3)));
         legend.cycle(code);
         assert!(!legend.is_active());
+    }
+
+    #[test]
+    fn only_switches_a_set_to_one_chip_in_one_step() {
+        let mut legend = LegendFilter::default();
+        let (code, cache, media) =
+            (ChipId::Kind(0), ChipId::Kind(7), ChipId::Kind(5));
+        // Nothing set: a click already means only, so no pill.
+        assert!(!legend.offers_only(cache));
+        legend.cycle(code);
+        // Code alone is already only Code; Cache would switch to it.
+        assert!(!legend.offers_only(code));
+        assert!(legend.offers_only(cache));
+        legend.solo(cache);
+        assert_eq!(legend.get(cache), Chip::Only);
+        assert_eq!(legend.get(code), Chip::Shown);
+        assert_eq!(legend.summary(), "Cache");
+
+        // A whole set, hidden chips too, collapses to the one.
+        legend.cycle(code);
+        legend.cycle(media);
+        legend.cycle(media);
+        legend.cycle(ChipId::Age(1));
+        legend.cycle(ChipId::Reclaimable);
+        assert!(legend.offers_only(cache));
+        legend.solo(code);
+        assert_eq!(legend.kinds_summary().as_deref(), Some("Code"));
+        // The other set and Suggested are not this set's business.
+        assert_eq!(legend.get(ChipId::Age(1)), Chip::Only);
+        assert_eq!(legend.reclaimable, Chip::Only);
+        assert!(!legend.offers_only(ChipId::Reclaimable));
     }
 
     #[test]

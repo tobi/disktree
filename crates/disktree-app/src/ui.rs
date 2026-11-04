@@ -68,6 +68,11 @@ pub mod icon {
 pub mod size {
     /// Minimum physical pointer target, also at the smallest UI zoom.
     pub const POINTER_TARGET: gpui_kit::Pixels = gpui_kit::px(24.0);
+    /// How far below the pointer's tip a tooltip starts: past the arrow
+    /// cursor (about 21 logical pixels on macOS, GNOME and Windows), so it
+    /// never sits under the pointer or over the row being pointed at.
+    /// Pixels, not rems: the cursor does not zoom with the UI.
+    pub const TOOLTIP_CLEARANCE: gpui_kit::Pixels = gpui_kit::px(26.0);
     /// Below this height budget, reserve a reading lane instead of repeating
     /// the color legend and long action captions in the semantic file list.
     pub const FILE_LIST_FULL_DETAILS: Rems = Rems(32.0);

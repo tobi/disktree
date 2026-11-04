@@ -26,8 +26,10 @@ use gpui_kit::{
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
     button_group, checkbox, dialog_button, dialog_description, dialog_popup,
-    dialog_title, with_tooltip,
+    dialog_title,
 };
+
+use crate::widgets::with_tooltip;
 
 use gpui_kit::prelude::FluentBuilder as _;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -3004,12 +3006,15 @@ fn legend_chip(
             format!("{} \u{00b7} {size} in the whole scan", app.legend.hint(id))
         },
     );
+    let pill = (app.legend_hover == Some(id) && app.legend.offers_only(id))
+        .then(|| legend_only_pill(id, &key, in_menu, theme, cx));
     with_tooltip(
         div()
             .id(ElementId::Name(key.clone().into()))
             .debug_selector(move || key)
             .role(gpui_kit::Role::Button)
             .aria_label(spoken)
+            .relative()
             .aria_value(state.spoken())
             .focusable()
             .tab_stop(true)
@@ -3031,13 +3036,25 @@ fn legend_chip(
             .when(faded, |chip| chip.opacity(0.42))
             .when(state == Chip::Hidden, |chip| chip.opacity(0.6))
             .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.legend_hover = Some(id);
+                } else if this.legend_hover == Some(id) {
+                    this.legend_hover = None;
+                }
+                cx.notify();
+            }))
             .on_key_down(cx.listener(
                 move |this, event: &KeyDownEvent, _, cx| {
-                    if matches!(event.keystroke.key.as_str(), "enter" | "space")
-                    {
-                        this.cycle_legend(id, cx);
-                        cx.stop_propagation();
+                    match event.keystroke.key.as_str() {
+                        "enter" | "space" => this.cycle_legend(id, cx),
+                        // The pill, for the keyboard.
+                        "o" if this.legend.offers_only(id) => {
+                            this.solo_legend(id, cx);
+                        }
+                        _ => return,
                     }
+                    cx.stop_propagation();
                 },
             ))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -3068,9 +3085,63 @@ fn legend_chip(
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary.opacity(0.75))
                     .child(size)
-            })),
+            }))
+            .children(pill),
         hint,
     )
+}
+
+/// The "only" pill a chip shows on hover once its set filters: one click
+/// from Code to just Cache, or from Code, Cache and Media to one of them,
+/// where the chip itself would add or cycle. Laid over the chip's right
+/// end, over its size, rather than beside it, so showing it never moves
+/// the chips after it out from under the pointer.
+fn legend_only_pill(
+    id: crate::legend::ChipId,
+    key: &str,
+    in_menu: bool,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let key = format!("{key}-only");
+    let (fill, ink) = (theme.accent, theme.on_accent);
+    div()
+        .id(ElementId::Name(key.clone().into()))
+        .debug_selector(move || key)
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("Show only {}", id.label()))
+        .absolute()
+        .right(px(2.))
+        .top_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .id("only")
+                .px(space::XS)
+                .border_1()
+                .border_color(fill.opacity(0.55))
+                .bg(theme.surface)
+                .text_size(text::CAPTION)
+                .text_color(fill)
+                .hover(move |style| style.bg(fill).text_color(ink))
+                .cursor_pointer()
+                .child("only"),
+        )
+        // The press is the pill's, not the chip's under it, which would
+        // cycle as well.
+        .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.solo_legend(id, cx);
+            if in_menu {
+                this.legend_menu_open = false;
+            }
+            window.focus(&this.focus, cx);
+        }))
 }
 
 /// Show all, or the pill that stands for the chips not on screen. A tab

@@ -12,7 +12,9 @@ use gpui_kit::{
     IntoElement, ParentElement, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, div, px, relative,
 };
-use gpui_omarchy::{ActiveTheme, ButtonVariant, Theme, button, with_tooltip};
+use gpui_omarchy::{ActiveTheme, ButtonVariant, Theme, button};
+
+use crate::widgets::with_tooltip;
 
 use crate::run_list::{Item, Status, Totals};
 use crate::semantics::AccessibleButton as _;

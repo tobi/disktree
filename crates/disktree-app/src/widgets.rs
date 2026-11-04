@@ -13,7 +13,52 @@ use gpui_kit::{
 };
 use gpui_omarchy::ActiveTheme;
 
-use crate::ui::{space, text};
+use crate::ui::{size, space, text};
+
+/// How long the pointer rests on a control before its tooltip shows.
+/// Omarchy's 400 ms fired while the pointer was still on its way across a
+/// row of chips, so a tooltip popped up over the next one.
+pub const TOOLTIP_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(700);
+
+/// Omarchy's tooltip, out of the pointer's way.
+///
+/// GPUI puts a tooltip's corner one pixel from the pointer's tip, so the
+/// box sat under the cursor and over whatever was next to it: the next
+/// chip, its "only" pill. The surface is drawn [`size::TOOLTIP_CLEARANCE`]
+/// lower inside a transparent frame, which keeps it clear of the arrow.
+/// Near the window's bottom GPUI flips the frame above the pointer; the
+/// gap is then above the surface, which still clears the tip.
+pub fn with_tooltip<T: gpui_kit::StatefulInteractiveElement>(
+    control: T,
+    text: impl Into<SharedString>,
+) -> T {
+    let text = text.into();
+    control
+        .tooltip_show_delay(TOOLTIP_DELAY)
+        .tooltip(move |_, cx| {
+            gpui_kit::AppContext::new(cx, |_| ClearTooltip(text.clone())).into()
+        })
+}
+
+struct ClearTooltip(SharedString);
+
+impl gpui_kit::Render for ClearTooltip {
+    fn render(
+        &mut self,
+        _: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<'_, Self>,
+    ) -> impl gpui_kit::IntoElement {
+        div()
+            .debug_selector(|| "app-tooltip".into())
+            .pt(size::TOOLTIP_CLEARANCE)
+            .child(
+                div()
+                    .debug_selector(|| "app-tooltip-surface".into())
+                    .child(gpui_omarchy::tooltip(self.0.clone(), cx)),
+            )
+    }
+}
 
 /// File counts, which is what a directory count is too.
 pub fn human_count(value: u64) -> String {

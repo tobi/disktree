@@ -8266,7 +8266,7 @@ fn a_toast_hides_the_treemap_under_it(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_export_menu_hides_the_list_under_it(cx: &mut TestAppContext) {
     use gpui_kit::Modifiers;
-    const TIP: &str = "omarchy-tooltip-surface";
+    const TIP: &str = "app-tooltip-surface";
     cx.update(init);
     let temp = fixture();
     let (view, cx, _tree) = review_with_tree(temp.path(), cx);
@@ -8307,8 +8307,10 @@ fn the_export_menu_hides_the_list_under_it(cx: &mut TestAppContext) {
 /// Rest the pointer at `at` past a tooltip's delay, and draw what shows.
 fn rest_at(cx: &mut Window, at: Point<Pixels>) {
     cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::none());
-    cx.executor()
-        .advance_clock(std::time::Duration::from_millis(600));
+    // Past the tooltip's delay, so a rest shows the tooltip it would.
+    cx.executor().advance_clock(
+        crate::widgets::TOOLTIP_DELAY + std::time::Duration::from_millis(100),
+    );
     cx.run_until_parked();
     draw(cx);
 }
@@ -8464,7 +8466,7 @@ fn the_empty_filter_note_hides_the_treemap_under_it(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_follow_pill_hides_the_row_under_it(cx: &mut TestAppContext) {
     use crate::run_list::{Item, RunList, Status};
-    const TIP: &str = "omarchy-tooltip-surface";
+    const TIP: &str = "app-tooltip-surface";
     cx.update(init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
@@ -11322,4 +11324,75 @@ fn an_agent_confirms_cache_decisions_by_path_with_both_intents_named(
     assert!(uvdata.join("payload").exists());
     assert!(!stale.exists());
     assert!(junk.join("blob.bin").exists());
+}
+
+/// Once a set filters, hovering another chip of it offers "only": one
+/// click from Code to just Cache, where the chip itself would add Cache.
+/// The chip's tooltip waits, then starts below the pointer rather than
+/// under it, so it never covers the pill or the next chip.
+#[gpui_kit::test]
+fn the_only_pill_switches_kinds_and_the_tooltip_stays_clear(
+    cx: &mut TestAppContext,
+) {
+    use crate::legend::{Chip, ChipId};
+    use disktree_core::classify::Category;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    draw(cx);
+    let kind = |wanted: Category| {
+        ChipId::Kind(
+            Category::LEGEND
+                .iter()
+                .position(|kind| *kind == wanted)
+                .unwrap(),
+        )
+    };
+    let (code, cache) = (kind(Category::Code), kind(Category::Cache));
+    let key = Box::leak(cache.key().into_boxed_str());
+    let pill = Box::leak(format!("{key}-only").into_boxed_str());
+
+    // Nothing set: a click already means only, so there is no pill.
+    let chip = cx.debug_bounds(key).expect("Cache is on the row");
+    let at = chip.center();
+    cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::default());
+    draw(cx);
+    assert!(cx.debug_bounds(pill).is_none(), "no pill with nothing set");
+
+    // Code is empty in the fixture, so setting it brings it from "+N"
+    // to the row, and Cache moves along.
+    cx.simulate_mouse_move(
+        gpui_kit::point(px(700.), px(600.)),
+        None,
+        gpui_kit::Modifiers::default(),
+    );
+    update(&view, cx, |app, cx| app.cycle_legend(code, cx));
+    draw(cx);
+    let chip = cx.debug_bounds(key).expect("Cache is on the row");
+    let at = chip.center();
+    cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::default());
+    draw(cx);
+    let only = cx.debug_bounds(pill).expect("the pill, once Code is set");
+    assert!(chip.contains(&only.center()), "laid over the chip");
+
+    // The tooltip waits for the pointer to rest, then starts below it.
+    assert!(cx.debug_bounds("app-tooltip").is_none(), "not at once");
+    cx.executor().advance_clock(
+        crate::widgets::TOOLTIP_DELAY + std::time::Duration::from_millis(100),
+    );
+    draw(cx);
+    let tip = cx.debug_bounds("app-tooltip-surface").expect("a tooltip");
+    assert!(
+        tip.top() >= at.y + crate::ui::size::TOOLTIP_CLEARANCE,
+        "the tooltip clears the cursor: {tip:?} vs {at:?}"
+    );
+    assert!(!tip.contains(&only.center()), "and the pill");
+
+    click_on(cx, pill);
+    cx.run_until_parked();
+    assert_eq!(read(&view, cx, |app| app.legend.get(cache)), Chip::Only);
+    assert_eq!(read(&view, cx, |app| app.legend.get(code)), Chip::Shown);
 }

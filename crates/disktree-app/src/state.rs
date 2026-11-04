@@ -561,6 +561,8 @@ pub struct Disktree {
     /// The pointer is over the "+N" button, whose own press toggles the
     /// menu; a press anywhere else closes it.
     pub legend_more_hover: bool,
+    /// The legend chip under the pointer, which shows its "only" pill.
+    pub legend_hover: Option<crate::legend::ChipId>,
     /// Bumped per keystroke; only the newest search's result is kept.
     find_epoch: u64,
     /// A search is running off the UI thread.
@@ -837,6 +839,7 @@ impl Disktree {
             shares_epoch: 0,
             legend_menu_open: false,
             legend_more_hover: false,
+            legend_hover: None,
             find_epoch: 0,
             finding: false,
             apply_pending: false,

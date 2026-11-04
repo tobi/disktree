@@ -25,7 +25,9 @@ use gpui_kit::{
     Window, WindowButton, WindowButtonLayout, WindowControlArea,
     WindowControls, div, img, px, rgb, svg, white,
 };
-use gpui_omarchy::{ActiveTheme as _, IconName, Theme, with_tooltip};
+use gpui_omarchy::{ActiveTheme as _, IconName, Theme};
+
+use crate::widgets::with_tooltip;
 
 use crate::palette;
 use crate::state::Disktree;

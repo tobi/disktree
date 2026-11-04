@@ -38,8 +38,9 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, IconName, Theme, button, icon,
-    with_tooltip,
 };
+
+use crate::widgets::with_tooltip;
 use serde::{Deserialize, Serialize};
 
 use crate::aux_window::{self, Spec};
