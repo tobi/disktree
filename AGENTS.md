@@ -162,9 +162,11 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
    early silently drops whole subtrees — it has happened once.
 4. **Only paths under the scanned root may be removed**, and mount points, the
    root, the home directory, any directory holding it, and symlink targets are
-   refused. On Windows so is every directory directly in the profiles folder
-   Windows reports (`FOLDERID_UserProfiles`, usually `C:\Users`); what is
-   inside a profile stays removable.
+   refused. So are the profiles folder and every directory directly in it:
+   on Windows the one Windows reports (`FOLDERID_UserProfiles`, usually
+   `C:\Users`), on macOS `/Users`. What is inside a profile stays
+   removable. The window asks the guards before a mark is made
+   (`removal::refusal`), so a refused path is never offered for marking.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a
    re-scan; `Marks::refresh` re-reads their sizes and drops what is gone.
 6. **The treemap is painted, not composed of elements.** Thousands of
@@ -204,6 +206,11 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
     confirmation for that operation. An expired or changed preview requires
     new confirmation. The app validates the intent and rechecks existing
     guards and its configured capacity limit for both UI and MCP removals.
+    Past the limit only the person can go: in the window, through Mark
+    anyway and then Review's second confirmation (a typed phrase by
+    default), with the worker held to the share confirmed. An agent's mark
+    past the limit is refused, and agents keep the default limit when the
+    window's is Off. `mark_guard.rs` holds the rule.
     Trash never falls back to permanent deletion. No headless or SSH removal.
     A linked window's tree and marks remain the source of truth; `ls` and
     `find` read it without navigating. Only an explicit `show` request moves
@@ -261,6 +268,7 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
 | clone sharing totals and conservative savings | `crates/disktree-core/src/sharing.rs` |
 | what git is asked about a checkout, when, and how many at once | `crates/disktree-app/src/git.rs` (the probe and its time limit), `crates/disktree-app/src/git_store.rs` (the queue, the bucket, the cache) |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
+| what may be marked, Mark anyway, Review's over-limit confirmation | `crates/disktree-app/src/mark_guard.rs`, the settings in `safety.rs` |
 | Removing and Done: the run's list, its rows, following and running figures; the row anatomy Review shares | `crates/disktree-app/src/run_view.rs`, the model in `run_list.rs`, Review's `mark_row` in `views.rs` |
 | what the explore bar folds into ⋮ at each width, and ⋮'s keys | `crates/disktree-app/src/toolbar.rs` |
 | the legend as a filter: its chips and what they keep | `crates/disktree-app/src/legend.rs`, the rule in `crates/disktree-core/src/filter.rs` |

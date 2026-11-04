@@ -59,7 +59,9 @@ leave alone. Read with `skill://pwrdisk-free-space/SKILL.md`.
 
 `pwrdisk_mark` keeps these back and says why: `/System`, `/Library`,
 `/private`, `/cores`, `/opt/homebrew` and the other system trees, the home
-directory and anything holding it, mount points, and the `.fseventsd` and
+directory and anything holding it, `/Users` and every account's folder in
+it (`/Users/Shared`, `/Users/Guest`, another user's home; what is inside
+one may be proposed), mount points, and the `.fseventsd` and
 `.Spotlight-V100` stores (use `mdutil` for Spotlight, never delete either).
 What is inside `/private/tmp` and `/private/var/tmp` (`/tmp` and
 `/var/tmp`) may be marked, as on Linux; the two folders themselves stay
@@ -119,7 +121,10 @@ paths and mode from `pwrdisk_removal_preview` before the destructive
 emptied, but is not guaranteed; permanent deletion cannot be undone through
 PwrDisk. Both modes use the existing removal guards and Settings > Safety's
 per-operation limit, 5% of each volume's capacity by default. Never bypass a
-refusal, increase the setting or split batches to evade it.
+refusal, increase the setting or split batches to evade it. A window
+refuses a mark that would take the list past the limit, and marks made
+without one are checked when they reach it: only the person can mark past
+it, in the window. Say so, and let them decide.
 
 MCP removal also requires interactive confirmation from the client (form
 elicitation). An agent-supplied confirmation value does not establish human

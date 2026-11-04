@@ -501,18 +501,17 @@ impl Disktree {
             } else {
                 (target.bytes, target.is_dir)
             };
-            if self.agent_mark(Target {
+            match self.agent_mark(Target {
                 hidden: is_hidden(&target.path, PathStyle::Native),
                 path: target.path.clone(),
                 bytes: measured.0,
                 is_dir: measured.1,
             }) {
-                marked += 1;
-            } else {
-                refused.push(Refused {
+                Ok(()) => marked += 1,
+                Err(reason) => refused.push(Refused {
                     path: target.path.clone(),
-                    reason: "the scanned root itself, or outside it".into(),
-                });
+                    reason,
+                }),
             }
         }
         self.leave_review_if_empty();
@@ -539,18 +538,24 @@ impl Disktree {
 
     /// Mark `target` for an agent: like a press of Space, except it never
     /// unmarks, and a path inside a marked directory is left alone rather
-    /// than toggled. Returns whether the path is marked afterwards.
-    fn agent_mark(&mut self, target: Target) -> bool {
+    /// than toggled. Err with the reason when it is not marked afterwards:
+    /// the guards refuse it, or it would take the list past the limit,
+    /// which only the person can go past.
+    fn agent_mark(&mut self, target: Target) -> Result<(), String> {
         if self.marks.contains(&target.path, PathStyle::Native) {
-            return true;
+            return Ok(());
         }
         if !target.path.starts_with(&self.root_path)
             || target.path == self.root_path
         {
-            return false;
+            return Err("the scanned root itself, or outside it".into());
         }
         if self.marked_ancestor(&target.path).is_some() {
-            return true;
+            return Ok(());
+        }
+        self.refusal_cache.replace(None);
+        if let Some(reason) = self.agent_mark_refusal(&target) {
+            return Err(reason);
         }
         self.space_baseline = self.space_baseline.or(self.space);
         let path = target.path.clone();
@@ -566,7 +571,7 @@ impl Disktree {
         for inner in &inside {
             self.marks.remove(inner, PathStyle::Native);
         }
-        true
+        Ok(())
     }
 
     /// Show `path`, rescanning from `root` first when the window is

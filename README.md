@@ -177,13 +177,22 @@ same map and its marks show up as the agent makes them. More in
 Only things inside the folder you scanned can be removed, and never:
 
 - the scanned folder itself, your home folder, or a folder that holds it;
+- `/Users` on macOS or `C:\Users` on Windows, or any account's folder in
+  it (what is inside one can still be marked);
 - system folders (`/usr`, `/etc`, `C:\Windows`, Program Files, Homebrew's
   prefix and the like), even where permissions would allow it;
 - a mount point, or anything with another disk mounted inside it;
 - what a symlink points to (the link is removed, not its target).
 
 Each rule is [tested](crates/disktree-core/src/removal.rs). The full list is
-in [the guide](docs/guide.md#what-it-refuses-to-do).
+in [the guide](docs/guide.md#what-it-refuses-to-do). These are checked
+before you mark, so Mark is never offered for them.
+
+One removal may also take only 5% of a disk by default. Past that, Mark
+becomes **Over 5% limit** with a ▾ that holds **Mark anyway**, and Review
+asks you to type what you are doing ("delete 20% of my disk") before it
+removes anything. Settings › Safety changes the limit, turns it off, or
+swaps the typing for a checkbox or nothing; agents are always held to it.
 
 ## Thanks, Tobi
 

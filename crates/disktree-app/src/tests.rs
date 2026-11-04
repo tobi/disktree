@@ -229,11 +229,16 @@ fn private_service_stores_draw_unavailable_and_partial_figures(
         cx.notify();
     });
     draw(cx);
+    // The guards refuse a service store, so it is never offered: the
+    // inspector says why, and Space marks nothing and says so.
+    assert!(cx.debug_bounds("mark-guard").is_some());
     press(cx, "space");
-    assert!(read(&view, cx, |app| app.plan().targets.is_empty()));
-    assert!(read(&view, cx, |app| !app.plan().blocked.is_empty()));
-    press(cx, "c");
-    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    assert!(read(&view, cx, |app| app.marks.is_empty()));
+    assert!(read(&view, cx, |app| {
+        app.notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("macOS manages"))
+    }));
 }
 
 #[cfg(target_os = "macos")]
@@ -1887,7 +1892,10 @@ fn settings_safety_reads_the_limit_once_and_shows_a_saved_pick(
     });
     let shown = |cx: &mut Window| {
         view.read_with(cx, |view, _| {
-            view.safety.as_ref().map(|limit| limit.percent()).ok()
+            view.safety
+                .as_ref()
+                .ok()
+                .and_then(|policy| policy.limit.map(Limit::percent))
         })
     };
     draw(cx);
@@ -8650,6 +8658,14 @@ fn marking_a_worktree_trio_one_by_one_frees_one_copy_at_the_end(
         // Allocated sizes: the helper's apparent sizes project nothing.
         Disktree::with_tree(path.clone(), root, ScanOptions::default(), 3, cx)
     });
+    // 30 GiB of synthetic worktrees on whatever disk runs the tests: past
+    // 5% of a small CI disk, which is not what this test is about.
+    update(&view, cx, |app, _| {
+        app.safety_policy.replace(Some(crate::safety::Policy {
+            limit: None,
+            ..crate::safety::Policy::default()
+        }));
+    });
     draw(cx);
     let mut seen = Vec::new();
     for name in ["wt-a", "wt-b", "wt-c"] {
@@ -9588,4 +9604,197 @@ fn the_marked_total_is_pinned_above_the_disk_with_the_review(
     );
     click_on(cx, "review");
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+}
+
+/// The fixture on a pretend 1 MB disk, with `junk` (300 kB, 30% of it)
+/// selected: past the default 5% limit.
+fn over_limit_view<'a>(
+    temp: &Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<Disktree>, &'a mut Window, Vec<usize>) {
+    let (view, cx) = view_over(temp, cx);
+    let junk = update(&view, cx, |app, cx| {
+        app.space = Some(SpaceInfo {
+            total: 1_000_000,
+            free: 100_000,
+            available: 100_000,
+        });
+        let junk = app
+            .tree()
+            .and_then(|tree| tree.find("junk").map(|(crumbs, _)| crumbs))
+            .expect("the junk directory");
+        app.select(Some(junk.clone()), cx);
+        junk
+    });
+    draw(cx);
+    (view, cx, junk)
+}
+
+/// Past the limit, Space marks nothing; only the chevron's Mark anyway
+/// does, and Review then wants the phrase before anything is removed.
+#[gpui_kit::test]
+fn past_the_limit_marking_needs_mark_anyway_and_review_the_phrase(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx, _) = over_limit_view(temp.path(), cx);
+    assert!(cx.debug_bounds("mark-guard").is_some());
+    assert!(cx.debug_bounds("inspector-mark-more").is_some());
+
+    press(cx, "space");
+    read(&view, cx, |app| {
+        assert!(app.marks.is_empty());
+        assert!(app.notice.as_ref().is_some_and(|(notice, _)| {
+            notice.contains("30%") && notice.contains("5% limit")
+        }));
+    });
+
+    click_on(cx, "inspector-mark-more");
+    assert!(cx.debug_bounds("mark-menu").is_some());
+    click_on(cx, "mark-anyway");
+    read(&view, cx, |app| {
+        assert_eq!(app.marks.len(), 1);
+        assert_eq!(app.mark_menu, None);
+    });
+
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::Permanent;
+    });
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    assert!(cx.debug_bounds("over-limit-gate").is_some());
+    assert!(cx.debug_bounds("over-limit-matched").is_none());
+
+    // Enter commits nothing until the phrase is typed.
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert!(!app.confirm_open);
+        assert!(app.run.is_none());
+        assert!(app.notice.as_ref().is_some_and(|(notice, _)| {
+            notice.contains("delete 30% of my disk")
+        }));
+    });
+
+    // Close is not enough, and neither is the other mode's verb.
+    click_on(cx, "over-limit-phrase");
+    cx.simulate_input("trash 30% of my disk");
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-matched").is_none());
+    let typed = "trash 30% of my disk".chars().count();
+    cx.simulate_keystrokes(&vec!["backspace"; typed].join(" "));
+    cx.simulate_input("Delete 30%  of my disk");
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-matched").is_some());
+    // What the worker is held to is what was typed, not the 5% setting:
+    // a share that grew past 30% since is refused there.
+    update(&view, cx, |app, cx| {
+        let plan = app.plan();
+        assert_eq!(
+            app.removal_limit(&plan, cx)
+                .map(disktree_core::removal_limit::Limit::percent),
+            Ok(30)
+        );
+    });
+
+    // Enter in the field commits, and the permanent dialog still asks.
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.confirm_open));
+    assert!(
+        temp.path().join("junk").exists(),
+        "nothing has happened yet"
+    );
+    press(cx, "enter");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Running);
+    let epoch = read(&view, cx, |app| app.run_epoch);
+    let mut finished = false;
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        finished = update(&view, cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "the removal finished");
+    assert!(!temp.path().join("junk").exists());
+    assert!(temp.path().join("keep/notes.txt").exists());
+    // The phrase confirmed that removal only: the next one asks again.
+    read(&view, cx, |app| {
+        assert!(app.over_phrase.is_none());
+        assert_eq!(app.over_ticked, None);
+    });
+}
+
+/// Settings › Safety relaxes the window, never an agent: Off gives the
+/// plain Mark back, Tick a box asks for a tick, and an agent is still held
+/// to 5%.
+#[gpui_kit::test]
+fn safety_settings_relax_the_window_but_never_an_agent(
+    cx: &mut TestAppContext,
+) {
+    use crate::safety::{Confirm, save_confirm, save_limit};
+
+    cx.update(init);
+    let temp = fixture();
+    let settings = tempfile::TempDir::new().expect("settings");
+    save_confirm(Some(settings.path()), Confirm::Tick).expect("tick");
+    let (view, cx, junk) = over_limit_view(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.removal_settings_dir = Some(settings.path().to_path_buf());
+        app.safety_policy.replace(None);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("inspector-mark-more").is_some());
+
+    // Ticked for 30% to the trash, then the mode changes: the tick was
+    // for the other one.
+    update(&view, cx, |app, cx| {
+        app.mark_anyway(&junk, cx);
+        app.removal_mode = RemovalMode::Trash;
+        app.open_review(cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-phrase").is_none());
+    click_on(cx, "over-limit-tick");
+    let met = |view: &Entity<Disktree>, cx: &mut Window| {
+        update(view, cx, |app, cx| {
+            let plan = app.plan();
+            let share = app.removal_gate(&plan).expect("past the limit");
+            app.gate_met(&share, cx)
+        })
+    };
+    assert!(met(&view, cx));
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::Permanent;
+    });
+    assert!(!met(&view, cx), "a tick is for one mode");
+
+    // Off: no gate in Review, the plain Mark in the inspector, and an
+    // agent still held to 5%.
+    save_limit(Some(settings.path()), None).expect("off");
+    update(&view, cx, |app, cx| {
+        app.safety_policy.replace(None);
+        let plan = app.plan();
+        assert_eq!(app.removal_gate(&plan), None);
+        app.clear_marks(cx);
+        app.screen = Screen::Explore;
+        app.select(Some(junk.clone()), cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("inspector-mark-more").is_none());
+    assert!(cx.debug_bounds("mark-guard").is_none());
+    update(&view, cx, |app, _| {
+        let target = app.target_at(&junk).expect("junk");
+        assert!(
+            app.agent_mark_refusal(&target)
+                .is_some_and(|reason| reason.contains("5% limit"))
+        );
+    });
+    press(cx, "space");
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
 }

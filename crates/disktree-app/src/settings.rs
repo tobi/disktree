@@ -13,6 +13,8 @@
 use crate::semantics::{AccessibleButton as _, text as readable};
 use disktree_core::path_style::PathStyle;
 use disktree_core::removal_limit::Limit;
+
+use crate::safety::Confirm;
 use std::path::PathBuf;
 
 use gpui_kit::prelude::FluentBuilder as _;
@@ -188,7 +190,7 @@ pub struct SettingsWindow {
     /// The saved removal limit, as Safety shows it: read when the window
     /// opens, whenever Safety is shown and after a pick is saved, never
     /// while drawing, which runs on every frame.
-    pub safety: Result<Limit, String>,
+    pub safety: Result<crate::safety::Policy, String>,
     focus: FocusHandle,
     pub pane_scroll: gpui_kit::ScrollHandle,
     strip_drag: bool,
@@ -207,7 +209,7 @@ impl SettingsWindow {
         Self {
             pane,
             updates_row: updater::selection().resolve(&installed).index(),
-            safety: crate::safety::load(updates_dir.as_deref()),
+            safety: crate::safety::load_policy(updates_dir.as_deref()),
             updates_dir,
             diagnostics: diagnostics::collect(cx),
             copied: None,
@@ -230,7 +232,7 @@ impl SettingsWindow {
 
     /// Read the saved removal limit again.
     fn reload_safety(&mut self) {
-        self.safety = crate::safety::load(self.updates_dir.as_deref());
+        self.safety = crate::safety::load_policy(self.updates_dir.as_deref());
         #[cfg(test)]
         work::SAFETY_LOADS.set(work::SAFETY_LOADS.get() + 1);
     }
@@ -508,13 +510,33 @@ impl Render for SettingsWindow {
     }
 }
 
-/// The removal limits Settings › Safety offers, in percent of a volume.
-const LIMITS: [u8; 6] = [1, 5, 10, 25, 50, 100];
+/// The removal limits Settings › Safety offers, in percent of a volume;
+/// `None` is Off, for the window only. 100% was the last choice before Off
+/// existed, and said the same less plainly.
+const LIMITS: [Option<u8>; 6] =
+    [Some(1), Some(5), Some(10), Some(25), Some(50), None];
 
 const APPLIES_TO: &str = "Trash may be recoverable until it is emptied; \
      restoring is not guaranteed. A permanent deletion cannot be undone \
      through PwrDisk. An agent must have the exact paths and mode confirmed \
      every time.";
+
+/// What no setting lifts, said where the settings are so a refusal is
+/// never a surprise.
+#[cfg(target_os = "macos")]
+const PROTECTED: &str = "/Users and each folder in it, your home and any \
+     folder holding it; /System, /Library, /private, /usr, /opt/homebrew \
+     and the other system trees; mount points and the scanned root.";
+#[cfg(windows)]
+const PROTECTED: &str = "The profiles folder and each profile in it, your \
+     home and any folder holding it; Windows and Program Files; mount \
+     points, drive roots and the scanned root.";
+#[cfg(not(any(target_os = "macos", windows)))]
+const PROTECTED: &str = "Your home and any folder holding it; /usr, /etc, \
+     /boot and the other system trees; mount points and the scanned root.";
+
+const AGENTS: &str = "Agents over MCP stop at the limit, at 5% when it is \
+     Off, and can never mark a protected folder or confirm for you.";
 
 // ── panes ───────────────────────────────────────────────────────────────
 
@@ -529,10 +551,10 @@ impl SettingsWindow {
         // One choice of six, so one control: the segments the review
         // screen uses for Trash or permanent, saved as soon as one is
         // picked. Six buttons read as six commands.
-        let picked = current.as_ref().ok().and_then(|limit| {
-            LIMITS
-                .iter()
-                .position(|&percent| percent == limit.percent())
+        let picked = current.as_ref().ok().and_then(|policy| {
+            LIMITS.iter().position(|&percent| {
+                percent == policy.limit.map(Limit::percent)
+            })
         });
         let entity = cx.entity().downgrade();
         let rows =
@@ -543,18 +565,25 @@ impl SettingsWindow {
                     LIMITS
                         .iter()
                         .map(|percent| {
-                            ChoiceItem::new(
-                                percent.to_string(),
-                                format!("{percent}%"),
+                            percent.map_or_else(
+                                || ChoiceItem::new("off", "Off"),
+                                |percent| {
+                                    ChoiceItem::new(
+                                        percent.to_string(),
+                                        format!("{percent}%"),
+                                    )
+                                },
                             )
                         })
                         .collect(),
                     picked,
                     move |index, window, cx| {
                         let _ = entity.update(cx, |this, cx| {
-                            this.note = Limit::new(LIMITS[index])
+                            this.note = LIMITS[index]
+                                .map(Limit::new)
+                                .transpose()
                                 .and_then(|limit| {
-                                    crate::safety::save(
+                                    crate::safety::save_limit(
                                         this.updates_dir.as_deref(),
                                         limit,
                                     )
@@ -563,6 +592,7 @@ impl SettingsWindow {
                             // Read back what was written, so the pane
                             // shows the file and not the click.
                             this.reload_safety();
+                            cx.set_global(crate::safety::Saved);
                             // Back to the window, as the other panes'
                             // controls do, so Tab keeps walking panes.
                             window.focus(&this.focus, cx);
@@ -572,6 +602,45 @@ impl SettingsWindow {
                     window,
                     cx,
                 ));
+        let confirmed = current.as_ref().ok().and_then(|policy| {
+            Confirm::ALL
+                .iter()
+                .position(|&confirm| confirm == policy.confirm)
+        });
+        let entity = cx.entity().downgrade();
+        let confirm = div().debug_selector(|| "safety-confirm".into()).child(
+            button_group(
+                "safety-confirm",
+                Confirm::ALL
+                    .iter()
+                    .map(|confirm| {
+                        ChoiceItem::new(confirm.label(), confirm.label())
+                    })
+                    .collect(),
+                confirmed,
+                move |index, window, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.note = crate::safety::save_confirm(
+                            this.updates_dir.as_deref(),
+                            Confirm::ALL[index],
+                        )
+                        .err();
+                        this.reload_safety();
+                        cx.set_global(crate::safety::Saved);
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    });
+                },
+                window,
+                cx,
+            ),
+        );
+        let caption = |id: &'static str, text: &'static str| {
+            readable(id, text)
+                .text_color(theme.foreground)
+                .child(text)
+                .into_any_element()
+        };
         let mut body = div()
             .flex()
             .flex_col()
@@ -590,20 +659,37 @@ impl SettingsWindow {
                         "Per operation",
                         Some(
                             "Measured data, as a share of each volume's \
-                             capacity. The default is 5%.",
+                             capacity. The default is 5%. Past it, Mark \
+                             needs Mark anyway.",
                         ),
                         vec![rows.into_any_element()],
                         theme,
                     ))
                     .child(field(
+                        "Over the limit",
+                        Some(
+                            "What Review asks after Mark anyway, before \
+                             anything is removed.",
+                        ),
+                        vec![confirm.into_any_element()],
+                        theme,
+                    ))
+                    .child(field(
+                        "Always protected",
+                        Some("Never offered for removal. Not a setting."),
+                        vec![caption("safety-protected", PROTECTED)],
+                        theme,
+                    ))
+                    .child(field(
+                        "Agents",
+                        Some("Marks and removals over MCP."),
+                        vec![caption("safety-agents", AGENTS)],
+                        theme,
+                    ))
+                    .child(field(
                         "Applies to",
                         Some("Trash and permanent deletion."),
-                        vec![
-                            readable("safety-applies", APPLIES_TO)
-                                .text_color(theme.foreground)
-                                .child(APPLIES_TO)
-                                .into_any_element(),
-                        ],
+                        vec![caption("safety-applies", APPLIES_TO)],
                         theme,
                     )),
             );

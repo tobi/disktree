@@ -220,10 +220,7 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     for target in targets {
         let path = normalize(&target.path);
         let reason =
-            refuse(&path, &root, home.as_ref(), &mounts.points, &mounts.media)
-                .or_else(|| {
-                    linked(&path, &root, real_root.as_deref(), home.as_ref())
-                });
+            judge(&path, &root, real_root.as_deref(), home.as_ref(), mounts);
         if let Some(reason) = reason {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
@@ -288,6 +285,36 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
         }
     }
     plan
+}
+
+/// Why the guards would keep `path` back from a removal under `root`.
+///
+/// `None` when they would let it through. The same judgement [`plan`]
+/// makes for each target, for one path, so the window can refuse a mark
+/// up front instead of offering one that Review would only keep back.
+pub fn refusal(path: &Path, root: &Path) -> Option<String> {
+    let root = normalize(root);
+    let home = std::env::home_dir().map(|home| Home::of(&home));
+    let real_root = fs::canonicalize(&root).ok();
+    judge(
+        &normalize(path),
+        &root,
+        real_root.as_deref(),
+        home.as_ref(),
+        &mount_points(),
+    )
+}
+
+/// One target against every guard: by spelling, then by where links lead.
+fn judge(
+    path: &Path,
+    root: &Path,
+    real_root: Option<&Path>,
+    home: Option<&Home>,
+    mounts: &MountTable,
+) -> Option<String> {
+    refuse(path, root, home, &mounts.points, &mounts.media)
+        .or_else(|| linked(path, root, real_root, home))
 }
 
 /// Trees the operating system owns. A whole-disk scan shows them, because
@@ -581,14 +608,26 @@ fn refuse(
     if home_key.is_some_and(|home| home.starts_with(&key)) {
         return Some("it contains the home directory".into());
     }
+    // macOS keeps every account's home in /Users, on the same volume as
+    // the system, and nothing marks another account's home as special: a
+    // whole-disk scan shows /Users/guest or /Users/Shared as just a folder.
+    // So /Users and each folder in it are refused there, as on Windows.
+    //
     // Elevated through another account's credentials, home is that admin's,
     // and the user's own profile is just another folder; elevation opens
     // every other profile too. So on Windows each directory in the profiles
     // folder (`C:\Users\tobi`, `Public`, `Default`) is refused, taken from
     // Windows and not from home, whose parent could be anything. What is
     // inside a profile stays removable, as under one's own home.
-    if profiles_key().is_some_and(|profiles| is_profile(path, &key, profiles)) {
-        return Some("a user profile cannot be removed".into());
+    if let Some(profiles) = profiles_key() {
+        // The folder itself holds every account's home, the operator's
+        // included, wherever this process's own home happens to be.
+        if key == profiles {
+            return Some(format!("it holds every {PROFILE}"));
+        }
+        if is_profile(path, &key, profiles) {
+            return Some(format!("a {PROFILE} cannot be removed"));
+        }
     }
     // By spelling too: the Data volume's root keeps its name as a key, while
     // everything under it is keyed as under `/`.
@@ -901,10 +940,36 @@ fn profiles_key() -> Option<&'static Path> {
     PROFILES.as_deref()
 }
 
-#[cfg(not(windows))]
+/// `/Users`, by key. Fixed on macOS: the system and its installer put
+/// every account's home there, and a different home location is still a
+/// home only for its own account.
+#[cfg(target_os = "macos")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as Windows', where Windows may not answer"
+)]
+fn profiles_key() -> Option<&'static Path> {
+    static PROFILES: std::sync::LazyLock<PathBuf> =
+        std::sync::LazyLock::new(|| guard_key(Path::new(MACOS_PROFILES)));
+    Some(PROFILES.as_path())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 const fn profiles_key() -> Option<&'static Path> {
     None
 }
+
+#[cfg(target_os = "macos")]
+const MACOS_PROFILES: &str = "/Users";
+
+/// What one folder in the profiles folder is called where it is refused.
+#[cfg(windows)]
+const PROFILE: &str = "user profile";
+#[cfg(target_os = "macos")]
+const PROFILE: &str = "user's home folder";
+/// Nowhere else has a profiles folder; never shown.
+#[cfg(not(any(windows, target_os = "macos")))]
+const PROFILE: &str = "";
 
 /// Whether `path`, keyed `key`, is a profile: a directory directly in
 /// `profiles`. A file or a link there is no profile and stays removable.
@@ -2944,6 +3009,69 @@ mod tests {
                 .to_lowercase()
                 .contains(&windows.to_lowercase())),
             "refused as part of {windows}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_home_folders_are_refused() {
+        let root = Path::new("/");
+        let refused = |path: &str, root: &Path| {
+            refuse(Path::new(path), root, None, &[], &[])
+        };
+        // Whatever this process's home is, /Users holds every account's.
+        assert!(
+            refused("/Users", root)
+                .is_some_and(|reason| reason.contains("every user"))
+        );
+        // Shared ships with macOS, so it is there to be judged as a folder.
+        for spelling in ["/Users/Shared", "/users/shared"] {
+            assert!(
+                refused(spelling, root)
+                    .is_some_and(|reason| reason.contains("home folder")),
+                "{spelling} is an account's folder"
+            );
+        }
+        // The Data volume's spelling is judged as the same place.
+        let data = Path::new(crate::space::MACOS_DATA_VOLUME);
+        assert!(
+            refused("/System/Volumes/Data/Users/Shared", data)
+                .is_some_and(|reason| reason.contains("home folder"))
+        );
+        // Inside a home folder stays removable, as under one's own home.
+        assert_eq!(refused("/Users/Shared/old-installer.pkg", root), None);
+        assert_eq!(refused("/Users/nobody-is-here", root), None);
+    }
+
+    #[test]
+    fn a_single_path_is_judged_as_a_plan_would() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let inside = root.join("cache");
+        fs::create_dir(&inside).expect("mkdir");
+        assert_eq!(refusal(&inside, root), None);
+        assert!(
+            refusal(root, root)
+                .is_some_and(|reason| reason.contains("scanned root"))
+        );
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        assert!(
+            refusal(elsewhere.path(), root)
+                .is_some_and(|reason| reason.contains("outside"))
+        );
+        let planned = plan(
+            &[Target {
+                path: root.to_path_buf(),
+                bytes: 0,
+                is_dir: true,
+                hidden: false,
+            }],
+            root,
+        );
+        assert_eq!(
+            Some(planned.blocked[0].reason.clone()),
+            refusal(root, root),
+            "one judgement, two callers"
         );
     }
 

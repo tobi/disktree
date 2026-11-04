@@ -35,7 +35,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::chrome::{self, Frame};
 use crate::git_store::{Probe, Shown};
 use crate::ledger::Cohort;
+use crate::mark_guard::{MarkCheck, Share};
 use crate::palette;
+use crate::safety::Confirm;
 use crate::state::{
     ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
 };
@@ -107,6 +109,9 @@ pub fn root(
 ) -> Stateful<Div> {
     if app.volumes_open {
         app.prepare_picker_inputs(window, cx);
+    }
+    if app.screen == Screen::Review {
+        app.prepare_over_phrase(window, cx);
     }
     app.apply_focus(window, cx);
     let fit = crate::toolbar::BarFit::for_width(
@@ -253,7 +258,7 @@ pub fn root(
             }
             // An open menu owns the arrows before the page behind it scrolls.
             if this.app_menu_open && app_menu_key(this, event, window, cx) { return; }
-            if !this.has_modal() && this.screen == Screen::Review && crate::ui::scroll_key(&event.keystroke.key, &this.review_scroll, window.rem_size()) { cx.stop_propagation(); cx.notify(); return; }
+            if !this.has_modal() && this.screen == Screen::Review && !this.editing_phrase(window, cx) && crate::ui::scroll_key(&event.keystroke.key, &this.review_scroll, window.rem_size()) { cx.stop_propagation(); cx.notify(); return; }
             if this.show_help && crate::ui::scroll_key(&event.keystroke.key, &this.help_scroll, window.rem_size()) { cx.stop_propagation(); cx.notify(); return; }
             if event.keystroke.key == "tab" && !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform {
                 if !this.has_modal() { this.find_open = false; }
@@ -268,7 +273,7 @@ pub fn root(
                     .flatten().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
                 if editing && event.keystroke.key != "escape" { return; }
             }
-            if event.keystroke.key == "?" && !this.has_modal() && !this.find_open {
+            if event.keystroke.key == "?" && !this.has_modal() && !this.find_open && !this.editing_phrase(window, cx) {
                 this.open_help(cx); this.apply_focus(window, cx); return;
             }
             if event.keystroke.key == "escape" && this.screen == Screen::Explore && !this.has_modal() && this.is_indexing() {
@@ -3074,7 +3079,37 @@ fn selection_section(
                 })),
         );
     }
-    if !is_current_root && !removed {
+    // A new mark is judged before it is offered: what the guards refuse is
+    // never offered at all, and past the limit only through Mark anyway.
+    let check = if is_current_root || removed || marked || covered_by.is_some()
+    {
+        MarkCheck::Allowed
+    } else {
+        app.target_at(&target)
+            .map_or(MarkCheck::Allowed, |candidate| app.mark_check(&candidate))
+    };
+    let guard = mark_guard_note(app, &check, node.is_dir(), theme, cx);
+    let mut menu = None;
+    if let MarkCheck::Protected(_) = &check {
+        actions = actions.child(
+            button("mark", "Can\u{2019}t remove", ButtonVariant::Outline, cx)
+                .debug_selector(|| "inspector-mark".into())
+                .tab_stop(true)
+                .flex_1()
+                .justify_center()
+                .semantic_disabled(true),
+        );
+    } else if let (MarkCheck::OverLimit(share), Some(path)) = (&check, &path) {
+        let open = app.mark_menu.as_deref() == Some(path.as_path());
+        actions = actions.child(over_limit_mark(
+            share,
+            path.clone(),
+            open,
+            theme,
+            cx,
+        ));
+        menu = open.then(|| mark_menu(share, target.clone(), theme, cx));
+    } else if !is_current_root && !removed {
         // Inside a marked directory there is nothing to mark on its own: it
         // goes with that directory, so the button offers to keep it by
         // unmarking the directory instead.
@@ -3127,7 +3162,9 @@ fn selection_section(
         .child(measure)
         .child(grid)
         .children(badges)
+        .children(guard)
         .child(actions)
+        .children(menu)
         .children(match node.category {
             Category::FilesystemEvents => Some(service_guidance(
                 disktree_core::macos_services::Service::Fsevents,
@@ -3141,6 +3178,218 @@ fn selection_section(
             )),
             _ => None,
         })
+}
+
+/// Why Mark is not the plain button: a rule in the warning colour, a chip
+/// and a line, above the actions so it is read before them.
+fn mark_guard_note(
+    app: &Disktree,
+    check: &MarkCheck,
+    is_dir: bool,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    let (chip, title, body, hint) = match check {
+        MarkCheck::Allowed => return None,
+        MarkCheck::Protected(reason) => {
+            // A home folder holds what is worth removing; the system trees
+            // and mount points do not, so only there is Open the way on.
+            let home = ["home folder", "user profile", "home directory"]
+                .iter()
+                .any(|word| reason.contains(word));
+            (
+                "Protected",
+                "PwrDisk never removes this".to_string(),
+                sentence(reason),
+                (home && is_dir)
+                    .then_some("Open it to mark what is inside.".to_string()),
+            )
+        }
+        MarkCheck::OverLimit(share) => {
+            let space = app.space.map_or(0, |space| space.total);
+            let allowed = u64::try_from(
+                u128::from(space) * u128::from(share.limit) / 100,
+            )
+            .unwrap_or(u64::MAX);
+            (
+                "Over limit",
+                format!("{}% of this disk", share.percent),
+                format!(
+                    "One removal may take up to {}% of a disk ({} of {}). \
+                     Mark something smaller, or use \u{25be} to mark it \
+                     anyway.",
+                    share.limit,
+                    human_bytes(allowed),
+                    human_bytes(space)
+                ),
+                Some("Change the limit in Settings \u{203a} Safety".into()),
+            )
+        }
+    };
+    Some(
+        div()
+            .debug_selector(|| "mark-guard".into())
+            .flex()
+            .flex_row()
+            .gap(space::SM)
+            .child(div().flex_shrink_0().w(space::XXS).bg(theme.warning))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .min_w_0()
+                    .py(space::XS)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(space::SM)
+                            .child(widgets::chip(chip, theme.warning, cx))
+                            .child(
+                                div()
+                                    .text_color(theme.bright)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.foreground)
+                            .child(body),
+                    )
+                    .children(hint.map(|hint| {
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(hint)
+                    })),
+            ),
+    )
+}
+
+/// A guard's reason as a sentence: capital first, full stop last.
+fn sentence(reason: &str) -> String {
+    let mut chars = reason.chars();
+    chars.next().map_or_else(String::new, |first| {
+        let mut text: String = first.to_uppercase().chain(chars).collect();
+        if !text.ends_with('.') {
+            text.push('.');
+        }
+        text
+    })
+}
+
+/// Mark past the limit: the main part says why it does nothing, and the
+/// chevron beside it, the one live part, opens the menu with Mark anyway.
+fn over_limit_mark(
+    share: &Share,
+    path: std::path::PathBuf,
+    open: bool,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_1()
+        .child(
+            button(
+                "mark",
+                format!("Over {}% limit", share.limit),
+                ButtonVariant::Outline,
+                cx,
+            )
+            .debug_selector(|| "inspector-mark".into())
+            .flex_1()
+            .justify_center()
+            .semantic_disabled(true),
+        )
+        .child(
+            button("mark-more", "\u{25be}", ButtonVariant::Outline, cx)
+                .debug_selector(|| "inspector-mark-more".into())
+                .aria_label("More ways to mark")
+                .tab_stop(true)
+                // At body size the glyph reads as a dot beside the label.
+                .text_size(text::HEADING)
+                .border_color(theme.warning)
+                .text_color(theme.warning)
+                .when(open, |button| button.bg(theme.warning.opacity(0.16)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.mark_menu = (!open).then(|| path.clone());
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                })),
+        )
+}
+
+/// What the chevron holds: Mark anyway, which names its cost, and the
+/// way to the setting. Drawn in the panel's flow, below the actions, so
+/// the panel's scroll never clips it; its rows are buttons, so Tab and a
+/// screen reader reach them as they reach Mark.
+fn mark_menu(
+    share: &Share,
+    crumbs: Vec<usize>,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let cost = format!(
+        "{}% of this disk \u{00b7} Review will ask you to confirm",
+        share.percent
+    );
+    div()
+        .id("mark-menu")
+        .debug_selector(|| "mark-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .p(space::SM)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .shadow_lg()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.mark_menu = None;
+            cx.notify();
+        }))
+        .child(
+            button("mark-anyway", "Mark anyway", ButtonVariant::Outline, cx)
+                .debug_selector(|| "mark-anyway".into())
+                .aria_description(cost.clone())
+                .tab_stop(true)
+                .justify_center()
+                .border_color(theme.warning)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.mark_anyway(&crumbs, cx);
+                    window.focus(&this.focus, cx);
+                })),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(cost),
+        )
+        .child(
+            button(
+                "mark-safety",
+                "Safety settings\u{2026}",
+                ButtonVariant::Outline,
+                cx,
+            )
+            .debug_selector(|| "mark-safety".into())
+            .tab_stop(true)
+            .justify_center()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.mark_menu = None;
+                crate::settings::open(crate::settings::Pane::Safety, cx);
+                window.focus(&this.focus, cx);
+            })),
+        )
 }
 
 fn service_guidance(
@@ -4997,6 +5246,10 @@ fn review_summary(
                         .child(explanation),
                 ),
         )
+        .children(
+            app.removal_gate(plan)
+                .map(|share| over_limit_gate(app, &share, theme, window, cx)),
+        )
         .child(
             div()
                 .flex()
@@ -5202,6 +5455,179 @@ fn export_menu(
 /// right. Moving to the trash is the default commit, so it is the primary
 /// action; a permanent deletion is the danger action and asks first, which
 /// its ellipsis promises. Over SSH nothing is removed here: Back alone.
+/// Past the limit, Review asks again before the commit button wakes: the
+/// share of the disk against the limit, then the phrase to type or the box
+/// to tick that Settings › Safety picked.
+fn over_limit_gate(
+    app: &Disktree,
+    share: &Share,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let fraction = |bytes: u64| {
+        (bytes as f32 / share.capacity.max(1) as f32).clamp(0.0, 1.0)
+    };
+    // The limit's tick on the meter, so the gap reads without arithmetic.
+    let limit_at = f32::from(share.limit) / 100.0;
+    let meter = div()
+        .relative()
+        .h(size::METER)
+        .bg(theme.divider())
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(gpui_kit::relative(fraction(share.bytes)))
+                .bg(theme.warning),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(-size::METER)
+                .bottom(-size::METER)
+                .left(gpui_kit::relative(limit_at))
+                .w(px(1.))
+                .bg(theme.bright),
+        );
+    let phrase = app.gate_phrase(share);
+    let policy = app.policy();
+    let ask: AnyElement = match policy.confirm {
+        Confirm::Nothing => div()
+            .text_size(text::CAPTION)
+            .text_color(theme.foreground)
+            .child(format!(
+                "Your limit is {}% per removal. Settings \u{203a} Safety asks \
+                 nothing more past it.",
+                share.limit
+            ))
+            .into_any_element(),
+        Confirm::Tick => {
+            let key = (share.percent, app.removal_mode);
+            let ticked = app.over_ticked == Some(key);
+            let verb = match app.removal_mode {
+                RemovalMode::Trash => "Move",
+                RemovalMode::Permanent => "Delete",
+            };
+            let entity = cx.entity().downgrade();
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.foreground)
+                        .child(format!(
+                            "Your limit is {}% per removal.",
+                            share.limit
+                        )),
+                )
+                .child(
+                    checkbox(
+                        "over-limit-tick",
+                        format!(
+                            "{verb} {}% of this disk{}",
+                            share.percent,
+                            if app.removal_mode == RemovalMode::Trash {
+                                " to the trash"
+                            } else {
+                                ""
+                            }
+                        ),
+                        if ticked {
+                            CheckboxState::Checked
+                        } else {
+                            CheckboxState::Unchecked
+                        },
+                        cx,
+                    )
+                    .debug_selector(|| "over-limit-tick".into())
+                    .tab_stop(true)
+                    .on_change(move |_, _, _, cx| {
+                        let _ = entity.update(cx, |this, cx| {
+                            this.over_ticked = (!ticked).then_some(key);
+                            cx.notify();
+                        });
+                    }),
+                )
+                .into_any_element()
+        }
+        Confirm::Phrase => {
+            let matched = app.gate_met(share, cx);
+            let field = app.over_phrase.as_ref().map(|input| {
+                gpui_omarchy::input("over-limit-phrase", input, window, cx)
+                    .debug_selector(|| "over-limit-phrase".into())
+                    .aria_label(format!("Type {phrase} to confirm"))
+            });
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::SM)
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.foreground)
+                        .child(format!(
+                            "Your limit is {}% per removal. To go past it, \
+                             type \u{201c}{phrase}\u{201d}.",
+                            share.limit
+                        )),
+                )
+                .children(field)
+                .when(matched, |this| {
+                    this.child(
+                        div()
+                            .debug_selector(|| "over-limit-matched".into())
+                            .text_size(text::CAPTION)
+                            .text_color(theme.success)
+                            .child("\u{2713} Matches"),
+                    )
+                })
+                .into_any_element()
+        }
+    };
+    div()
+        .id("over-limit-gate")
+        .debug_selector(|| "over-limit-gate".into())
+        .role(gpui_kit::Role::Group)
+        .aria_label(format!(
+            "This removes {}% of a disk, past the {}% limit",
+            share.percent, share.limit
+        ))
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .p(space::MD)
+        .border_1()
+        .border_color(theme.warning)
+        .bg(theme.warning.opacity(0.07))
+        .child(
+            div()
+                .text_color(theme.bright)
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("This removes {}% of a disk", share.percent)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap(space::SM)
+                .text_size(text::CAPTION)
+                .child(format!(
+                    "{} of {}",
+                    human_bytes(share.bytes),
+                    human_bytes(share.capacity)
+                ))
+                .child(format!("limit {}%", share.limit)),
+        )
+        .child(meter)
+        .child(ask)
+}
+
 fn review_actions(
     app: &Disktree,
     plan: &disktree_core::removal::Plan,
@@ -5223,7 +5649,10 @@ fn review_actions(
         }));
     let unavailable = plan.is_empty()
         || (app.removal_mode == RemovalMode::Trash
-            && !app.trash_backend.is_available());
+            && !app.trash_backend.is_available())
+        || app
+            .removal_gate(plan)
+            .is_some_and(|share| !app.gate_met(&share, cx));
     let commit = app.remote.is_none().then(|| {
         let count = plan.targets.len();
         let noun = if count == 1 { "item" } else { "items" };

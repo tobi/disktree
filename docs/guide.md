@@ -159,6 +159,18 @@ there, then choose:
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
 
+One removal may take only so much of a disk: 5% of the volume's capacity
+by default, counting everything marked. A mark that would pass it is not
+made by Space or **Mark for removal**: the button reads **Over 5% limit**,
+and the ▾ beside it holds **Mark anyway**, which names the share. Review
+then shows the share against the limit and keeps the commit button off
+until you type the phrase it shows, such as `delete 20% of my disk`
+(`trash …` to the trash). Removal is held to the share you typed: if what
+is marked has grown past it when the removal starts, nothing is removed.
+Settings › Safety sets the limit (1%, 5%, 10%, 25%, 50% or Off) and what
+Review asks past it (type a phrase, tick a box, or nothing more). Neither
+lets an agent past the limit.
+
 The commit is the footer's right-hand button; beside it, **Move & rescan**
 (**Delete & rescan…** in permanent mode, `shift enter`) does the same and
 then scans again. **Back** is beside them; **Export** and **Unmark all** sit
@@ -719,6 +731,14 @@ tested:
 - a directory holding your home directory or a system tree is refused (on
   macOS `/Users` is on the same volume as `/`, and `/opt` holds
   `/opt/homebrew`);
+- every account's folder is refused, and so is the folder holding them:
+  `/Users` and each folder in it on macOS, the profiles folder (usually
+  `C:\Users`) and each profile on Windows. What is inside one stays
+  removable;
+- these are asked before a mark is made: the panel says why instead of
+  offering **Mark for removal**, and Space marks nothing;
+- one removal may take only so much of a disk, 5% by default (see
+  [Removing](#removing));
 - system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`,
   `/gnu/store`, Homebrew's prefix on macOS and Linux, …) are
   refused even where permissions would allow it: packages own them, and

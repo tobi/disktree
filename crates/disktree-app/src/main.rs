@@ -34,6 +34,7 @@ mod log_view;
 #[cfg(debug_assertions)]
 mod logs_fixture;
 mod logs_window;
+mod mark_guard;
 mod marks;
 mod palette;
 mod placement;
