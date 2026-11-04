@@ -212,8 +212,9 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
     default), which names each disk past the limit, with the worker
     holding each of those disks to its confirmed share and every other
     disk to the limit. An agent's mark past the limit is refused, and
-    agents keep the default limit when the window's is Off.
-    `mark_guard.rs` holds the rule.
+    agents keep the default limit when the window's is Off, on the
+    worker as at the preview: nothing the person confirms in Review
+    raises an agent's removal. `mark_guard.rs` holds the rule.
     Trash never falls back to permanent deletion. No headless or SSH removal.
     A linked window's tree and marks remain the source of truth; `ls` and
     `find` read it without navigating. Only an explicit `show` request moves

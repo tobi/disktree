@@ -230,11 +230,14 @@ impl Disktree {
         self.removal_mode = request.mode.mode();
         self.confirm_open = false;
         self.rescan_after_removal = request.rescan;
-        // begin_removal associates both UI and MCP runs with this preview.
+        // Starting a run associates both UI and MCP runs with this preview.
         if let Some(agent) = &mut self.agent {
             agent.removal_preview = Some(prepared);
         }
-        self.begin_removal(cx);
+        // Held to the agent limit, not the window's: with the window's Off
+        // the preview was checked at the agent limit, and growth since must
+        // be refused at the same limit.
+        self.begin_agent_removal(cx);
         if self.screen != Screen::Running {
             if let Some(agent) = &mut self.agent {
                 agent.removal_preview = None;

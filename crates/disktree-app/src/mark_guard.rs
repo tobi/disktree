@@ -441,6 +441,18 @@ impl Disktree {
         Ok(ceilings)
     }
 
+    /// The limits an agent's removal is held to: the agent limit on every
+    /// disk. Review's confirmation never raises it, and the window's Off
+    /// never lifts it, so a share that grew past the limit since the
+    /// preview is refused on the worker as it was at the preview.
+    pub fn agent_removal_limit(&self, plan: &Plan) -> Result<Ceilings, String> {
+        let ceilings = Ceilings::from(self.reload_policy()?.agent_limit());
+        ceilings.check_with(&plan.targets, |path| {
+            (self.disk_probe)(path).map(|disk| (disk.key, disk.capacity))
+        })?;
+        Ok(ceilings)
+    }
+
     /// Make Review's phrase field once there is a window to make it in.
     /// Enter in it commits, as Enter on the list does, once it matches.
     pub fn prepare_over_phrase(
