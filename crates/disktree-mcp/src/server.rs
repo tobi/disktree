@@ -27,8 +27,9 @@ use rmcp::{
 };
 
 use crate::session::{
-    EstimateParams, FindParams, LsParams, PathsParams, RemovalPreviewParams,
-    RemoveParams, ScanParams, ScanPlan, Session, ShowParams, run_scan,
+    EstimateParams, FindParams, LsParams, PathsParams, RankParams,
+    RemovalPreviewParams, RemoveParams, ScanParams, ScanPlan, Session,
+    ShowParams, run_scan,
 };
 use crate::skills::{self, SKILLS};
 
@@ -41,8 +42,15 @@ const SCAN_WAIT: Duration = Duration::from_mins(10);
 /// What the client is told at `initialize`: enough to use the tools well,
 /// and safely, without reading a skill first.
 const INSTRUCTIONS: &str = "\
-Start with pwrdisk_status, then scan and explore with pwrdisk_ls and \
-pwrdisk_find. Use pwrdisk_estimate for a hypothetical path list without \
+Read skill://pwrdisk-free-space/SKILL.md with pwrdisk_read_skill and its \
+OS reference before choosing cleanup candidates. In PwrAgent, resource \
+reads use the exact serverNameInAgent from manage_mcp_connections \
+action=describe_thread, never the client label. Start with pwrdisk_status, then scan and explore with pwrdisk_ls and \
+pwrdisk_find. Compare explicit candidates with pwrdisk_rank; private and \
+reclaim_lower values are before retention, not immediate recovered space. \
+Use pwrdisk_retention on each selected volume before promising recovery; \
+snapshot presence cannot attribute exact selected-path bytes. \
+Use pwrdisk_estimate for a hypothetical path list without \
 changing the cart; bounded clone-holder peers are inspection leads only. \
 Browsing never moves the displayed directory. Call \
 pwrdisk_show only when the user asks to see a path or requests following. \
@@ -76,6 +84,20 @@ A linked window's tree and marks are the source of truth. Read \
 skill://pwrdisk-free-space/SKILL.md and the matching references/macos.md, \
 references/linux.md or references/windows.md before marking or removal. \
 For read-only audits use skill://pwrdisk-explain-usage/SKILL.md.";
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SkillParams {
+    /// An exact skill:// URI from the PwrDisk skill catalog.
+    uri: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RetentionParams {
+    /// An absolute path on the selected volume; run for each volume.
+    path: std::path::PathBuf,
+}
 
 /// The server: one session behind a lock, so the tools can run from any
 /// protocol task while scans run off to the side.
@@ -114,13 +136,71 @@ impl Server {
 impl Server {
     /// What this session knows: scans held, the window if one is open, what
     /// is marked, the last removal, and every volume's free space. Start
-    /// here.
+    /// here. Read `skill://pwrdisk-free-space/SKILL.md` with `pwrdisk_read_skill`.
+    /// Read it and the OS reference via this tool's exact MCP server name,
+    /// not its product/client label. In PwrAgent, `manage_mcp_connections`
+    /// `action=describe_thread` supplies `serverNameInAgent`; use that exact
+    /// value with `list_mcp_resources(server=...)` and `read_mcp_resource`.
     #[tool(
         name = "pwrdisk_status",
         annotations(title = "PwrDisk status", read_only_hint = true)
     )]
     async fn status(&self) -> String {
         self.with(Session::status)
+    }
+
+    /// Read the required PwrDisk skill or OS reference directly, using its
+    /// skill URI. Start with `skill://pwrdisk-free-space/SKILL.md` before
+    /// choosing cleanup candidates, then references/macos.md, linux.md or
+    /// windows.md. Also exposed as MCP resources: in PwrAgent use
+    /// `manage_mcp_connections(action="describe_thread").serverNameInAgent`
+    /// as the exact server for `list_mcp_resources` and `read_mcp_resource`.
+    #[tool(
+        name = "pwrdisk_read_skill",
+        annotations(title = "Read PwrDisk skill", read_only_hint = true)
+    )]
+    async fn read_skill(
+        &self,
+        Parameters(params): Parameters<SkillParams>,
+    ) -> Result<String, String> {
+        skills::read(&params.uri)
+            .map(str::to_owned)
+            .ok_or_else(|| "Unknown PwrDisk skill resource URI".into())
+    }
+
+    /// Read-only retention preflight before proposing recovered space.
+    /// On macOS lists Time Machine snapshots for the path's volume with a
+    /// bounded command. Never changes snapshots. Reports presence only:
+    /// selected-path retention bytes and immediate recovery remain unknown.
+    /// Not a complete APFS snapshot or open-file inventory.
+    #[tool(
+        name = "pwrdisk_retention",
+        annotations(
+            title = "Inspect retention uncertainty",
+            read_only_hint = true
+        )
+    )]
+    async fn retention(
+        &self,
+        Parameters(params): Parameters<RetentionParams>,
+    ) -> Result<String, String> {
+        crate::retention::inspect(&params.path).await
+    }
+
+    /// Rank explicit candidate paths by private allocation or standalone
+    /// conservative reclaim lower bound. Read-only, no marking. Unknown
+    /// values are null and sort last; known zero stays zero. The complete
+    /// union is estimated once: never add candidate bounds. Ranking does
+    /// not establish ownership, disposability or immediate recovered space.
+    #[tool(
+        name = "pwrdisk_rank",
+        annotations(title = "Rank cleanup candidates", read_only_hint = true)
+    )]
+    async fn rank(
+        &self,
+        Parameters(params): Parameters<RankParams>,
+    ) -> Result<String, String> {
+        self.with(|session| session.rank(&params))
     }
 
     /// Scan a directory tree and keep the result for the other tools. With
@@ -173,7 +253,8 @@ impl Server {
 
     /// List a scanned directory, largest first: each entry's share, size,
     /// kind of data, whether its space can be had back and why, and when it
-    /// was last written. Never changes the directory shown in the window.
+    /// was last written. Sorts by listed allocation, not predicted recovery;
+    /// compare explicit candidates with `pwrdisk_rank`. Never moves the view.
     #[tool(
         name = "pwrdisk_ls",
         annotations(title = "List a directory", read_only_hint = true)
@@ -189,7 +270,8 @@ impl Server {
     /// every scanned root: files over a size, everything reclaimable
     /// (caches, build output, package stores), one kind of data, a name,
     /// or what nobody has written to in a while. A matching directory is
-    /// listed once, without its contents.
+    /// listed once, without its contents. Sorts by listed allocation;
+    /// compare explicit candidates with `pwrdisk_rank` before recommending.
     #[tool(
         name = "pwrdisk_find",
         annotations(title = "Find the largest matches", read_only_hint = true)
@@ -243,10 +325,11 @@ impl Server {
     /// PwrDisk window when one is open, and the user removes them from the
     /// review screen. Returns the plan: what is marked, what the guards
     /// keep back and why (the home directory, an account's folder, a mount
-    /// point, a system tree), what is covered by another mark, and the
-    /// free space it gives back on the volume. A linked window refuses a
-    /// mark that would take the list past the capacity limit; only the
-    /// person can mark past it, in the window.
+    /// point, a system tree), what is covered by another mark, and
+    /// scan-derived reclaim bounds before retention. These are not
+    /// guaranteed recovered space. A linked window refuses a mark that
+    /// would take the list past the capacity limit; only the person can
+    /// mark past it, in the window.
     #[tool(
         name = "pwrdisk_mark",
         annotations(
@@ -301,6 +384,9 @@ impl Server {
         Parameters(params): Parameters<RemoveParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, String> {
+        if let Some(outcome) = self.with(|s| s.removal_outcome(&params)) {
+            return Ok(outcome);
+        }
         let message =
             self.with(|session| session.removal_confirmation_message(&params))?;
         if !context
@@ -308,17 +394,28 @@ impl Server {
             .supported_elicitation_modes()
             .contains(&rmcp::service::ElicitationMode::Form)
         {
-            return Err("This MCP client does not support interactive form confirmation. No removal started. Use human review in PwrDisk; never approve it through computer use.".into());
+            return Err("This MCP client does not support interactive form confirmation. No MCP removal request was sent; check pwrdisk_status for any native UI operation. Use human review in PwrDisk; never approve it through computer use.".into());
         }
         let requested_schema = ElicitationSchema::builder().required_property(
             "confirmed", PrimitiveSchemaDefinition::Boolean(BooleanSchema::new().with_default(false)
                 .description("I confirm removal of exactly these paths in the stated mode and understand the consequences")),
         ).build().map_err(ToString::to_string)?;
-        let answer = context.peer.create_elicitation(ElicitRequestParams::FormElicitationParams {
-            meta: None, message, requested_schema,
-        }).await.map_err(|error| format!("Removal not started: confirmation failed ({error}); obtain a new preview"))?;
+        let answer = context
+            .peer
+            .create_elicitation(ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message,
+                requested_schema,
+            })
+            .await;
+        // The person may have approved in the native UI while this form
+        // was open. Cancellation describes the form, not that operation.
+        if let Some(outcome) = self.with(|s| s.removal_outcome(&params)) {
+            return Ok(outcome);
+        }
+        let answer = answer.map_err(|error| format!("MCP confirmation failed ({error}). No MCP removal request was sent; native UI outcome could not be verified. Check pwrdisk_status. Never retry automatically."))?;
         if !confirmed_by_user(&answer) {
-            return Err("Removal not started: user declined or cancelled confirmation. A new preview is required.".into());
+            return Err("MCP confirmation was declined or cancelled. No MCP removal request was sent; native UI outcome could not be verified. Check pwrdisk_status before considering a new preview. Never retry automatically.".into());
         }
         self.with(|session| session.remove(&params))
     }
@@ -614,6 +711,59 @@ mod tests {
         for skill in SKILLS {
             assert!(instructions.contains(&skill.uri()), "{}", skill.name);
         }
+    }
+
+    #[tokio::test]
+    async fn skills_are_readable_directly_from_tool_discovery() {
+        let server = Server::new(Session::detached(
+            std::env::temp_dir().join("pwrdisk-no-window.sock"),
+            None,
+        ));
+        for skill in SKILLS {
+            for file in skill.files {
+                let text = server
+                    .read_skill(Parameters(SkillParams {
+                        uri: skills::uri(skill.name, file.path),
+                    }))
+                    .await
+                    .expect("tool reads exact resource");
+                assert_eq!(text, file.text);
+            }
+        }
+        assert!(
+            server
+                .read_skill(Parameters(SkillParams {
+                    uri: "file:///etc/passwd".into()
+                }))
+                .await
+                .is_err()
+        );
+        let tools = Server::tool_router().list_all();
+        for name in ["pwrdisk_read_skill", "pwrdisk_retention", "pwrdisk_rank"]
+        {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("discoverable");
+            assert_eq!(
+                tool.annotations
+                    .as_ref()
+                    .expect("annotations")
+                    .read_only_hint,
+                Some(true)
+            );
+        }
+        let status = tools
+            .iter()
+            .find(|tool| tool.name == "pwrdisk_status")
+            .expect("status");
+        assert!(
+            status
+                .description
+                .as_ref()
+                .expect("onboarding")
+                .contains("serverNameInAgent")
+        );
     }
     #[test]
     fn removal_is_a_destructive_non_idempotent_write_and_listing_is_read_only()

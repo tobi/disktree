@@ -36,6 +36,55 @@ impl PreparedRemoval {
 }
 
 impl Disktree {
+    /// Associate a native UI run with a preview only for the same selection,
+    /// mode and scan. This records an outcome; it never authorizes a run.
+    pub(crate) fn track_agent_removal(&mut self) {
+        let matches = self
+            .agent
+            .as_ref()
+            .and_then(|a| a.removal_preview.as_ref())
+            .is_some_and(|prepared| {
+                prepared.preview.root == self.root_path
+                    && prepared.preview.mode.mode() == self.removal_mode
+                    && prepared.marks == self.marks.items()
+                    && self.tree.as_ref().is_some_and(|tree| {
+                        Weak::ptr_eq(&Arc::downgrade(tree), &prepared.tree)
+                    })
+                    && prepared.preview.paths.iter().eq(self
+                        .run_list
+                        .items
+                        .iter()
+                        .map(|item| &item.target.path))
+            });
+        if matches && let Some(agent) = &mut self.agent {
+            let prepared =
+                agent.removal_preview.take().expect("matched preview");
+            agent.removal_operation = Some(disktree_link::RemovalOperation {
+                preview_id: prepared.preview.preview_id,
+                mode: prepared.preview.mode,
+                paths: prepared.preview.paths,
+                finished: false,
+                removed: 0,
+                failed: 0,
+                pending: self.run_list.items.len(),
+            });
+            agent.removal_operation_epoch = self.run_epoch;
+        }
+    }
+
+    pub(crate) fn update_agent_removal(&mut self, finished: bool) {
+        if let Some(agent) = &mut self.agent
+            && agent.removal_operation_epoch == self.run_epoch
+            && let Some(operation) = &mut agent.removal_operation
+        {
+            let totals = self.run_list.totals();
+            operation.finished = finished;
+            operation.removed = totals.removed;
+            operation.failed = totals.failed_all();
+            operation.pending = totals.total - totals.removed - totals.failed;
+        }
+    }
+
     pub(crate) fn agent_prepare_removal(
         &mut self,
         mode: RemovalChoice,
@@ -129,6 +178,18 @@ impl Disktree {
         request: &ConfirmedRemoval,
         cx: &mut Context<'_, Self>,
     ) -> Response {
+        if self
+            .agent
+            .as_ref()
+            .and_then(|a| a.removal_operation.as_ref())
+            .is_some_and(|operation| {
+                operation.preview_id == request.preview_id
+                    && operation.mode == request.mode
+                    && operation.paths == request.paths
+            })
+        {
+            return Response::State(self.agent_state());
+        }
         // Consume before validation: failures and retries need a new preview.
         let Some(prepared) = self
             .agent
@@ -169,8 +230,15 @@ impl Disktree {
         self.removal_mode = request.mode.mode();
         self.confirm_open = false;
         self.rescan_after_removal = request.rescan;
+        // begin_removal associates both UI and MCP runs with this preview.
+        if let Some(agent) = &mut self.agent {
+            agent.removal_preview = Some(prepared);
+        }
         self.begin_removal(cx);
         if self.screen != Screen::Running {
+            if let Some(agent) = &mut self.agent {
+                agent.removal_preview = None;
+            }
             return Response::error(
                 "Removal did not start; inspect status before preparing another preview",
             );

@@ -17,12 +17,21 @@ use crate::session::Session;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_interactive_user_confirmation_reaches_the_removal_request() {
-    for (supports_form, action, confirmed, expected) in [
-        (false, "accept", true, 0),
-        (true, "decline", true, 0),
-        (true, "cancel", true, 0),
-        (true, "accept", false, 0),
-        (true, "accept", true, 1),
+    for (supports_form, action, confirmed, native, expected) in [
+        (false, "accept", true, 0, 0),
+        (true, "decline", true, 0, 0),
+        (true, "cancel", true, 0, 0),
+        (true, "accept", false, 0, 0),
+        (true, "accept", true, 0, 1),
+        (true, "cancel", false, 1, 0), // UI still running.
+        (true, "cancel", false, 2, 0), // UI completed before cancellation.
+        (true, "decline", false, 3, 0), // Partial failure in native UI.
+        (true, "accept", true, 2, 0),  // UI completed before acceptance.
+        (true, "cancel", false, 4, 0), // Unrelated preview.
+        (true, "cancel", false, 5, 0), // Different mode.
+        (true, "cancel", false, 6, 0), // Different path list.
+        (true, "error", false, 0, 0),  // Proxy/client lifecycle failure.
+        (true, "error", false, 2, 0),  // UI completion before form error.
     ] {
         let temp = tempfile::tempdir().expect("fixture");
         let file = temp.path().join("candidate");
@@ -38,10 +47,12 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
         let calls = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
         let (count, stop) = (Arc::clone(&calls), Arc::clone(&stopped));
+        let native_state = Arc::new(AtomicUsize::new(0));
+        let ui_state = Arc::clone(&native_state);
         let root = temp.path().to_path_buf();
         let candidate = file.clone();
         let window = std::thread::spawn(move || {
-            let state = State {
+            let mut state = State {
                 version: VERSION,
                 app_version: "0.13.0".into(),
                 root: root.clone(),
@@ -56,6 +67,7 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                     is_dir: false,
                 }],
                 space: None,
+                removal_operation: None,
                 removal: None,
                 removals: None,
                 tree: None,
@@ -67,6 +79,34 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                     if let Incoming::Request { request, reply, .. } = incoming {
                         let answer = match request {
                             Request::Hello { .. } | Request::State => {
+                                let native = ui_state.load(Ordering::SeqCst);
+                                state.removal_operation =
+                                    (native > 0).then(|| {
+                                        disktree_link::RemovalOperation {
+                                            preview_id: if native == 4 {
+                                                "other-preview"
+                                            } else {
+                                                "fixture-preview"
+                                            }
+                                            .into(),
+                                            mode: if native == 5 {
+                                                RemovalChoice::Trash
+                                            } else {
+                                                RemovalChoice::Permanent
+                                            },
+                                            paths: if native == 6 {
+                                                vec![root.join("other")]
+                                            } else {
+                                                vec![candidate.clone()]
+                                            },
+                                            finished: native != 1,
+                                            removed: usize::from(
+                                                native != 1 && native != 3,
+                                            ),
+                                            failed: usize::from(native == 3),
+                                            pending: usize::from(native == 1),
+                                        }
+                                    });
                                 Response::State(state.clone())
                             }
                             Request::PrepareRemoval { mode } => {
@@ -152,6 +192,13 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
                 assert!(message.contains("permanently deletes"));
                 assert!(message.contains("cannot be undone"));
                 assert!(message.contains("5% of each volume"));
+                native_state.store(native, Ordering::SeqCst);
+                if action == "error" {
+                    send(&mut output, json!({"jsonrpc":"2.0","id":response["id"],"error":{
+                        "code":-32603,"message":"fixture client disconnected"
+                    }})).await;
+                    continue;
+                }
                 // This simulates the client's user response, never model input.
                 send(
                     &mut output,
@@ -163,9 +210,31 @@ async fn only_interactive_user_confirmation_reaches_the_removal_request() {
             } else if response["id"] == 3 {
                 assert_eq!(
                     response["result"]["isError"] == true,
-                    expected == 0,
+                    expected == 0 && !(1..=3).contains(&native),
                     "{response}"
                 );
+                let text = response.to_string();
+                if (1..=3).contains(&native) {
+                    assert!(
+                        text.contains("exact previewed selection"),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains(if native == 1 {
+                            "already running"
+                        } else {
+                            "finished"
+                        }),
+                        "{text}"
+                    );
+                    assert!(text.contains("Do not retry"), "{text}");
+                    if native == 3 {
+                        assert!(text.contains("1 failed"), "{text}");
+                    }
+                    assert!(!text.contains("new preview"), "{text}");
+                } else if supports_form && expected == 0 {
+                    assert!(text.contains("could not be verified"), "{text}");
+                }
                 break;
             }
         }

@@ -187,6 +187,28 @@ pub struct LsParams {
     pub show: bool,
 }
 
+/// Ranking metric; values remain scan-derived, before retention.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, serde::Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RankBy {
+    #[default]
+    Private,
+    ReclaimLower,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RankParams {
+    /// Explicit candidates from one completed scan; 1 to 50 paths.
+    pub paths: Vec<PathBuf>,
+    /// Private allocation (default), or standalone reclaim lower bound.
+    /// Neither metric predicts immediate free space; null sorts last.
+    #[serde(default)]
+    pub by: RankBy,
+}
+
 /// A hypothetical selection; the marked cart is never used or modified.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -793,10 +815,10 @@ impl Session {
     }
 
     /// Estimate without adopting or handing over marks from either side.
-    pub fn estimate_paths(
+    fn estimate_report_for(
         &self,
         params: &EstimateParams,
-    ) -> Result<String, String> {
+    ) -> Result<disktree_core::planning::Report, String> {
         use disktree_core::planning::{self, Context};
         if params.paths.is_empty() || params.paths.len() > planning::MAX_PATHS {
             return Err(format!("Supply 1 to {} paths.", planning::MAX_PATHS));
@@ -879,10 +901,69 @@ impl Session {
                 peer_limit,
             )?
         };
+        Ok(report)
+    }
+
+    pub fn estimate_paths(
+        &self,
+        params: &EstimateParams,
+    ) -> Result<String, String> {
+        let report = self.estimate_report_for(params)?;
         let json =
             serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
         Ok(format!(
-            "Read-only hypothetical selection; marks, scan root, navigation and removal intents are unchanged. All byte values are bytes.\n{json}\nPeer rows are alternatives, not additive savings. Additional bounds subtract the original selection's opposite bound. with_all_returned_peers evaluates their union once. Peers are clone-holder directories to inspect, not removal recommendations. Clone IDs cannot enumerate all extent owners, particularly after modification. references_not_seen_in_scan counts unresolved references without owner paths, never known peers; filtered or truncated scans cannot establish that count. Peer candidates are direct children of peers.scope; widen peer_scope explicitly to inspect another part of this scan."
+            "Read-only hypothetical selection; marks, scan root, navigation and removal intents are unchanged. All byte values are bytes. listed_bytes is apparent logical size only when context.apparent_size=true; otherwise it is reported allocation including repeated clone allocation. private_allocation is scan-derived, and reclaim is the selected union before retention. {}\n{json}\nPeer rows are alternatives, not additive savings. Additional bounds subtract the original selection's opposite bound. with_all_returned_peers evaluates their union once. Peers are clone-holder directories to inspect, not removal recommendations. Clone IDs cannot enumerate all extent owners, particularly after modification. references_not_seen_in_scan counts unresolved references without owner paths, never known peers; filtered or truncated scans cannot establish that count. Peer candidates are direct children of peers.scope; widen peer_scope explicitly to inspect another part of this scan.",
+            retention_notice()
+        ))
+    }
+
+    /// Rank explicit candidates without marks or clone-peer discovery.
+    pub fn rank(&self, params: &RankParams) -> Result<String, String> {
+        if params.paths.is_empty() || params.paths.len() > 50 {
+            return Err(
+                "Supply 1 to 50 candidate paths from one complete scan.".into(),
+            );
+        }
+        let selection = self.estimate_report_for(&EstimateParams {
+            paths: params.paths.clone(),
+            peer_scope: None,
+            peer_limit: Some(0),
+        })?;
+        let mut candidates = Vec::new();
+        for path in &params.paths {
+            let report = self.estimate_report_for(&EstimateParams {
+                paths: vec![path.clone()],
+                peer_scope: None,
+                peer_limit: Some(0),
+            })?;
+            if report.context != selection.context {
+                return Err("Scan context changed during ranking; inspect status and rank again.".into());
+            }
+            candidates.push(report);
+        }
+        let candidates: Vec<_> = rank_candidates(candidates, params.by)
+            .into_iter()
+            .map(|candidate| {
+                let report = candidate.estimate;
+                serde_json::json!({
+                    "value": candidate.value,
+                    "paths": report.accepted,
+                    "refused": report.refused,
+                    "listed_bytes": report.listed_bytes,
+                    "apparent_size": report.context.apparent_size,
+                    "private_allocation": report.private_allocation,
+                    "reclaim": report.reclaim,
+                    "metadata_complete": report.metadata_complete,
+                    "scan_complete": report.scan_complete,
+                })
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "rank_by": params.by, "candidates": candidates, "selection_union": selection,
+        })).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Read-only candidate ranking, known values descending; null is unavailable, never zero. Candidate estimates are alternatives, not additive; selection_union evaluates the full set once. Private allocation is not immediate recovered space. Reclaim lower bounds are before retention, not guaranteed savings. Ownership and cleanup method are not established by ranking: inspect classification with pwrdisk_find/ls, prefer the owning tool, and check worktree status before proposing it. Never remove worktrees just to unlock clone groups.\n{json}\n{}",
+            retention_notice()
         ))
     }
 
@@ -1506,8 +1587,40 @@ impl Session {
         Ok(message)
     }
 
+    /// Read the exact preview's outcome without Hello, mark handover or writes.
+    pub fn removal_outcome(&self, params: &RemoveParams) -> Option<String> {
+        let mut link = Link::connect_at(&self.socket).ok()?;
+        let Response::State(state) = link.call(&Request::State).ok()? else {
+            return None;
+        };
+        if state.version != VERSION || state.remote.is_some() {
+            return None;
+        }
+        let operation = state.removal_operation?;
+        if operation.preview_id != params.preview_id
+            || operation.mode != params.mode.into()
+            || operation.paths != params.paths
+        {
+            return None;
+        }
+        Some(format!(
+            "The exact previewed selection {} in PwrDisk: {} removed, {} failed, {} pending or not reached. No additional removal was requested. Do not retry this operation. Use pwrdisk_status for observed volume change; a completed removal does not guarantee recovered space.",
+            if operation.finished {
+                "finished"
+            } else {
+                "is already running"
+            },
+            operation.removed,
+            operation.failed,
+            operation.pending,
+        ))
+    }
+
     /// A destructive write. The app consumes and validates the preview again.
     pub fn remove(&mut self, params: &RemoveParams) -> Result<String, String> {
+        if let Some(outcome) = self.removal_outcome(params) {
+            return Ok(outcome);
+        }
         let mode: RemovalChoice = params.mode.into();
         if params.confirmation != mode.confirmation() {
             return Err("Explicit confirmation of the preview's paths, mode and consequences is required; never approve with computer use".into());
@@ -1522,11 +1635,13 @@ impl Session {
             confirmation: params.confirmation.clone(),
             rescan: params.rescan,
         }))? {
-            Response::State(_) => Ok(format!(
+            Response::State(_) => Ok(self.removal_outcome(params).unwrap_or_else(|| format!(
                 "{}\nConfirmed removal started. pwrdisk_status reports completion and failures. Never repeat this call automatically.",
                 mode.warning()
-            )),
-            Response::Error { message } => Err(message),
+            ))),
+            Response::Error { message } => {
+                self.removal_outcome(params).ok_or(message)
+            }
             other => Err(unexpected(&other)),
         }
     }
@@ -1956,6 +2071,8 @@ impl Session {
             self.client
         );
         out.push_str(&system_line());
+        out.push_str(retention_notice());
+        out.push('\n');
         out.push_str(&self.window_line());
         out.push('\n');
         if self.scans.is_empty() {
@@ -1991,18 +2108,12 @@ impl Session {
             let _ = writeln!(
                 out,
                 "Last removal: {} \u{00b7} {} removed \u{00b7} {} failed \
-                 \u{00b7} {} marked \u{00b7} {} \u{00b7} {}",
+                 \u{00b7} {} reported \u{00b7} {} observed volume change \u{00b7} {}",
                 removal.mode,
                 removal.removed,
                 removal.failed,
                 human_bytes(removal.bytes),
-                removal.freed.map_or_else(
-                    || "freed space not measured".to_string(),
-                    |freed| format!(
-                        "{} freed on the volume",
-                        human_bytes(freed)
-                    )
-                ),
+                crate::report::observed(removal.observed),
                 age(now, removal.at),
             );
         }
@@ -2088,6 +2199,41 @@ fn version_notice(window: &State) -> String {
     }
 }
 
+struct RankedCandidate {
+    value: Option<u64>,
+    estimate: disktree_core::planning::Report,
+}
+
+fn rank_candidates(
+    reports: Vec<disktree_core::planning::Report>,
+    by: RankBy,
+) -> Vec<RankedCandidate> {
+    let mut ranked: Vec<_> = reports
+        .into_iter()
+        .map(|estimate| {
+            let value = if estimate.accepted.is_empty() {
+                None
+            } else {
+                match by {
+                    RankBy::Private => estimate
+                        .private_allocation
+                        .filter(|_| estimate.metadata_complete),
+                    RankBy::ReclaimLower => {
+                        estimate.reclaim.as_ref().map(|bounds| bounds.lower)
+                    }
+                }
+            };
+            RankedCandidate { value, estimate }
+        })
+        .collect();
+    ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.value));
+    ranked
+}
+
+const fn retention_notice() -> &'static str {
+    "Retention preflight: not performed by the scan or estimate. Before promising recovered space, use pwrdisk_retention for each selected volume on macOS and read the system skill reference. Snapshot presence is a retention risk, not proof of bytes held by these paths; absence does not rule out other snapshots or open files. Immediate recovered bytes are unknown, even for private allocation and reclaim lower bounds."
+}
+
 fn estimate_report(estimate: &SelectionEstimate) -> String {
     let mut out = format!(
         "Selected-set reclaim estimate: {}–{}{}. Before snapshots, open files \
@@ -2102,6 +2248,8 @@ fn estimate_report(estimate: &SelectionEstimate) -> String {
             ""
         },
     );
+    out.push_str(retention_notice());
+    out.push('\n');
     // APFS reference counts include clones outside the scan, which can
     // never be selected: say why the estimate is below the listed bytes.
     if estimate.shared > 0 {
@@ -2709,6 +2857,96 @@ mod tests {
     }
 
     #[test]
+    fn ranking_prefers_private_data_to_large_clones_and_keeps_unknown_last() {
+        use disktree_core::planning::{self, Context};
+        let temp = tempfile::tempdir_in(std::env::current_dir().expect("cwd"))
+            .expect("fixture");
+        let root = temp.path().canonicalize().expect("root");
+        let scan = clone_copies_with_plain(&root, 3, 6 * 1024 * 1024);
+        let mut context = Context::of(&root, &scan.options, scan.at, 0);
+        // Synthetic clone metadata on every test host; no real clone probe.
+        context.clone_metadata = true;
+        let estimate = |name: &str| {
+            planning::estimate(
+                &scan.tree,
+                context.clone(),
+                &[root.join(name)],
+                None,
+                0,
+            )
+            .expect("estimate")
+        };
+        let clone = estimate("copy-a");
+        let plain = estimate("plain");
+        assert!(clone.listed_bytes > plain.listed_bytes);
+        let mut unknown = clone.clone();
+        unknown.private_allocation = None;
+        unknown.reclaim = None;
+        let mut incomplete = clone.clone();
+        incomplete.metadata_complete = false;
+        for by in [RankBy::Private, RankBy::ReclaimLower] {
+            let ranked = rank_candidates(
+                vec![unknown.clone(), clone.clone(), plain.clone()],
+                by,
+            );
+            assert!(ranked[0].value.expect("plain") > 0);
+            assert_eq!(ranked[0].estimate.accepted, [root.join("plain")]);
+            assert_eq!(ranked[1].value, Some(0), "known clone zero");
+            assert_eq!(ranked[2].value, None, "unknown is not zero");
+        }
+        assert_eq!(
+            rank_candidates(vec![incomplete], RankBy::Private)[0].value,
+            None
+        );
+        let union =
+            planning::estimate(&scan.tree, context, &copies(&root), None, 0)
+                .expect("union");
+        assert!(
+            union.reclaim.expect("union bounds").lower
+                > clone.reclaim.expect("alone bounds").upper
+        );
+    }
+
+    #[test]
+    fn ranking_is_read_only_and_apparent_measurements_are_unavailable() {
+        let temp = fixture();
+        let mut session = unlinked(temp.path());
+        scanned(&mut session, temp.path());
+        let before = session.marks.clone();
+        let text = session
+            .rank(&RankParams {
+                paths: vec![
+                    temp.path().join("Downloads"),
+                    temp.path().join("notes"),
+                ],
+                by: RankBy::Private,
+            })
+            .expect("rank");
+        let (_, json) = text.split_once('\n').expect("JSON");
+        let value: serde_json::Value = serde_json::Deserializer::from_str(json)
+            .into_iter()
+            .next()
+            .expect("value")
+            .expect("JSON");
+        assert!(value["candidates"][0]["value"].is_null());
+        assert!(
+            value["selection_union"]["context"]["apparent_size"]
+                .as_bool()
+                .expect("mode")
+        );
+        assert_eq!(session.marks, before);
+        assert!(session.pending_removal.is_none());
+        assert!(
+            session
+                .rank(&RankParams {
+                    paths: vec![],
+                    by: RankBy::Private
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn hypothetical_selection_preserves_the_offline_cart_and_scan() {
         let temp = fixture();
         let mut session = unlinked(temp.path());
@@ -2901,12 +3139,14 @@ mod tests {
                 estimate: Some(SelectionEstimate::of(&plan)),
                 marks: self.marks.clone(),
                 space: None,
+                removal_operation: None,
                 removal: Some(Removal {
                     mode: "trash".into(),
                     removed: 2,
                     failed: 0,
                     bytes: 700_000,
-                    freed: Some(690_000),
+                    freed: Some(0),
+                    observed: Some(-28_311_552),
                     at: now() - 120,
                 }),
                 removals: Some(disktree_link::RemovalLedger {
@@ -2916,13 +3156,13 @@ mod tests {
                         failed: 0,
                         reported: 700_000,
                         private: Some(650_000),
-                        observed: Some(690_000),
+                        observed: Some(-28_311_552),
                         started: now() - 125,
                         finished: now() - 120,
                     }],
                     reported: 700_000,
                     private: Some(650_000),
-                    observed: Some(690_000),
+                    observed: Some(-28_311_552),
                 }),
                 tree: Some(TreeSummary {
                     bytes: self.tree.root().bytes,
@@ -3492,6 +3732,14 @@ mod tests {
     /// Three directories, each holding one full clone of a group APFS
     /// counts `references` members of, beside a plain directory.
     fn clone_copies(root: &Path, references: u32) -> Scan {
+        clone_copies_with_plain(root, references, 12 * 1024 * 1024)
+    }
+
+    fn clone_copies_with_plain(
+        root: &Path,
+        references: u32,
+        plain_bytes: u64,
+    ) -> Scan {
         use disktree_core::sharing::{Allocation, CloneInfo};
         use disktree_core::tree::{Metric, NodeKind, aggregate};
         const MIB: u64 = 1024 * 1024;
@@ -3499,7 +3747,15 @@ mod tests {
         for name in ["copy-a", "copy-b", "copy-c", "plain"] {
             std::fs::create_dir(root.join(name)).expect("fixture directory");
             let mut dir = Draft::directory(name);
-            let mut file = Draft::entry("data", NodeKind::File, 12 * MIB);
+            let mut file = Draft::entry(
+                "data",
+                NodeKind::File,
+                if name == "plain" {
+                    plain_bytes
+                } else {
+                    12 * MIB
+                },
+            );
             if name != "plain" {
                 file.allocation = Some(Box::new(Allocation {
                     bytes: 12 * MIB,
@@ -3915,6 +4171,11 @@ mod tests {
         let status = session.status();
         assert!(status.contains("Claude Code"), "{status}");
         assert!(status.contains("Last removal: trash"), "{status}");
+        assert!(
+            status.contains("-27 MiB observed volume change"),
+            "{status}"
+        );
+        assert!(!status.contains("0 B freed"), "{status}");
         assert!(status.contains("Removed since the scan"), "{status}");
         assert!(status.contains("Total: 684 KiB reported"), "{status}");
         assert!(status.contains("scanned "), "{status}");

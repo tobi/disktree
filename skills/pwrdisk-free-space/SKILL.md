@@ -18,6 +18,15 @@ instead: a question is not a request to delete anything.
 
 ## Before you start
 
+Read this skill before choosing candidates, not only before marking. Use
+`pwrdisk_read_skill` with this URI and the OS reference below. The same
+files are MCP resources. In PwrAgent, call
+`manage_mcp_connections(action="describe_thread")`, find PwrDisk's exact
+`serverNameInAgent`, then use it for `list_mcp_resources(server=...)` and
+`read_mcp_resource(server=..., uri=...)`. Neither `pwrdisk` nor the reported
+client label (such as `pwragent-pwrdisk-proxy`) establishes the server name.
+A failed guessed name is not evidence that the skill is missing.
+
 Read the reference for the system `pwrdisk_status` names. Each lists what
 that system hides from a file scan, what it refuses, and what must never be
 marked:
@@ -81,6 +90,23 @@ Looking is free; acting is the user's call.
 
 ## Ground rules
 
+- **Check retention before promising recovery.** On macOS call
+  `pwrdisk_retention` for a path on each selected volume before proposing
+  a recovery amount. It lists local Time Machine snapshots without changing
+  them; other snapshots, open files and concurrent writes remain unmeasured.
+  Failed, unsupported or unrecognized checks mean unknown, never zero.
+  Snapshot presence is a plausible retention mechanism, not proof of the
+  exact bytes held. Even an empty list cannot guarantee immediate recovery.
+  Report that uncertainty upfront, including for mostly private selections.
+- **Keep five different metrics separate.** Apparent logical size is known
+  only if measured in that mode. An ALLOCATED scan reports allocation,
+  including shared/repeated clone blocks; never relabel it apparent size.
+  Private allocation is the scan's estimate of unshared bytes. Reclaim
+  bounds evaluate the whole selected union before retention. Observed
+  recovery is the signed before/after available-space delta on the measured
+  volume, which concurrent writes affect too. A negative delta is a loss of
+  available space, not "0 B freed". Do not subtract private from reported
+  allocation to explain all missing recovery.
 - **Estimate before marking.** For a hypothetical path list use
   `pwrdisk_estimate` without changing the cart. Evaluate the whole set;
   never sum directory reclaim estimates or mark worktrees temporarily.
@@ -160,7 +186,15 @@ Looking is free; acting is the user's call.
    the scanning and shows the result. The result lists the top level,
    largest first, and *worth a look*: the biggest directories that could
    plausibly go.
-3. **Walk, biggest first.** `pwrdisk_ls` on the largest directories, a few
+3. **Walk and compare physical candidates.** Allocation-sorted tools show
+   large listings, not the largest likely savings. Pass a bounded explicit
+   candidate path list to `pwrdisk_rank` (`by: "private"` or
+   `"reclaim_lower"`) to compare scan-derived physical figures; null is
+   unavailable and distinct from measured zero. The returned union is not
+   the sum of candidate rows. Ranking establishes neither ownership nor
+   cleanup method; check both before proposing anything. Never delete a
+   worktree merely to unlock a clone group.
+   Continue with `pwrdisk_ls` on the largest directories, a few
    levels down, until a directory clearly belongs to one project or one
    tool. Leave the displayed directory unchanged. Use `pwrdisk_show` only
    when the user asks to see a path or has requested following.
@@ -195,7 +229,12 @@ Looking is free; acting is the user's call.
    `pwrdisk_remove` with the exact preview ID, ordered paths, mode and required
    confirmation text. The preview expires after five minutes and is single
    use. Any refusal, changed selection, changed scan or expiration requires
-   a new preview and fresh user confirmation. A tool response saying the
+   a new preview and fresh user confirmation, after checking outcome.
+   A cancelled MCP form describes the form, not native UI removal. If the
+   exact previewed selection finished or is running, do not replay it or
+   request another preview. Read status and reconcile failures or unreached
+   paths with the user. An unavailable outcome is not permission to retry.
+   A tool response saying the
    operation started is not proof it completed; never retry it automatically.
 9. **Report.** `pwrdisk_status` reports completed and failed removals and
    measured freed space. Report that figure, not a projection. Trash is not

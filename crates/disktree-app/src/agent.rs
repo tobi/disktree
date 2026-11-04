@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use disktree_core::query;
 use disktree_core::removal::{Plan, RemovalMode, Target};
-use disktree_core::space::space_info;
 use disktree_core::tree::{Node, path_of};
 use disktree_link::{
     FindRequest, FoundList, Incoming, Insight, Listener, Listing, Mark,
@@ -54,6 +53,8 @@ pub struct AgentLink {
     /// The last removal, for an agent that asks what was freed.
     pub last_removal: Option<Removal>,
     pub(crate) removal_preview: Option<crate::agent_removal::PreparedRemoval>,
+    pub(crate) removal_operation: Option<disktree_link::RemovalOperation>,
+    pub(crate) removal_operation_epoch: u64,
 }
 
 impl AgentLink {
@@ -64,6 +65,8 @@ impl AgentLink {
             pending_show: None,
             last_removal: None,
             removal_preview: None,
+            removal_operation: None,
+            removal_operation_epoch: 0,
         }
     }
 }
@@ -646,12 +649,12 @@ impl Disktree {
             return;
         };
         let totals = self.run_list.totals();
-        let freed = space_info(&self.root_path)
-            .ok()
-            .zip(self.space_baseline)
-            .map(|(now, before)| {
-                now.available.saturating_sub(before.available)
-            });
+        // Use the same measurement and per-run baseline as the ledger.
+        let observed = self
+            .ledger
+            .cohorts()
+            .last()
+            .and_then(crate::ledger::Cohort::observed);
         agent.last_removal = Some(Removal {
             mode: match self.removal_mode {
                 RemovalMode::Trash => "trash".to_string(),
@@ -660,7 +663,8 @@ impl Disktree {
             removed: totals.removed,
             failed: totals.failed_all(),
             bytes: totals.reported_done,
-            freed,
+            freed: observed.map(|delta| delta.max(0).unsigned_abs()),
+            observed,
             at: now_seconds(),
         });
     }
@@ -730,6 +734,10 @@ impl Disktree {
                 .agent
                 .as_ref()
                 .and_then(|agent| agent.last_removal.clone()),
+            removal_operation: self
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.removal_operation.clone()),
             removals: self.agent_ledger(),
             tree: self.tree.as_deref().map(|tree| TreeSummary {
                 bytes: tree.root().bytes,

@@ -48,7 +48,7 @@ pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Protocol version, bumped when a message changes shape. Both sides are
 /// built from one tree, so a mismatch means an old window is still open.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Updating the GUI does not replace a process hosted by an MCP client.
 pub const RECONNECT_MCP: &str = "Updating PwrDisk's GUI does not restart its MCP server. In your MCP client, restart/reconnect the PwrDisk MCP server using `pwrdisk mcp` from the updated installation. If the GUI is outdated, quit and reopen the updated PwrDisk app.";
@@ -584,8 +584,24 @@ pub struct Removal {
     /// Free space gained on the volume, measured before and after; `None`
     /// when the volume could not be read.
     pub freed: Option<u64>,
+    /// Signed available-space delta for this run, including concurrent writes.
+    #[serde(default)]
+    pub observed: Option<i64>,
     /// Unix seconds when it finished.
     pub at: i64,
+}
+
+/// Outcome of the exact previewed selection, including native UI removal.
+/// Kept after completion and rescans so an outstanding form can reconcile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalOperation {
+    pub preview_id: String,
+    pub mode: RemovalChoice,
+    pub paths: Vec<PathBuf>,
+    pub finished: bool,
+    pub removed: usize,
+    pub failed: usize,
+    pub pending: usize,
 }
 
 /// One removal since the last scan, three ways.
@@ -639,6 +655,8 @@ pub struct State {
     pub estimate: Option<SelectionEstimate>,
     pub space: Option<Space>,
     pub removal: Option<Removal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_operation: Option<RemovalOperation>,
     /// The removals since the scan on screen, which the tree already
     /// leaves out.
     #[serde(default, skip_serializing_if = "Option::is_none")]

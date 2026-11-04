@@ -17,6 +17,16 @@ use disktree_link::{Clones, Entry, Found, Listing};
 /// Width of the share bar on a row.
 const BAR: usize = 8;
 
+pub fn observed(delta: Option<i64>) -> String {
+    delta.map_or_else(
+        || "not measured".to_string(),
+        |delta| {
+            let sign = if delta < 0 { "-" } else { "+" };
+            format!("{sign}{}", human_bytes(delta.unsigned_abs()))
+        },
+    )
+}
+
 /// `~/x` for a path under the home directory, else the path as it is.
 pub fn display(path: &Path, home: Option<&Path>) -> String {
     match home {
@@ -32,15 +42,6 @@ pub fn display(path: &Path, home: Option<&Path>) -> String {
 /// The removals since the window's scan, each three ways, then the total:
 /// what to report after several batches, since the tree is not rescanned.
 pub fn ledger(ledger: &disktree_link::RemovalLedger, now: i64) -> String {
-    let observed = |delta: Option<i64>| {
-        delta.map_or_else(
-            || "not measured".to_string(),
-            |delta| {
-                let sign = if delta < 0 { "-" } else { "+" };
-                format!("{sign}{}", human_bytes(delta.unsigned_abs()))
-            },
-        )
-    };
     let private = |bytes: Option<u64>| {
         bytes.map_or_else(|| "unknown".into(), human_bytes)
     };

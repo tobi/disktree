@@ -5868,9 +5868,9 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     assert!(
         matches!(
             ask(cx, Request::Remove(confirmed(&preview))),
-            Response::Error { .. }
+            Response::State(_)
         ),
-        "no replay"
+        "a duplicate reports the running operation without replay"
     );
     let epoch = read(&view, cx, |app| app.run_epoch);
     let mut done = false;
@@ -5889,6 +5889,65 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     assert!(root.join("keep/notes.txt").exists());
     assert!(root.join(".cache/blob.bin").exists());
     assert_eq!(read(&view, cx, |app| app.run_list.totals().failed), 0);
+
+    // A pending MCP form does not own native UI approval. Complete another
+    // exact preview through the same entry point as native confirmation.
+    ask(
+        cx,
+        Request::Mark {
+            root: root.clone(),
+            targets: vec![MarkRequest {
+                path: root.join(".cache"),
+                bytes: 0,
+                is_dir: true,
+            }],
+        },
+    );
+    let Response::RemovalPreview(native) = ask(
+        cx,
+        Request::PrepareRemoval {
+            mode: disktree_link::RemovalChoice::Permanent,
+        },
+    ) else {
+        panic!("native preview");
+    };
+    update(&view, cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        app.begin_removal(cx);
+    });
+    let native_epoch = read(&view, cx, |app| app.run_epoch);
+    let Response::State(running) = ask(cx, Request::State) else {
+        panic!("state");
+    };
+    let operation = running.removal_operation.expect("native run correlated");
+    assert_eq!(operation.preview_id, native.preview_id);
+    assert!(!operation.finished);
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if update(&view, cx, |app, cx| {
+            !app.poll_removal_once(native_epoch, cx)
+        }) {
+            break;
+        }
+    }
+    assert!(!root.join(".cache").exists());
+    let Response::State(completed) =
+        ask(cx, Request::Remove(confirmed(&native)))
+    else {
+        panic!("late request reports outcome");
+    };
+    let operation = completed.removal_operation.expect("completed outcome");
+    assert!(operation.finished);
+    assert_eq!(
+        (operation.removed, operation.failed, operation.pending),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        read(&view, cx, |app| app.run_epoch),
+        native_epoch,
+        "no second run"
+    );
+    assert!(root.join("keep/notes.txt").exists());
 
     // Hanging up takes the name out of the header.
     drop(link);

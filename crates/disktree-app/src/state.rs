@@ -3572,6 +3572,7 @@ impl Disktree {
         let epoch = self.run_epoch;
         self.run_list =
             crate::run_list::RunList::new(self.run_items(&plan.targets));
+        self.track_agent_removal();
         self.run_scroll = gpui_kit::UniformListScrollHandle::new();
         self.run_free_before = before.map(|space| space.available);
         self.stop_requested = false;
@@ -3673,8 +3674,8 @@ impl Disktree {
         }
         if finished {
             self.run = None;
-            self.record_removal();
             let removed = self.record_cohort();
+            self.record_removal();
             self.marks.clear();
             self.unmarked = None;
             self.screen = Screen::Done;
@@ -3685,6 +3686,7 @@ impl Disktree {
                 self.start_scan(cx);
             }
         }
+        self.update_agent_removal(finished);
         if changed {
             cx.notify();
         }

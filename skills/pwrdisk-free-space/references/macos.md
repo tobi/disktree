@@ -5,6 +5,24 @@ leave alone. Read with `skill://pwrdisk-free-space/SKILL.md`.
 
 ## Reading the numbers
 
+Before promising recovery, call `pwrdisk_retention` for each selected
+volume. This read-only, time-bounded check lists local Time Machine
+snapshots. It does not quantify blocks retained from the selected paths,
+list all APFS snapshots, inspect open files or predict concurrent writes.
+Unknown and measured zero snapshots are distinct. Snapshot presence is
+plausible evidence of retention, not proof that it explains an exact
+shortfall; absence does not guarantee immediate recovery. Do not thin,
+delete or alter snapshots as part of this check. Even a set with almost
+all private allocation can yield no immediate available-space increase.
+
+An allocated scan's reported bytes are allocation, never apparent logical
+size. Keep reported allocation, private allocation, whole-set reclaim
+bounds and signed observed volume change separate. Logical size is a fifth
+metric only when measured. Use `pwrdisk_rank` on explicit candidates to
+compare private allocation or standalone reclaim lower bounds; unavailable
+is null, not zero. Establish ownership and the owning tool's cleanup method
+separately, and do not propose worktrees just to release clone groups.
+
 - **APFS clones share blocks.** Finder duplicates, `cp -c` and some package
   managers make clones: two copies can cost one copy's space, and removing
   one frees little or nothing. PwrDisk counts each file's allocation, so a
