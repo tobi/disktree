@@ -995,6 +995,8 @@ fn explore(
     // only gives way when the mosaic would be too narrow to read.
     let panel = (app.show_selection || app.is_indexing())
         && width_rems >= PANEL_SHOWN_REMS;
+    let compact =
+        window.viewport_size().height.as_f32() / app.rem < COMPACT_PANEL_REMS;
     if panel && let Some(path) = panel_checkout(app) {
         app.want_git(&path, window.is_window_active(), cx);
     }
@@ -1089,7 +1091,9 @@ fn explore(
                         // panel and the bands below.
                         .children(toasts),
                 )
-                .children(panel.then(|| side_panel(app, &theme, cx))),
+                .children(
+                    panel.then(|| side_panel(app, compact, &theme, cx)),
+                ),
         )
         .children((app.is_indexing() && !panel).then(|| {
             div()
@@ -1129,6 +1133,13 @@ fn git_target(app: &Disktree) -> Option<Vec<usize>> {
 
 /// Width, in rem, below which the side panel gives the mosaic its room.
 const PANEL_SHOWN_REMS: f32 = 52.0;
+/// Height, in rem, below which the side panel is compact: the selection's
+/// figures fold into one line and an idle agent line goes, so Marked and
+/// Worth a look start in sight. A 1200×600 window with an assessment
+/// selected otherwise opens on the selection alone; 48 rem is 768 px at
+/// the default size, and in rems interface zoom walks through it as a
+/// shorter window does, as the bar's tiers do across.
+const COMPACT_PANEL_REMS: f32 = 48.0;
 
 /// What the panel handle drags. The width itself lives in the app state.
 #[derive(Clone, Copy, Debug)]
@@ -2721,6 +2732,7 @@ fn legend_button(
 /// needs, next to the mosaic rather than under it.
 fn side_panel(
     app: &Disktree,
+    compact: bool,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
@@ -2761,13 +2773,13 @@ fn side_panel(
         .child(handle)
         // Selection guidance and progress can exceed a short, zoomed window,
         // so both scroll with the lists while free space stays visible below.
-        .child(panel_lists(app, &plan, theme, cx))
+        .child(panel_lists(app, &plan, compact, theme, cx))
         .children(scan_error_line(app, theme))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
         .children(marked_total(app, &plan, theme, cx))
         .child(disk_section(app, &plan, theme, cx).flex_shrink_0())
-        .child(agent_line(app, theme))
+        .children(agent_line(app, compact, theme))
 }
 
 /// The panel's scrolling lists, each under a header that stays in sight
@@ -2775,6 +2787,7 @@ fn side_panel(
 fn panel_lists(
     app: &Disktree,
     plan: &Plan,
+    compact: bool,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
@@ -2786,7 +2799,7 @@ fn panel_lists(
     // must stay reachable above the Mark it qualifies on a short window.
     if !app.is_indexing() {
         lists.push((
-            selection_section(app, theme, cx)
+            selection_section(app, compact, theme, cx)
                 .flex_shrink_0()
                 .into_any_element(),
             None,
@@ -2807,7 +2820,7 @@ fn panel_lists(
     // Suggestions can; the cart cannot.
     lists.push((
         marked_section(app, plan, theme, cx).into_any_element(),
-        Some(marked_head(app, cx)),
+        Some(marked_head(app, theme, cx)),
     ));
     lists.push((rule(), None));
     lists.push((
@@ -2847,7 +2860,7 @@ fn panel_lists(
         .track_scroll(&app.panel_scroll)
         .flex()
         .flex_col()
-        .gap(space::LG)
+        .gap(if compact { space::MD } else { space::LG })
         .flex_1()
         .min_h_0()
         .overflow_y_scroll();
@@ -2929,16 +2942,28 @@ fn section_head(content: Div) -> Div {
         .child(content)
 }
 
-fn marked_head(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+fn marked_head(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
     let count = app.marks.len();
-    section_head(widgets::eyebrow(
-        if count == 0 {
-            "Marked".to_string()
-        } else {
-            format!("Marked · {count}")
-        },
-        cx,
-    ))
+    if count == 0 {
+        // Empty, the section is this one line: a row under it that only
+        // says how to fill it is never worth its height.
+        return section_head(widgets::eyebrow("Marked", cx))
+            .child(head_note("Space to mark", theme));
+    }
+    section_head(widgets::eyebrow(format!("Marked · {count}"), cx))
+}
+
+/// The quiet words in an empty section's header, where a full one shows
+/// its count or total.
+fn head_note(note: &'static str, theme: &Theme) -> Div {
+    div()
+        .text_size(text::CAPTION)
+        .text_color(theme.secondary)
+        .child(note)
 }
 
 fn worth_head(
@@ -2947,7 +2972,20 @@ fn worth_head(
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let total: u64 = app.insights.iter().map(|candidate| candidate.bytes).sum();
-    section_head(widgets::eyebrow("Worth a look", cx)).when(total > 0, |head| {
+    let head = section_head(widgets::eyebrow("Worth a look", cx));
+    if app.insights.is_empty() {
+        // Listed rows are suggestions for review, so an empty list says
+        // there are none, never that nothing is disposable.
+        return head.child(head_note(
+            if app.tree().is_some() {
+                "none"
+            } else {
+                "after the scan"
+            },
+            theme,
+        ));
+    }
+    head.when(total > 0, |head| {
         head.child(
             div()
                 .text_size(text::CAPTION)
@@ -2962,22 +3000,28 @@ fn worth_head(
 /// things to do with it.
 fn selection_section(
     app: &Disktree,
+    compact: bool,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let section = div()
         .flex()
         .flex_col()
-        .gap(space::MD)
-        .child(widgets::eyebrow("Selection", cx));
+        // Compact, tighter, so the lists below start in sight.
+        .gap(if compact { space::SM } else { space::MD });
     let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
     let Some(node) = app.node_at(&target) else {
-        return section.child(
+        return section.child(widgets::eyebrow("Selection", cx)).child(
             div()
                 .text_color(theme.secondary)
                 .child("Point at a tile or select one with the arrows"),
         );
     };
+    // The bold name heads the section; compact, its label is the one line
+    // that says nothing the name does not.
+    let section = section.when(!compact, |section| {
+        section.child(widgets::eyebrow("Selection", cx))
+    });
     let path = app.path_at(&target);
     let artifact = path.as_deref().and_then(|path| {
         disktree_core::artifact::assess(path, app.path_style(), node)
@@ -3137,11 +3181,10 @@ fn selection_section(
             shown,
             Shown::Answer(Probe::Known(state)) if state.is_clean()
         );
-        widgets::figure(
+        (
             "Git",
             value,
             if clean { theme.success } else { theme.bright },
-            cx,
         )
     } else {
         let kind = node.reclaim.map_or_else(
@@ -3150,9 +3193,35 @@ fn selection_section(
                 format!("{} \u{00b7} {}", node.category.label(), reason.label())
             },
         );
-        widgets::figure("Kind", kind, theme.bright, cx)
+        ("Kind", kind, theme.bright)
     };
+    let of_scan = widgets::percent(node.bytes, root_value);
+    let written = widgets::ago(crate::state::now_seconds(), node.modified);
+    // Compact, the four figures are one line the person can open: the
+    // decision rests on the name, the size and the assessment, which stay.
+    let summary = compact.then(|| {
+        selection_summary(
+            &[
+                format!("{of_scan} of scan"),
+                match node.files {
+                    1 => "1 file".to_string(),
+                    files => format!("{} files", widgets::human_count(files)),
+                },
+                if written == "unknown" {
+                    "age unknown".to_string()
+                } else {
+                    written.clone()
+                },
+                fourth.1.clone(),
+            ],
+            app.selection_details,
+            theme,
+            cx,
+        )
+    });
+    let fourth = widgets::figure(fourth.0, fourth.1, fourth.2, cx);
     let grid = div()
+        .debug_selector(|| "selection-figures".into())
         .flex()
         .flex_col()
         .gap(space::MD)
@@ -3162,7 +3231,7 @@ fn selection_section(
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Of scan",
-                    widgets::percent(node.bytes, root_value),
+                    of_scan,
                     theme.bright,
                     cx,
                 )))
@@ -3179,7 +3248,7 @@ fn selection_section(
                 .flex_row()
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Last write",
-                    widgets::ago(crate::state::now_seconds(), node.modified),
+                    written,
                     theme.bright,
                     cx,
                 )))
@@ -3322,7 +3391,10 @@ fn selection_section(
     section
         .child(identity)
         .child(measure)
-        .child(grid)
+        .children(summary)
+        .when(!compact || app.selection_details, |section| {
+            section.child(grid)
+        })
         .children(badges)
         .children(artifact.map(|detection| {
             artifact_assessment(detection, node.category, theme, cx)
@@ -3343,6 +3415,59 @@ fn selection_section(
             )),
             _ => None,
         })
+}
+
+/// The compact panel's one line of figures: share of the scan, files, last
+/// write and kind (or git), with a chevron that opens the grid beneath it.
+fn selection_summary(
+    parts: &[String; 4],
+    open: bool,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Stateful<Div> {
+    let line = parts.join(" \u{00b7} ");
+    div()
+        .id("selection-summary")
+        .debug_selector(|| "selection-summary".into())
+        .role(gpui_kit::Role::Button)
+        .aria_label(format!("Details: {line}"))
+        .aria_expanded(open)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .py(space::XS)
+        .border_t_1()
+        .border_b_1()
+        .border_color(theme.divider())
+        .text_size(text::CAPTION)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.hover_fill()))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.selection_details = !this.selection_details;
+            window.focus(&this.focus, cx);
+            cx.notify();
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(theme.foreground)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(line),
+        )
+        .child(
+            gpui_omarchy::icon(if open {
+                gpui_omarchy::IconName::ChevronDown
+            } else {
+                gpui_omarchy::IconName::ChevronRight
+            })
+            .size(icon::SM)
+            .text_color(theme.secondary)
+            .flex_shrink_0(),
+        )
 }
 
 /// What a recognized artifact is, how it was told, and what to do first.
@@ -3757,18 +3882,7 @@ fn worth_section(
         .gap(space::XS)
         .child(worth_head(app, theme, cx));
     if app.insights.is_empty() {
-        return section.child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(if app.tree().is_some() {
-                    // Listed rows are suggestions for review, so an empty
-                    // list must not imply that they were disposable.
-                    "No cleanup suggestions"
-                } else {
-                    "Waiting for the scan"
-                }),
-        );
+        return section;
     }
     let selected = app.action_target();
     for (index, candidate) in app.insights.iter().enumerate() {
@@ -3888,16 +4002,11 @@ fn marked_section(
         .flex()
         .flex_col()
         .gap(space::XS)
-        .child(marked_head(app, cx))
+        .child(marked_head(app, theme, cx))
         .child(crate::semantics::status("marked-summary", format!("{} marked paths; {} listed bytes; {} included, {} blocked, {} covered. Estimated reclaimable: {}. Projections use only the measured volume.",
             count, plan.bytes(), plan.targets.len(), plan.blocked.len(), plan.covered.len(), savings(plan.reclaimable_bytes(), plan.possible_bytes()))));
     if count == 0 {
-        return section.child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child("Space marks the tile you point at"),
-        );
+        return section;
     }
     for (index, item) in app.marks.items().iter().take(MARKED_ROWS).enumerate()
     {
@@ -7002,8 +7111,17 @@ fn agent_pill(app: &Disktree, theme: &Theme) -> Option<Stateful<Div>> {
 
 /// The way to an agent, under the disk: who is connected, or how to
 /// connect one. Quiet, since most sessions never need it.
-fn agent_line(app: &Disktree, theme: &Theme) -> Stateful<Div> {
+fn agent_line(
+    app: &Disktree,
+    compact: bool,
+    theme: &Theme,
+) -> Option<Stateful<Div>> {
     let presence = app.agent.as_ref().and_then(|agent| agent.presence.clone());
+    // Idle, the line is an invitation; a short panel needs the room more,
+    // and Help › Connect an AI Agent (MCP)… is still the way in.
+    if compact && presence.is_none() {
+        return None;
+    }
     let mut line = div()
         .id("agent-line")
         .debug_selector(|| "agent-line".into())
@@ -7040,7 +7158,7 @@ fn agent_line(app: &Disktree, theme: &Theme) -> Stateful<Div> {
                 .child("Connect an AI agent (MCP) \u{203a}");
         }
     }
-    line
+    Some(line)
 }
 
 /// Settings › Agents (MCP): how to connect an agent, who is connected,

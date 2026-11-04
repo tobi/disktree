@@ -109,9 +109,15 @@ a root. Explicit command-line paths and `--disk` still start directly;
   is marked; *Worth a look*, the largest cleanup suggestions and agent
   findings to review; then, pinned above the disk, the marks taken together —
   how much is marked, what removing all of it frees, and the way to the
-  review screen; and the disk, free now and after the marks. On a short
-  window the selection and the lists scroll; the disk stays in view. Drag
-  its left edge to resize it; double-click the edge to reset.
+  review screen; and the disk, free now and after the marks. An empty
+  list is one line: *Marked* says "Space to mark" and *Worth a look*
+  "none". On a short window (under 48 rem, 768 px at the default size)
+  the share, files, last write and kind fold into one line under the size
+  that opens them again, the selection's label goes, and the line inviting
+  an AI agent shows only once one is connected; Help › Connect an AI Agent
+  (MCP)… is always there. The assessment and Mark never fold. What still
+  does not fit scrolls; the disk stays in view. Drag the panel's left edge
+  to resize it; double-click the edge to reset.
 
 One colour is kept apart: amber marks the selection, the main action, and
 cleanup suggestions.
@@ -476,7 +482,7 @@ On macOS the command lives inside the app, at
 the bare command line and each client's command with the binary's full
 path and a Copy button, and who is connected. **Help › Connect an AI
 Agent (MCP)…** and the **Connect an AI agent (MCP)** line under the disk
-open it.)
+open it; on a short window that line waits until an agent connects.)
 
 Then ask it what is eating your disk. The agent walks the tree largest
 first, lists every cache, build directory and package store at once, and

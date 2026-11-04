@@ -9835,6 +9835,98 @@ fn the_marked_total_is_pinned_above_the_disk_with_the_review(
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
 }
 
+/// An empty Marked or Worth a look is its header alone, at any height: the
+/// hint and the "none" sit where a full section shows its count or total.
+#[gpui_kit::test]
+fn empty_panel_lists_are_one_line(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    draw(cx);
+    // The header, and the gap before the section's hidden status line.
+    let head =
+        px((crate::ui::size::SECTION_HEAD.0 + crate::ui::space::XS.0) * 16.)
+            + px(0.5);
+    let marked = cx.debug_bounds("marked-section").expect("marked");
+    let worth = cx.debug_bounds("worth-section").expect("worth a look");
+    assert!(marked.size.height <= head, "{marked:?}");
+    assert!(worth.size.height <= head, "{worth:?}");
+
+    let crumbs = read(&view, cx, |app| {
+        app.crumbs_for_path(&temp.path().join("junk"))
+            .expect("present")
+    });
+    update(&view, cx, |app, cx| app.toggle_mark(&crumbs, cx));
+    draw(cx);
+    let marked = cx.debug_bounds("marked-section").expect("marked");
+    assert!(marked.size.height > head, "a row: {marked:?}");
+    assert!(cx.debug_bounds("marked-row-0").is_some());
+}
+
+/// Under 48 rem tall the selection's four figures are one line that opens
+/// the grid, and an idle agent line gives way, so with an assessment
+/// selected at 1200×600 Marked still starts in sight; suggestions may
+/// scroll, the cart may not. The assessment itself never folds. A tall
+/// window draws the grid as before.
+#[gpui_kit::test]
+fn a_short_panel_folds_the_selection_figures(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let output = temp.path().join("target/debug/deps");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("libapp.rlib"), vec![b'x'; 200_000]).unwrap();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let (crumbs, _) = app
+            .tree()
+            .unwrap()
+            .descend(Path::new("target/debug/deps"))
+            .unwrap();
+        app.selected = Some(crumbs);
+        app.hovered = None;
+        app.pointer_active = false;
+        cx.notify();
+    });
+    cx.simulate_resize(gpui_kit::size(px(1200.), px(600.)));
+    draw(cx);
+    draw(cx);
+    assert!(cx.debug_bounds("selection-summary").is_some(), "one line");
+    assert!(
+        cx.debug_bounds("selection-figures").is_none(),
+        "grid folded"
+    );
+    assert!(
+        cx.debug_bounds("artifact-suggested").is_some(),
+        "never folds"
+    );
+    assert!(cx.debug_bounds("agent-line").is_none(), "idle line gone");
+    let scroll = cx.debug_bounds("side-panel-scroll").unwrap();
+    let marked = cx.debug_bounds("marked-section").unwrap();
+    assert!(
+        marked.bottom() <= scroll.bottom(),
+        "Marked in sight: {marked:?} {scroll:?}"
+    );
+
+    // The chevron opens the grid, and it stays open for the session.
+    click_on(cx, "selection-summary");
+    draw(cx);
+    assert!(read(&view, cx, |app| app.selection_details));
+    assert!(cx.debug_bounds("selection-figures").is_some(), "opened");
+    assert!(cx.debug_bounds("selection-summary").is_some(), "to close");
+    click_on(cx, "selection-summary");
+    draw(cx);
+    assert!(cx.debug_bounds("selection-figures").is_none(), "closed");
+
+    // Tall: the grid, no summary, and the invitation to connect an agent.
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    assert!(cx.debug_bounds("selection-summary").is_none());
+    assert!(cx.debug_bounds("selection-figures").is_some());
+    assert!(cx.debug_bounds("agent-line").is_some());
+}
+
 /// A side panel list's header stays at the top of the list while its rows
 /// scroll under it, and the next section pushes it up rather than covering
 /// it, as PwrGit's and PwrAgnt's sidebars do.
@@ -9857,6 +9949,15 @@ fn panel_headers_stay_in_sight_while_their_list_scrolls(
             .unwrap();
     }
     let (view, cx) = view_over(temp.path(), cx);
+    // Rows for Marked's header to stay above: empty, the section is only
+    // its header.
+    for name in ["junk", ".cache"] {
+        let crumbs = read(&view, cx, |app| {
+            app.crumbs_for_path(&temp.path().join(name))
+                .expect("present")
+        });
+        update(&view, cx, |app, cx| app.toggle_mark(&crumbs, cx));
+    }
     // Short enough that the lists scroll.
     cx.simulate_resize(gpui_kit::size(px(1100.), px(520.)));
     draw(cx);

@@ -554,6 +554,10 @@ pub struct Disktree {
     /// dropdown (`app_menu::menus`), since there is no global menu bar.
     pub app_menu_open: bool,
     pub show_selection: bool,
+    /// A short panel folds the selection's figures into one summary line;
+    /// this is whether the person has opened it. It stays open for the
+    /// session, whatever is selected, so it is not undone by every arrow.
+    pub selection_details: bool,
     pub focus: FocusHandle,
     /// The app is quitting: what this window holds is left to the system,
     /// which takes a process's memory back whole when it exits.
@@ -813,6 +817,7 @@ impl Disktree {
             show_help: false,
             app_menu_open: false,
             show_selection: true,
+            selection_details: false,
             focus: cx.focus_handle(),
             crumb_menu: None,
             color_mode: ColorMode::Kind,
