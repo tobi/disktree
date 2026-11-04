@@ -96,6 +96,8 @@ pub mod size {
     pub const ROW_BAR: Rems = Rems(5.5);
     /// A legend or identity swatch.
     pub const SWATCH: Rems = Rems(0.625);
+    /// The legend's "+N" menu: room for the longest kind and its size.
+    pub const LEGEND_MENU: Rems = Rems(13.0);
     /// A thin meter: share of the scan, the disk.
     pub const METER: Rems = Rems(0.3125);
     /// Fixed progress rows keep paths and changing counters from reflowing.

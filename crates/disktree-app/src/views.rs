@@ -997,6 +997,28 @@ fn explore(
         && width_rems >= PANEL_SHOWN_REMS;
     let compact =
         window.viewport_size().height.as_f32() / app.rem < COMPACT_PANEL_REMS;
+    // The legend's row is the mosaic's column, less its padding.
+    let edges = &app.content_edges;
+    let legend_room = window.viewport_size().width
+        - edges.left
+        - edges.right
+        - if panel {
+            px(app.panel_rems * app.rem)
+        } else {
+            px(0.)
+        }
+        - px(space::LG.0 * 2. * app.rem);
+    let legend_fit = legend_fit(app, legend_room, window, &theme);
+    let legend_drawn =
+        !app.file_list || !crate::file_list::compact(window, app.rem);
+    // A menu with nothing to hang from is closed, not kept for later: it
+    // would swallow the next Escape and reopen by itself when the row
+    // overflows again. Its button's hover goes with it, since the button
+    // may have left from under a resting pointer.
+    if !legend_drawn || legend_fit.more.is_empty() {
+        app.legend_menu_open = false;
+        app.legend_more_hover = false;
+    }
     if panel && let Some(path) = panel_checkout(app) {
         app.want_git(&path, window.is_window_active(), cx);
     }
@@ -1072,7 +1094,7 @@ fn explore(
                         .flex_1()
                         .min_w_0()
                         .min_h_0()
-                        .when(!app.file_list || !crate::file_list::compact(window, app.rem), |view| view.child(trail_and_legend(app, &theme, cx)))
+                        .when(legend_drawn, |view| view.child(trail_and_legend(app, &legend_fit, &theme, cx)))
                         .child(
                             div()
                                 .id("file-navigation")
@@ -2333,6 +2355,7 @@ fn power_popup(
 /// what the colours mean on the row under it.
 fn trail_and_legend(
     app: &Disktree,
+    fit: &LegendFit,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
@@ -2355,7 +2378,7 @@ fn trail_and_legend(
         .px(space::LG)
         .py(space::SM)
         .child(row)
-        .child(legend(app, theme, cx))
+        .child(legend(app, fit, theme, cx))
 }
 
 /// What the whole scan found, as one quiet line; unreadable paths are
@@ -2431,45 +2454,169 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         })
 }
 
+/// Which legend chips go on the row and which in its "+N" menu.
+pub struct LegendFit {
+    /// On the row, in the legend's order.
+    pub shown: Vec<crate::legend::ChipId>,
+    /// In the menu, in the legend's order.
+    pub more: Vec<crate::legend::ChipId>,
+}
+
+/// What a chip keeps of the whole scan, once that is worked out.
+fn chip_share(app: &Disktree, id: crate::legend::ChipId) -> Option<u64> {
+    use crate::legend::ChipId;
+    let shares = app.legend_shares.as_deref()?;
+    Some(match id {
+        ChipId::Reclaimable => shares.suggested,
+        ChipId::Kind(index) => shares.kind(Category::LEGEND[index]),
+        ChipId::Age(index) => shares.ages.get(index).copied().unwrap_or(0),
+    })
+}
+
+/// A chip's size beside its name: the bytes it keeps, in the units the
+/// tiles use. Nothing until the shares are worked out.
+fn chip_size(app: &Disktree, id: crate::legend::ChipId) -> Option<String> {
+    chip_share(app, id).map(disktree_core::size::human_bytes_short)
+}
+
+/// Under this share of the scan a chip is too small to see on the mosaic
+/// (a tile of 1/1000 of it is a few pixels at most), so it goes in the menu
+/// even when the row has room. Empty chips always do.
+const LITTLE_SHARE: u64 = 1_000;
+
+/// Lay the legend out on one row of `room`: chips that are set always
+/// stay, as do the ones with data; empty and tiny ones go in the "+N"
+/// menu, and when the rest still do not fit, the smallest follow them.
+/// Widths are measured from the shaped labels, so the row never wraps
+/// and never clips a chip.
+fn legend_fit(
+    app: &Disktree,
+    room: gpui_kit::Pixels,
+    window: &Window,
+    theme: &Theme,
+) -> LegendFit {
+    use crate::legend::{Chip, ChipId};
+    let mut ids = vec![ChipId::Reclaimable];
+    if app.color_mode == ColorMode::Age {
+        ids.extend((0..palette::AGE_BUCKETS.len()).map(ChipId::Age));
+    } else {
+        ids.extend((0..Category::LEGEND.len()).map(ChipId::Kind));
+    }
+    let total = app.tree().map_or(0, |tree| tree.bytes);
+    let set = |id: ChipId| app.legend.get(id) != Chip::Shown;
+    let little = |id: ChipId| {
+        chip_share(app, id).is_some_and(|bytes| {
+            bytes == 0 || bytes.saturating_mul(LITTLE_SHARE) < total
+        })
+    };
+    let (mut shown, mut more): (Vec<_>, Vec<_>) =
+        ids.iter().partition(|id| set(**id) || !little(**id));
+
+    let rem = app.rem;
+    let font_size = px(text::CAPTION.0 * rem);
+    let font = gpui_kit::font(theme.font.clone());
+    let measure = |text: String| {
+        let run = gpui_kit::TextRun {
+            len: text.len(),
+            font: font.clone(),
+            color: theme.foreground,
+            ..gpui_kit::TextRun::default()
+        };
+        window
+            .text_system()
+            .shape_line(text.into(), font_size, &[run], None)
+            .width
+    };
+    let rems = |value: f32| px(value * rem);
+    // The chip's own box: padding, border, swatch and the gaps between its
+    // swatch, name and size (see `legend_chip`).
+    // Shaped once per chip, not once per pass of the loop below.
+    let widths: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let size = chip_size(app, *id)
+                .map_or(px(0.), |size| measure(size) + rems(space::XS.0));
+            rems(space::XS.0.mul_add(3., size::SWATCH.0))
+                + px(2.)
+                + measure(id.label().to_owned())
+                + size
+        })
+        .collect();
+    let chip = |id: ChipId| {
+        ids.iter()
+            .position(|other| *other == id)
+            .map_or(px(0.), |index| widths[index])
+    };
+    let gap = rems(space::XS.0);
+    let button =
+        |label: String| measure(label) + rems(space::SM.0 * 2.) + px(2.);
+    let mut fixed = px(0.);
+    if app.legend.is_active() {
+        fixed += button("Show all \u{00d7}".to_owned()) + gap;
+    }
+    let off_screen = if app.color_mode == ColorMode::Age {
+        app.legend.kinds_summary()
+    } else {
+        app.legend.ages_summary()
+    };
+    if let Some(summary) = off_screen {
+        fixed += button(summary) + gap;
+    }
+    let more_button = |count: usize| {
+        button(format!("+{count}")) + rems(space::XS.0 + icon::SM.0) + gap
+    };
+    // A margin: the row is measured from the window, not laid out.
+    let room = room - rems(space::SM.0);
+    loop {
+        let row = shown.iter().fold(px(0.), |sum, id| sum + chip(*id) + gap);
+        let extra = if more.is_empty() {
+            px(0.)
+        } else {
+            more_button(more.len() + 1)
+        };
+        if fixed + row + extra <= room {
+            break;
+        }
+        // The smallest chip that is not set goes next; before the shares
+        // are known, the last one.
+        let Some(position) = shown
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| !set(**id))
+            .min_by_key(|(position, id)| {
+                (chip_share(app, **id).unwrap_or(0), usize::MAX - position)
+            })
+            .map(|(position, _)| position)
+        else {
+            break;
+        };
+        more.push(shown.remove(position));
+    }
+    more.sort_by_key(|id| ids.iter().position(|other| other == id));
+    LegendFit { shown, more }
+}
+
 /// The key to the colours, and the filter: the categories, or the age
 /// ramp in age mode, each a chip that cycles shown → only → hidden (see
-/// `legend.rs`). It wraps onto another line rather than clip a chip.
-fn legend(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
+/// `legend.rs`) with what it keeps of the scan beside it. One row: what
+/// does not fit (see [`legend_fit`]) is in the "+N" menu at its end.
+fn legend(
+    app: &Disktree,
+    fit: &LegendFit,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
     use crate::legend::ChipId;
-    let ground = palette::category_fill(theme, Category::Other, 0);
-    let hatch = cx.omarchy().bright.opacity(0.5);
-    let mut chips = vec![legend_chip(
-        app,
-        theme,
-        ChipId::Reclaimable,
-        widgets::hatch_swatch(hatch, ground),
-        cx,
-    )];
+    let chips: Vec<_> = fit
+        .shown
+        .iter()
+        .map(|id| legend_chip(app, theme, *id, false, cx))
+        .collect();
     // The set of chips that is not on screen still filters, so it shows as
     // one pill that clears it.
     let (off_screen, pill) = if app.color_mode == ColorMode::Age {
-        for (index, _) in palette::AGE_BUCKETS.iter().enumerate() {
-            let color = palette::age_accent(theme, index);
-            chips.push(legend_chip(
-                app,
-                theme,
-                ChipId::Age(index),
-                legend_swatch(app.legend.get(ChipId::Age(index)), color),
-                cx,
-            ));
-        }
         (ChipId::Kind(0), app.legend.kinds_summary())
     } else {
-        for (index, category) in Category::LEGEND.iter().enumerate() {
-            let color = palette::category_accent(theme, *category);
-            chips.push(legend_chip(
-                app,
-                theme,
-                ChipId::Kind(index),
-                legend_swatch(app.legend.get(ChipId::Kind(index)), color),
-                cx,
-            ));
-        }
         (ChipId::Age(0), app.legend.ages_summary())
     };
     let pill = pill.map(|summary| {
@@ -2487,12 +2634,15 @@ fn legend(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
         .legend
         .is_active()
         .then(|| show_all_button("legend-clear", theme, cx));
-    // One wrapping row: Show all and the pill lead, so they are never the
-    // part that moves to another line.
+    // Show all and the pill lead, so they are never what gives way; the
+    // menu sits at the row's right end, where an overflow is looked for.
+    let more = legend_more(app, fit, theme, cx);
     div()
         .debug_selector(|| "legend".into())
         .flex()
         .flex_row()
+        // Only set chips are kept on the row whatever its width, so enough
+        // of them on a narrow window still wrap rather than clip.
         .flex_wrap()
         .items_center()
         .gap(space::XS)
@@ -2500,6 +2650,121 @@ fn legend(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
         .children(clear)
         .children(pill)
         .children(chips)
+        .when(more.is_some(), |row| row.child(div().flex_1()))
+        .children(more)
+}
+
+/// The "+N" button at the end of the legend's row, and its menu: the chips
+/// with no room on the row, each still a filter, with what it keeps.
+fn legend_more(
+    app: &Disktree,
+    fit: &LegendFit,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    if fit.more.is_empty() {
+        return None;
+    }
+    let open = app.legend_menu_open;
+    let count = fit.more.len();
+    let hover = theme.foreground.opacity(0.1);
+    let button = with_tooltip(
+        div()
+            .id("legend-more")
+            .debug_selector(|| "legend-more".into())
+            .role(gpui_kit::Role::Button)
+            .aria_label(format!(
+                "{count} more legend {}",
+                if count == 1 { "chip" } else { "chips" }
+            ))
+            .aria_expanded(open)
+            .focusable()
+            .tab_stop(true)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::XS)
+            .flex_shrink_0()
+            .min_h(size::POINTER_TARGET)
+            .px(space::SM)
+            .border_1()
+            .border_color(if open {
+                theme.foreground.opacity(0.35)
+            } else {
+                gpui_kit::transparent_black()
+            })
+            .when(open, |button| button.bg(theme.foreground.opacity(0.14)))
+            .hover(move |style| style.bg(hover))
+            .cursor_pointer()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .on_hover(cx.listener(|this, hovered: &bool, _, _| {
+                this.legend_more_hover = *hovered;
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    this.legend_menu_open = !this.legend_menu_open;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.legend_menu_open = !this.legend_menu_open;
+                cx.notify();
+            }))
+            .child(format!("+{count}"))
+            .child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::ChevronDown)
+                    .size(icon::SM),
+            ),
+        "Kinds with little or no data, and those the row has no room for",
+    );
+    let menu = open.then(|| {
+        let rows = fit
+            .more
+            .iter()
+            .map(|id| legend_chip(app, theme, *id, true, cx));
+        div().absolute().top_full().right_0().child(
+            deferred(
+                // Hung from the right edge, the row's end, so it opens
+                // inward rather than off the window.
+                anchored()
+                    .anchor(gpui_kit::Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .offset(gpui_kit::point(px(0.), px(4.)))
+                    .child(
+                        div()
+                            .id("legend-menu")
+                            .debug_selector(|| "legend-menu".into())
+                            .occlude()
+                            .flex()
+                            .flex_col()
+                            .min_w(size::LEGEND_MENU)
+                            .p(space::XS)
+                            .bg(theme.surface)
+                            .border_1()
+                            .border_color(theme.control_border())
+                            .shadow_lg()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                // A press on "+N" is the button's.
+                                if !this.legend_more_hover {
+                                    this.legend_menu_open = false;
+                                    cx.notify();
+                                }
+                            }))
+                            .children(rows),
+                    ),
+            )
+            .with_priority(2),
+        )
+    });
+    Some(
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(button)
+            .children(menu),
+    )
 }
 
 /// Over a mosaic or list the legend has emptied: that nothing here
@@ -2605,21 +2870,53 @@ fn legend_chip(
     app: &Disktree,
     theme: &Theme,
     id: crate::legend::ChipId,
-    swatch: Div,
+    in_menu: bool,
     cx: &Context<'_, Disktree>,
 ) -> Stateful<Div> {
-    use crate::legend::Chip;
+    use crate::legend::{Chip, ChipId};
     let state = app.legend.get(id);
+    let swatch = match id {
+        ChipId::Reclaimable => widgets::hatch_swatch(
+            cx.omarchy().bright.opacity(0.5),
+            palette::category_fill(theme, Category::Other, 0),
+        ),
+        ChipId::Kind(index) => legend_swatch(
+            state,
+            palette::category_accent(theme, Category::LEGEND[index]),
+        ),
+        ChipId::Age(index) => {
+            legend_swatch(state, palette::age_accent(theme, index))
+        }
+    };
+    let size = chip_size(app, id);
     let only = state == Chip::Only;
     let faded = state == Chip::Shown && app.legend.narrowed(id);
     let hover = theme.foreground.opacity(0.06);
-    let key = id.key();
+    // In the menu a chip is a row of its own, under its own name, so a
+    // test or a screen reader never finds two of one chip.
+    let key = if in_menu {
+        format!("legend-menu-{}", id.key().trim_start_matches("legend-"))
+    } else {
+        id.key()
+    };
+    // The size is the whole scan's, wherever the view is, as the filter
+    // is: said so, since the mosaic beside it may show a single folder.
+    let spoken = size.as_ref().map_or_else(
+        || id.label().to_owned(),
+        |size| format!("{}, {size} in the scan", id.label()),
+    );
+    let hint = size.as_ref().map_or_else(
+        || app.legend.hint(id),
+        |size| {
+            format!("{} \u{00b7} {size} in the whole scan", app.legend.hint(id))
+        },
+    );
     with_tooltip(
         div()
             .id(ElementId::Name(key.clone().into()))
             .debug_selector(move || key)
             .role(gpui_kit::Role::Button)
-            .aria_label(id.label())
+            .aria_label(spoken)
             .aria_value(state.spoken())
             .focusable()
             .tab_stop(true)
@@ -2652,8 +2949,14 @@ fn legend_chip(
             ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.cycle_legend(id, cx);
+                // A chip set from the menu moves to the row, where its
+                // state shows; the menu has done its job.
+                if in_menu {
+                    this.legend_menu_open = false;
+                }
                 window.focus(&this.focus, cx);
             }))
+            .when(in_menu, |row| row.w_full().px(space::SM))
             .child(swatch)
             .child(
                 div()
@@ -2664,9 +2967,16 @@ fn legend_chip(
                         theme.secondary
                     })
                     .when(state == Chip::Hidden, Styled::line_through)
+                    .when(in_menu, Styled::flex_1)
                     .child(id.label()),
-            ),
-        app.legend.hint(id),
+            )
+            .children(size.map(|size| {
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary.opacity(0.75))
+                    .child(size)
+            })),
+        hint,
     )
 }
 
@@ -3432,6 +3742,15 @@ fn selection_summary(
         .role(gpui_kit::Role::Button)
         .aria_label(format!("Details: {line}"))
         .aria_expanded(open)
+        .focusable()
+        .tab_stop(true)
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                this.selection_details = !this.selection_details;
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }))
         .flex()
         .flex_row()
         .items_center()

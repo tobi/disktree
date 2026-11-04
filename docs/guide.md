@@ -80,8 +80,11 @@ a root. Explicit command-line paths and `--disk` still start directly;
   the scanned root a crumb is dimmer, and clicking it widens the scan to
   there (see [The whole disk](#the-whole-disk)).
 - **Under it:** the scan totals and the filter when one is typed, and on
-  its own row the legend, which wraps onto another line rather than hide
-  an entry.
+  its own row the legend. Each entry carries what it holds of the whole
+  scan, in the same unit as the tiles. The row never wraps: kinds that
+  hold nothing, or less than a thousandth of the scan, and then the
+  smallest when the row runs out of room, wait in a **+N** menu at its
+  end. Setting one there moves it onto the row, where its state shows.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches, virtual
   machines — at one muted level, lighter with depth. A diagonal hatch is

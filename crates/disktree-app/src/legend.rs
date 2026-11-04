@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use disktree_core::classify::Category;
-use disktree_core::filter::{Keep, Rule, filter_with};
+use disktree_core::filter::{Keep, Rule, filter_with, shares};
 use gpui_kit::Context;
 
 use crate::palette::AGE_BUCKETS;
@@ -301,6 +301,34 @@ impl Disktree {
         self.legend
             .is_active()
             .then(|| self.legend.rule(self.scanned_at))
+    }
+
+    /// Work out what each chip would keep of the whole scan, off the UI
+    /// thread, for the sizes beside the chips. Once per tree: ages are
+    /// measured from the scan, as the age colours are.
+    pub fn refresh_shares(&mut self, cx: &Context<'_, Self>) {
+        self.shares_epoch += 1;
+        let epoch = self.shares_epoch;
+        let Some(tree) = self.tree.clone() else {
+            self.legend_shares = None;
+            return;
+        };
+        let now = self.scanned_at;
+        let task = cx.background_executor().spawn(async move {
+            let limits: Vec<i64> =
+                AGE_BUCKETS.iter().map(|(limit, _)| *limit).collect();
+            shares(tree.root(), now, &limits)
+        });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch == this.shares_epoch {
+                    this.legend_shares = Some(Arc::new(found));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Work out what the legend keeps, from the scanned root down, off the

@@ -9596,10 +9596,11 @@ fn marking_a_partly_shown_folder_says_it_takes_all_of_it(
     assert!(cx.debug_bounds("selection-partly-shown").is_none());
 }
 
-/// Every chip is a filter, so none may be clipped away: the legend wraps
-/// instead, at any width and text size, in both colour modes.
+/// Every chip is a filter, so none may be clipped away or pushed onto a
+/// second row: the legend is one row, at any width and text size, in both
+/// colour modes, and what it has no room for is in its "+N" menu.
 #[gpui_kit::test]
-fn every_legend_chip_stays_inside_the_window(cx: &mut TestAppContext) {
+fn every_legend_chip_is_on_the_row_or_in_its_menu(cx: &mut TestAppContext) {
     use crate::legend::ChipId;
     use disktree_core::classify::Category;
 
@@ -9627,28 +9628,160 @@ fn every_legend_chip_stays_inside_the_window(cx: &mut TestAppContext) {
                 cx.simulate_resize(gpui_kit::size(px(width), px(900.)));
                 cx.update(|window, _| window.set_rem_size(px(rem)));
                 draw(cx);
+                draw(cx);
                 let legend = cx.debug_bounds("legend").expect("legend");
+                let mut missing = Vec::new();
                 for id in chips.iter().copied().chain([ChipId::Reclaimable]) {
                     let at = format!("{id:?} at {width} rem {rem}");
                     let key = Box::leak(id.key().into_boxed_str());
-                    let chip = cx.debug_bounds(key).expect(&at);
-                    assert!(
-                        chip.right() <= px(width) + px(0.5)
-                            && chip.left() >= px(0.)
-                            && chip.size.width > px(0.),
-                        "{at}: {chip:?}"
-                    );
-                    // Clipped chips used to run on past the legend's edge,
-                    // under the side panel, while still inside the window.
+                    let Some(chip) = cx.debug_bounds(key) else {
+                        missing.push(id);
+                        continue;
+                    };
                     assert!(
                         chip.right() <= legend.right() + px(0.5)
-                            && chip.bottom() <= legend.bottom() + px(0.5),
+                            && chip.left() >= px(0.)
+                            && chip.size.width > px(0.),
                         "{at}: {chip:?} inside the legend {legend:?}"
                     );
+                    // One row: no chip starts below the first line.
+                    assert!(
+                        chip.top() - legend.top() < chip.size.height,
+                        "{at}: {chip:?} on the legend's one row {legend:?}"
+                    );
                 }
+                if missing.is_empty() {
+                    assert!(cx.debug_bounds("legend-more").is_none());
+                    continue;
+                }
+                let more = cx.debug_bounds("legend-more").expect("+N");
+                assert!(more.right() <= legend.right() + px(0.5), "{more:?}");
+                click_on(cx, "legend-more");
+                draw(cx);
+                for id in missing {
+                    let key = format!(
+                        "legend-menu-{}",
+                        id.key().trim_start_matches("legend-")
+                    );
+                    let at = format!("{key} at {width} rem {rem}");
+                    let row = cx
+                        .debug_bounds(Box::leak(key.into_boxed_str()))
+                        .expect(&at);
+                    assert!(
+                        row.right() <= px(width) + px(0.5)
+                            && row.left() >= px(0.),
+                        "{at}: {row:?}"
+                    );
+                }
+                click_on(cx, "legend-more");
+                draw(cx);
+                assert!(cx.debug_bounds("legend-menu").is_none());
             }
         }
     }
+}
+
+/// The legend belongs to the scan, not to the folder on screen: drilling
+/// into a folder with none of a kind keeps that kind's chip set, on the
+/// row and at its scan-wide size, and coming back up finds it unchanged.
+#[gpui_kit::test]
+fn a_set_chip_survives_drilling_into_a_folder_without_its_kind(
+    cx: &mut TestAppContext,
+) {
+    use crate::legend::{Chip, ChipId};
+    use disktree_core::classify::Category;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    draw(cx);
+    let cache = ChipId::Kind(
+        Category::LEGEND
+            .iter()
+            .position(|kind| *kind == Category::Cache)
+            .unwrap(),
+    );
+    let key = Box::leak(cache.key().into_boxed_str());
+    let shares = read(&view, cx, |app| app.legend_shares.clone());
+    for state in [Chip::Only, Chip::Hidden] {
+        update(&view, cx, |app, cx| {
+            app.clear_legend(None, cx);
+            while app.legend.get(cache) != state {
+                app.cycle_legend(cache, cx);
+            }
+        });
+        // `junk` holds no cache at all.
+        let junk = read(&view, cx, |app| {
+            app.crumbs_for_path(&temp.path().join("junk"))
+                .expect("junk")
+        });
+        update(&view, cx, |app, cx| app.go_to(junk, cx));
+        draw(cx);
+        draw(cx);
+        assert_eq!(read(&view, cx, |app| app.legend.get(cache)), state);
+        assert!(cx.debug_bounds(key).is_some(), "{state:?}: on the row");
+        assert_eq!(
+            read(&view, cx, |app| app.legend_shares.clone()),
+            shares,
+            "sizes are the scan's, not the folder's"
+        );
+        update(&view, cx, Disktree::ascend);
+        draw(cx);
+        assert_eq!(read(&view, cx, |app| app.legend.get(cache)), state);
+        assert!(cx.debug_bounds(key).is_some());
+    }
+}
+
+/// Each chip says how much of the scan it keeps. Empty and tiny kinds wait
+/// in "+N"; a chip set from there moves to the row, where its state shows.
+#[gpui_kit::test]
+fn legend_chips_carry_sizes_and_empty_kinds_wait_in_the_menu(
+    cx: &mut TestAppContext,
+) {
+    use crate::legend::{Chip, ChipId};
+    use disktree_core::classify::Category;
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1440.), px(900.)));
+    draw(cx);
+    draw(cx);
+    let shares = read(&view, cx, |app| app.legend_shares.clone())
+        .expect("shares worked out");
+    let cache = Category::LEGEND
+        .iter()
+        .position(|kind| *kind == Category::Cache)
+        .unwrap();
+    // `.cache/blob.bin` holds 300,000 bytes of the fixture's ~601,000.
+    assert_eq!(shares.kind(Category::Cache), 300_000);
+    let key = Box::leak(ChipId::Kind(cache).key().into_boxed_str());
+    assert!(cx.debug_bounds(key).is_some(), "Cache has data: on the row");
+    // The fixture holds no code: Code waits in the menu.
+    let code = Category::LEGEND
+        .iter()
+        .position(|kind| *kind == Category::Code)
+        .unwrap();
+    assert_eq!(shares.kind(Category::Code), 0);
+    let code_key = Box::leak(ChipId::Kind(code).key().into_boxed_str());
+    assert!(cx.debug_bounds(code_key).is_none(), "empty: not on the row");
+    assert!(cx.debug_bounds("legend-more").is_some());
+
+    click_on(cx, "legend-more");
+    draw(cx);
+    let menu_key =
+        Box::leak(format!("legend-menu-kind-{code}").into_boxed_str());
+    assert!(cx.debug_bounds(menu_key).is_some(), "Code is in the menu");
+    click_on(cx, menu_key);
+    draw(cx);
+    assert_eq!(
+        read(&view, cx, |app| app.legend.get(ChipId::Kind(code))),
+        Chip::Only
+    );
+    assert!(!read(&view, cx, |app| app.legend_menu_open), "menu closed");
+    assert!(cx.debug_bounds(code_key).is_some(), "set: on the row");
 }
 
 /// A filter that keeps nothing in the folder on screen says so, says

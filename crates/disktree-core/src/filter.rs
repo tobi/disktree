@@ -114,12 +114,70 @@ impl Rule {
     }
 
     fn age_bucket(&self, modified: i64) -> usize {
-        let days = (self.now - modified) / 86_400;
-        self.age_limits
-            .iter()
-            .position(|limit| days <= *limit)
-            .unwrap_or_else(|| self.age_limits.len().saturating_sub(1))
+        age_bucket(self.now, &self.age_limits, modified)
     }
+}
+
+/// Which age chip a write time falls in: the first limit, in days, it is
+/// within, or the last chip when it is older than them all.
+fn age_bucket(now: i64, limits: &[i64], modified: i64) -> usize {
+    let days = (now - modified) / 86_400;
+    limits
+        .iter()
+        .position(|limit| days <= *limit)
+        .unwrap_or_else(|| limits.len().saturating_sub(1))
+}
+
+/// What each legend chip would keep of a whole tree.
+///
+/// In the tree's own metric: the bytes a chip set to only would show.
+/// Judged per file by the facts [`Rule::passes`] reads, so a chip's total
+/// is the "Showing" figure a click on it gives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shares {
+    /// By kind, indexed by `Category as usize` (a kind is a bit of a
+    /// `u16`, so there are at most sixteen).
+    pub kinds: [u64; 16],
+    /// Files with a cleanup suggestion.
+    pub suggested: u64,
+    /// By age chip, one per limit given; a file with no write time is in
+    /// none.
+    pub ages: Vec<u64>,
+}
+
+impl Shares {
+    pub const fn kind(&self, category: Category) -> u64 {
+        self.kinds[category as usize]
+    }
+}
+
+/// Sum every file beneath `root` into [`Shares`], with ages measured from
+/// `now` against `age_limits` in days, as a [`Rule`] measures them.
+pub fn shares(root: Node<'_>, now: i64, age_limits: &[i64]) -> Shares {
+    let mut shares = Shares {
+        ages: vec![0; age_limits.len()],
+        ..Shares::default()
+    };
+    // A stack, not recursion: a scan can be deeper than a thread's stack
+    // is comfortable with. The root's children, as a filter starts there:
+    // a scan of one file holds nothing to filter.
+    let mut stack: Vec<Node<'_>> = root.children().iter().collect();
+    while let Some(node) = stack.pop() {
+        let children = node.children();
+        if !children.is_empty() {
+            stack.extend(children.iter());
+            continue;
+        }
+        shares.kinds[node.category as usize] += node.bytes;
+        if node.reclaim.is_some() {
+            shares.suggested += node.bytes;
+        }
+        if node.modified > 0 && !age_limits.is_empty() {
+            shares.ages[age_bucket(now, age_limits, node.modified)] +=
+                node.bytes;
+        }
+    }
+    shares
 }
 
 impl Matches {
@@ -553,6 +611,38 @@ mod tests {
             now: NOW,
             ..Rule::default()
         }
+    }
+
+    /// Every chip's share is what that chip alone, set to only, would
+    /// show: the same files, judged by the same facts.
+    #[test]
+    fn shares_are_what_each_chip_would_show() {
+        let tree = kinds();
+        let root = tree.root();
+        let base = rule();
+        let shares = shares(root, NOW, &base.age_limits);
+        for category in [Category::Code, Category::Media, Category::Cache] {
+            let only = Rule {
+                only: Rule::bit(category),
+                ..base.clone()
+            };
+            let shown = filter_with(root, &[], "", Some(&only))
+                .map_or(0, |found| found.bytes);
+            assert_eq!(shares.kind(category), shown, "{category:?}");
+        }
+        assert_eq!(shares.kind(Category::Code), 55);
+        assert_eq!(shares.kind(Category::Media), 120);
+        assert_eq!(shares.suggested, 40);
+        let suggested = Rule {
+            reclaimable: Some(true),
+            ..base
+        };
+        assert_eq!(
+            filter_with(root, &[], "", Some(&suggested)).map(|f| f.bytes),
+            Some(shares.suggested)
+        );
+        // This week: main.rs, app and dog.jpg; over a year: the rest.
+        assert_eq!(shares.ages, vec![150, 0, 0, 0, 25]);
     }
 
     /// How `names` takes part, asked the way a layout asks.
