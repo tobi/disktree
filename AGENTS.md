@@ -209,9 +209,11 @@ or `cargo run` to look at a change. The window-harness tests (`make test`,
     guards and its configured capacity limit for both UI and MCP removals.
     Past the limit only the person can go: in the window, through Mark
     anyway and then Review's second confirmation (a typed phrase by
-    default), with the worker held to the share confirmed. An agent's mark
-    past the limit is refused, and agents keep the default limit when the
-    window's is Off. `mark_guard.rs` holds the rule.
+    default), which names each disk past the limit, with the worker
+    holding each of those disks to its confirmed share and every other
+    disk to the limit. An agent's mark past the limit is refused, and
+    agents keep the default limit when the window's is Off.
+    `mark_guard.rs` holds the rule.
     Trash never falls back to permanent deletion. No headless or SSH removal.
     A linked window's tree and marks remain the source of truth; `ls` and
     `find` read it without navigating. Only an explicit `show` request moves

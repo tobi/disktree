@@ -163,10 +163,14 @@ One removal may take only so much of a disk: 5% of the volume's capacity
 by default, counting everything marked. A mark that would pass it is not
 made by Space or **Mark for removal**: the button reads **Over 5% limit**,
 and the ▾ beside it holds **Mark anyway**, which names the share. Review
-then shows the share against the limit and keeps the commit button off
-until you type the phrase it shows, such as `delete 20% of my disk`
-(`trash …` to the trash). Removal is held to the share you typed: if what
-is marked has grown past it when the removal starts, nothing is removed.
+then shows each disk the removal takes past the limit, its share against
+the limit, and keeps the commit button off until you type the phrase it
+shows, such as `delete 20% of my disk` (`trash …` to the trash), or
+`delete 20% and 19% of my disks` when marks on a disk mounted inside the
+scan pass the limit there too. Each disk counts on its own, and removal
+holds each to the share you typed for it and every other disk to the
+limit: if what is marked has grown past that when the removal starts,
+nothing is removed.
 Settings › Safety sets the limit (1%, 5%, 10%, 25%, 50% or Off) and what
 Review asks past it (type a phrase, tick a box, or nothing more). Neither
 lets an agent past the limit.

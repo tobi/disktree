@@ -9799,6 +9799,24 @@ fn unmark_all_offers_undo_on_its_toast(cx: &mut TestAppContext) {
     assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
 }
 
+/// `junk` on a pretend 1 MB USB disk mounted inside the scan, the rest on
+/// a boot disk of `boot` bytes, as Review's probe finds them.
+fn two_disks(path: &Path, boot: u64) -> crate::mark_guard::Disk {
+    if path.components().any(|part| part.as_os_str() == "junk") {
+        crate::mark_guard::Disk {
+            key: "usb".into(),
+            capacity: 1_000_000,
+            name: "/Volumes/USB".into(),
+        }
+    } else {
+        crate::mark_guard::Disk {
+            key: "boot".into(),
+            capacity: boot,
+            name: "/".into(),
+        }
+    }
+}
+
 /// The fixture on a pretend 1 MB disk, with `junk` (300 kB, 30% of it)
 /// selected: past the default 5% limit.
 fn over_limit_view<'a>(
@@ -9807,6 +9825,14 @@ fn over_limit_view<'a>(
 ) -> (Entity<Disktree>, &'a mut Window, Vec<usize>) {
     let (view, cx) = view_over(temp, cx);
     let junk = update(&view, cx, |app, cx| {
+        // Every path on one pretend 1 MB disk.
+        app.disk_probe = |_| {
+            Ok(crate::mark_guard::Disk {
+                key: "disk".into(),
+                capacity: 1_000_000,
+                name: "/".into(),
+            })
+        };
         app.space = Some(SpaceInfo {
             total: 1_000_000,
             free: 100_000,
@@ -9883,11 +9909,8 @@ fn past_the_limit_marking_needs_mark_anyway_and_review_the_phrase(
     // a share that grew past 30% since is refused there.
     update(&view, cx, |app, cx| {
         let plan = app.plan();
-        assert_eq!(
-            app.removal_limit(&plan, cx)
-                .map(disktree_core::removal_limit::Limit::percent),
-            Ok(30)
-        );
+        let ceilings = app.removal_limit(&plan, cx).expect("confirmed");
+        assert_eq!(ceilings.of("disk").percent(), 30);
     });
 
     // Enter in the field commits, and the permanent dialog still asks.
@@ -9919,6 +9942,91 @@ fn past_the_limit_marking_needs_mark_anyway_and_review_the_phrase(
     read(&view, cx, |app| {
         assert!(app.over_phrase.is_none());
         assert_eq!(app.over_ticked, None);
+    });
+}
+
+/// A mark on a disk mounted inside the scan counts against that disk, not
+/// the scanned one. Review names each disk past the limit, and the worker
+/// holds each to the share confirmed for it and every other to the limit:
+/// 30% confirmed for one disk lets nothing past 5% on another.
+#[gpui_kit::test]
+fn past_the_limit_review_names_each_disk_and_holds_each_to_its_own_share(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx, junk) = over_limit_view(temp.path(), cx);
+    let keep = update(&view, cx, |app, cx| {
+        // A boot disk large enough that nothing here nears its limit.
+        app.disk_probe = |path| Ok(two_disks(path, 1_000_000_000));
+        app.removal_mode = RemovalMode::Permanent;
+        app.mark_anyway(&junk, cx);
+        app.open_review(cx);
+        app.tree()
+            .and_then(|tree| tree.find("keep").map(|(crumbs, _)| crumbs))
+            .expect("the keep directory")
+    });
+    draw(cx);
+
+    // Only the USB disk is past the limit, and the gate says which.
+    assert!(cx.debug_bounds("over-limit-disk-0").is_some());
+    assert!(cx.debug_bounds("over-limit-disk-1").is_none());
+    update(&view, cx, |app, _| {
+        let gate = app.removal_gate(&app.plan()).expect("past the limit");
+        assert_eq!(gate.summary(), "30% of /Volumes/USB");
+        assert_eq!(app.gate_phrase(&gate), "delete 30% of my disk");
+    });
+    click_on(cx, "over-limit-phrase");
+    cx.simulate_input("delete 30% of my disk");
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-matched").is_some());
+    update(&view, cx, |app, cx| {
+        let plan = app.plan();
+        let ceilings = app.removal_limit(&plan, cx).expect("confirmed");
+        assert_eq!(ceilings.of("usb").percent(), 30);
+        assert_eq!(ceilings.of("boot").percent(), 5, "not confirmed");
+    });
+
+    // `keep` takes a small boot disk past the limit too: the gate lists
+    // both, the phrase names both shares, and the one typed is no longer
+    // enough.
+    update(&view, cx, |app, cx| {
+        // A 10 kB boot disk, which `keep` (1 kB) takes past the limit.
+        app.disk_probe = |path| Ok(two_disks(path, 10_000));
+        app.screen = Screen::Explore;
+        app.mark_anyway(&keep, cx);
+        app.open_review(cx);
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-disk-0").is_some());
+    assert!(cx.debug_bounds("over-limit-disk-1").is_some());
+    assert!(cx.debug_bounds("over-limit-matched").is_none());
+    update(&view, cx, |app, cx| {
+        let plan = app.plan();
+        let gate = app.removal_gate(&plan).expect("past the limit");
+        assert_eq!(gate.summary(), "30% of /Volumes/USB and 10% of /");
+        assert_eq!(app.gate_phrase(&gate), "delete 30% and 10% of my disks");
+        let refused = app.removal_limit(&plan, cx).expect_err("unconfirmed");
+        assert!(
+            refused.contains("delete 30% and 10% of my disks"),
+            "{refused}"
+        );
+    });
+    // A click lands the caret where it falls in the text; clear from the
+    // end so every character typed before goes.
+    click_on(cx, "over-limit-phrase");
+    cx.simulate_keystrokes("end");
+    let typed = "delete 30% of my disk".chars().count();
+    cx.simulate_keystrokes(&vec!["backspace"; typed].join(" "));
+    cx.simulate_input("delete 30% and 10% of my disks");
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-matched").is_some());
+    update(&view, cx, |app, cx| {
+        let plan = app.plan();
+        let ceilings = app.removal_limit(&plan, cx).expect("confirmed");
+        assert_eq!(ceilings.of("usb").percent(), 30);
+        assert_eq!(ceilings.of("boot").percent(), 10);
+        assert_eq!(ceilings.of("elsewhere").percent(), 5);
     });
 }
 

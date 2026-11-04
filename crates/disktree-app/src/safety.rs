@@ -163,18 +163,38 @@ pub fn share_percent(bytes: u64, capacity: u64) -> u8 {
     u8::try_from(percent.min(100)).unwrap_or(100)
 }
 
-/// What Review asks the person to type for a removal of `percent` of a
-/// disk in `mode`. The verb is the mode's, so the phrase is read for both
-/// how much and how.
+/// What Review asks the person to type for a removal of `percents` of
+/// disks in `mode`, one share per disk past the limit. The verb is the
+/// mode's, so the phrase is read for how much, how, and how many disks:
+/// "delete 20% of my disk", "trash 20% and 19% of my disks".
 pub fn phrase(
-    percent: u8,
+    percents: &[u8],
     mode: disktree_core::removal::RemovalMode,
 ) -> String {
     let verb = match mode {
         disktree_core::removal::RemovalMode::Permanent => "delete",
         disktree_core::removal::RemovalMode::Trash => "trash",
     };
-    format!("{verb} {percent}% of my disk")
+    let disks = if percents.len() > 1 {
+        "my disks"
+    } else {
+        "my disk"
+    };
+    let shares = series(percents.iter().map(|percent| format!("{percent}%")));
+    format!("{verb} {shares} of {disks}")
+}
+
+/// `items` as a reader lists them: "a", "a and b", "a, b and c".
+pub fn series(items: impl IntoIterator<Item = String>) -> String {
+    let mut items: Vec<String> = items.into_iter().collect();
+    let Some(last) = items.pop() else {
+        return String::new();
+    };
+    if items.is_empty() {
+        last
+    } else {
+        format!("{} and {last}", items.join(", "))
+    }
 }
 
 /// Whether `typed` says `phrase`: case and the spaces around and between
@@ -231,8 +251,17 @@ mod tests {
         assert_eq!(share_percent(201, 1000), 21);
         assert_eq!(share_percent(5, 0), 100, "no capacity is the worst case");
         assert_eq!(share_percent(u64::MAX, 1), 100);
-        let typed = phrase(20, RemovalMode::Permanent);
+        let typed = phrase(&[20], RemovalMode::Permanent);
         assert_eq!(typed, "delete 20% of my disk");
+        assert_eq!(
+            phrase(&[20, 19], RemovalMode::Trash),
+            "trash 20% and 19% of my disks"
+        );
+        assert_eq!(
+            phrase(&[20, 19, 7], RemovalMode::Permanent),
+            "delete 20%, 19% and 7% of my disks"
+        );
+        assert_eq!(series(Vec::new()), "");
         assert!(matches("  Delete 20%  of my DISK ", &typed));
         assert!(!matches("delete 2% of my disk", &typed));
         assert!(!matches("trash 20% of my disk", &typed));

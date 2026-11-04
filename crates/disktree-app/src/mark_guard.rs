@@ -6,11 +6,16 @@
 //! judged when it is made: a protected path is never marked, and a mark
 //! that takes a volume past Settings › Safety's limit needs Mark anyway
 //! here and a second confirmation in Review.
+//!
+//! Review counts each disk on its own, as the worker does: a scan can hold
+//! marks on a disk mounted inside it, and a share confirmed for one disk
+//! says nothing about another.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use disktree_core::removal::{Plan, Target};
-use disktree_core::removal_limit::Limit;
+use disktree_core::removal::{Plan, RemovalMode, Target};
+use disktree_core::removal_limit::{Ceilings, Limit, Usage};
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::{App, AppContext as _, Context, Focusable as _, Window};
 use gpui_omarchy::Status;
@@ -51,11 +56,145 @@ impl Share {
             limit: limit.percent(),
         })
     }
+
+    /// The share unrounded, for ordering two disks whose rounded shares
+    /// tie: parts per million of capacity.
+    fn bytes_share(&self) -> u128 {
+        u128::from(self.bytes) * 1_000_000 / u128::from(self.capacity.max(1))
+    }
 }
 
 /// One path's answer from the guards, kept while the inspector stays on
 /// it: judging reads the filesystem, and the inspector draws every frame.
 pub type RefusalCache = Option<(PathBuf, PathBuf, Option<String>)>;
+
+/// The disk removing a path gives space back on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disk {
+    /// The worker's name for it, from
+    /// [`disktree_core::removal_limit::volume_of`]: the key a confirmed
+    /// share is raised under.
+    pub key: String,
+    pub capacity: u64,
+    /// Where it is mounted, for the person to read.
+    pub name: String,
+}
+
+/// How Review finds a path's disk; [`disk_of`] outside tests.
+pub type DiskProbe = fn(&Path) -> Result<Disk, String>;
+
+/// The probe's answers by marked path, for Review's frames: the probe
+/// reads the filesystem, and Review draws the gate every frame.
+pub type DiskCache = HashMap<PathBuf, Result<Disk, String>>;
+
+/// The disk `path` is on, as the worker's check counts it, named by
+/// where it is mounted. Both come from the path the check reads, so a
+/// marked link is named by the disk it sits on, not the one it points to.
+pub fn disk_of(path: &Path) -> Result<Disk, String> {
+    let entry = disktree_core::removal_limit::volume_entry(path)?;
+    let (key, capacity) = disktree_core::removal_limit::volume_of(entry)?;
+    let name = disktree_core::space::volume_root_for(entry)
+        .map_or_else(|| key.clone(), |root| root.display().to_string());
+    Ok(Disk {
+        key,
+        capacity,
+        name,
+    })
+}
+
+/// One disk a removal takes past the limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Over {
+    pub key: String,
+    pub name: String,
+    pub share: Share,
+}
+
+/// Review's second confirmation: every disk a removal takes past the
+/// window's limit, the largest share first, as the phrase reads them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gate {
+    pub over: Vec<Over>,
+    pub limit: u8,
+}
+
+/// What a tick confirmed: each disk's share, and the mode.
+pub type Ticked = (Vec<(String, u8)>, RemovalMode);
+
+impl Gate {
+    /// The disks of `usage` past `limit`; `None` when none is.
+    fn new(
+        usage: Vec<Usage>,
+        names: &BTreeMap<String, String>,
+        limit: Limit,
+    ) -> Option<Self> {
+        let mut over: Vec<Over> = usage
+            .into_iter()
+            .filter_map(
+                |Usage {
+                     volume,
+                     bytes,
+                     capacity,
+                 }| {
+                    let share = Share::over(bytes, capacity, limit)?;
+                    let name = names
+                        .get(&volume)
+                        .cloned()
+                        .unwrap_or_else(|| volume.clone());
+                    Some(Over {
+                        key: volume,
+                        name,
+                        share,
+                    })
+                },
+            )
+            .collect();
+        // Stable, so equal shares keep the worker's key order.
+        over.sort_by_key(|over| std::cmp::Reverse(over.share.bytes_share()));
+        (!over.is_empty()).then(|| Self {
+            over,
+            limit: limit.percent(),
+        })
+    }
+
+    /// Each disk's share, in the gate's order.
+    pub fn percents(&self) -> Vec<u8> {
+        self.over.iter().map(|over| over.share.percent).collect()
+    }
+
+    /// "30% of /" or "31% of / and 30% of /Volumes/USB".
+    pub fn summary(&self) -> String {
+        crate::safety::series(
+            self.over.iter().map(|over| {
+                format!("{}% of {}", over.share.percent, over.name)
+            }),
+        )
+    }
+
+    /// What a tick of this gate in `mode` confirms.
+    pub fn ticked(&self, mode: RemovalMode) -> Ticked {
+        (
+            self.over
+                .iter()
+                .map(|over| (over.key.clone(), over.share.percent))
+                .collect(),
+            mode,
+        )
+    }
+
+    /// `base`, with each disk here raised to its confirmed share and no
+    /// other: a mark on a disk this gate does not name stays at `base`.
+    fn ceilings(&self, base: Limit) -> Result<Ceilings, String> {
+        self.over
+            .iter()
+            .try_fold(Ceilings::from(base), |ceilings, over| {
+                Ok(ceilings.raise(
+                    over.key.clone(),
+                    Limit::new(over.share.percent.max(1))?,
+                ))
+            })
+    }
+}
 
 impl Disktree {
     /// Settings › Safety as last read. Read once and again before every
@@ -112,8 +251,11 @@ impl Disktree {
     }
 
     /// Whether marking `target` passes `limit` on the scanned volume.
-    /// Every mark counts against it, wherever it lives: the worker checks
-    /// each volume again, and over-counting only asks sooner.
+    /// Every mark counts against it, wherever it lives, so a mark on
+    /// another disk can be over- or under-counted here: a small disk
+    /// mounted inside the scan passes its own limit long before the scanned
+    /// one does. Review and the worker count each disk on its own, and
+    /// those are what hold a removal to the limit.
     fn over_limit(&self, target: &Target, limit: Limit) -> Option<Share> {
         Share::over(self.marked_with(target), self.capacity()?, limit)
     }
@@ -188,69 +330,115 @@ impl Disktree {
         self.toggle_mark_checked(crumbs, true, cx);
     }
 
-    /// Marked bytes against the scanned volume when they pass the window's
-    /// limit, for Review's second confirmation. Every target counts, as at
-    /// marking. `None` with the limit off, over SSH, or with no capacity
-    /// known, where the worker's own check still stands.
-    pub fn removal_gate(&self, plan: &Plan) -> Option<Share> {
+    /// The plan's bytes disk by disk, with each disk's name, as the
+    /// worker's check groups them. `fresh` asks the probe again and keeps
+    /// its answers; otherwise answers kept since Review opened are reused.
+    fn usage(
+        &self,
+        plan: &Plan,
+        fresh: bool,
+    ) -> Result<(Vec<Usage>, BTreeMap<String, String>), String> {
+        let mut cache = self.disk_cache.borrow_mut();
+        let mut names = BTreeMap::new();
+        let usage =
+            disktree_core::removal_limit::usage(&plan.targets, |path| {
+                let disk = if fresh {
+                    let disk = (self.disk_probe)(path);
+                    cache.insert(path.to_path_buf(), disk.clone());
+                    disk
+                } else {
+                    cache
+                        .entry(path.to_path_buf())
+                        .or_insert_with(|| (self.disk_probe)(path))
+                        .clone()
+                }?;
+                names.entry(disk.key.clone()).or_insert(disk.name);
+                Ok((disk.key, disk.capacity))
+            })?;
+        Ok((usage, names))
+    }
+
+    /// Forget which disk each mark is on, so Review reads them again. Every
+    /// way into Review does this: a disk mounted or unmounted since the
+    /// last visit is then seen.
+    pub fn reread_disks(&self) {
+        self.disk_cache.borrow_mut().clear();
+    }
+
+    /// Every disk the plan takes past the window's limit, for Review's
+    /// second confirmation. `None` with the limit off, over SSH, or when a
+    /// disk cannot be read, where the worker's own check still stands.
+    pub fn removal_gate(&self, plan: &Plan) -> Option<Gate> {
         if self.remote.is_some() {
             return None;
         }
         let limit = self.policy().limit?;
-        Share::over(plan.bytes(), self.capacity()?, limit)
+        let (usage, names) = self.usage(plan, false).ok()?;
+        Gate::new(usage, &names, limit)
     }
 
-    /// The phrase Review asks for `share`, in the current mode.
-    pub fn gate_phrase(&self, share: &Share) -> String {
-        phrase(share.percent, self.removal_mode)
+    /// The phrase Review asks for `gate`, in the current mode.
+    pub fn gate_phrase(&self, gate: &Gate) -> String {
+        phrase(&gate.percents(), self.removal_mode)
     }
 
-    /// Whether the person has confirmed `share` as Settings asks.
-    pub fn gate_met(&self, share: &Share, cx: &App) -> bool {
+    /// Whether the person has confirmed `gate` as Settings asks.
+    pub fn gate_met(&self, gate: &Gate, cx: &App) -> bool {
         match self.policy().confirm {
             Confirm::Nothing => true,
             Confirm::Tick => {
-                self.over_ticked == Some((share.percent, self.removal_mode))
+                self.over_ticked.as_ref()
+                    == Some(&gate.ticked(self.removal_mode))
             }
             Confirm::Phrase => self.over_phrase.as_ref().is_some_and(|input| {
-                matches(&input.read(cx).value(), &self.gate_phrase(share))
+                matches(&input.read(cx).value(), &self.gate_phrase(gate))
             }),
         }
     }
 
-    /// The limit the worker holds this removal to: what the person
-    /// confirmed when past the window's limit, so a share that grew since
-    /// is refused; otherwise the window's. Err with the notice to show.
+    /// The limits the worker holds this removal to: on each disk past the
+    /// window's limit, the share the person confirmed for that disk, so a
+    /// share that grew since is refused; on every other disk, the window's.
+    /// Err with the notice to show.
     pub fn removal_limit(
         &self,
         plan: &Plan,
         cx: &App,
-    ) -> Result<Limit, String> {
+    ) -> Result<Ceilings, String> {
         let policy = self.reload_policy()?;
-        let limit = match self.removal_gate(plan) {
-            Some(share) if !self.gate_met(&share, cx) => {
+        // Off still counts against a capacity, so an unknown one fails
+        // closed; it just never says no for size.
+        let base = policy.limit.map_or_else(|| Limit::new(100), Ok)?;
+        let (usage, names) = self.usage(plan, true)?;
+        let gate = policy
+            .limit
+            .filter(|_| self.remote.is_none())
+            .and_then(|limit| Gate::new(usage, &names, limit));
+        let ceilings = match gate {
+            Some(gate) if !self.gate_met(&gate, cx) => {
                 return Err(match policy.confirm {
                     Confirm::Tick => format!(
-                        "this removes {}% of the disk; tick the box to go \
-                         past the {}% limit",
-                        share.percent, share.limit
+                        "this removes {}; tick the box to go past the {}% \
+                         limit",
+                        gate.summary(),
+                        gate.limit
                     ),
                     _ => format!(
-                        "this removes {}% of the disk; type \u{201c}{}\
-                         \u{201d} to go past the {}% limit",
-                        share.percent,
-                        self.gate_phrase(&share),
-                        share.limit
+                        "this removes {}; type \u{201c}{}\u{201d} to go past \
+                         the {}% limit",
+                        gate.summary(),
+                        self.gate_phrase(&gate),
+                        gate.limit
                     ),
                 });
             }
-            Some(share) => Limit::new(share.percent.max(1))?,
-            // Off still counts against a capacity, so an unknown one
-            // fails closed; it just never says no for size.
-            None => policy.limit.map_or_else(|| Limit::new(100), Ok)?,
+            Some(gate) => gate.ceilings(base)?,
+            None => Ceilings::from(base),
         };
-        limit.check(&plan.targets)?;
-        Ok(limit)
+        ceilings.check_with(&plan.targets, |path| {
+            (self.disk_probe)(path).map(|disk| (disk.key, disk.capacity))
+        })?;
+        Ok(ceilings)
     }
 
     /// Make Review's phrase field once there is a window to make it in.
@@ -303,5 +491,55 @@ mod tests {
             Share::over(u64::MAX, 1, five).map(|s| s.percent),
             Some(100)
         );
+    }
+
+    fn usage(volume: &str, bytes: u64, capacity: u64) -> Usage {
+        Usage {
+            volume: volume.into(),
+            bytes,
+            capacity,
+        }
+    }
+
+    #[test]
+    fn a_gate_lists_each_disk_past_the_limit_and_raises_only_those() {
+        let names = BTreeMap::from([
+            ("boot".to_owned(), "/".to_owned()),
+            ("usb".to_owned(), "/Volumes/USB".to_owned()),
+        ]);
+        let five = Limit::default();
+        let gate = Gate::new(
+            vec![
+                usage("boot", 190, 1000),
+                usage("other", 50, 1000),
+                usage("usb", 200, 1000),
+            ],
+            &names,
+            five,
+        )
+        .expect("two disks past 5%");
+        // Largest first.
+        assert_eq!(gate.percents(), [20, 19]);
+        assert_eq!(gate.summary(), "20% of /Volumes/USB and 19% of /");
+        assert_eq!(
+            gate.ticked(RemovalMode::Trash),
+            (
+                vec![("usb".to_owned(), 20), ("boot".to_owned(), 19)],
+                RemovalMode::Trash
+            )
+        );
+        let ceilings = gate.ceilings(five).expect("ceilings");
+        assert_eq!(ceilings.of("usb").percent(), 20);
+        assert_eq!(ceilings.of("boot").percent(), 19);
+        assert_eq!(ceilings.of("other"), five, "within the limit, held to it");
+
+        assert_eq!(
+            Gate::new(vec![usage("boot", 50, 1000)], &names, five),
+            None
+        );
+        // A disk with no name reads as its key.
+        let unnamed = Gate::new(vec![usage("disk9", 60, 1000)], &names, five)
+            .expect("past 5%");
+        assert_eq!(unnamed.summary(), "6% of disk9");
     }
 }

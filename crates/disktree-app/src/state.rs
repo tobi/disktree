@@ -614,9 +614,16 @@ pub struct Disktree {
     pub mark_menu: Option<PathBuf>,
     /// Review's field for the over-limit phrase, made when first shown.
     pub over_phrase: Option<Entity<InputState>>,
-    /// The share and mode the over-limit box was ticked for: a tick says
-    /// "20%, to the trash", and means nothing once either changes.
-    pub over_ticked: Option<(u8, RemovalMode)>,
+    /// The shares and mode the over-limit box was ticked for: a tick says
+    /// "20% of this disk, to the trash", and means nothing once any of it
+    /// changes.
+    pub over_ticked: Option<crate::mark_guard::Ticked>,
+    /// How Review finds the disk a marked path is on. A field so a test
+    /// can stand in two disks where its fixture has one.
+    pub disk_probe: crate::mark_guard::DiskProbe,
+    /// The probe's answers for Review's frames; see
+    /// [`Self::removal_gate`].
+    pub disk_cache: RefCell<crate::mark_guard::DiskCache>,
     roots_job: Option<disktree_core::remote::RemoteRoots>,
     volume_epoch: u64,
     pub volumes: Vec<disktree_core::space::Volume>,
@@ -826,6 +833,8 @@ impl Disktree {
             mark_menu: None,
             over_phrase: None,
             over_ticked: None,
+            disk_probe: crate::mark_guard::disk_of,
+            disk_cache: RefCell::default(),
             roots_job: None,
             volume_epoch: 0,
             volumes: Vec::new(),
@@ -1610,6 +1619,7 @@ impl Disktree {
                 cx,
             );
         } else {
+            self.reread_disks();
             self.screen = Screen::Review;
             self.focus_request = Some(FocusTarget::Root);
         }

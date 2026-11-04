@@ -35,7 +35,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::chrome::{self, Frame};
 use crate::git_store::{Probe, Shown};
 use crate::ledger::Cohort;
-use crate::mark_guard::{MarkCheck, Share};
+use crate::mark_guard::{Gate, MarkCheck, Over, Share};
 use crate::palette;
 use crate::safety::Confirm;
 use crate::state::{
@@ -4424,6 +4424,7 @@ fn review_button(
         .hover(move |style| style.bg(highlight.opacity(0.18)))
         .active(move |style| style.bg(highlight.opacity(0.26)))
         .on_click(cx.listener(|this, _, window, cx| {
+            this.reread_disks();
             this.screen = Screen::Review;
             cx.notify();
             window.focus(&this.focus, cx);
@@ -5361,7 +5362,7 @@ fn review_summary(
         )
         .children(
             app.removal_gate(plan)
-                .map(|share| over_limit_gate(app, &share, theme, window, cx)),
+                .map(|gate| over_limit_gate(app, &gate, theme, window, cx)),
         )
         .child(
             div()
@@ -5563,66 +5564,42 @@ fn export_menu(
         .when(app.export_menu_open, |export| export.child(deferred(menu)))
 }
 
-/// The review screen's footer. Exporting and unmarking stay on the left,
-/// since neither leaves the screen; Back and the commit end it, on the
-/// right. Moving to the trash is the default commit, so it is the primary
-/// action; a permanent deletion is the danger action and asks first, which
-/// its ellipsis promises. Over SSH nothing is removed here: Back alone.
-/// Past the limit, Review asks again before the commit button wakes: the
-/// share of the disk against the limit, then the phrase to type or the box
-/// to tick that Settings › Safety picked.
+/// Past the limit, Review asks again before the commit button wakes: each
+/// disk past it with its share against the limit, then the phrase to type
+/// or the box to tick that Settings › Safety picked.
 fn over_limit_gate(
     app: &Disktree,
-    share: &Share,
+    gate: &Gate,
     theme: &Theme,
     window: &Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Stateful<Div> {
-    let fraction = |bytes: u64| {
-        (bytes as f32 / share.capacity.max(1) as f32).clamp(0.0, 1.0)
-    };
-    // The limit's tick on the meter, so the gap reads without arithmetic.
-    let limit_at = f32::from(share.limit) / 100.0;
-    let meter = div()
-        .relative()
-        .h(size::METER)
-        .bg(theme.divider())
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(gpui_kit::relative(fraction(share.bytes)))
-                .bg(theme.warning),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(-size::METER)
-                .bottom(-size::METER)
-                .left(gpui_kit::relative(limit_at))
-                .w(px(1.))
-                .bg(theme.bright),
-        );
-    let phrase = app.gate_phrase(share);
+    let phrase = app.gate_phrase(gate);
     let policy = app.policy();
     let ask: AnyElement = match policy.confirm {
         Confirm::Nothing => div()
             .text_size(text::CAPTION)
             .text_color(theme.foreground)
             .child(format!(
-                "Your limit is {}% per removal. Settings \u{203a} Safety asks \
-                 nothing more past it.",
-                share.limit
+                "Your limit is {}% of a disk per removal. Settings \u{203a} \
+                 Safety asks nothing more past it.",
+                gate.limit
             ))
             .into_any_element(),
         Confirm::Tick => {
-            let key = (share.percent, app.removal_mode);
-            let ticked = app.over_ticked == Some(key);
+            let key = gate.ticked(app.removal_mode);
+            let ticked = app.over_ticked.as_ref() == Some(&key);
             let verb = match app.removal_mode {
                 RemovalMode::Trash => "Move",
                 RemovalMode::Permanent => "Delete",
+            };
+            let shares = crate::safety::series(
+                gate.percents().iter().map(|percent| format!("{percent}%")),
+            );
+            let disks = if gate.over.len() > 1 {
+                "these disks"
+            } else {
+                "this disk"
             };
             let entity = cx.entity().downgrade();
             div()
@@ -5634,16 +5611,15 @@ fn over_limit_gate(
                         .text_size(text::CAPTION)
                         .text_color(theme.foreground)
                         .child(format!(
-                            "Your limit is {}% per removal.",
-                            share.limit
+                            "Your limit is {}% of a disk per removal.",
+                            gate.limit
                         )),
                 )
                 .child(
                     checkbox(
                         "over-limit-tick",
                         format!(
-                            "{verb} {}% of this disk{}",
-                            share.percent,
+                            "{verb} {shares} of {disks}{}",
                             if app.removal_mode == RemovalMode::Trash {
                                 " to the trash"
                             } else {
@@ -5660,6 +5636,7 @@ fn over_limit_gate(
                     .debug_selector(|| "over-limit-tick".into())
                     .tab_stop(true)
                     .on_change(move |_, _, _, cx| {
+                        let key = key.clone();
                         let _ = entity.update(cx, |this, cx| {
                             this.over_ticked = (!ticked).then_some(key);
                             cx.notify();
@@ -5669,7 +5646,7 @@ fn over_limit_gate(
                 .into_any_element()
         }
         Confirm::Phrase => {
-            let matched = app.gate_met(share, cx);
+            let matched = app.gate_met(gate, cx);
             let field = app.over_phrase.as_ref().map(|input| {
                 gpui_omarchy::input("over-limit-phrase", input, window, cx)
                     .debug_selector(|| "over-limit-phrase".into())
@@ -5684,9 +5661,9 @@ fn over_limit_gate(
                         .text_size(text::CAPTION)
                         .text_color(theme.foreground)
                         .child(format!(
-                            "Your limit is {}% per removal. To go past it, \
-                             type \u{201c}{phrase}\u{201d}.",
-                            share.limit
+                            "Your limit is {}% of a disk per removal. To go \
+                             past it, type \u{201c}{phrase}\u{201d}.",
+                            gate.limit
                         )),
                 )
                 .children(field)
@@ -5702,13 +5679,22 @@ fn over_limit_gate(
                 .into_any_element()
         }
     };
+    let heading = match gate.over.as_slice() {
+        [one] => format!("This removes {}% of a disk", one.share.percent),
+        many => format!(
+            "This removes more than {}% of {} disks",
+            gate.limit,
+            many.len()
+        ),
+    };
     div()
         .id("over-limit-gate")
         .debug_selector(|| "over-limit-gate".into())
         .role(gpui_kit::Role::Group)
         .aria_label(format!(
-            "This removes {}% of a disk, past the {}% limit",
-            share.percent, share.limit
+            "This removes {}, past the {}% limit",
+            gate.summary(),
+            gate.limit
         ))
         .flex()
         .flex_col()
@@ -5721,8 +5707,52 @@ fn over_limit_gate(
             div()
                 .text_color(theme.bright)
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(format!("This removes {}% of a disk", share.percent)),
+                .child(heading),
         )
+        .children(
+            gate.over
+                .iter()
+                .enumerate()
+                .map(|(index, over)| over_limit_disk(index, over, theme)),
+        )
+        .child(ask)
+}
+
+/// One disk in the over-limit gate: where it is mounted, its share
+/// against its capacity, and a meter with the limit's tick on it, so the
+/// gap reads without arithmetic.
+fn over_limit_disk(index: usize, over: &Over, theme: &Theme) -> Div {
+    let share = &over.share;
+    let fraction =
+        (share.bytes as f32 / share.capacity.max(1) as f32).clamp(0.0, 1.0);
+    let limit_at = f32::from(share.limit) / 100.0;
+    let meter = div()
+        .relative()
+        .h(size::METER)
+        .bg(theme.divider())
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(gpui_kit::relative(fraction))
+                .bg(theme.warning),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(-size::METER)
+                .bottom(-size::METER)
+                .left(gpui_kit::relative(limit_at))
+                .w(px(1.))
+                .bg(theme.bright),
+        );
+    div()
+        .debug_selector(move || format!("over-limit-disk-{index}"))
+        .flex()
+        .flex_col()
+        .gap(space::XS)
         .child(
             div()
                 .flex()
@@ -5730,17 +5760,28 @@ fn over_limit_gate(
                 .justify_between()
                 .gap(space::SM)
                 .text_size(text::CAPTION)
-                .child(format!(
-                    "{} of {}",
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme.foreground)
+                        .child(over.name.clone()),
+                )
+                .child(div().flex_none().child(format!(
+                    "{} of {} \u{b7} {}%",
                     human_bytes(share.bytes),
-                    human_bytes(share.capacity)
-                ))
-                .child(format!("limit {}%", share.limit)),
+                    human_bytes(share.capacity),
+                    share.percent
+                ))),
         )
         .child(meter)
-        .child(ask)
 }
 
+/// The review screen's footer. Exporting and unmarking stay on the left,
+/// since neither leaves the screen; Back and the commit end it, on the
+/// right. Moving to the trash is the default commit, so it is the primary
+/// action; a permanent deletion is the danger action and asks first, which
+/// its ellipsis promises. Over SSH nothing is removed here: Back alone.
 fn review_actions(
     app: &Disktree,
     plan: &disktree_core::removal::Plan,
@@ -5765,7 +5806,7 @@ fn review_actions(
             && !app.trash_backend.is_available())
         || app
             .removal_gate(plan)
-            .is_some_and(|share| !app.gate_met(&share, cx));
+            .is_some_and(|gate| !app.gate_met(&gate, cx));
     let commit = app.remote.is_none().then(|| {
         let count = plan.targets.len();
         let noun = if count == 1 { "item" } else { "items" };

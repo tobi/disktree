@@ -326,6 +326,7 @@ impl Disktree {
                 if self.marks.is_empty() {
                     return Response::error("nothing is marked");
                 }
+                self.reread_disks();
                 self.screen = Screen::Review;
                 self.confirm_open = false;
                 self.note_agent(None, "opened the review screen".to_string());
