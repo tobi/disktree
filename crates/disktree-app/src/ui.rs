@@ -117,6 +117,9 @@ pub mod size {
     pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.
     pub const REVIEW_SUMMARY: Rems = Rems(22.5);
+    /// Exact owner command previews need more room than a short delete alert.
+    pub const CLEANUP_PREVIEW_WIDTH: Rems = Rems(44.0);
+    pub const CLEANUP_PREVIEW_HEIGHT_FRACTION: f32 = 0.6;
     /// The review list's share-bar lane.
     pub const SHARE_LANE: Rems = Rems(6.0);
     /// The review list's size lane: right-aligned, so sizes compare.

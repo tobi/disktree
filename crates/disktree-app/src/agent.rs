@@ -52,6 +52,7 @@ pub struct AgentLink {
     /// The last removal, for an agent that asks what was freed.
     pub last_removal: Option<Removal>,
     pub(crate) removal_preview: Option<crate::agent_removal::PreparedRemoval>,
+    pub(crate) raw_inspection: Option<crate::agent_removal::RawInspection>,
     pub(crate) removal_operation: Option<disktree_link::RemovalOperation>,
     pub(crate) removal_operation_epoch: u64,
 }
@@ -64,6 +65,7 @@ impl AgentLink {
             pending_show: None,
             last_removal: None,
             removal_preview: None,
+            raw_inspection: None,
             removal_operation: None,
             removal_operation_epoch: 0,
         }
@@ -281,13 +283,14 @@ impl Disktree {
                 }
                 if let Some(agent) = &mut self.agent {
                     agent.removal_preview = None;
+                    agent.raw_inspection = None;
                 }
                 self.note_agent(Some(client), "connected".to_string());
                 Response::State(self.agent_state())
             }
             Request::State => Response::State(self.agent_state()),
             Request::PrepareRemoval { mode } => {
-                self.agent_prepare_removal(*mode)
+                self.agent_prepare_removal(*mode, cx)
             }
             Request::Remove(request) => self.agent_remove(request, cx),
             Request::Show { root, path } => self.agent_show(root, path, cx),
@@ -326,8 +329,7 @@ impl Disktree {
                 if self.marks.is_empty() {
                     return Response::error("nothing is marked");
                 }
-                self.reread_disks();
-                self.screen = Screen::Review;
+                self.open_review(cx);
                 self.confirm_open = false;
                 self.note_agent(None, "opened the review screen".to_string());
                 cx.notify();
@@ -734,6 +736,7 @@ impl Disktree {
             mode: match self.removal_mode {
                 RemovalMode::Trash => "trash".to_string(),
                 RemovalMode::Permanent => "permanent".to_string(),
+                RemovalMode::OwnerCleanup => "owner_cleanup".to_string(),
             },
             removed: totals.removed,
             failed: totals.failed_all(),
@@ -741,6 +744,7 @@ impl Disktree {
             freed: observed.map(|delta| delta.max(0).unsigned_abs()),
             observed,
             at: now_seconds(),
+            cleanup: self.cleanup_results.clone(),
         });
     }
 
@@ -760,6 +764,9 @@ impl Disktree {
                     mode: match cohort.mode {
                         RemovalMode::Trash => "trash".to_string(),
                         RemovalMode::Permanent => "permanent".to_string(),
+                        RemovalMode::OwnerCleanup => {
+                            "owner_cleanup".to_string()
+                        }
                     },
                     removed: cohort.removed,
                     failed: cohort.failed,
@@ -855,7 +862,8 @@ impl Disktree {
     ) -> SelectionEstimate {
         // Apparent lengths cannot project physical savings, and disabling
         // APFS metadata cannot establish that all listed blocks are private.
-        if self.options.apparent_size
+        if self.removal_mode == RemovalMode::OwnerCleanup
+            || self.options.apparent_size
             || (cfg!(target_os = "macos") && !self.options.apfs_clone_metadata)
         {
             return SelectionEstimate::unknown(plan);

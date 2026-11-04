@@ -45,19 +45,32 @@ pub fn ledger(ledger: &disktree_link::RemovalLedger, now: i64) -> String {
     let private = |bytes: Option<u64>| {
         bytes.map_or_else(|| "unknown".into(), human_bytes)
     };
-    let mut out = String::from(
-        "Removed since the scan (the tree already leaves these out; \
-         reported counts a clone in every place, private is what the scan \
-         saw as theirs alone, observed is the volume's measured change):\n",
-    );
+    let mut out = if ledger
+        .cohorts
+        .iter()
+        .any(|cohort| cohort.mode == "owner_cleanup")
+    {
+        String::from(
+            "Cleanup since the scan: owner command counts and scope allocation are separate from raw removals; owner success does not mean the root disappeared. Observed is the measured volume change.\n",
+        )
+    } else {
+        String::from(
+            "Removed since the scan (the tree already leaves these out; reported counts a clone in every place, private is what the scan saw as theirs alone, observed is the volume's measured change):\n",
+        )
+    };
     for (index, cohort) in ledger.cohorts.iter().enumerate() {
         let _ = writeln!(
             out,
-            "  {}. {} \u{00b7} {} removed \u{00b7} {} failed \u{00b7} {} \
+            "  {}. {} \u{00b7} {} {} \u{00b7} {} failed \u{00b7} {} \
              reported \u{00b7} {} private \u{00b7} {} observed \u{00b7} {}",
             index + 1,
             cohort.mode,
             cohort.removed,
+            if cohort.mode == "owner_cleanup" {
+                "owner commands succeeded"
+            } else {
+                "removed"
+            },
             cohort.failed,
             human_bytes(cohort.reported),
             private(cohort.private),

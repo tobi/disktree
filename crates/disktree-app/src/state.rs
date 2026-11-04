@@ -457,6 +457,8 @@ pub struct Disktree {
     /// pressing its button toggles instead of reopening.
     pub export_menu_was_open: bool,
     pub removal_mode: RemovalMode,
+    pub cleanup_review: Option<crate::cleanup::Review>,
+    pub cleanup_results: Vec<disktree_core::cleanup::Report>,
     pub trash_backend: TrashBackend,
     /// The permanent-deletion alert dialog is open. Trash needs no dialog: it
     /// is reversible, so it commits directly.
@@ -785,6 +787,8 @@ impl Disktree {
                 RemovalMode::Permanent
             },
             trash_backend,
+            cleanup_review: None,
+            cleanup_results: vec![],
             confirm_open: false,
             confirm_focus: cx.focus_handle(),
             overlay_return: None,
@@ -1651,6 +1655,14 @@ impl Disktree {
         } else {
             self.reread_disks();
             self.screen = Screen::Review;
+            if self.remote.is_none()
+                && self.marks.items().iter().any(|target| {
+                    disktree_core::cleanup::inspection_reason(&target.path)
+                        .is_some()
+                })
+            {
+                self.removal_mode = RemovalMode::OwnerCleanup;
+            }
             self.focus_request = Some(FocusTarget::Root);
         }
         cx.notify();
@@ -2961,12 +2973,31 @@ impl Disktree {
         };
         run.cancel();
         self.stop_requested = true;
-        self.say("stopping after the current item", Status::Warning, cx);
+        self.say(
+            if self.removal_mode == RemovalMode::OwnerCleanup {
+                "cancelling owner command; partial cleanup may have occurred"
+            } else {
+                "stopping after the current item"
+            },
+            Status::Warning,
+            cx,
+        );
         cx.notify();
     }
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
+        if self.remote.is_none()
+            && self.removal_mode == RemovalMode::OwnerCleanup
+            && let Ok(prepared) = self.cleanup_ready()
+        {
+            return prepared.plan.clone();
+        }
+        self.selection_plan()
+    }
+
+    /// Only marked paths: owner execution scopes must never widen exports.
+    pub(crate) fn selection_plan(&self) -> Plan {
         #[cfg(test)]
         crate::marks::work::PLANS.set(crate::marks::work::PLANS.get() + 1);
         if self.remote.is_some() {
@@ -3509,7 +3540,13 @@ impl Disktree {
         self.rescan_after_removal = rescan;
         match self.removal_mode {
             RemovalMode::Trash => self.begin_removal(cx),
-            RemovalMode::Permanent => {
+            RemovalMode::Permanent | RemovalMode::OwnerCleanup => {
+                if self.removal_mode == RemovalMode::OwnerCleanup
+                    && self.cleanup_ready().is_err()
+                {
+                    self.prepare_cleanup(cx);
+                    return;
+                }
                 self.confirm_open = true;
                 self.focus_request = Some(FocusTarget::Dialog);
                 cx.notify();
@@ -3613,6 +3650,24 @@ impl Disktree {
             return;
         }
         let plan = self.plan();
+        if self.removal_mode != RemovalMode::OwnerCleanup
+            && let Some((target, reason)) =
+                plan.targets.iter().find_map(|target| {
+                    disktree_core::cleanup::inspection_reason(&target.path)
+                        .map(|reason| (target, reason))
+                })
+        {
+            self.say(
+                format!(
+                    "{}: {reason}. Choose Owner cleanup and preview its actual scope.",
+                    target.path.display()
+                ),
+                Status::Warning,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         if plan.is_empty() {
             self.say("nothing is marked", Status::Warning, cx);
             cx.notify();
@@ -3641,6 +3696,18 @@ impl Disktree {
             cx.notify();
             return;
         }
+        let cleanup = if self.removal_mode == RemovalMode::OwnerCleanup {
+            match self.take_cleanup() {
+                Ok(prepared) => Some(prepared),
+                Err(reason) => {
+                    self.say(reason, Status::Warning, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // Measured now rather than read from the ticker, which can be a
         // second old: the observed figure is only as good as its baseline.
         let before = space_info(&self.root_path).ok().or(self.space);
@@ -3658,17 +3725,24 @@ impl Disktree {
         self.track_agent_removal();
         self.run_scroll = gpui_kit::UniformListScrollHandle::new();
         self.run_free_before = before.map(|space| space.available);
+        self.cleanup_results.clear();
         self.stop_requested = false;
         // A confirmation is for this removal only: the next one past the
         // limit asks again, even for the same share and mode.
         self.over_phrase = None;
         self.over_ticked = None;
         self.screen = Screen::Running;
-        self.run = Some(disktree_core::removal::spawn_limited(
-            plan,
-            self.removal_mode,
-            limit,
-        ));
+        self.run = Some(if let Some(prepared) = cleanup {
+            // Consume the exact preview before starting; a retry needs new
+            // preparation and consent even when the command fails.
+            disktree_core::removal::spawn_cleanup(prepared, limit)
+        } else {
+            disktree_core::removal::spawn_limited(
+                plan,
+                self.removal_mode,
+                limit,
+            )
+        });
         Self::poll_removal(epoch, cx);
         cx.notify();
     }
@@ -3714,6 +3788,9 @@ impl Disktree {
         while let Some(event) = run.poll() {
             changed = true;
             match event {
+                RemovalEvent::Cleanup(report) => {
+                    self.cleanup_results.push(report);
+                }
                 // The list was built from the plan, so it already holds
                 // the total the worker announces.
                 RemovalEvent::Start { .. } => {}
@@ -3764,7 +3841,13 @@ impl Disktree {
             self.screen = Screen::Done;
             // What went stays drawn, as removed, until a scan: a rescan
             // of a whole disk takes minutes and is asked for, never implied.
-            self.note_removed(removed);
+            if self.removal_mode == RemovalMode::OwnerCleanup {
+                // Owner success does not mean the cache directory vanished.
+                // Partial failure can change it too. A fresh tree is required.
+                self.rescan_after_removal = true;
+            } else {
+                self.note_removed(removed);
+            }
             if std::mem::take(&mut self.rescan_after_removal) {
                 self.start_scan(cx);
             }
@@ -3868,7 +3951,11 @@ impl Disktree {
             return Vec::new();
         };
         let removed: Vec<_> = self.run_list.removed().cloned().collect();
-        let private = self.private_estimate(&removed);
+        let private = if start.mode == RemovalMode::OwnerCleanup {
+            None
+        } else {
+            self.private_estimate(&removed)
+        };
         let totals = self.run_list.totals();
         self.ledger.push(crate::ledger::Cohort {
             mode: start.mode,
@@ -3923,7 +4010,8 @@ impl Disktree {
         &self,
         targets: &[disktree_core::removal::Target],
     ) -> Vec<crate::run_list::Item> {
-        let private_known = self.private_known();
+        let private_known = self.private_known()
+            && self.removal_mode != RemovalMode::OwnerCleanup;
         let mut resolver = self.tree.as_ref().map(|tree| {
             crate::marks::Resolver::new(
                 &self.root_path,
@@ -4184,8 +4272,7 @@ impl Disktree {
         .detach();
     }
 
-    /// Save what the plan would act on as a list of paths, one per line,
-    /// wherever the user chooses: for a script, or for later.
+    /// Save marked paths, one per line, without widening to owner scopes.
     pub fn save_delete_list(&mut self, cx: &mut Context<'_, Self>) {
         self.save_export(false, cx);
     }
@@ -4195,18 +4282,14 @@ impl Disktree {
     }
 
     fn save_export(&mut self, script: bool, cx: &mut Context<'_, Self>) {
-        let plan = self.plan();
-        if plan.is_empty() {
-            self.say("nothing to save", Status::Warning, cx);
-            cx.notify();
-            return;
-        }
-        let list = if script {
-            self.delete_script(&plan.targets)
-        } else {
-            disktree_core::export::delete_list(&plan.targets)
+        let (list, count) = match self.export_text(script) {
+            Ok(export) => export,
+            Err(reason) => {
+                self.say(reason, Status::Warning, cx);
+                cx.notify();
+                return;
+            }
         };
-        let count = plan.targets.len();
         let directory =
             std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let filename = if script {
@@ -4240,38 +4323,66 @@ impl Disktree {
         .detach();
     }
 
-    fn delete_script(&self, targets: &[Target]) -> String {
+    /// Both save and copy use this boundary before opening a prompt or
+    /// changing the clipboard. A raw script cannot stand in for an owner.
+    pub(crate) fn export_text(
+        &self,
+        script: bool,
+    ) -> Result<(String, usize), String> {
+        let plan = self.selection_plan();
+        if plan.is_empty() {
+            return Err("nothing selected for export".into());
+        }
+        if !script {
+            return Ok((
+                disktree_core::export::delete_list(&plan.targets),
+                plan.targets.len(),
+            ));
+        }
+        if self.removal_mode == RemovalMode::OwnerCleanup
+            || (self.remote.is_none()
+                && plan.targets.iter().any(|target| {
+                    disktree_core::cleanup::inspection_reason(&target.path)
+                        .is_some()
+                }))
+        {
+            return Err("Cache selections require owner cleanup or inspection; a raw deletion script cannot replace owner cleanup".into());
+        }
         let identity = if self.remote.is_some() {
             self.remote_identity.clone()
         } else {
             disktree_core::identity::HostIdentity::current()
         };
-        disktree_core::export::delete_script_for(
-            targets,
+        let text = disktree_core::export::delete_script_for(
+            &plan.targets,
             &self.root_path,
             self.remote.as_deref(),
             identity.as_ref(),
-        )
+        );
+        Ok((text, plan.targets.len()))
     }
 
     pub fn copy_delete_script(&mut self, cx: &mut Context<'_, Self>) {
-        let plan = self.plan();
-        if plan.is_empty() {
-            self.say("nothing to copy", Status::Warning, cx);
-        } else {
-            let script = self.delete_script(&plan.targets);
-            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(script));
-            self.say(
-                "copied delete script; previews by default, checks host before deletion",
-                Status::Success, cx);
+        match self.export_text(true) {
+            Ok((script, _)) => {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                    script,
+                ));
+                self.say(
+                    "copied delete script; previews by default, checks host before deletion",
+                    Status::Success,
+                    cx,
+                );
+            }
+            Err(reason) => self.say(reason, Status::Warning, cx),
         }
         cx.notify();
     }
 
     /// Copy instructions for a coding agent to free the space by removing
-    /// what the plan would act on, after checking each path.
+    /// the marked paths, after checking each path.
     pub fn copy_agent_prompt(&mut self, cx: &mut Context<'_, Self>) {
-        let plan = self.plan();
+        let plan = self.selection_plan();
         if plan.is_empty() {
             self.say("nothing to copy", Status::Warning, cx);
             cx.notify();

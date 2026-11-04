@@ -286,6 +286,7 @@ impl From<CategoryName> for Category {
 pub enum RemovalModeName {
     Trash,
     Permanent,
+    OwnerCleanup,
 }
 
 impl From<RemovalModeName> for RemovalChoice {
@@ -293,6 +294,7 @@ impl From<RemovalModeName> for RemovalChoice {
         match mode {
             RemovalModeName::Trash => Self::Trash,
             RemovalModeName::Permanent => Self::Permanent,
+            RemovalModeName::OwnerCleanup => Self::OwnerCleanup,
         }
     }
 }
@@ -300,7 +302,8 @@ impl From<RemovalModeName> for RemovalChoice {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RemovalPreviewParams {
-    /// Required: trash (possibly recoverable) or permanent (cannot be undone).
+    /// Required: `owner_cleanup` for recognized caches, trash or permanent for
+    /// ordinary paths. Owner cleanup previews the entire actual command scope.
     pub mode: RemovalModeName,
 }
 
@@ -313,8 +316,8 @@ pub struct RemoveParams {
     pub mode: RemovalModeName,
     /// Exact ordered path list returned by the preview and approved by the user.
     pub paths: Vec<PathBuf>,
-    /// Only after explicit user confirmation: MOVE TO TRASH or PERMANENTLY DELETE,
-    /// matching the preview. Approval to mark is not approval to remove.
+    /// Only after explicit user confirmation: RUN OWNER CLEANUP, MOVE TO TRASH
+    /// or PERMANENTLY DELETE, matching the preview. Marking is not approval.
     pub confirmation: String,
     /// Rescan once the removal finishes. Default false, so the next batch
     /// can be found and marked at once; a rescan of a large volume takes
@@ -1584,6 +1587,9 @@ impl Session {
                 human_bytes(volume.capacity)
             );
         }
+        for operation in &preview.cleanup {
+            let _ = writeln!(message, "\n{}", operation.description());
+        }
         message.push_str(&estimate_report(&preview.estimate));
         message.push_str("\nApproval to mark does not authorize removal. Only these listed paths are included; directory removal includes their contents. Listed bytes are not guaranteed freed space.");
         Ok(message)
@@ -1606,13 +1612,18 @@ impl Session {
             return None;
         }
         Some(format!(
-            "The exact previewed selection {} in PwrDisk: {} removed, {} failed, {} pending or not reached. No additional removal was requested. Do not retry this operation. Use pwrdisk_status for observed volume change; a completed removal does not guarantee recovered space.",
+            "The exact previewed selection {} in PwrDisk: {} {}, {} failed, {} pending or not reached. No additional removal was requested. Do not retry this operation. Use pwrdisk_status for observed volume change; a completed removal does not guarantee recovered space.",
             if operation.finished {
                 "finished"
             } else {
                 "is already running"
             },
             operation.removed,
+            if operation.mode == RemovalChoice::OwnerCleanup {
+                "owner commands succeeded"
+            } else {
+                "removed"
+            },
             operation.failed,
             operation.pending,
         ))
@@ -2037,7 +2048,11 @@ impl Session {
         // otherwise deletes; the agent has to say which before the user
         // presses Enter.
         let backend = detect_trash_backend();
-        let how = if backend.is_available() {
+        let how = if self.marks.iter().any(|target| {
+            disktree_core::cleanup::inspection_reason(&target.path).is_some()
+        }) {
+            "Caches require Owner cleanup. Prepare and read the owner command, whole actual scope, effects and limitations before the user confirms. Unavailable or unsupported owners need inspection; no raw deletion fallback".into()
+        } else if backend.is_available() {
             format!(
                 "Enter moves the marks to {}, where they can be recovered \
                  and their space comes back only once it is emptied; \
@@ -2107,12 +2122,20 @@ impl Session {
         if let Some(removal) =
             self.window.as_ref().and_then(|state| state.removal.clone())
         {
+            for report in &removal.cleanup {
+                let _ = writeln!(out, "{}", report.description());
+            }
             let _ = writeln!(
                 out,
-                "Last removal: {} \u{00b7} {} removed \u{00b7} {} failed \
+                "Last removal: {} \u{00b7} {} {} \u{00b7} {} failed \
                  \u{00b7} {} reported \u{00b7} {} observed volume change \u{00b7} {}",
                 removal.mode,
                 removal.removed,
+                if removal.mode == "owner_cleanup" {
+                    "owner commands succeeded"
+                } else {
+                    "removed"
+                },
                 removal.failed,
                 human_bytes(removal.bytes),
                 crate::report::observed(removal.observed),
@@ -3151,6 +3174,7 @@ mod tests {
                     freed: Some(0),
                     observed: Some(-28_311_552),
                     at: now() - 120,
+                    cleanup: vec![],
                 }),
                 removals: Some(disktree_link::RemovalLedger {
                     cohorts: vec![disktree_link::RemovalCohort {

@@ -48,7 +48,7 @@ pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Protocol version, bumped when a message changes shape. Both sides are
 /// built from one tree, so a mismatch means an old window is still open.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Updating the GUI does not replace a process hosted by an MCP client.
 pub const RECONNECT_MCP: &str = "Updating PwrDisk's GUI does not restart its MCP server. In your MCP client, restart/reconnect the PwrDisk MCP server using `pwrdisk mcp` from the updated installation. If the GUI is outdated, quit and reopen the updated PwrDisk app.";
@@ -176,6 +176,7 @@ impl FindRequest {
 pub enum RemovalChoice {
     Trash,
     Permanent,
+    OwnerCleanup,
 }
 
 impl RemovalChoice {
@@ -183,12 +184,16 @@ impl RemovalChoice {
         match self {
             Self::Trash => disktree_core::removal::RemovalMode::Trash,
             Self::Permanent => disktree_core::removal::RemovalMode::Permanent,
+            Self::OwnerCleanup => {
+                disktree_core::removal::RemovalMode::OwnerCleanup
+            }
         }
     }
     pub const fn confirmation(self) -> &'static str {
         match self {
             Self::Trash => "MOVE TO TRASH",
             Self::Permanent => "PERMANENTLY DELETE",
+            Self::OwnerCleanup => "RUN OWNER CLEANUP",
         }
     }
     pub const fn warning(self) -> &'static str {
@@ -198,6 +203,9 @@ impl RemovalChoice {
             }
             Self::Permanent => {
                 "Destructive: permanently deletes the listed paths. This cannot be undone through PwrDisk or Trash."
+            }
+            Self::OwnerCleanup => {
+                "Destructive owner-managed cleanup: invokes only the previewed owner commands for their entire stated scopes, including unselected siblings. No Trash recovery and no raw deletion fallback. Stop the owning tools before approval. Listed allocation is not guaranteed freed space; APFS snapshots, clones and open files can retain blocks."
             }
         }
     }
@@ -215,6 +223,8 @@ pub struct RemovalPreview {
     pub limit_percent: u8,
     pub volumes: Vec<disktree_core::removal_limit::Budget>,
     pub expires_in_seconds: u64,
+    /// Actual owner command scopes. Empty for raw removal modes.
+    pub cleanup: Vec<disktree_core::cleanup::Operation>,
 }
 
 /// Supplied only after the agent obtains explicit user confirmation of
@@ -608,6 +618,7 @@ pub struct Removal {
     pub observed: Option<i64>,
     /// Unix seconds when it finished.
     pub at: i64,
+    pub cleanup: Vec<disktree_core::cleanup::Report>,
 }
 
 /// Outcome of the exact previewed selection, including native UI removal.

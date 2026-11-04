@@ -112,7 +112,7 @@ impl Category {
 /// This is a heuristic assessment, independent of removal authorization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Reclaim {
-    /// A cache: whatever wrote it will write it again.
+    /// A cache inspection candidate; its name is not deletion permission.
     Regenerable,
     /// A sync client's old versions of files.
     SyncHistory,

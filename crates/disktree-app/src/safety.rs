@@ -174,6 +174,7 @@ pub fn phrase(
     let verb = match mode {
         disktree_core::removal::RemovalMode::Permanent => "delete",
         disktree_core::removal::RemovalMode::Trash => "trash",
+        disktree_core::removal::RemovalMode::OwnerCleanup => "clean",
     };
     let disks = if percents.len() > 1 {
         "my disks"
@@ -266,5 +267,9 @@ mod tests {
         assert!(!matches("delete 2% of my disk", &typed));
         assert!(!matches("trash 20% of my disk", &typed));
         assert!(!matches("", &typed));
+        assert_eq!(
+            phrase(&[20], RemovalMode::OwnerCleanup),
+            "clean 20% of my disk"
+        );
     }
 }

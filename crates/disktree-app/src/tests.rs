@@ -5638,6 +5638,33 @@ fn the_tooltip_follows_the_pointer_inside_a_client_side_frame(
     assert_eq!(tip.top(), at.y + px(gap));
 }
 
+/// Only a read-only preview may be retried while its worker is preparing.
+fn await_removal_preview(
+    ask: &mut impl FnMut(
+        &mut Window,
+        disktree_link::Request,
+    ) -> disktree_link::Response,
+    cx: &mut Window,
+    request: &disktree_link::Request,
+) -> disktree_link::RemovalPreview {
+    assert!(matches!(
+        request,
+        disktree_link::Request::PrepareRemoval { .. }
+    ));
+    for _ in 0..400 {
+        cx.run_until_parked();
+        match ask(cx, request.clone()) {
+            disktree_link::Response::RemovalPreview(preview) => return preview,
+            disktree_link::Response::Error { message }
+                if message.contains("preparing") => {}
+            response => panic!("preview refused: {response:?}"),
+        }
+        draw(cx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("preview worker did not finish");
+}
+
 /// Link `view` to an agent over a real socket or pipe named after `temp`,
 /// as `pwrdisk mcp` does.
 #[cfg(any(unix, windows))]
@@ -5701,6 +5728,11 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     cx.update(init);
     let temp = fixture();
     let root = temp.path().to_path_buf();
+    // Native approval needs ordinary output too: cache fixtures are
+    // inspection-only and cannot exercise successful raw removal.
+    std::fs::create_dir(root.join("native-output")).expect("native output");
+    std::fs::write(root.join("native-output/artifact"), b"fixture")
+        .expect("native payload");
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
 
@@ -5925,10 +5957,12 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     let preview_request = Request::PrepareRemoval {
         mode: disktree_link::RemovalChoice::Permanent,
     };
-    let Response::RemovalPreview(preview) = ask(cx, preview_request.clone())
-    else {
-        panic!("preview");
-    };
+    assert!(matches!(
+        ask(cx, preview_request.clone()),
+        Response::Error { message } if message.contains("preparing")
+    ));
+    assert!(matches!(ask(cx, Request::State), Response::State(_)));
+    let preview = await_removal_preview(&mut ask, cx, &preview_request);
     assert_eq!(preview.estimate.paths, preview.paths);
     assert_eq!(preview.estimate.lower, 0, "apparent fixture sizes");
     assert_eq!(preview.estimate.upper, None);
@@ -5976,10 +6010,7 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
         ask(cx, Request::Remove(confirmed(&preview))),
         Response::Error { .. }
     ));
-    let Response::RemovalPreview(changed) = ask(cx, preview_request.clone())
-    else {
-        panic!("preview");
-    };
+    let changed = await_removal_preview(&mut ask, cx, &preview_request);
     ask(
         cx,
         Request::Unmark {
@@ -6006,10 +6037,7 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
     update(&view, cx, |app, _| {
         app.removal_settings_dir = Some(settings.clone());
     });
-    let Response::RemovalPreview(old_policy) = ask(cx, preview_request.clone())
-    else {
-        panic!("preview");
-    };
+    let old_policy = await_removal_preview(&mut ask, cx, &preview_request);
     crate::safety::save(
         Some(&settings),
         disktree_core::removal_limit::Limit::new(10).expect("10%"),
@@ -6025,9 +6053,7 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
         disktree_core::removal_limit::Limit::default(),
     )
     .expect("restore fixture policy");
-    let Response::RemovalPreview(preview) = ask(cx, preview_request) else {
-        panic!("preview");
-    };
+    let preview = await_removal_preview(&mut ask, cx, &preview_request);
     assert_eq!(preview.paths, [root.join("junk")]);
     assert_eq!(preview.limit_percent, 5);
     let started = ask(cx, Request::Remove(confirmed(&preview)));
@@ -6067,20 +6093,19 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
         Request::Mark {
             root: root.clone(),
             targets: vec![MarkRequest {
-                path: root.join(".cache"),
+                path: root.join("native-output"),
                 bytes: 0,
                 is_dir: true,
             }],
         },
     );
-    let Response::RemovalPreview(native) = ask(
+    let native = await_removal_preview(
+        &mut ask,
         cx,
-        Request::PrepareRemoval {
+        &Request::PrepareRemoval {
             mode: disktree_link::RemovalChoice::Permanent,
         },
-    ) else {
-        panic!("native preview");
-    };
+    );
     update(&view, cx, |app, cx| {
         app.removal_mode = RemovalMode::Permanent;
         app.begin_removal(cx);
@@ -6100,7 +6125,8 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
             break;
         }
     }
-    assert!(!root.join(".cache").exists());
+    assert!(!root.join("native-output").exists());
+    assert!(root.join(".cache/blob.bin").exists());
     let Response::State(completed) =
         ask(cx, Request::Remove(confirmed(&native)))
     else {
@@ -6698,9 +6724,16 @@ fn the_removal_list_stays_on_screen_from_start_to_done(
     use crate::run_list::Status;
     cx.update(init);
     let temp = fixture();
+    // This test exercises ordinary raw removal. Cache removal is covered
+    // separately and must go through an owner preview.
+    let build_output = temp.path().join("target/debug/deps");
+    std::fs::create_dir_all(build_output.parent().expect("build profile"))
+        .expect("build output parent");
+    std::fs::rename(temp.path().join(".cache"), &build_output)
+        .expect("ordinary removal fixture");
     let (view, cx) = view_over(temp.path(), cx);
     let epoch = update(&view, cx, |app, cx| {
-        for name in [".cache", "junk/deeper"] {
+        for name in ["target/debug/deps", "junk/deeper"] {
             let crumbs = app
                 .crumbs_for_path(&app.root_path.join(name))
                 .expect("in the tree");
@@ -6723,12 +6756,12 @@ fn the_removal_list_stays_on_screen_from_start_to_done(
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|item| item.status == Status::Waiting));
         assert_eq!(app.run_list.current(), Some(0));
-        let cache = items
+        let output = items
             .iter()
-            .find(|item| item.target.path.ends_with(".cache"))
-            .expect("the cache is listed");
-        assert_eq!(cache.kind(), Some("regenerable"), "and says why");
-        assert_eq!(cache.target.bytes, 300_000);
+            .find(|item| item.target.path == build_output)
+            .expect("the build output is listed");
+        assert_eq!(output.kind(), Some("build output"), "and says why");
+        assert_eq!(output.target.bytes, 300_000);
     });
 
     let mut finished = false;
@@ -6761,7 +6794,8 @@ fn the_removal_list_stays_on_screen_from_start_to_done(
         assert_eq!((totals.removed, totals.failed), (2, 0));
         assert_eq!(totals.reported_done, 400_000);
     });
-    assert!(!temp.path().join(".cache").exists());
+    assert!(!build_output.exists());
+    assert!(temp.path().join("target/debug").exists());
     assert!(temp.path().join("keep/notes.txt").exists());
 }
 
@@ -9968,6 +10002,172 @@ fn the_marked_total_is_pinned_above_the_disk_with_the_review(
     assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
 }
 
+/// Preparation yields to the window; confirmation leaves fresh recursive
+/// inspection to the removal worker, which must still refuse new caches.
+#[gpui_kit::test]
+fn raw_inspection_prepares_off_thread_and_execution_rechecks(
+    cx: &mut TestAppContext,
+) {
+    use disktree_link::{ConfirmedRemoval, RemovalChoice, Request, Response};
+
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    #[cfg(not(windows))]
+    let socket = temp.path().join("inspection.sock");
+    #[cfg(windows)]
+    let socket = PathBuf::from(format!(
+        r"\\.\pipe\pwrdisk-inspection-{}",
+        temp.path()
+            .file_name()
+            .expect("temp name")
+            .to_string_lossy()
+    ));
+    let listener = disktree_link::Listener::bind_at(&socket).expect("link");
+    update(&view, cx, |app, cx| {
+        app.attach_agent(listener, cx);
+        let junk = child_crumbs(app, &[], "junk");
+        app.toggle_mark(&junk, cx);
+    });
+    let mut ask = |cx: &mut Window, request: Request| {
+        update(&view, cx, |app, cx| app.answer_agent(&request, cx))
+    };
+    let request = Request::PrepareRemoval {
+        mode: RemovalChoice::Permanent,
+    };
+    assert!(
+        matches!(ask(cx, request.clone()), Response::Error { message }
+        if message.contains("preparing"))
+    );
+    // Another request and a frame can proceed while inspection is pending.
+    assert!(matches!(ask(cx, Request::State), Response::State(_)));
+    draw(cx);
+    let preview = await_removal_preview(&mut ask, cx, &request);
+    assert_eq!(preview.paths, [temp.path().join("junk")]);
+
+    // This appears after the preview. Confirmation must not walk it on the
+    // UI thread, but the fresh worker check must protect it before writes.
+    let tag = temp.path().join("junk/deeper/CACHEDIR.TAG");
+    std::fs::write(&tag, "cache").expect("fixture cache appeared");
+    let response = ask(
+        cx,
+        Request::Remove(ConfirmedRemoval {
+            preview_id: preview.preview_id,
+            mode: preview.mode,
+            paths: preview.paths,
+            confirmation: preview.mode.confirmation().into(),
+            rescan: false,
+        }),
+    );
+    assert!(matches!(response, Response::State(state)
+        if state.screen == "running"));
+    let epoch = read(&view, cx, |app| app.run_epoch);
+    let mut done = false;
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        done = update(&view, cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if done {
+            break;
+        }
+    }
+    assert!(done);
+    read(&view, cx, |app| assert_eq!(app.run_list.totals().failed, 1));
+    assert!(tag.exists());
+    assert!(temp.path().join("junk/blob.bin").exists());
+    assert!(temp.path().join("keep/notes.txt").exists());
+}
+
+/// Exporting a cache selection cannot substitute raw deletion for its owner.
+#[gpui_kit::test]
+fn cache_exports_keep_marks_and_refuse_raw_scripts(cx: &mut TestAppContext) {
+    cx.update(init);
+    let temp = fixture();
+    let selected = temp.path().join(".cache").join("blob.bin");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let cache = child_crumbs(app, &[], ".cache");
+        let file = child_crumbs(app, &cache, "blob.bin");
+        app.toggle_mark(&file, cx);
+        app.open_review(cx);
+        let (list, count) = app.export_text(false).expect("marked list");
+        assert_eq!(count, 1);
+        assert_eq!(list, format!("{}\n", selected.display()));
+        for mode in [
+            RemovalMode::OwnerCleanup,
+            RemovalMode::Permanent,
+            RemovalMode::Trash,
+        ] {
+            app.removal_mode = mode;
+            assert!(
+                app.export_text(true)
+                    .expect_err("no raw script")
+                    .contains("owner cleanup")
+            );
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                "keep".into(),
+            ));
+            app.copy_delete_script(cx);
+            app.save_delete_script(cx);
+            assert!(
+                app.notice()
+                    .as_ref()
+                    .expect("refusal")
+                    .0
+                    .contains("owner cleanup")
+            );
+        }
+    });
+    assert_eq!(clipboard(cx), "keep", "refusal leaves clipboard alone");
+    assert!(selected.exists());
+    assert!(temp.path().join("junk/blob.bin").exists());
+}
+
+/// Cache classification steers review, but grants no generic deletion.
+#[gpui_kit::test]
+fn cache_review_requires_owner_preview_and_never_falls_back_to_raw_removal(
+    cx: &mut TestAppContext,
+) {
+    cx.update(init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let cache = child_crumbs(app, &[], ".cache");
+        app.toggle_mark(&cache, cx);
+        app.open_review(cx);
+        assert_eq!(app.removal_mode, RemovalMode::OwnerCleanup);
+        // Confirm cannot execute a missing owner preview, even if reached
+        // directly rather than through the disabled/preview UI.
+        app.confirm_delete(cx);
+        assert!(app.run.is_none());
+        assert_eq!(app.screen, Screen::Review);
+        assert!(app.cleanup_description().contains("Prepare a new"));
+        // Neither explicit raw mode can silently replace owner cleanup.
+        for mode in [RemovalMode::Permanent, RemovalMode::Trash] {
+            app.removal_mode = mode;
+            app.begin_removal(cx);
+            assert!(app.run.is_none());
+            assert!(
+                app.notice()
+                    .as_ref()
+                    .expect("refusal")
+                    .0
+                    .contains("Owner cleanup")
+            );
+        }
+        app.removal_mode = RemovalMode::OwnerCleanup;
+        app.confirm_open = true;
+        app.cancel_delete(cx);
+        assert!(!app.confirm_open);
+        assert!(app.run.is_none());
+    });
+    draw(cx);
+    assert!(temp.path().join(".cache/blob.bin").exists());
+    assert!(temp.path().join("junk/blob.bin").exists());
+}
+
 /// An empty Marked or Worth a look is its header alone, at any height: the
 /// hint and the "none" sit where a full section shows its count or total.
 #[gpui_kit::test]
@@ -10506,14 +10706,13 @@ fn an_agent_removal_stays_at_the_agent_limit_with_the_windows_off(
     );
 
     // The preview is checked at the agent limit, Off or not.
-    let Response::RemovalPreview(preview) = ask(
+    let preview = await_removal_preview(
+        &mut ask,
         cx,
-        Request::PrepareRemoval {
+        &Request::PrepareRemoval {
             mode: RemovalChoice::Permanent,
         },
-    ) else {
-        panic!("preview");
-    };
+    );
     assert_eq!(preview.limit_percent, 5);
 
     // Since the preview, `junk` has become 30% of its disk: a pretend
@@ -10601,6 +10800,13 @@ fn safety_settings_relax_the_window_but_never_an_agent(
         app.removal_mode = RemovalMode::Permanent;
     });
     assert!(!met(&view, cx), "a tick is for one mode");
+
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::OwnerCleanup;
+    });
+    assert!(!met(&view, cx), "trash approval cannot authorize cleanup");
+    draw(cx);
+    assert!(cx.debug_bounds("over-limit-tick").is_some());
 
     // Off: no gate in Review, the plain Mark in the inspector, and an
     // agent still held to 5%.

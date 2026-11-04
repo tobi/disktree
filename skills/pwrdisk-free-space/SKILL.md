@@ -215,14 +215,17 @@ Looking is free; acting is the user's call.
 4. **Sweep.** `pwrdisk_find` with `reclaimable: true` lists every cache,
    build directory and verified package store at once. These are cleanup
    candidates, not removal eligibility or guaranteed savings. Read reported
-   guard refusals; never bypass them. Confirm pnpm's store with `pnpm store
-   path` and prefer `pnpm store prune`; its installation also holds the
-   executable, global tools and `.tools`, which are not a disposable store.
+   guard refusals; never bypass them. A cache name or regenerable hatch is
+   insufficient permission for raw deletion. Resolve its owner and preview
+   owner-managed cleanup; unknown runtime/install caches need inspection.
+   pnpm installations include executables, global tools and `.tools`; do not
+   treat them as disposable stores or assume prune has directory-local scope.
    `kind: "file"` with
    `min_bytes` finds huge files. `older_than_days` finds what nobody has
    touched. `name` matches part of a name.
 5. **Classify each candidate**, in one line each:
-   - *regenerable*: caches, build output, installed dependencies;
+   - *regenerable*: an inspection lead, never deletion authorization;
+     bookkeeping-sensitive caches require their owning tool;
    - *tool-owned*: stores, images, simulators, toolchains; offer the
      tool's command;
    - *user data*: media, downloads, archives, documents, VM disks, synced
@@ -238,7 +241,17 @@ Looking is free; acting is the user's call.
 8. **Confirm removal or hand it over.** To let the person remove in the
    app, announce `pwrdisk_review`, open it, and stop; never approve through
    computer use. For requested MCP removal, call `pwrdisk_removal_preview`
-   with an explicit `trash` or `permanent` mode, show every returned path and
+   with `owner_cleanup` for supported tool caches (otherwise explicit
+   `trash` or `permanent` for ordinary paths). Show every owner, version,
+   executable, argument list, environment override, selected path, actual
+   whole-cache scope, effects and limitations, including unselected siblings.
+   Every mode may return preparing while inspection runs on a worker;
+   retry only the read-only preview. Exports contain marked paths, never
+   expanded owner scopes; a refused raw script is not a deletion fallback.
+   Cache tags/layouts on ancestors protect contained files and subtrees too.
+   Unknown,
+   unsupported, unavailable or failed owners never fall back to raw deletion.
+   Show every returned actual-scope path and
    the consequences, and wait for explicit user confirmation. Only then call
    `pwrdisk_remove` with the exact preview ID, ordered paths, mode and required
    confirmation text. The preview expires after five minutes and is single
@@ -253,7 +266,11 @@ Looking is free; acting is the user's call.
 9. **Report.** `pwrdisk_status` reports completed and failed removals and
    measured freed space. Report that figure, not a projection. Trash is not
    guaranteed recoverable and does not guarantee an immediate space saving.
-   Removal does not rescan unless `pwrdisk_remove` is given `rescan: true`,
+   Owner cleanup always rescans and reports command success/failure separately
+   from scope allocation and observed free-space change. Success need not
+   remove the cache root or free its listed allocation; APFS snapshots/clones,
+   hardlinks and open files can retain blocks. Never alter snapshots.
+   Raw removal does not rescan unless `pwrdisk_remove` is given `rescan: true`,
    so the next batch can be found at once. Until a rescan, listings keep
    the scan's sizes but say "removed since the scan" on what went, and
    "N of it removed since the scan" on a directory that lost part of

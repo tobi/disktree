@@ -221,3 +221,13 @@ your own Mac build, and how to work on the code.
 
 MIT. See [LICENSE](LICENSE) and
 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+
+### Owner-managed cache cleanup
+
+Recognized tool caches use **Owner cleanup** in Review, or MCP's
+`pwrdisk_removal_preview` with `mode: "owner_cleanup"`. Preview the installed
+owner's exact command and whole-cache scope before approval. Missing,
+unsupported or failed owner commands never fall back to recursive deletion;
+unknown runtime caches remain inspection candidates. Listed allocation is
+separate from measured free-space change. See [supported owners, versions
+and scope limitations](docs/owner-cleanup.md).

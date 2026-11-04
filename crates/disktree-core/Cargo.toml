@@ -19,7 +19,7 @@ sha2 = "0.10"
 
 # rustix has no filesystem calls on Windows; `windows.rs` covers them there.
 [target.'cfg(not(windows))'.dependencies]
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 # The Recycle Bin, through the shell's own file operation.

@@ -63,9 +63,11 @@ impl Row<'_> {
             (Self::Waiting, _) => "waiting",
             (Self::Current, RemovalMode::Trash) => "moving\u{2026}",
             (Self::Current, RemovalMode::Permanent) => "removing\u{2026}",
+            (Self::Current, RemovalMode::OwnerCleanup) => "cleaning\u{2026}",
             (Self::Skipped, _) => "not reached",
             (Self::Removed, RemovalMode::Trash) => "in trash",
             (Self::Removed, RemovalMode::Permanent) => "removed",
+            (Self::Removed, RemovalMode::OwnerCleanup) => "command succeeded",
             (Self::Failed(_), _) => "failed",
         }
     }
@@ -86,6 +88,8 @@ const fn mode_phrase(mode: RemovalMode, done: bool) -> &'static str {
         (RemovalMode::Trash, true) => "moved to trash",
         (RemovalMode::Permanent, false) => "deleting permanently",
         (RemovalMode::Permanent, true) => "deleted permanently",
+        (RemovalMode::OwnerCleanup, false) => "running owner cleanup",
+        (RemovalMode::OwnerCleanup, true) => "owner commands completed",
     }
 }
 
@@ -123,8 +127,16 @@ pub fn running(
                 (crate::chrome::Platform::current()
                     == crate::chrome::Platform::Linux)
                     .then(|| {
-                        widgets::hint("esc", "stop after this item", cx)
-                            .into_any_element()
+                        widgets::hint(
+                            "esc",
+                            if app.removal_mode == RemovalMode::OwnerCleanup {
+                                "cancel owner command"
+                            } else {
+                                "stop after this item"
+                            },
+                            cx,
+                        )
+                        .into_any_element()
                     }),
                 None,
                 // Outlined, not danger: it loses nothing, and what was
@@ -134,6 +146,9 @@ pub fn running(
                         "stop-removal",
                         if app.stop_requested {
                             "Stopping\u{2026}"
+                        } else if app.removal_mode == RemovalMode::OwnerCleanup
+                        {
+                            "Cancel owner command"
                         } else {
                             "Stop after this item"
                         },
@@ -163,7 +178,12 @@ pub fn done(
 ) -> Div {
     let theme = cx.omarchy().clone();
     let totals = app.run_list.totals();
-    let mut subtitle = format!("{} removed", totals.removed);
+    let owner_cleanup = app.removal_mode == RemovalMode::OwnerCleanup;
+    let mut subtitle = if owner_cleanup {
+        format!("{} owner commands succeeded", totals.removed)
+    } else {
+        format!("{} removed", totals.removed)
+    };
     if totals.failed_all() > 0 {
         let _ = write!(subtitle, " \u{b7} {} failed", totals.failed_all());
     }
@@ -295,15 +315,22 @@ fn list_column(
     theme: &Theme,
     cx: &gpui_kit::Context<'_, Disktree>,
 ) -> Div {
-    let note = match phase {
-        Phase::Running => "in the order they are removed".to_string(),
-        Phase::Done if totals.failed == 1 => {
-            "1 could not be removed".to_string()
+    let note = if app.removal_mode == RemovalMode::OwnerCleanup {
+        format!(
+            "Owner commands: {} succeeded, {} failed; scope allocation is not freed space",
+            totals.removed, totals.failed
+        )
+    } else {
+        match phase {
+            Phase::Running => "in the order they are removed".to_string(),
+            Phase::Done if totals.failed == 1 => {
+                "1 could not be removed".to_string()
+            }
+            Phase::Done if totals.failed > 0 => {
+                format!("{} could not be removed", totals.failed)
+            }
+            Phase::Done => String::new(),
         }
-        Phase::Done if totals.failed > 0 => {
-            format!("{} could not be removed", totals.failed)
-        }
-        Phase::Done => String::new(),
     };
     // Only the rows in view are built: this screen redraws with every
     // report and every free-space sample, and a run can be thousands long.
@@ -352,10 +379,11 @@ fn list_column(
         .id("run-list")
         .debug_selector(|| "run-list".into())
         .role(gpui_kit::Role::List)
-        .aria_label(format!(
-            "{} items to remove; {} removed; {} failed",
-            totals.total, totals.removed, totals.failed
-        ))
+        .aria_label(if app.removal_mode == RemovalMode::OwnerCleanup {
+            format!("{} owner commands; {} succeeded; {} failed", totals.total, totals.removed, totals.failed)
+        } else { format!(
+            "{} items to remove; {} removed; {} failed", totals.total, totals.removed, totals.failed
+        ) })
         .flex()
         .flex_col()
         .flex_1()
@@ -797,7 +825,11 @@ fn sidebar(
         }));
     if phase == Phase::Done {
         figures = figures.child(figure_row(
-            "Removed",
+            if app.removal_mode == RemovalMode::OwnerCleanup {
+                "Commands succeeded"
+            } else {
+                "Removed"
+            },
             None,
             format!("{} of {}", totals.removed, totals.total),
             theme.bright,
@@ -807,7 +839,11 @@ fn sidebar(
     figures = figures
         .child(figure_row(
             "Reported",
-            Some("listed size of what went"),
+            Some(if app.removal_mode == RemovalMode::OwnerCleanup {
+                "scan allocation of successful command scopes; not freed bytes"
+            } else {
+                "listed size of what went"
+            }),
             of(human_bytes(reported), human_bytes(totals.reported_all)),
             theme.bright,
             theme,
@@ -851,7 +887,13 @@ fn sidebar(
             cx,
         ));
     }
-    panel.child(caption(note(app, phase), theme))
+    panel
+        .children(
+            app.cleanup_results
+                .iter()
+                .map(|report| caption(report.description(), theme)),
+        )
+        .child(caption(note(app, phase), theme))
 }
 
 /// What the mode means for the figures above it.
@@ -865,6 +907,9 @@ const fn note(app: &Disktree, phase: Phase) -> &'static str {
             "Deleting permanently; nothing removed can be recovered. Stop \
              finishes the item in hand first."
         }
+        (Phase::Running, RemovalMode::OwnerCleanup) => {
+            "Running the approved owner commands. Stop cancels the current command; it may already have changed the cache. No raw deletion fallback."
+        }
         (Phase::Done, _) if app.scan.is_some() => {
             "Rescanning so the numbers on screen match the disk again."
         }
@@ -876,6 +921,9 @@ const fn note(app: &Disktree, phase: Phase) -> &'static str {
         (Phase::Done, RemovalMode::Permanent) => {
             "What was removed stays in the treemap, greyed out, until you \
              rescan; it cannot be marked again."
+        }
+        (Phase::Done, RemovalMode::OwnerCleanup) => {
+            "Owner success means the command exited successfully, not that its entire scope was deleted. Reported is scope allocation; observed is measured free-space change. Open files, APFS clones and snapshots can retain blocks. Inspect failures before a new preview; no raw deletion fallback."
         }
     }
 }
@@ -953,9 +1001,9 @@ fn figure_row(
         )
 }
 
-fn caption(text_: &'static str, theme: &Theme) -> Div {
+fn caption(text_: impl Into<SharedString>, theme: &Theme) -> Div {
     div()
         .text_size(text::CAPTION)
         .text_color(theme.secondary)
-        .child(text_)
+        .child(text_.into())
 }

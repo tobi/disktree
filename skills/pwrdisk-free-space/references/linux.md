@@ -65,7 +65,7 @@ would read it.
 
 | what | where | prefer |
 | --- | --- | --- |
-| user caches | `~/.cache/<app>` | close the app; they regrow |
+| user caches | `~/.cache/<app>` | close the app; use its supported cleanup; unknown owners need inspection |
 | pacman packages | `/var/cache/pacman/pkg` | `paccache -dk1`, then `paccache -rk1` (root) |
 | apt and dnf packages | `/var/cache/apt`, `/var/cache/dnf` | `apt clean`, `dnf clean all` (root) |
 | unused Flatpak runtimes | `/var/lib/flatpak`, `~/.local/share/flatpak` | `flatpak uninstall --unused` |
@@ -104,6 +104,37 @@ never approve its buttons or confirmation keys through computer use.
 
 Capacity checks charge a symbolic link to its containing volume, not its
 destination.
+
+## Owner-managed caches
+
+A cache name or regenerable classification is an inspection lead, never
+permission to recursively delete it. Request `owner_cleanup` through
+`pwrdisk_removal_preview` for supported owners. Show the resolved owner,
+version, executable, arguments, configured root, full actual scope (including
+unselected siblings), effects and limitations before explicit confirmation.
+The exact returned actual-scope paths and `RUN OWNER CLEANUP` are required.
+Unavailable commands do not establish absent software. Unsupported versions,
+unknown runtime/install caches and failed owner commands require inspection;
+never substitute raw deletion or a shell command.
+
+Cache tags and owner layouts on ancestors protect contained files and
+subtrees too. All removal modes may return a preparing response while
+inspection runs on a worker; retry only the read-only preview. Exported
+lists keep marked paths, and raw script exports cannot replace owner cleanup.
+
+On macOS and Linux the initial adapters cover npm packages (9–11), npm's
+separate npx cache (11.2–11.x), uv (0.11.x), pip (23–26) and Cypress (13–15),
+only when their installed CLI resolves the selected cache. pnpm, Homebrew,
+Playwright and Puppeteer remain explicit inspection-only owners because their
+full command/configuration scopes are not supported. Windows command
+launchers have no execution adapter yet. Neither containers nor volumes are
+cleanup scopes.
+
+Cleanup success reports the owner's exit result, not guaranteed savings.
+Report allocation separately from observed volume availability before/after;
+other activity, hardlinks, open files, APFS clones and snapshots can retain
+blocks. PwrDisk always rescans after owner cleanup, even partial failure.
+Never alter snapshots to force the reported allocation to become free space.
 
 ## Developer artifacts and virtual machines
 
