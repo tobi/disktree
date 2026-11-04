@@ -7,6 +7,55 @@ an update. Keep new entries under Unreleased until the version is cut.
 
 ## Unreleased
 
+## v0.17.0
+
+- Artifact assessments - Distinguish Detected artifacts from Suggested for
+  review cleanup candidates in the inspector and MCP reports, with the
+  identification evidence and guidance shown before marking. Recognize
+  more developer dependency and build-cache layouts without treating whole
+  tool homes or generic build folders as disposable.
+- VM and Git data - Identify virtual disks, checkpoints, saved VM memory,
+  Git metadata and worktrees without recommending their removal. VM and
+  Git contents also prevent enclosing directories from being suggested as
+  a whole. Review warns when marked VM data may hold unique work.
+- Protected folders - Refuse protected paths before they can be marked.
+  Protect the profiles folder and each home directory directly beneath it
+  on macOS, Linux and Windows, including Linux's linked `/home` spelling.
+  Contents inside a home remain eligible under the other removal guards.
+- Removal limits - Require Mark anyway to mark beyond the configured
+  capacity limit. Review defaults to a second, typed confirmation naming
+  each affected disk and its share. Each disk is held to its own confirmed
+  share; growth beyond it is refused. Settings > Safety offers a checkbox
+  or no second step instead of typing, and an Off choice for the window.
+- Agent limits - Agents cannot use the person's over-limit override. They
+  retain the default 5% limit when the window's limit is Off, both at the
+  preview and when the removal worker remeasures the selection.
+- Removal outcomes - A worker that cannot start now finishes with every
+  item marked failed. MCP reconciles a preview's exact native-UI removal
+  outcome before issuing another request, including cancellation or errors
+  in an outstanding confirmation form. Observed volume changes retain
+  their sign rather than reporting a decrease in free space as zero.
+- Agent planning - Add read-only `pwrdisk_rank` to compare up to 50 explicit
+  candidates, `pwrdisk_retention` for a bounded macOS Time Machine snapshot
+  presence check, and `pwrdisk_read_skill` for embedded guidance. Snapshot
+  presence does not quantify retained bytes or guarantee recovered space.
+- Agents settings - Put connection status, copyable MCP setup commands and
+  the first prompt in Settings > Agents (MCP), also reachable from Help >
+  Connect an AI Agent (MCP) and the connected-agent indicator.
+- Notices - Show transient notices as timed toasts, keep errors until
+  dismissed, and offer Undo after Unmark all. Copy buttons confirm in place.
+  Toasts, floating menus and list controls no longer activate content
+  underneath the pointer. Scan headings no longer clip letter descenders.
+- Side panel - Pin section headers while their rows scroll. Short or
+  zoomed windows fold secondary selection figures and empty sections,
+  keeping assessments, marking actions and the disk meter accessible.
+- Legend - Show each filter chip's size across the whole scan and keep the
+  legend on one row. Empty, tiny or overflowing kinds move into a +N menu;
+  active filters remain visible. Rename Reclaimable to Suggested to match
+  the distinction between identification and cleanup assessment.
+- Compatibility - The window link now uses protocol version 7. Update
+  and restart both the PwrDisk window and MCP process together.
+
 ## v0.16.0
 
 - Removal progress - Keep the complete approved list available from the
