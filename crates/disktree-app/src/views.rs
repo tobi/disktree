@@ -1365,6 +1365,18 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         .text_size(text::CAPTION)
         .text_color(theme.secondary)
         .child(div().text_color(theme.foreground).child(human_bytes(bytes)))
+        .when(
+            tree.is_some_and(|node| node.reclaimable().is_some()),
+            |this| {
+                this.child(if tree.is_some_and(|node| node.size_estimated) {
+                    "· Btrfs estimated size"
+                } else if app.options.apparent_size {
+                    "· apparent size"
+                } else {
+                    "· Btrfs data (shared blocks counted once)"
+                })
+            },
+        )
         .child(format!(
             "· {} files · {} dirs",
             widgets::human_count(files),
@@ -1584,7 +1596,25 @@ fn selection_section(
             text::TITLE,
             cx,
         ))
-        .child(widgets::bar(share, highlight, cx));
+        .child(widgets::bar(share, highlight, cx))
+        .children(node.reclaimable().map(|bytes| {
+            widgets::row(
+                "Conservative reclaim estimate",
+                human_bytes(bytes),
+                cx,
+            )
+        }))
+        .when(node.reclaimable().is_some(), |this| {
+            this.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(
+                        "Size is this path’s contribution to the scan. \
+                        Reclaim excludes shared, compressed and unknown data.",
+                    ),
+            )
+        });
 
     let fourth = if app.remote.is_none()
         && node.is_dir()
@@ -2293,6 +2323,16 @@ fn disk_section(
 /// this volume's, which is the usual case.
 fn not_counted(plan: &Plan) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+    if plan.btrfs_estimate {
+        parts.push(
+            "Conservative Btrfs estimate: shared, compressed and \
+                    unknown data excluded; rescan after changes"
+                .into(),
+        );
+    }
+    if plan.deferred_to_trash {
+        parts.push("Space is released only after the trash is emptied".into());
+    }
     if plan.foreign() > 0 {
         parts.push(format!("{} on other volumes", human_bytes(plan.foreign())));
     }
@@ -2584,6 +2624,8 @@ fn indexing_progress(
         .child(div().h(size::PROGRESS_ROW).truncate().child(
             if app.remote.is_some() {
                 app.remote_progress.stage.label()
+            } else if app.progress.accounting {
+                "Measuring shared disk space (sizes are provisional)"
             } else {
                 "Reading this computer"
             },
@@ -3042,8 +3084,13 @@ fn review_summary(
                     cx,
                 ))
                 .child(widgets::row(
-                    "Space freed",
+                    "Selected size",
                     human_bytes(plan.bytes()),
+                    cx,
+                ))
+                .child(widgets::row(
+                    "Estimated freed here",
+                    human_bytes(plan.reclaim()),
                     cx,
                 ))
                 .children(left_out),

@@ -39,8 +39,8 @@ const MAX_ERROR_DETAIL: usize = 50;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanOptions {
     /// Measure apparent length instead of allocated blocks. Apparent size is
-    /// what `ls -l` shows; blocks are what the volume actually spends, which is
-    /// what a disk-space tool normally wants.
+    /// what `ls -l` shows. Local Btrfs scans separately measure extents and
+    /// conservative reclaim estimates; other Unix scans use allocated blocks.
     pub apparent_size: bool,
     /// Follow symlinks. Off by default: a home directory is full of links, and
     /// following them double-counts.
@@ -93,6 +93,7 @@ pub struct ScanProgress {
     bytes: AtomicU64,
     errors: AtomicU64,
     finished: AtomicBool,
+    pub(crate) accounting: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
     preview_root: OnceLock<PathBuf>,
@@ -112,6 +113,8 @@ pub struct ScanSnapshot {
     pub bytes: u64,
     pub errors: u64,
     pub finished: bool,
+    /// The local walk is complete and Btrfs extent accounting is running.
+    pub accounting: bool,
     pub cancelled: bool,
     /// Admitted directory jobs, not a machine-wide thread limit.
     pub threads: usize,
@@ -197,6 +200,7 @@ impl ScanProgress {
             bytes: self.bytes.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
+            accounting: self.accounting.load(Ordering::Relaxed),
             cancelled: self.is_cancelled(),
             threads: self.threads.load(Ordering::Relaxed),
             threads_settled: self.threads_settled.load(Ordering::Relaxed),
@@ -241,7 +245,7 @@ impl ScanHandle {
     ) -> Self {
         let progress = Arc::new(ScanProgress::default());
         let context = Arc::new(WalkContext {
-            known,
+            known: known.filter(|known| known.tree.storage.is_none()),
             options,
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
@@ -834,6 +838,8 @@ impl PendingDir {
             name: partial.name,
             kind: NodeKind::Directory,
             bytes: 0,
+            storage: None,
+            size_estimated: false,
             files: 0,
             dirs: 1,
             inode: None,
@@ -992,6 +998,17 @@ fn scan_on_pool(
     let node = node.ok_or_else(|| {
         io::Error::other(format!("{} produced no tree", root.display()))
     })?;
+    #[cfg(target_os = "linux")]
+    let node = {
+        let mut node = node;
+        crate::btrfs::measure(
+            root,
+            &mut node,
+            &context.progress,
+            &context.options,
+        )?;
+        node
+    };
     Ok(finish_tree(node, &context.options, pool))
 }
 

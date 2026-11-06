@@ -76,6 +76,11 @@ pub struct Node {
     /// Subtree total: direct contents plus every descendant. A file's own
     /// size, or nothing for a second name of a file already charged.
     pub bytes: u64,
+    /// Conservative Btrfs reclaim estimate. None uses ordinary accounting.
+    /// Shared, compressed, multiply linked and unreadable data is excluded.
+    pub(crate) storage: Option<NonZeroU64>,
+    /// Some sizes are logical estimates because physical lengths are unknown.
+    pub size_estimated: bool,
     /// Files at or beneath this node; `1` for a file.
     pub files: u64,
     /// Directories at or beneath this node; `1` for a directory. Four
@@ -109,6 +114,8 @@ impl Node {
             name: name.into(),
             kind: NodeKind::Directory,
             bytes: 0,
+            storage: None,
+            size_estimated: false,
             files: 0,
             dirs: 1,
             inode: None,
@@ -130,6 +137,8 @@ impl Node {
             name: name.into(),
             kind,
             bytes,
+            storage: None,
+            size_estimated: false,
             files: u64::from(kind == NodeKind::File),
             dirs: 0,
             inode: None,
@@ -139,6 +148,16 @@ impl Node {
             reclaim: None,
             children: Vec::new(),
         }
+    }
+
+    /// Conservative bytes recoverable from Btrfs data at scan time.
+    pub fn reclaimable(&self) -> Option<u64> {
+        self.storage.map(|bytes| bytes.get() - 1)
+    }
+
+    /// Encode zero in the nonzero niche to store the estimate in one word.
+    pub(crate) const fn set_reclaimable(&mut self, bytes: u64) {
+        self.storage = NonZeroU64::new(bytes.saturating_add(1));
     }
 
     pub const fn is_dir(&self) -> bool {
@@ -394,6 +413,15 @@ fn aggregate_at(
         files += child.files;
         dirs += child.dirs;
     }
+    if node.storage.is_some()
+        || node.children.iter().any(|child| child.storage.is_some())
+    {
+        node.set_reclaimable(node.children.iter().fold(0_u64, |sum, child| {
+            sum.saturating_add(child.reclaimable().unwrap_or(child.bytes))
+        }));
+    }
+    node.size_estimated = node.read_error
+        || node.children.iter().any(|child| child.size_estimated);
     node.bytes = bytes;
     node.files = files;
     node.dirs = dirs;
@@ -441,7 +469,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn a_node_stays_small() {
-        assert_eq!(size_of::<Node>(), 88);
+        assert_eq!(size_of::<Node>(), 104);
     }
 
     #[test]

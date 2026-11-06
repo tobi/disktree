@@ -31,7 +31,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
-            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev btrfs-progs
 
       # Pinned: the lint gate denies clippy::all and ::pedantic, and a newer
       # clippy's new lints are a change to make on purpose, not by surprise.
@@ -47,6 +47,22 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+      # Extent sharing cannot be tested on the runner's ordinary filesystem.
+      # Only this disposable image is formatted; no host device is touched.
+      - name: Btrfs integration
+        run: |
+          btrfs_image="$RUNNER_TEMP/disktree-btrfs.img"
+          btrfs_fixture="$RUNNER_TEMP/disktree-btrfs"
+          truncate -s 512M "$btrfs_image"
+          mkfs.btrfs -f "$btrfs_image"
+          mkdir -p "$btrfs_fixture"
+          sudo mount -o loop,compress=zstd "$btrfs_image" "$btrfs_fixture"
+          trap 'sudo umount "$btrfs_fixture"' EXIT
+          sudo chown "$(id -u):$(id -g)" "$btrfs_fixture"
+          export DISKTREE_BTRFS_TEST_DIR="$btrfs_fixture"
+          cargo test -p disktree-core btrfs
+          cargo test -p disktree-app btrfs_review
 
   check-macos:
     name: Lint and test (macOS)

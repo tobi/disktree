@@ -6,6 +6,8 @@
 //! be built and tested without GPUI, a display, or a GPU.
 
 pub mod access;
+#[cfg(target_os = "linux")]
+mod btrfs;
 pub mod classify;
 pub mod deployment;
 pub mod export;
