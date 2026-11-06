@@ -399,9 +399,10 @@ escaped in the prompt, so it cannot pass for another path.
 
 ## What it measures
 
-- **Disk usage** by default: `st_blocks × 512`, the number `du` reports and the
-  space that actually comes back when a file is deleted. Apparent size (what
-  `ls -l` shows) is one toggle away.
+- **Disk usage** by default: allocated bytes, with extent-aware accounting
+  for local Btrfs scans (see below). Other Unix filesystems use
+  `st_blocks × 512`, like `du`. Allocation is not a guarantee of space freed
+  by deletion. Apparent size (`ls -l`) is one toggle away.
 - **Hardlinks once.** Two names for one inode cost one file.
 - **Hidden entries included**, because `~/.cache` is often the biggest thing in
   a home directory. Symlinks are not followed.
@@ -418,6 +419,47 @@ The scan follows [dust](https://github.com/bootandy/dust)'s approach: one rayon
 scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
 and removes duplicate hardlinks.
+
+## Btrfs accounting on Linux
+
+Local Btrfs scans inspect file extents without root privileges. Reflinked
+copies count once across the scanned tree, including partial overlaps and
+copies in different subvolumes of the same filesystem. Shared data is
+assigned to the first path in name order, so a duplicate tile can be zero;
+that is its contribution to this scan, not the file's apparent length.
+Scanning that directory alone can therefore give a larger contribution.
+The **Apparent size** toggle still shows file lengths.
+
+**Size and reclaimable space are different measurements.** The removal
+preview uses a conservative estimate of exclusive, uncompressed data, not
+selected tile sizes. It excludes shared extents (including references in
+snapshots or outside the scan), hardlinked files, compressed data and files
+that cannot be measured. Selecting every visible copy does not establish
+that no other reference exists: shared data remains excluded. A zero
+estimate means no exclusive data was verified, not that deletion can never
+free space. Trash shows no immediate saving; emptying it is a separate step.
+
+The kernel's unprivileged FIEMAP interface does not report compressed
+physical lengths. Compressed extents are counted once by their extent
+address using a **logical-size estimate**, visibly labelled in the scan
+summary. Inline or unsupported mappings, inaccessible files and files
+changed during measurement retain their ordinary size with the same
+estimate label. These totals are not exact physical disk usage and can
+still exceed the volume's used space. The volume meter always uses
+`statvfs`; metadata, replicas, snapshots and other files also affect it.
+
+Accounting is a cancellable second pass after indexing. Btrfs scans are
+remeasured when widening the root; extent addresses are never cached across
+scans. Estimates describe scan-time data and can change after writes or
+new snapshots, so rescan before acting on old results. Remote SSH scans
+currently retain their existing allocated-byte accounting.
+
+To exercise real reflinks on a writable Btrfs filesystem (temporary files
+only, no mounts or elevated access):
+
+```sh
+DISKTREE_BTRFS_TEST_DIR=/path/on/btrfs cargo test -p disktree-core btrfs
+```
 
 ## Choosing sources and roots
 

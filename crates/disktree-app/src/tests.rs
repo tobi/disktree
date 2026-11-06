@@ -2357,3 +2357,47 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+/// The same real-Btrfs opt-in as the core fixtures, rendered through the UI.
+#[gpui_kit::test]
+#[cfg(target_os = "linux")]
+fn btrfs_review_uses_reclaim_estimates_in_apparent_mode(
+    cx: &mut TestAppContext,
+) {
+    let Some(parent) = std::env::var_os("DISKTREE_BTRFS_TEST_DIR") else {
+        return;
+    };
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::tempdir_in(parent).unwrap();
+    let first = temp.path().join("first");
+    std::fs::write(&first, vec![b'x'; 1024 * 1024]).unwrap();
+    std::fs::File::open(&first).unwrap().sync_all().unwrap();
+    assert!(
+        std::process::Command::new("cp")
+            .arg("--reflink=always")
+            .arg(&first)
+            .arg(temp.path().join("second"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let crumbs = app.crumbs_for_path(&first).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.removal_mode = RemovalMode::Permanent;
+        assert_eq!(app.plan().bytes(), 1024 * 1024);
+        assert_eq!(app.plan().reclaim(), 0);
+        assert!(app.plan().btrfs_estimate);
+        app.screen = Screen::Review;
+    });
+    draw(cx);
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::Trash;
+        assert_eq!(app.plan().reclaim(), 0);
+        assert!(app.plan().deferred_to_trash);
+    });
+    draw(cx);
+    assert!(first.exists(), "preview never deletes the selection");
+}

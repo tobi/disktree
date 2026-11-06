@@ -82,6 +82,11 @@ pub struct Plan {
     reclaim: u64,
     /// Bytes the targets free on other volumes; see [`Self::foreign`].
     foreign: u64,
+    /// Btrfs uses a conservative data-only estimate, not the tile weights.
+    pub btrfs_estimate: bool,
+    /// Moving files to trash does not immediately release their blocks.
+    pub deferred_to_trash: bool,
+    omitted: u64,
 }
 
 impl Plan {
@@ -109,7 +114,69 @@ impl Plan {
     /// either, since a projection the meter cannot stand behind is worse
     /// than a smaller one.
     pub fn unattributed(&self) -> u64 {
-        self.bytes().saturating_sub(self.reclaim + self.foreign)
+        self.bytes().saturating_sub(
+            self.reclaim
+                .saturating_add(self.foreign)
+                .saturating_add(self.omitted),
+        )
+    }
+
+    /// Replace tile-based projections with the scan's independent estimates.
+    /// This is a lookup over the accepted targets, never an I/O scan per frame.
+    pub fn account_storage(
+        &mut self,
+        tree: &crate::tree::Node,
+        mode: RemovalMode,
+    ) {
+        let mounts = crate::space::mount_table();
+        self.reclaim = 0;
+        self.foreign = 0;
+        self.omitted = 0;
+        self.btrfs_estimate = false;
+        self.deferred_to_trash = false;
+        for target in &self.targets {
+            let node = target.path.strip_prefix(&self.root).ok().and_then(
+                |relative| {
+                    relative.components().try_fold(tree, |node, component| {
+                        node.child_named(
+                            &component.as_os_str().to_string_lossy(),
+                        )
+                    })
+                },
+            );
+            let estimate =
+                node.and_then(crate::tree::Node::reclaimable).or_else(|| {
+                    (node.is_none() && tree.reclaimable().is_some())
+                        .then_some(0)
+                });
+            self.btrfs_estimate |= estimate.is_some();
+            let bytes = estimate.unwrap_or(target.bytes);
+            let omitted = target.bytes.saturating_sub(bytes);
+            match crate::space::attribution(
+                mounts.as_deref(),
+                &self.root,
+                &target.path,
+            ) {
+                crate::space::Attribution::Scanned => {
+                    self.reclaim = self.reclaim.saturating_add(bytes);
+                    self.omitted = self.omitted.saturating_add(omitted);
+                }
+                crate::space::Attribution::Other => {
+                    self.foreign = self.foreign.saturating_add(bytes);
+                    self.omitted = self.omitted.saturating_add(omitted);
+                }
+                crate::space::Attribution::Unknown => {}
+            }
+        }
+        if mode == RemovalMode::Trash {
+            self.deferred_to_trash = true;
+            self.omitted = self
+                .omitted
+                .saturating_add(self.reclaim)
+                .saturating_add(self.foreign);
+            self.reclaim = 0;
+            self.foreign = 0;
+        }
     }
 
     pub const fn is_empty(&self) -> bool {

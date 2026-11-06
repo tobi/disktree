@@ -62,8 +62,13 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 
 ## Invariants
 
-1. **Sizes come from `st_blocks * 512` unless apparent size was asked for.**
-   That is the number that comes back when a file is deleted. On macOS the
+1. **Sizes use allocated bytes unless apparent size was asked for.**
+   Local Btrfs scans deduplicate extents in `btrfs.rs`; compressed lengths
+   and measurement fallbacks are explicitly estimated. Other Unix scans
+   use `st_blocks * 512`. Neither number guarantees reclaimed space:
+   Btrfs keeps a separate conservative estimate in `Node::reclaimable`.
+   Shared extents, hardlinks, compressed and unknown data are excluded.
+   Trash projects no immediate saving. On macOS the
    directory listing reports it and `st_size` for a whole buffer of entries:
    every fork's allocation, and the data fork's length; see `macos.rs`. On
    Windows it is the allocation the directory listing reports; see

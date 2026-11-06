@@ -2210,7 +2210,11 @@ impl Disktree {
             // this computer's mounts or project an unmeasured saving.
             return selection;
         }
-        plan(self.marks.items(), &self.root_path)
+        let mut result = plan(self.marks.items(), &self.root_path);
+        if let Some(tree) = self.tree() {
+            result.account_storage(tree, self.removal_mode);
+        }
+        result
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────
