@@ -25,6 +25,7 @@ use gpui_omarchy::{
 
 use gpui_kit::prelude::FluentBuilder as _;
 
+use crate::appearance;
 use crate::palette;
 use crate::state::{
     ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
@@ -111,7 +112,7 @@ pub fn root(
         .size_full()
         .bg(theme.background)
         .text_color(theme.foreground)
-        .font_family(theme.font)
+        .font_family(appearance::font(&theme))
         .text_size(text::BODY)
         .child(body);
     if let Some(tip) = cursor_tooltip(app, window, cx) {
@@ -3599,7 +3600,7 @@ fn card_surface(cx: &gpui_kit::App) -> Div {
         .border_color(theme.control_border())
         .bg(theme.background.opacity(0.93))
         .text_color(theme.foreground)
-        .font_family(theme.font.clone())
+        .font_family(appearance::font(theme))
         .text_size(text::CAPTION)
 }
 

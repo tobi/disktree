@@ -13,6 +13,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{ActiveTheme, Status};
 
+use crate::appearance;
 use crate::ui::{space, text};
 
 /// File counts, which is what a directory count is too.
@@ -92,7 +93,7 @@ pub fn chip(label: impl Into<SharedString>, color: Hsla, cx: &App) -> Div {
         .bg(color.opacity(0.1))
         .text_color(color)
         .text_size(text::CAPTION)
-        .font_family(theme.font.clone())
+        .font_family(appearance::font(theme))
         .child(label.into())
 }
 
@@ -279,7 +280,7 @@ pub fn glyph_bar(
     let theme = cx.omarchy();
     div()
         .text_size(text::CAPTION)
-        .font_family(theme.font.clone())
+        .font_family(appearance::font(theme))
         .text_color(color)
         .child(SharedString::from(share_bar(part, total, width)))
 }
