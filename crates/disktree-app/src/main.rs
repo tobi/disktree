@@ -182,6 +182,7 @@ fn run() -> Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
+            appearance::follow_desktop_face(cx);
             app_menu::install(cx);
             let home = std::env::home_dir();
             let native_look = appearance::follows_system(home.as_deref());

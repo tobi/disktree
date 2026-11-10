@@ -1423,10 +1423,12 @@ name = "disktree-app"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "disktree-core",
  "dunce",
  "gpui-kit",
  "gpui-omarchy",
+ "notify",
  "rustc-hash 2.1.3",
  "tempfile",
  "windows-sys 0.61.2",

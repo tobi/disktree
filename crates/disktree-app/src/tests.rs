@@ -15,8 +15,9 @@ use gpui_kit::{
     Bounds, Context, Entity, Pixels, Point, TestAppContext, VisualTestContext,
     px,
 };
-use gpui_omarchy::Theme;
+use gpui_omarchy::{ActiveTheme, Theme};
 
+use crate::appearance;
 use crate::state::{Disktree, Screen};
 
 /// A small tree on disk: two directories, a nested file, and a hidden one.
@@ -1160,6 +1161,33 @@ fn both_appearances_draw(cx: &mut TestAppContext) {
         draw(cx);
         assert!(cx.debug_bounds("disktree-root").is_some());
     }
+}
+
+/// gpui-omarchy's own controls read `Theme::font`, and a theme reload resets
+/// it: the desktop face must be set at startup and survive the reload, or
+/// buttons and checkboxes fall back to the system face.
+#[gpui_kit::test]
+fn the_desktop_face_survives_a_theme_reload(cx: &TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    cx.update(|cx| {
+        let mut theme = Theme::tokyo_night();
+        theme.font = "System UI".into();
+        theme.mono_font = "Stale Mono".into();
+        theme.apply(cx);
+        appearance::follow_face(cx, true);
+    });
+    cx.update(|cx| {
+        assert_eq!(cx.omarchy().font, cx.omarchy().mono_font);
+        assert_ne!(cx.omarchy().font.as_ref(), "System UI");
+    });
+
+    // Reloading the theme is what `Theme::apply` does, and it puts both
+    // fields back to their startup values; the observer has to win.
+    cx.update(|cx| Theme::flexoki_light().apply(cx));
+    cx.update(|cx| {
+        assert_eq!(cx.omarchy().font, cx.omarchy().mono_font);
+        assert_ne!(cx.omarchy().font.as_ref(), "System UI");
+    });
 }
 
 /// A view built without a scan keeps working: the screens must not assume a
