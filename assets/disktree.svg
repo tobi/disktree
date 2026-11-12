@@ -1,12 +1,26 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!-- disktree's mark: a treemap, with the band a directory keeps for its name. -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <rect width="64" height="64" fill="#1a1b26"/>
-  <rect x="5" y="5" width="54" height="54" fill="#3a4152"/>
-  <rect x="5" y="5" width="54" height="9" fill="#7aa2f7"/>
-  <rect x="8" y="17" width="30" height="39" fill="#2a653b"/>
-  <rect x="8" y="17" width="30" height="7" fill="#9ece6a"/>
-  <rect x="41" y="17" width="15" height="24" fill="#362f5e"/>
-  <rect x="41" y="17" width="15" height="6" fill="#bb9af7"/>
-  <rect x="41" y="44" width="15" height="12" fill="#e0af68"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>disktree</title>
+  <desc>A treemap of a disk seen from the front: a dark window filled with blocks sized by what they hold, one picked out to be removed, each piece with a hard shadow.</desc>
+  <defs>
+    <linearGradient id="main" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#7aa2f7"/>
+      <stop offset="1" stop-color="#8faef6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(256 256) scale(1.2) translate(-256 -256)">
+    <!-- The window; one hard shadow, as Hype's slides. -->
+    <rect x="76" y="92" width="360" height="328" rx="22" fill="#0e0e14" transform="translate(0 8)"/>
+    <rect x="76" y="92" width="360" height="328" rx="22" fill="#1a1b26" stroke="#414868" stroke-width="3"/>
+    <!-- The treemap: one block per folder, sized by what it holds, on an even
+         gutter. -->
+    <rect x="100" y="116" width="160" height="280" rx="14" fill="url(#main)"/>
+    <rect x="124" y="140" width="72" height="14" rx="7" fill="#0e0e14" opacity=".35"/>
+    <rect x="272" y="116" width="140" height="120" rx="14" fill="#c0caf5"/>
+    <rect x="272" y="248" width="64" height="148" rx="14" fill="#414868"/>
+    <rect x="348" y="328" width="64" height="68" rx="14" fill="#565f89"/>
+    <!-- The block picked for removal, raised off the map. -->
+    <rect x="348" y="248" width="64" height="68" rx="14" fill="#0e0e14" transform="translate(0 6)"/>
+    <rect x="348" y="248" width="64" height="68" rx="14" fill="#bb9af7"/>
+    <rect x="362" y="264" width="36" height="12" rx="6" fill="#0e0e14" opacity=".35"/>
+  </g>
 </svg>
