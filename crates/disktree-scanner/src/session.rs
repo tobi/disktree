@@ -607,6 +607,79 @@ impl Scanner {
         }
     }
 
+    /// Look up a cached subtree for `host` and `root` without starting a walk.
+    ///
+    /// Useful for remote SSH hosts whose live walk runs over the network rather
+    /// than on the local filesystem.
+    pub fn lookup_cached(
+        &self,
+        host: &HostKey,
+        root: &Path,
+        options: &ScanOptions,
+        policy: &CachePolicy,
+    ) -> Option<(Arc<TreeArena>, Freshness)> {
+        let db_opt = self
+            .storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .db();
+        let (tx, _rx) = mpsc::channel();
+        let cached = self.try_load_cached(
+            db_opt.as_ref(),
+            host,
+            root,
+            options,
+            unix_now(),
+            policy,
+            &tx,
+        )?;
+        Some((Arc::new(cached.arena), cached.freshness))
+    }
+
+    /// Persist a completed snapshot (for example, a finished remote SSH scan)
+    /// into the in-memory cache immediately and into the on-disk cache DB in
+    /// the background.
+    pub fn store_snapshot(
+        &self,
+        host: &HostKey,
+        arena: &Arc<TreeArena>,
+        options: &ScanOptions,
+        scanned_at: u64,
+    ) {
+        let db_opt = {
+            let mut guard = self
+                .storage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cache) = guard.mem_cache_mut() {
+                cache.insert(
+                    (host.as_db_key(), arena.root_path().to_path_buf()),
+                    (
+                        Arc::clone(arena),
+                        scanned_at,
+                        options.cache_topology_mask(),
+                    ),
+                );
+            }
+            guard.db()
+        };
+        if let Some(db) = db_opt {
+            let storage = Arc::clone(&self.storage);
+            let host = host.clone();
+            let arena = Arc::clone(arena);
+            let options = *options;
+            let _ = thread::Builder::new()
+                .name("disktree-cache-write".into())
+                .spawn(move || {
+                    if let Err(reason) =
+                        db.store_subtree(&host, &arena, &options, scanned_at)
+                    {
+                        downgrade_storage(&storage, reason);
+                    }
+                });
+        }
+    }
+
     /// Return diagnostic stats for the persistent/temp cache database.
     pub fn cache_stats(&self) -> io::Result<CacheStats> {
         let db_opt = self

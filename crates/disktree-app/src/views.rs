@@ -900,6 +900,7 @@ fn explore(
             );
     }
     let mosaic: Mosaic = app.prepare();
+    app.tick_freshness_fades(window);
     let width_rems = window.viewport_size().width.as_f32() / app.rem;
     // The panel is where the selection, the marks and the disk live; it
     // only gives way when the mosaic would be too narrow to read.

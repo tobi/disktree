@@ -618,17 +618,37 @@ fn build_node(
 /// a pre-built tree or in tests).
 #[must_use]
 pub fn node_to_arena(root_path: PathBuf, root: &Node) -> TreeArena {
+    node_to_arena_at(root_path, root, 0)
+}
+
+/// Convert a [`Node`] tree into a [`TreeArena`] and stamp every directory with
+/// `scanned_at` (used when persisting completed remote SSH scans to SWR cache).
+#[must_use]
+pub fn node_to_arena_at(
+    root_path: PathBuf,
+    root: &Node,
+    scanned_at: u64,
+) -> TreeArena {
     let mut arena = TreeArena::new(root_path, root.name.as_ref());
     let root_id = arena.root();
-    copy_node_into_arena(&mut arena, root_id, root);
+    copy_node_into_arena(&mut arena, root_id, root, scanned_at);
     arena.aggregate(true, true);
+    if scanned_at > 0 {
+        arena.refresh_statuses(scanned_at, 1);
+    }
     arena
 }
 
-fn copy_node_into_arena(arena: &mut TreeArena, parent: NodeId, node: &Node) {
+fn copy_node_into_arena(
+    arena: &mut TreeArena,
+    parent: NodeId,
+    node: &Node,
+    scanned_at: u64,
+) {
     {
         let target = arena.node_mut(parent);
         target.modified = node.modified;
+        target.scanned_at = scanned_at;
         target.flags.set(NodeFlags::READ_ERROR, node.read_error);
         target
             .flags
@@ -662,7 +682,7 @@ fn copy_node_into_arena(arena: &mut TreeArena, parent: NodeId, node: &Node) {
             arena.record_hardlink(id, dev, ino.get());
         }
         if kind == ScannerKind::Directory {
-            copy_node_into_arena(arena, id, child);
+            copy_node_into_arena(arena, id, child, scanned_at);
         }
     }
 }
@@ -1086,6 +1106,34 @@ mod tests {
         assert_eq!(reused.bytes, 200, "b.bin was never read");
         assert_eq!(reused.files, 1);
         assert_eq!(tree.bytes, 250);
+    }
+
+    #[test]
+    fn node_to_arena_roundtrips_remote_trees_for_swr_cache() {
+        let mut root = Node::directory("dev-home");
+        root.modified = 1_700_000_000;
+        let mut sub = Node::directory(".cache");
+        sub.read_error = true;
+        sub.children
+            .push(Node::entry("blob.bin", NodeKind::File, 4096));
+        root.children.push(sub);
+        root.children
+            .push(Node::entry("readme.md", NodeKind::File, 512));
+        aggregate(&mut root, Metric::Bytes);
+
+        let arena =
+            node_to_arena_at(PathBuf::from("/home/dev"), &root, 1_700_000_123);
+        let roundtrip = arena_to_node(&arena, false, true, true, Metric::Bytes);
+        assert_eq!(roundtrip.bytes, 4608);
+        assert_eq!(roundtrip.files, 2);
+        let cache = roundtrip.child_named(".cache").expect(".cache");
+        assert!(cache.read_error);
+        assert_eq!(cache.bytes, 4096);
+
+        let without_hidden =
+            arena_to_node(&arena, false, false, true, Metric::Bytes);
+        assert_eq!(without_hidden.bytes, 512);
+        assert!(without_hidden.child_named(".cache").is_none());
     }
 
     #[test]

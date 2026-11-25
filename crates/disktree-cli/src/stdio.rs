@@ -2,11 +2,13 @@
 //!
 //! Invoked over SSH by `disktree` (auto-deployed from the portable binary or
 //! found on the server's `PATH`). Enforces a 1 GiB address-space ceiling on
-//! Linux, a 5-minute wall deadline, and exits immediately if the SSH pipe
+//! Linux, a 30-minute wall deadline, and exits immediately if the SSH pipe
 //! closes so a blocked filesystem never outlives the connection.
 
 use std::io::{self, BufReader, BufWriter, Read as _};
 use std::time::Duration;
+
+const STDOUT_BUFFER_BYTES: usize = 256 * 1024;
 
 pub fn serve_stdio_v1() -> io::Result<()> {
     limit_resources()?;
@@ -15,10 +17,8 @@ pub fn serve_stdio_v1() -> io::Result<()> {
     std::thread::Builder::new()
         .name("scan-deadline".into())
         .spawn(|| {
-            std::thread::park_timeout(Duration::from_mins(5));
-            eprintln!(
-                "Remote scan exceeded five minutes; scan a smaller path."
-            );
+            std::thread::park_timeout(Duration::from_mins(30));
+            eprintln!("Remote scan exceeded 30 minutes; scan a smaller path.");
             std::process::exit(1);
         })?;
     let mut input = BufReader::new(io::stdin());
@@ -49,7 +49,7 @@ pub fn serve_stdio_v1() -> io::Result<()> {
     }
     disktree_core::remote::serve_session(
         session,
-        &mut BufWriter::new(io::stdout().lock()),
+        &mut BufWriter::with_capacity(STDOUT_BUFFER_BYTES, io::stdout().lock()),
     )
 }
 

@@ -10,9 +10,20 @@ use disktree_scanner::{
     NodeKind, StreamConfig, StreamItem, stream_walk_with_config,
 };
 use rustc_hash::FxHashSet;
+use serde::Serialize;
 
 use crate::remote::{Record, send};
 use crate::scan::ScanOptions;
+
+#[derive(Serialize)]
+struct Enter<'a> {
+    enter: &'a str,
+}
+
+#[derive(Serialize)]
+struct Heartbeat<'a> {
+    directory: &'a Path,
+}
 
 // Legacy peers require helper-side accounting. Modern clients explicitly
 // negotiate desktop de-duplication and never populate this table.
@@ -76,11 +87,8 @@ fn stream_with_boundaries(
                 last.elapsed() >= crate::remote_progress::INTERVAL
             })
         {
-            serde_json::to_writer(
-                &mut *out,
-                &serde_json::json!({"directory": dir}),
-            )
-            .map_err(io::Error::other)?;
+            serde_json::to_writer(&mut *out, &Heartbeat { directory: dir })
+                .map_err(io::Error::other)?;
             out.write_all(b"\n")?;
             // Flush on a timer even when few tree records fill the buffer.
             out.flush()?;
@@ -97,7 +105,7 @@ fn stream_with_boundaries(
                 maybe_heartbeat(&path, &mut heartbeat, out)?;
                 if live_tree {
                     let wire_name = if depth == 0 { "" } else { name.as_str() };
-                    send(out, &serde_json::json!({"enter": wire_name}))?;
+                    send(out, &Enter { enter: wire_name })?;
                 }
             }
             StreamItem::LeaveDir {

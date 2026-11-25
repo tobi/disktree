@@ -44,6 +44,19 @@ pub enum TileFreshness {
     Updating,
 }
 
+impl TileFreshness {
+    /// Target fade toward `inset` for this freshness state (`0.0` = full colour).
+    #[must_use]
+    pub const fn fade_amount(self) -> f32 {
+        match self {
+            Self::Fresh => 0.0,
+            Self::Updating => 0.14,
+            Self::Stale => 0.28,
+            Self::Scheduled => 0.42,
+        }
+    }
+}
+
 /// How one tile should be drawn, resolved before the paint callback runs so
 /// that painting never has to look anything up.
 #[derive(Clone, Debug)]
@@ -62,6 +75,9 @@ pub struct TileDeco {
     pub filtered: Filtered,
     /// Cache freshness / background refresh queue state.
     pub freshness: TileFreshness,
+    /// Animated fade factor toward `inset` (`0.0..=0.42`) so freshness
+    /// transitions glide smoothly into colour over ~200 ms instead of popping.
+    pub freshness_fade: f32,
     /// Part of it could not be read: flagged in its corner.
     pub unreadable: bool,
     pub marked: bool,
@@ -140,6 +156,7 @@ pub fn preview(
             reclaimable: false,
             filtered: Filtered::Shown,
             freshness: TileFreshness::Fresh,
+            freshness_fade: 0.0,
             unreadable: false,
             marked: false,
             covered: false,
@@ -326,13 +343,12 @@ impl Colors {
             None => self.fill[category_index(tile.category)][depth],
         };
         // Freshness uses subtle fades toward `inset` so category hues stay
-        // calm: queued folders step back slightly, stale folders soften a bit,
-        // and actively updating folders lift back toward full colour.
-        let fill = match tile.freshness {
-            TileFreshness::Fresh => fill,
-            TileFreshness::Updating => palette::mix(fill, self.inset, 0.14),
-            TileFreshness::Stale => palette::mix(fill, self.inset, 0.28),
-            TileFreshness::Scheduled => palette::mix(fill, self.inset, 0.42),
+        // calm; `freshness_fade` interpolates smoothly over 200 ms when a
+        // square finishes scanning instead of snapping into colour.
+        let fill = if tile.freshness_fade > 0.001 {
+            palette::mix(fill, self.inset, tile.freshness_fade)
+        } else {
+            fill
         };
         // Only what matches keeps its colour; a directory holding matches
         // steps back less, so the way to them stays readable.

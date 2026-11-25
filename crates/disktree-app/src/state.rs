@@ -112,6 +112,52 @@ pub fn panel_width(pointer_x: f32, viewport: f32, rem: f32) -> f32 {
 /// How many "worth a look" findings the panel lists.
 const INSIGHT_LIMIT: usize = 6;
 
+/// Duration of the tile freshness colour fade when a square becomes fresh.
+const FRESHNESS_FADE_MS: f32 = 200.0;
+
+#[derive(Clone, Copy, Debug)]
+struct TileFade {
+    from: f32,
+    target: f32,
+    started: Instant,
+}
+
+impl TileFade {
+    fn settled(value: f32, now: Instant) -> Self {
+        let elapsed = Duration::from_millis(250);
+        Self {
+            from: value,
+            target: value,
+            started: now.checked_sub(elapsed).unwrap_or(now),
+        }
+    }
+
+    fn value(&self, now: Instant) -> f32 {
+        if (self.from - self.target).abs() < f32::EPSILON {
+            return self.target;
+        }
+        let elapsed_ms =
+            now.saturating_duration_since(self.started).as_secs_f32() * 1000.0;
+        let t = (elapsed_ms / FRESHNESS_FADE_MS).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        (self.target - self.from).mul_add(eased, self.from)
+    }
+
+    fn is_running(&self, now: Instant) -> bool {
+        (self.from - self.target).abs() >= f32::EPSILON
+            && now.saturating_duration_since(self.started).as_secs_f32()
+                * 1000.0
+                < FRESHNESS_FADE_MS
+    }
+}
+
+fn remote_cache_host(host: &str) -> disktree_scanner::HostKey {
+    disktree_scanner::HostKey::Remote(disktree_scanner::HostIdentity {
+        hostname: host.to_owned(),
+        machine_id: None,
+    })
+}
+
 /// Which screen the app is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Screen {
@@ -985,6 +1031,8 @@ pub struct Disktree {
     pub view: View,
     /// The in-flight layout transition, if a level was just entered or left.
     pub transition: Option<LayoutTransition>,
+    /// Per-tile smooth colour fade when freshness changes (200 ms ease-out).
+    tile_fades: FxHashMap<PathBuf, TileFade>,
     pub layout_options: LayoutOptions,
     cache: Option<LayoutCache>,
     marked: Option<MarkedCrumbs>,
@@ -1166,6 +1214,7 @@ impl Disktree {
             pointer_active: false,
             view: View::default(),
             transition: None,
+            tile_fades: FxHashMap::default(),
             layout_options: LayoutOptions {
                 max_depth: depth.clamp(1, 6),
                 ..LayoutOptions::default()
@@ -2060,6 +2109,7 @@ impl Disktree {
         self.updating_paths.clear();
         self.refreshed_paths.clear();
         self.active_scan_path = None;
+        self.tile_fades.clear();
         self.crumbs.clear();
         self.selected = None;
         self.hovered = None;
@@ -2071,22 +2121,63 @@ impl Disktree {
         self.clear_filter();
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
-        if let Some(host) = &self.remote {
+        if let Some(host) = self.remote.clone() {
+            let intent = if !self.root_path.as_os_str().is_empty()
+                && let Some((arena, freshness)) = self.scanner.lookup_cached(
+                    &remote_cache_host(&host),
+                    &self.root_path,
+                    &self.options.to_scanner(),
+                    &policy,
+                )
+                && !matches!(freshness, Freshness::Partial { .. })
+            {
+                let is_fresh = matches!(freshness, Freshness::Fresh { .. });
+                let node = disktree_core::scan::arena_to_node(
+                    &arena,
+                    self.options.apparent_size,
+                    self.options.include_hidden,
+                    self.options.dedup_hardlinks,
+                    self.options.metric,
+                );
+                self.arena = Some(arena);
+                self.freshness = Some(freshness);
+                self.device = Some(format!("{host} · read-only · cached"));
+                self.install_tree(node, None, cx);
+                if is_fresh && !policy.force_refresh {
+                    self.progress.finished = true;
+                    self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
+                    cx.notify();
+                    return;
+                }
+                ScanIntent::Refresh {
+                    metric: self.options.metric,
+                    forced: policy.force_refresh,
+                }
+            } else {
+                ScanIntent::Initial
+            };
             let request = disktree_core::remote::Request {
                 root: (!self.root_path.as_os_str().is_empty())
                     .then(|| self.root_path.clone()),
                 disk: self.remote_disk,
                 options: self.options,
             };
-            match disktree_core::remote::RemoteScan::spawn(host, &request) {
+            match disktree_core::remote::RemoteScan::spawn(&host, &request) {
                 Ok(handle) => {
-                    self.active_scan = Some(ActiveScan::Remote {
-                        handle,
-                        intent: ScanIntent::Initial,
-                    });
+                    self.active_scan =
+                        Some(ActiveScan::Remote { handle, intent });
                     Self::poll_scan(epoch, cx);
                 }
-                Err(error) => self.scan_error = Some(error.to_string()),
+                Err(error) => {
+                    if self.tree.is_some() {
+                        self.notice = Some((
+                            format!("Refresh failed: {error}"),
+                            Status::Warning,
+                        ));
+                    } else {
+                        self.scan_error = Some(error.to_string());
+                    }
+                }
             }
             cx.notify();
             return;
@@ -2201,6 +2292,25 @@ impl Disktree {
                             format!("{host} · read-only · space at scan")
                         });
                         let node = snapshot.tree;
+                        let scanned_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let arena =
+                            Arc::new(disktree_core::scan::node_to_arena_at(
+                                self.root_path.clone(),
+                                &node,
+                                scanned_at,
+                            ));
+                        if let Some(host) = self.remote.as_deref() {
+                            self.scanner.store_snapshot(
+                                &remote_cache_host(host),
+                                &arena,
+                                &self.options.to_scanner(),
+                                scanned_at,
+                            );
+                        }
+                        self.arena = Some(arena);
+                        self.freshness = Some(Freshness::Live { scanned_at });
                         if let Some((metric, directory, selected)) =
                             refresh_paths
                         {
@@ -2222,7 +2332,14 @@ impl Disktree {
                             self.scan_started.map(|t| t.elapsed());
                     }
                     Err(error) => {
-                        self.scan_error = Some(error.to_string());
+                        if self.tree.is_some() {
+                            self.notice = Some((
+                                format!("Refresh failed: {error}"),
+                                Status::Warning,
+                            ));
+                        } else {
+                            self.scan_error = Some(error.to_string());
+                        }
                     }
                 }
                 self.active_scan = None;
@@ -3507,6 +3624,9 @@ impl Disktree {
         let refresh_mode = self.refresh_mode();
         let mut decorations = Vec::with_capacity(tiles.len());
         let mut slots: Vec<LabelSlot<'_>> = Vec::new();
+        let now_instant = Instant::now();
+        let mut tile_fades = std::mem::take(&mut self.tile_fades);
+        let mut visible_fade_keys = FxHashSet::default();
         for tile in tiles {
             let crumbs = tile.crumbs();
             let node = match &tile.kind {
@@ -3527,6 +3647,23 @@ impl Disktree {
             };
             let freshness =
                 self.tile_freshness_at(crumbs, now_unix, refresh_mode);
+            let target_fade = freshness.fade_amount();
+            let freshness_fade = match &tile.kind {
+                TileKind::Node { crumbs } => {
+                    if let Some(path) = self.path_at(crumbs) {
+                        visible_fade_keys.insert(path.clone());
+                        sample_tile_fade(
+                            &mut tile_fades,
+                            path,
+                            target_fade,
+                            now_instant,
+                        )
+                    } else {
+                        target_fade
+                    }
+                }
+                TileKind::Others { .. } => target_fade,
+            };
             let is_marked = marked.contains(crumbs);
             // Everything inside a marked directory goes with it, so it is
             // drawn marked too.
@@ -3542,6 +3679,7 @@ impl Disktree {
                 reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
                 filtered,
                 freshness,
+                freshness_fade,
                 unreadable: node.is_some_and(|n| n.read_error),
                 marked: is_marked,
                 covered: is_covered,
@@ -3581,6 +3719,10 @@ impl Disktree {
                 marked: node.is_some() && (is_marked || is_covered),
             });
         }
+        tile_fades.retain(|path, fade| {
+            visible_fade_keys.contains(path) || fade.is_running(now_instant)
+        });
+        drop(visible_fade_keys);
 
         slots.sort_by(|left, right| {
             let left_area = left.rect.w * left.rect.h;
@@ -3609,6 +3751,7 @@ impl Disktree {
             })
             .collect();
         self.cache = Some(cache);
+        self.tile_fades = tile_fades;
 
         Mosaic {
             tiles: decorations,
@@ -4790,8 +4933,40 @@ impl Disktree {
                 self.transition = None;
             }
         }
+        self.tick_freshness_fades(window);
     }
 
+    /// Keep animation frames flowing while any tile is mid-fade after a
+    /// freshness change (200 ms ease-out), then stop cleanly at 0% idle CPU.
+    pub fn tick_freshness_fades(&self, window: &Window) {
+        let now = Instant::now();
+        if self.tile_fades.values().any(|fade| fade.is_running(now)) {
+            window.request_animation_frame();
+        }
+    }
+}
+
+fn sample_tile_fade(
+    tile_fades: &mut FxHashMap<PathBuf, TileFade>,
+    path: PathBuf,
+    target: f32,
+    now: Instant,
+) -> f32 {
+    if let Some(fade) = tile_fades.get_mut(&path) {
+        if (fade.target - target).abs() >= f32::EPSILON {
+            let current = fade.value(now);
+            fade.from = current;
+            fade.target = target;
+            fade.started = now;
+        }
+        fade.value(now)
+    } else {
+        tile_fades.insert(path, TileFade::settled(target, now));
+        target
+    }
+}
+
+impl Disktree {
     /// A tile's rectangle for this frame: mid-transition it is on its way from
     /// where it was to where it is.
     fn animated_rect(&self, rect: Rect) -> Rect {
@@ -5321,5 +5496,25 @@ mod tests {
         let (state, effects) = step(state, Event::Reset);
         assert!(matches!(state.phase, Phase::Idle));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn tile_fade_eases_smoothly_over_200ms() {
+        let start = Instant::now();
+        let fade = TileFade {
+            from: 0.28,
+            target: 0.0,
+            started: start,
+        };
+        assert!((fade.value(start) - 0.28).abs() < 1e-5);
+        assert!(fade.is_running(start));
+        let mid = fade.value(start + Duration::from_millis(100));
+        assert!(
+            mid > 0.0 && mid < 0.28,
+            "expected smooth mid fade, got {mid}"
+        );
+        let done = fade.value(start + Duration::from_millis(200));
+        assert!(done.abs() < 1e-5);
+        assert!(!fade.is_running(start + Duration::from_millis(200)));
     }
 }
