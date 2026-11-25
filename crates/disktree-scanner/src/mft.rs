@@ -20,10 +20,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::num::NonZeroU64;
 use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -33,8 +32,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE,
 };
 
-use crate::scan::{ScanOptions, ScanProgress};
-use crate::tree::{Node, NodeKind};
+use crate::types::{NodeKind, ScanOptions};
+use crate::walk::{BuiltChild, BuiltNode, LeafRecord, WalkProgress};
 use crate::windows::{Aligned, drive_letter};
 
 /// Most bytes read per call: large enough that the disk streams, small
@@ -162,12 +161,13 @@ struct Geometry {
 
 /// The tree under `root`, read from the volume's file table; `None` when
 /// the table cannot be read and the walk has to measure instead.
-pub fn scan(
+pub(crate) fn scan(
     root: &Path,
     canonical: &Path,
     options: &ScanOptions,
-    progress: &ScanProgress,
-) -> Option<io::Result<Node>> {
+    cancel: &AtomicBool,
+    progress: &WalkProgress,
+) -> Option<io::Result<BuiltNode>> {
     // A followed link can lead off this volume, or back into it a second
     // time, and the table describes neither: the walk follows them.
     if options.follow_links {
@@ -189,15 +189,15 @@ pub fn scan(
         geometry.record,
         &reads,
         &mut infos,
-        options.apparent_size,
+        cancel,
         progress,
     )?;
-    if progress.is_cancelled() {
+    if cancel.load(Ordering::Relaxed) {
         return Some(Err(cancelled()));
     }
 
     let (mut names, texts) = merge(parsed, &mut infos);
-    if progress.is_cancelled() {
+    if cancel.load(Ordering::Relaxed) {
         return Some(Err(cancelled()));
     }
     if !is_root_directory(&infos) {
@@ -211,10 +211,14 @@ pub fn scan(
         texts,
         starts,
         options,
-        progress,
+        cancel,
         directories: AtomicUsize::new(0),
     };
-    let tree = table.directory(ROOT, crate::scan::file_name(root), 0);
+    let root_name = root.file_name().map_or_else(
+        || root.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let tree = table.directory(ROOT, root_name, false, 0);
     // Hundreds of megabytes, whose freeing the caller would otherwise
     // wait out before it can finish the tree.
     let Table {
@@ -229,7 +233,9 @@ pub fn scan(
     let _ = std::thread::Builder::new()
         .spawn(move || drop((infos, names, texts, starts)));
     match tree {
-        Ok(_) | Err(Stop) if progress.is_cancelled() => Some(Err(cancelled())),
+        Ok(_) | Err(Stop) if cancel.load(Ordering::Relaxed) => {
+            Some(Err(cancelled()))
+        }
         Ok(node) => Some(Ok(node)),
         Err(Stop) => None,
     }
@@ -605,8 +611,8 @@ fn read_records(
     record: usize,
     reads: &[(u64, u64, u64)],
     infos: &mut [Info],
-    apparent_size: bool,
-    progress: &ScanProgress,
+    cancel: &AtomicBool,
+    progress: &WalkProgress,
 ) -> Option<Vec<Parsed>> {
     let threads = rayon::current_num_threads().max(1);
     let mut stretches: Vec<Vec<&mut [Info]>> =
@@ -637,7 +643,7 @@ fn read_records(
                 .step_by(threads)
                 .zip(stretches)
             {
-                if progress.is_cancelled() {
+                if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 let buffer = buffer.bytes(usize::try_from(size).ok()?);
@@ -649,12 +655,13 @@ fn read_records(
                     u32::try_from(chunk).ok()?,
                     stretch,
                 );
-                let bytes = if apparent_size {
-                    chunk.apparent
-                } else {
-                    chunk.allocated
-                };
-                progress.add(chunk.files, 0, bytes);
+                progress.files.fetch_add(chunk.files, Ordering::Relaxed);
+                progress
+                    .allocated_bytes
+                    .fetch_add(chunk.allocated, Ordering::Relaxed);
+                progress
+                    .apparent_bytes
+                    .fetch_add(chunk.apparent, Ordering::Relaxed);
                 parsed.push(chunk);
             }
             Some(parsed)
@@ -1063,7 +1070,7 @@ struct Table<'a> {
     texts: Vec<String>,
     starts: Vec<u32>,
     options: &'a ScanOptions,
-    progress: &'a ScanProgress,
+    cancel: &'a AtomicBool,
     /// Directories built so far. Each is built from one entry, so more of
     /// them than there are entries means one was reached twice: a crafted
     /// table that gives directories several names doubles the tree at
@@ -1090,15 +1097,16 @@ impl Table<'_> {
         }
     }
 
-    /// Mirrors what the walk keeps: see `WalkContext::classify`.
+    /// Mirrors what the walk keeps: see `scan_dir`.
     fn directory(
         &self,
         number: u32,
-        name: Box<str>,
+        name: String,
+        hidden: bool,
         depth: usize,
-    ) -> Result<Node, Stop> {
+    ) -> Result<BuiltNode, Stop> {
         if depth >= MOST_LEVELS
-            || self.progress.is_cancelled()
+            || self.cancel.load(Ordering::Relaxed)
             || self.directories.fetch_add(1, Ordering::Relaxed)
                 > self.names.len()
         {
@@ -1107,10 +1115,14 @@ impl Table<'_> {
         let descend = self.options.max_depth.is_none_or(|max| depth < max);
         let sequence =
             self.infos.get(number as usize).map(|info| info.sequence);
+        let modified = self
+            .infos
+            .get(number as usize)
+            .map_or(0, |info| info.modified);
         let child = |entry: &Entry| {
             // A root directory holds hundreds of thousands of files; a
             // check per entry lets a cancel stop within one.
-            if self.progress.is_cancelled() {
+            if self.cancel.load(Ordering::Relaxed) {
                 return Some(Err(Stop));
             }
             // An entry naming a parent whose record has since been reused.
@@ -1120,8 +1132,8 @@ impl Table<'_> {
             self.child(entry, depth, descend).transpose()
         };
         let entries = self.entries(number);
-        // See `tree::PARALLEL_LEVELS`: parallel only near the top.
-        let children = if depth < crate::tree::PARALLEL_LEVELS {
+        const PARALLEL_LEVELS: usize = 3;
+        let children = if depth < PARALLEL_LEVELS {
             entries
                 .par_iter()
                 .filter_map(child)
@@ -1135,9 +1147,14 @@ impl Table<'_> {
             }
             children
         };
-        let mut node = Node::directory(name);
-        node.children = children;
-        Ok(node)
+        Ok(BuiltNode {
+            name,
+            modified,
+            read_error: false,
+            hidden,
+            lossy_name: false,
+            children,
+        })
     }
 
     /// The node for `entry`; `None` for one the walk would not list.
@@ -1146,7 +1163,7 @@ impl Table<'_> {
         entry: &Entry,
         depth: usize,
         descend: bool,
-    ) -> Result<Option<Node>, Stop> {
+    ) -> Result<Option<BuiltChild>, Stop> {
         // The root is its own parent.
         if entry.child == entry.parent || entry.child < FIRST_USER_RECORD {
             return Ok(None);
@@ -1158,12 +1175,8 @@ impl Table<'_> {
             return Ok(None);
         }
         let name = self.name(entry);
-        if !self.options.include_hidden
-            && (name.starts_with('.')
-                || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0)
-        {
-            return Ok(None);
-        }
+        let hidden = name.starts_with('.')
+            || info.attributes & FILE_ATTRIBUTE_HIDDEN != 0;
         let link = info.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             && info.reparse_tag & NAME_SURROGATE != 0;
         if info.directory && !link {
@@ -1171,26 +1184,24 @@ impl Table<'_> {
                 return Ok(None);
             }
             return self
-                .directory(entry.child, name.into(), depth + 1)
-                .map(Some);
+                .directory(entry.child, name.to_owned(), hidden, depth + 1)
+                .map(|dir| Some(BuiltChild::Dir(dir)));
         }
-        let size = if self.options.apparent_size {
-            info.apparent
-        } else {
-            info.allocated
-        };
         let kind = if link {
             NodeKind::Symlink
         } else {
             NodeKind::File
         };
-        let mut node = Node::entry(name, kind, size);
-        node.modified = info.modified;
-        if info.names > 1 {
-            node.inode = NonZeroU64::new(u64::from(entry.child))
-                .map(|record| (0, record));
-        }
-        Ok(Some(node))
+        Ok(Some(BuiltChild::Leaf(LeafRecord {
+            name: name.to_owned(),
+            kind,
+            allocated_bytes: info.allocated,
+            apparent_bytes: info.apparent,
+            modified: info.modified,
+            hidden,
+            lossy_name: false,
+            hardlink: (info.names > 1).then(|| (0, u64::from(entry.child))),
+        })))
     }
 }
 
@@ -1477,7 +1488,8 @@ mod tests {
             .map(|read| (read * 4096, 4096, read * 4))
             .collect();
         let mut infos = super::table(&reads, RECORD);
-        let progress = ScanProgress::default();
+        let cancel = AtomicBool::new(false);
+        let progress = WalkProgress::default();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(3)
             .build()
@@ -1489,7 +1501,7 @@ mod tests {
                     RECORD,
                     &reads,
                     &mut infos,
-                    false,
+                    &cancel,
                     &progress,
                 )
             })
@@ -1510,7 +1522,7 @@ mod tests {
                 &texts[entry.chunk as usize][at..][..usize::from(entry.len)];
             assert_eq!(text, format!("f{}", entry.child));
         }
-        assert_eq!(progress.snapshot().files, 64);
+        assert_eq!(progress.files.load(Ordering::Relaxed), 64);
     }
 
     #[test]
@@ -1575,7 +1587,7 @@ mod tests {
     fn table<'a>(
         rows: &[(u32, u32, u16, &str, Info)],
         options: &'a ScanOptions,
-        progress: &'a ScanProgress,
+        cancel: &'a AtomicBool,
     ) -> Table<'a> {
         let mut infos = vec![Info::default(); 64];
         infos[ROOT as usize] = Info {
@@ -1606,16 +1618,35 @@ mod tests {
             texts: vec![text],
             starts,
             options,
-            progress,
+            cancel,
             directories: AtomicUsize::new(0),
         }
     }
 
-    fn paths(node: &Node, prefix: &str, out: &mut Vec<(String, NodeKind)>) {
+    fn paths(
+        node: &BuiltNode,
+        prefix: &str,
+        include_hidden: bool,
+        out: &mut Vec<(String, NodeKind)>,
+    ) {
         for child in &node.children {
-            let path = format!("{prefix}{}", child.name);
-            out.push((path.clone(), child.kind));
-            paths(child, &format!("{path}/"), out);
+            match child {
+                BuiltChild::Dir(dir) => {
+                    if !include_hidden && dir.hidden {
+                        continue;
+                    }
+                    let path = format!("{prefix}{}", dir.name);
+                    out.push((path.clone(), NodeKind::Directory));
+                    paths(dir, &format!("{path}/"), include_hidden, out);
+                }
+                BuiltChild::Leaf(leaf) => {
+                    if !include_hidden && leaf.hidden {
+                        continue;
+                    }
+                    out.push((format!("{prefix}{}", leaf.name), leaf.kind));
+                }
+                BuiltChild::Grafted { .. } => {}
+            }
         }
     }
 
@@ -1698,7 +1729,7 @@ mod tests {
             "sub/linked.txt",
             "visible.txt",
         ];
-        let progress = ScanProgress::default();
+        let cancel = AtomicBool::new(false);
         for (include_hidden, max_depth, expected) in
             [(true, None, everything), (false, Some(1), shallow_visible)]
         {
@@ -1707,15 +1738,16 @@ mod tests {
                 max_depth,
                 ..ScanOptions::default()
             };
-            let Ok(root) = table(&rows, &options, &progress).directory(
+            let Ok(root) = table(&rows, &options, &cancel).directory(
                 ROOT,
                 "C:\\".into(),
+                false,
                 0,
             ) else {
                 panic!("the table is not cut short");
             };
             let mut found = Vec::new();
-            paths(&root, "", &mut found);
+            paths(&root, "", include_hidden, &mut found);
             found.sort_by(|left, right| left.0.cmp(&right.0));
             let kind = |path: &str| match path {
                 "link" => NodeKind::Symlink,
@@ -1729,7 +1761,14 @@ mod tests {
             assert_eq!(found, expected, "include_hidden {include_hidden}");
 
             // Only a file with a second name needs its identity kept.
-            let inode = |name: &str| root.child_named(name).unwrap().identity();
+            let inode = |name: &str| {
+                root.children.iter().find_map(|child| match child {
+                    BuiltChild::Leaf(leaf) if leaf.name == name => {
+                        leaf.hardlink
+                    }
+                    _ => None,
+                })
+            };
             assert_eq!(inode("linked.txt"), Some((0, 31)));
             assert_eq!(inode("visible.txt"), None);
         }
@@ -1749,9 +1788,9 @@ mod tests {
             (40, 41, 1, "again", dir),
         ];
         let options = ScanOptions::default();
-        let progress = ScanProgress::default();
-        let table = table(&rows, &options, &progress);
-        assert!(table.directory(ROOT, "C:\\".into(), 0).is_err());
-        assert!(!progress.is_cancelled());
+        let cancel = AtomicBool::new(false);
+        let table = table(&rows, &options, &cancel);
+        assert!(table.directory(ROOT, "C:\\".into(), false, 0).is_err());
+        assert!(!cancel.load(Ordering::Relaxed));
     }
 }

@@ -119,9 +119,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 
 10. **Discovery is not a scan.** Local launch scans `$HOME` directly, while
     bare `disktree ssh HOST` and the location dialog list mounts in the
-    selected machine's namespace without probing them; scans stop at nested
-    mounts, including bind mounts and same-device subvolumes. Switching
-    machines clears marks and identity. The Unix SSH helper streams records
+    selected machine's namespace without probing them. Local scans include
+    distinct same-filesystem Btrfs subvolumes, but exclude overlapping mount
+    views, snapshots, other disks and network mounts; remote scans stop at
+    every nested mount. Switching machines clears marks and identity. The Unix
+    SSH helper streams records
     and never retains the tree. SSH hosts are Unix, so remote paths
     are POSIX on every client: join, split and compare them through
     `PathStyle`, never `std::path`, which uses `\` on Windows.
@@ -135,17 +137,19 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 
 | change | where |
 | --- | --- |
-| bounded Unix SSH traversal | `crates/disktree-core/src/remote_walk.rs` |
+| parallel scan, arena, Protobuf cache DB, SWR | `crates/disktree-scanner/src/` (`walk.rs`, `tree.rs`, `db.rs`, `session.rs`) |
+| bounded-memory streaming walk | `crates/disktree-scanner/src/stream.rs` (wired into `disktree-core/src/remote_walk.rs`) |
+| terminal TUI and `--json` / `--ndjson` CLI | `crates/disktree-cli/src/` |
 | SSH protocol, discovery and transport | `crates/disktree-core/src/remote.rs` |
 | joining, splitting or comparing a scanned path | `crates/disktree-core/src/path_style.rs` |
-| measurement, filtering, parallelism | `crates/disktree-core/src/scan.rs` |
+| arena-to-treemap projection and `ScanHandle` | `crates/disktree-core/src/scan.rs` |
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
-| what macOS lists and measures in bulk | `crates/disktree-core/src/macos.rs` — `unsafe` for `getattrlistbulk` |
-| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — `unsafe` for Win32 |
-| reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
+| what macOS lists and measures in bulk | `crates/disktree-scanner/src/macos.rs` — `unsafe` for `getattrlistbulk` |
+| what Windows lists, measures and compares differently | `crates/disktree-scanner/src/windows.rs` — `unsafe` for Win32 |
+| reading a whole NTFS drive from its file table | `crates/disktree-scanner/src/mft.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

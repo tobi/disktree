@@ -1,34 +1,22 @@
-//! Bounded-memory SSH traversal. No Node, arena, child vector or sort:
-//! the receiver owns the tree; the helper retains only its open ancestors.
-use std::fs::{self, ReadDir};
-use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
+//! Bounded-memory SSH wire serializer backed by `disktree-scanner`'s streaming
+//! walker. No Node, arena, child vector or sort: the receiver owns the tree;
+//! the helper retains only its open ancestors.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use disktree_scanner::{
+    NodeKind, StreamConfig, StreamItem, stream_walk_with_config,
+};
+use rustc_hash::FxHashSet;
 
 use crate::remote::{Record, send};
-use crate::scan::{ScanOptions, measure, modified_seconds};
+use crate::scan::ScanOptions;
 
 // Legacy peers require helper-side accounting. Modern clients explicitly
 // negotiate desktop de-duplication and never populate this table.
 const MAX_PENDING_LINKS: usize = 65_536;
-
-struct Frame {
-    entries: Option<ReadDir>,
-    record: Record,
-}
-
-impl Frame {
-    fn open(path: &Path, name: String) -> Self {
-        let entries = fs::read_dir(path);
-        let failed = entries.is_err();
-        Self {
-            entries: entries.ok(),
-            record: Record(name, 0, 0, 0, 0, failed, 0),
-        }
-    }
-}
 
 pub fn stream(
     root: &Path,
@@ -40,7 +28,8 @@ pub fn stream(
 ) -> io::Result<()> {
     if options.follow_links || !options.one_filesystem {
         return Err(io::Error::other(
-            "Remote streaming scans never follow symlinks or cross mounts;              select that mount as a separate scan root.",
+            "Remote streaming scans never follow symlinks or cross mounts; \
+             select that mount as a separate scan root.",
         ));
     }
     // Require a table, not just st_dev: a bind mount can have the same dev.
@@ -70,139 +59,132 @@ fn stream_with_boundaries(
     client_dedup: bool,
     live_tree: bool,
 ) -> io::Result<()> {
-    if live_tree {
-        send(out, &serde_json::json!({"enter": ""}))?;
-    }
-    let device = fs::metadata(root)?.dev();
-    let mut frames = vec![Frame::open(root, "root".into())];
-    // Only the legacy wire mode needs a table. Modern sessions emit each
-    // hardlink's identity directly and leave this map empty.
-    let mut links = FxHashMap::<(u64, u64), u64>::default();
-    let mut directory = root.to_path_buf();
-    let mut heartbeat = None::<std::time::Instant>;
-    while let Some(frame) = frames.last_mut() {
+    let scanner_opts = options.to_scanner();
+    let config = StreamConfig {
+        excluded: excluded.clone(),
+        dedup_in_walker: !client_dedup,
+        max_pending_links: (!client_dedup).then_some(MAX_PENDING_LINKS),
+        skip_lossy_names: true,
+    };
+    let mut heartbeat = None::<Instant>;
+    let maybe_heartbeat = |dir: &Path,
+                           heartbeat: &mut Option<Instant>,
+                           out: &mut dyn Write|
+     -> io::Result<()> {
         if live_progress
             && heartbeat.is_none_or(|last| {
                 last.elapsed() >= crate::remote_progress::INTERVAL
             })
         {
-            send(out, &serde_json::json!({"directory": directory}))?;
+            serde_json::to_writer(
+                &mut *out,
+                &serde_json::json!({"directory": dir}),
+            )
+            .map_err(io::Error::other)?;
+            out.write_all(b"\n")?;
             // Flush on a timer even when few tree records fill the buffer.
             out.flush()?;
-            heartbeat = Some(std::time::Instant::now());
+            *heartbeat = Some(Instant::now());
         }
-        let entry = match frame.entries.as_mut().and_then(Iterator::next) {
-            None => {
-                let frame = frames.pop().expect("frame checked above");
-                send(out, &frame.record)?;
-                directory.pop();
-                continue;
-            }
-            Some(Err(_)) => {
-                frame.record.5 = true;
-                continue;
-            }
-            Some(Ok(entry)) => entry,
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            // A replacement character must never become a deletable path.
-            frame.record.5 = true;
-            continue;
-        };
-        if !options.include_hidden && name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        // Before metadata or read_dir: do not trigger an automount.
-        if excluded.contains(&path) {
-            continue;
-        }
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            frame.record.5 = true;
-            continue;
-        };
-        if meta.dev() != device {
-            continue;
-        }
-        if meta.is_dir() {
-            if options.max_depth.is_some_and(|limit| frames.len() > limit) {
-                continue;
-            }
-            frames.last_mut().expect("parent exists").record.6 += 1;
-            directory.clone_from(&path);
-            if live_tree {
-                send(out, &serde_json::json!({"enter": name}))?;
-            }
-            frames.push(Frame::open(&path, name.to_owned()));
-            continue;
-        }
-        let kind = if meta.is_file() {
-            1
-        } else if meta.is_symlink() {
-            2
-        } else {
-            3
-        };
-        let mut bytes = if kind == 3 {
-            0
-        } else {
-            measure(&meta, options.apparent_size)
-        };
-        let hardlinked =
-            options.dedup_hardlinks && meta.is_file() && meta.nlink() > 1;
-        if hardlinked && !client_dedup {
-            let identity = (meta.dev(), meta.ino());
-            if let Some(remaining) = links.get_mut(&identity) {
-                bytes = 0;
-                *remaining -= 1;
-                if *remaining == 0 {
-                    links.remove(&identity);
+        Ok(())
+    };
+
+    stream_walk_with_config(root, &scanner_opts, &config, None, |item| {
+        match item {
+            StreamItem::EnterDir {
+                path, name, depth, ..
+            } => {
+                maybe_heartbeat(&path, &mut heartbeat, out)?;
+                if live_tree {
+                    let wire_name = if depth == 0 { "" } else { name.as_str() };
+                    send(out, &serde_json::json!({"enter": wire_name}))?;
                 }
-            } else {
-                if links.len() >= MAX_PENDING_LINKS {
-                    return Err(io::Error::other(format!(
-                        "remote hardlink tracking limit reached at {}; scan a smaller root",
-                        path.display()
-                    )));
+            }
+            StreamItem::LeaveDir {
+                name,
+                depth,
+                read_error,
+                direct_children,
+                ..
+            } => {
+                let wire_name =
+                    if depth == 0 { "root".to_owned() } else { name };
+                let record = Record(
+                    wire_name,
+                    0,
+                    0,
+                    0,
+                    0,
+                    read_error,
+                    direct_children as usize,
+                );
+                send(out, &record)?;
+            }
+            StreamItem::Entry {
+                path,
+                name,
+                kind,
+                allocated_bytes,
+                apparent_bytes,
+                modified,
+                hardlink,
+                ..
+            } => {
+                if let Some(parent) = path.parent() {
+                    maybe_heartbeat(parent, &mut heartbeat, out)?;
                 }
-                links.insert(identity, meta.nlink() - 1);
+                let wire_kind = match kind {
+                    NodeKind::Directory => 0,
+                    NodeKind::File => 1,
+                    NodeKind::Symlink => 2,
+                    NodeKind::Other => 3,
+                };
+                let bytes = if wire_kind == 3 {
+                    0
+                } else if options.apparent_size {
+                    apparent_bytes
+                } else {
+                    allocated_bytes
+                };
+                let record = Record(
+                    name,
+                    wire_kind,
+                    bytes,
+                    u64::from(kind == NodeKind::File),
+                    modified,
+                    false,
+                    0,
+                );
+                if client_dedup
+                    && options.dedup_hardlinks
+                    && let Some(link) = hardlink
+                {
+                    #[derive(serde::Serialize)]
+                    struct Linked<'a> {
+                        link: (u64, u64),
+                        entry: &'a Record,
+                    }
+                    send(
+                        out,
+                        &Linked {
+                            link,
+                            entry: &record,
+                        },
+                    )?;
+                } else {
+                    send(out, &record)?;
+                }
             }
+            StreamItem::Error { .. } => {}
         }
-        let record = Record(
-            name.to_owned(),
-            kind,
-            bytes,
-            u64::from(meta.is_file()),
-            modified_seconds(&meta),
-            false,
-            0,
-        );
-        if hardlinked && client_dedup {
-            // The desktop already owns the tree and its compact identity
-            // index. The server retains no per-file state in this mode.
-            #[derive(serde::Serialize)]
-            struct Linked<'a> {
-                link: (u64, u64),
-                entry: &'a Record,
-            }
-            send(
-                out,
-                &Linked {
-                    link: (meta.dev(), meta.ino()),
-                    entry: &record,
-                },
-            )?;
-        } else {
-            send(out, &record)?;
-        }
-        frames.last_mut().expect("parent exists").record.6 += 1;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn records(

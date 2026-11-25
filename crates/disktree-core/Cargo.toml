@@ -9,7 +9,12 @@ description = "Filesystem scanning and treemap layout for disktree"
 [lints]
 workspace = true
 
+[features]
+default = ["cache-db"]
+cache-db = ["disktree-scanner/cache-db"]
+
 [dependencies]
+disktree-scanner = { path = "../disktree-scanner", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
@@ -24,13 +29,9 @@ rustix = { version = "1.1", features = ["fs"] }
 [target.'cfg(windows)'.dependencies]
 # The Recycle Bin, through the shell's own file operation.
 trash = { version = "5.2.9", default-features = false, features = ["coinit_apartmentthreaded"] }
-winapi-util = "0.1.11"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # The system trash, through NSFileManager: what Finder's Move to Trash does,
@@ -41,7 +42,3 @@ trash = { version = "5.2.9", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
-
-# CPU-only sampling; the GUI dependency graph already pins this version.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
-sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }

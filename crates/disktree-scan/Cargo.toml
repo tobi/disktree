@@ -10,7 +10,7 @@ description = "Read-only headless scanner for disktree SSH sessions"
 workspace = true
 
 [dependencies]
-disktree-core.workspace = true
+disktree-core = { path = "../disktree-core", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", features = ["process"] }

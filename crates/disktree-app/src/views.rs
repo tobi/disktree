@@ -66,7 +66,7 @@ pub fn root(
             // Where `r` would: not behind the confirmation, and not under
             // the review list or a removal that is still running.
             if this.can_start_over() {
-                this.start_scan(cx);
+                this.refresh_scan(cx);
             }
         }))
         .on_action(cx.listener(
@@ -1329,8 +1329,7 @@ fn view_settings(
         .tab_stop(false)
         .on_change(move |_, _, window, cx| {
             let _ = entity.update(cx, |this, cx| {
-                this.options.include_hidden = !this.options.include_hidden;
-                this.start_scan(cx);
+                this.toggle_hidden(cx);
             });
             window.focus(&focus, cx);
         })
@@ -1345,8 +1344,7 @@ fn view_settings(
         .tab_stop(false)
         .on_change(move |_, _, window, cx| {
             let _ = entity.update(cx, |this, cx| {
-                this.options.apparent_size = !this.options.apparent_size;
-                this.start_scan(cx);
+                this.toggle_apparent_size(cx);
             });
             window.focus(&focus, cx);
         })
@@ -1501,7 +1499,7 @@ fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
 
     let theme = cx.omarchy().clone();
     let cpus = app.cpu_threads;
-    let threads = app.options.threads.max_threads.min(cpus);
+    let threads = app.options.threads.unwrap_or(cpus).min(cpus);
     let name = app.power_choice.map_or("Custom", PowerEfficiency::name);
     let open = app.power_menu.is_some();
     let trigger = div()
@@ -1693,7 +1691,20 @@ fn trail_and_legend(
         .gap(space::LG)
         .px(space::LG)
         .py(space::SM)
-        .child(scan_totals(app, theme));
+        .child(scan_totals(app, theme))
+        .child(with_tooltip(
+            button("refresh-scan", "Refresh", ButtonVariant::Outline, cx)
+                .debug_selector(|| "refresh-scan".into())
+                .tab_stop(false)
+                .px(space::SM)
+                .py(space::XS)
+                .disabled(app.is_indexing())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.refresh_scan(cx);
+                    window.focus(&this.focus, cx);
+                })),
+            "Refresh the scanned root · r",
+        ));
     if app.find_open || !app.find.is_empty() {
         row = row.child(find_field(app, theme));
     }
@@ -1707,7 +1718,11 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         return div()
             .text_size(text::CAPTION)
             .text_color(theme.secondary)
-            .child("Live overview · incomplete · top-level contributions");
+            .child(if app.refresh_metric.is_some() {
+                "Refreshing · showing the previous scan"
+            } else {
+                "Live overview · incomplete · top-level contributions"
+            });
     }
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
@@ -1734,6 +1749,13 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
                 widgets::human_count(errors)
             )))
         })
+        .when(
+            matches!(
+                app.freshness,
+                Some(disktree_scanner::Freshness::Fresh { .. })
+            ),
+            |this| this.child("· cached"),
+        )
 }
 
 /// The key to the colours: the categories, or the age ramp in age mode.
@@ -2929,7 +2951,14 @@ fn indexing_progress(
         .gap(space::XS)
         .text_size(text::BODY)
         .text_color(theme.foreground)
-        .child(widgets::eyebrow("Indexing", cx))
+        .child(widgets::eyebrow(
+            if app.refresh_metric.is_some() {
+                "Refreshing"
+            } else {
+                "Indexing"
+            },
+            cx,
+        ))
         .child(div().h(size::PROGRESS_ROW).truncate().child(
             if app.remote.is_some() {
                 app.remote_progress.stage.label()

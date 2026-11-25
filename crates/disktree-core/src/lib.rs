@@ -12,10 +12,6 @@ pub mod export;
 pub mod filter;
 pub mod identity;
 pub mod insights;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(windows)]
-mod mft;
 pub mod path_style;
 pub mod payload;
 pub mod remote;
@@ -25,10 +21,9 @@ mod remote_walk;
 pub mod removal;
 pub mod scan;
 pub mod scan_preview;
-pub mod scan_threads;
 pub mod size;
 pub mod space;
 pub mod tree;
 pub mod treemap;
 #[cfg(windows)]
-mod windows;
+pub(crate) use disktree_scanner::windows;

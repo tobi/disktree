@@ -18,13 +18,19 @@ use disktree_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
     detect_trash_backend, plan,
 };
-use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
+use disktree_core::scan::{
+    Known, ScanHandle, ScanOptions, ScanSnapshot, ScanUpdate, arena_to_node,
+    node_to_arena,
+};
 use disktree_core::space::{
     SpaceInfo, device_for, space_info, volume_root_for,
 };
 use disktree_core::tree::{Metric, Node, path_of};
 use disktree_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
+};
+use disktree_scanner::{
+    CachePolicy, Freshness, Scanner, StorageMode, TreeArena,
 };
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::{
@@ -359,9 +365,14 @@ pub struct Disktree {
     /// to toggle, not a press outside the menu that closes it first.
     pub power_hover: bool,
     pub cpu_threads: usize,
+    scanner: Scanner,
+    pub arena: Option<Arc<TreeArena>>,
+    pub freshness: Option<Freshness>,
     pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
     pub scan_epoch: u64,
+    /// Metric of a background refresh, or `None` for a normal scan.
+    pub refresh_metric: Option<Metric>,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
 
@@ -538,6 +549,15 @@ impl Disktree {
             None
         };
         let trash_backend = detect_trash_backend();
+        let scanner = if cfg!(test) {
+            Scanner::new(StorageMode::InMemory, CachePolicy::default())
+                .expect("in-memory scanner")
+        } else {
+            Scanner::open_default().unwrap_or_else(|_| {
+                Scanner::new(StorageMode::InMemory, CachePolicy::default())
+                    .expect("in-memory fallback scanner")
+            })
+        };
         let mut tree = Self {
             root_path,
             remote,
@@ -556,9 +576,13 @@ impl Disktree {
             power_menu: None,
             power_hover: false,
             cpu_threads: crate::power::cpu_threads(),
+            scanner,
+            arena: None,
+            freshness: None,
             tree: None,
             scan: None,
             scan_epoch: 0,
+            refresh_metric: None,
             progress: ScanSnapshot::default(),
             scan_error: None,
             screen: Screen::Explore,
@@ -687,6 +711,7 @@ impl Disktree {
             app.options.metric,
             app.path_style(),
         );
+        app.arena = Some(Arc::new(node_to_arena(app.root_path.clone(), &tree)));
         app.tree = Some(Arc::new(tree));
         app.cache = None;
         app.refresh_insights();
@@ -736,6 +761,7 @@ impl Disktree {
             scan.cancel();
         }
         self.scan_epoch += 1;
+        self.refresh_metric = None;
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
         self.scan_error = None;
@@ -743,15 +769,19 @@ impl Disktree {
         self.scan_elapsed = None;
         self.scan_root.clone_from(&above);
         self.remember();
+        let known_path = self
+            .root_path
+            .canonicalize()
+            .unwrap_or_else(|_| self.root_path.clone());
+        let arena = self.arena.clone().unwrap_or_else(|| {
+            Arc::new(node_to_arena(known_path.clone(), &tree))
+        });
         let known = Known {
-            path: self.root_path.clone(),
-            tree,
+            path: known_path,
+            arena,
         };
-        self.scan = Some(ScanHandle::spawn_with(
-            above,
-            self.options.clone(),
-            Some(known),
-        ));
+        self.scan =
+            Some(ScanHandle::spawn_with(above, self.options, Some(known)));
         Self::poll_scan(epoch, cx);
         cx.notify();
     }
@@ -1209,6 +1239,7 @@ impl Disktree {
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
         self.scan_preview = None;
+        self.refresh_metric = None;
         if self.remote_scan.take().is_some() {
             self.scan_epoch += 1;
             self.progress.cancelled = true;
@@ -1243,7 +1274,7 @@ impl Disktree {
             cx.notify();
             return;
         }
-        self.options.threads = preset.policy(self.cpu_threads);
+        self.options.threads = Some(preset.threads(self.cpu_threads));
         self.power_choice = Some(preset);
         let label = preset.label(self.cpu_threads);
         self.notice = Some(match self.power_settings_path.as_deref() {
@@ -1331,8 +1362,86 @@ impl Disktree {
         true
     }
 
-    /// Start a fresh scan, abandoning any walk still in progress.
+    /// Refresh the whole scanned root in the background. Keeping its old tree
+    /// visible also preserves hardlink accounting across the current view and
+    /// the rest of the root; a subtree-only scan could charge a link twice.
+    pub fn refresh_scan(&mut self, cx: &mut Context<'_, Self>) {
+        if self.tree.is_none() {
+            self.start_scan_with_policy(
+                CachePolicy {
+                    force_refresh: true,
+                    ..CachePolicy::default()
+                },
+                cx,
+            );
+            return;
+        }
+        if self.is_indexing() {
+            return;
+        }
+        self.scan_epoch += 1;
+        let epoch = self.scan_epoch;
+        self.refresh_metric = Some(self.options.metric);
+        self.progress = ScanSnapshot::default();
+        self.remote_progress =
+            disktree_core::remote_progress::Progress::default();
+        self.scan_error = None;
+        self.scan_preview = None;
+        self.preview_updated = None;
+        self.scan_started = Some(Instant::now());
+        self.scan_elapsed = None;
+        self.scan_root.clone_from(&self.root_path);
+        if let Some(host) = &self.remote {
+            let request = disktree_core::remote::Request {
+                root: Some(self.root_path.clone()),
+                disk: self.remote_disk,
+                options: self.options,
+            };
+            match disktree_core::remote::RemoteScan::spawn(host, &request) {
+                Ok(scan) => self.remote_scan = Some(scan),
+                Err(error) => {
+                    self.refresh_metric = None;
+                    self.scan_error = Some(error.to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            let policy = CachePolicy {
+                force_refresh: true,
+                ..CachePolicy::default()
+            };
+            match ScanHandle::spawn_session(
+                &self.scanner,
+                self.root_path.clone(),
+                self.options,
+                policy,
+            ) {
+                Ok(scan) => self.scan = Some(scan),
+                Err(error) => {
+                    self.refresh_metric = None;
+                    self.scan_error = Some(error.to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        Self::poll_scan(epoch, cx);
+        cx.notify();
+    }
+
+    /// Start a scan, serving fresh/stale cache immediately via SWR when
+    /// available and abandoning any walk still in progress.
     pub fn start_scan(&mut self, cx: &mut Context<'_, Self>) {
+        self.start_scan_with_policy(CachePolicy::default(), cx);
+    }
+
+    fn start_scan_with_policy(
+        &mut self,
+        policy: CachePolicy,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.refresh_metric = None;
         if self.awaiting_root {
             self.open_volumes(cx);
             return;
@@ -1353,6 +1462,8 @@ impl Disktree {
             self.remember();
         }
         discard(self.tree.take());
+        self.arena = None;
+        self.freshness = None;
         self.crumbs.clear();
         self.selected = None;
         self.hovered = None;
@@ -1371,7 +1482,7 @@ impl Disktree {
                 root: (!self.root_path.as_os_str().is_empty())
                     .then(|| self.root_path.clone()),
                 disk: self.remote_disk,
-                options: self.options.clone(),
+                options: self.options,
             };
             match disktree_core::remote::RemoteScan::spawn(host, &request) {
                 Ok(scan) => {
@@ -1383,12 +1494,24 @@ impl Disktree {
             cx.notify();
             return;
         }
-        self.scan = Some(ScanHandle::spawn(
+        match ScanHandle::spawn_session(
+            &self.scanner,
             self.root_path.clone(),
-            self.options.clone(),
-        ));
-        Self::poll_scan(epoch, cx);
-        cx.notify();
+            self.options,
+            policy,
+        ) {
+            Ok(scan) => {
+                self.scan = Some(scan);
+                // Drain any instant cache hit so warm launches paint on frame 1.
+                if self.poll_scan_once(epoch, cx) {
+                    Self::poll_scan(epoch, cx);
+                }
+            }
+            Err(error) => {
+                self.scan_error = Some(error.to_string());
+                cx.notify();
+            }
+        }
     }
 
     fn poll_scan(epoch: u64, cx: &Context<'_, Self>) {
@@ -1449,6 +1572,14 @@ impl Disktree {
             };
             match outcome {
                 Ok(snapshot) => {
+                    let refresh_paths = self.refresh_metric.map(|_| {
+                        (
+                            self.current_path(),
+                            self.selected
+                                .as_deref()
+                                .and_then(|c| self.path_at(c)),
+                        )
+                    });
                     self.root_path = snapshot.header.root;
                     self.home = snapshot.header.home;
                     self.disk_root = snapshot.header.disk_root;
@@ -1459,15 +1590,19 @@ impl Disktree {
                         format!("{host} · read-only · space at scan")
                     });
                     let node = snapshot.tree;
-                    self.marks.refresh(
-                        &self.root_path,
-                        &node,
-                        self.options.metric,
-                        self.path_style(),
-                    );
-                    self.tree = Some(Arc::new(node));
-                    self.refresh_insights();
-                    self.select_largest(cx);
+                    if let Some((directory, selected)) = refresh_paths {
+                        self.install_refresh(node, &directory, selected, cx);
+                    } else {
+                        self.marks.refresh(
+                            &self.root_path,
+                            &node,
+                            self.options.metric,
+                            self.path_style(),
+                        );
+                        self.tree = Some(Arc::new(node));
+                        self.refresh_insights();
+                        self.select_largest(cx);
+                    }
                     self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
                 }
                 Err(error) => {
@@ -1475,6 +1610,7 @@ impl Disktree {
                 }
             }
             self.remote_scan = None;
+            self.refresh_metric = None;
             self.scan_preview = None;
             self.progress.finished = true;
             cx.notify();
@@ -1494,56 +1630,184 @@ impl Disktree {
                 self.preview_updated = Some(Instant::now());
             }
         }
-        let Some(outcome) = scan.poll() else {
+        let Some(update) = scan.poll_update() else {
             cx.notify();
             return true;
         };
-        match outcome {
-            Ok(node) => {
-                // A widening scan lands on a new root: move the view up to it,
-                // with the directory it came from selected.
-                let came_from = (self.scan_root != self.root_path)
-                    .then(|| self.root_path.clone());
-                if came_from.is_some() {
-                    self.clear_filter();
-                    self.root_path.clone_from(&self.scan_root);
-                    self.space = space_info(&self.root_path).ok();
-                    self.device = device_for(&self.root_path);
-                    self.file_table = file_table_readable(&self.root_path);
+        match update {
+            ScanUpdate::Cached {
+                arena,
+                node,
+                freshness,
+            } => {
+                let is_fresh = matches!(freshness, Freshness::Fresh { .. });
+                self.arena = Some(arena);
+                self.freshness = Some(freshness);
+                self.install_tree(node, false, cx);
+                if is_fresh {
+                    self.scan = None;
+                    self.refresh_metric = None;
+                    self.scan_preview = None;
+                    self.progress.finished = true;
+                    cx.notify();
+                    return false;
                 }
-                let metric = self.options.metric;
-                self.marks.refresh(
-                    &self.root_path,
-                    &node,
-                    metric,
-                    self.path_style(),
-                );
-                discard(self.tree.replace(Arc::new(node)));
-                self.cache = None;
-                self.refresh_insights();
+                // Stale/partial SWR hit: paint immediately and keep polling
+                // for the live background revalidation.
+                self.refresh_metric = Some(self.options.metric);
+                cx.notify();
+                return true;
+            }
+            ScanUpdate::Live { arena, node }
+                if self.refresh_metric.is_some() =>
+            {
+                let directory = self.current_path();
+                let selected =
+                    self.selected.as_deref().and_then(|c| self.path_at(c));
+                self.arena = Some(arena);
+                self.freshness = Some(Freshness::Live {
+                    scanned_at: disktree_scanner::unix_now(),
+                });
+                self.install_refresh(node, &directory, selected, cx);
                 self.scan_elapsed =
                     self.scan_started.map(|started| started.elapsed());
-                if let Some(from) = came_from {
-                    let crumbs = self.crumbs_for_path(&from);
-                    self.crumbs.clear();
-                    self.view = View::default();
-                    self.transition = None;
-                    self.forget_hover();
-                    self.selected = crumbs.and_then(|crumbs| {
-                        crumbs.first().map(|&top| vec![top])
-                    });
-                }
-                self.keep_selection_valid();
-                self.prune_history();
-                self.select_largest(cx);
             }
-            Err(error) => self.scan_error = Some(error.to_string()),
+            ScanUpdate::Live { arena, node } => {
+                let came_from = self.scan_root != self.root_path;
+                self.arena = Some(arena);
+                self.freshness = Some(Freshness::Live {
+                    scanned_at: disktree_scanner::unix_now(),
+                });
+                self.install_tree(node, came_from, cx);
+            }
+            ScanUpdate::Error(error) => {
+                self.scan_error = Some(error.to_string());
+            }
+            ScanUpdate::Finished => {}
         }
         self.scan = None;
+        self.refresh_metric = None;
         self.scan_preview = None;
         self.progress.finished = true;
         cx.notify();
         false
+    }
+
+    fn install_tree(
+        &mut self,
+        node: Node,
+        widening: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let came_from = widening.then(|| self.root_path.clone());
+        if came_from.is_some() {
+            self.clear_filter();
+            self.root_path.clone_from(&self.scan_root);
+            self.space = space_info(&self.root_path).ok();
+            self.device = device_for(&self.root_path);
+            self.file_table = file_table_readable(&self.root_path);
+        }
+        let metric = self.options.metric;
+        self.marks
+            .refresh(&self.root_path, &node, metric, self.path_style());
+        discard(self.tree.replace(Arc::new(node)));
+        self.cache = None;
+        self.refresh_insights();
+        self.scan_elapsed = self.scan_started.map(|started| started.elapsed());
+        if let Some(from) = came_from {
+            let crumbs = self.crumbs_for_path(&from);
+            self.crumbs.clear();
+            self.view = View::default();
+            self.transition = None;
+            self.forget_hover();
+            self.selected =
+                crumbs.and_then(|crumbs| crumbs.first().map(|&top| vec![top]));
+        }
+        self.keep_selection_valid();
+        self.prune_history();
+        self.select_largest(cx);
+    }
+
+    /// Re-project the current `TreeArena` after toggling `apparent_size` or
+    /// `include_hidden` without rescanning disk.
+    pub fn toggle_hidden(&mut self, cx: &mut Context<'_, Self>) {
+        self.options.include_hidden = !self.options.include_hidden;
+        if self.remote.is_none()
+            && let Some(arena) = self.arena.clone()
+        {
+            self.reproject_arena(&arena, cx);
+        } else {
+            self.start_scan(cx);
+        }
+    }
+
+    /// Toggle allocated vs apparent sizes with zero rescan when backed by a
+    /// local `TreeArena`.
+    pub fn toggle_apparent_size(&mut self, cx: &mut Context<'_, Self>) {
+        self.options.apparent_size = !self.options.apparent_size;
+        if self.remote.is_none()
+            && let Some(arena) = self.arena.clone()
+        {
+            self.reproject_arena(&arena, cx);
+        } else {
+            self.start_scan(cx);
+        }
+    }
+
+    fn reproject_arena(
+        &mut self,
+        arena: &TreeArena,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let directory = self.current_path();
+        let selected = self.selected.as_deref().and_then(|c| self.path_at(c));
+        let node = arena_to_node(
+            arena,
+            self.options.apparent_size,
+            self.options.include_hidden,
+            self.options.dedup_hardlinks,
+            self.options.metric,
+        );
+        self.install_refresh(node, &directory, selected, cx);
+        self.select_largest(cx);
+    }
+
+    /// Reattach the view and selection by absolute path: sorting may have
+    /// changed every crumb while the old tree remained interactive.
+    fn install_refresh(
+        &mut self,
+        mut node: Node,
+        directory: &Path,
+        selected: Option<PathBuf>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.refresh_metric != Some(self.options.metric) {
+            disktree_core::tree::aggregate(&mut node, self.options.metric);
+        }
+        self.marks.refresh(
+            &self.root_path,
+            &node,
+            self.options.metric,
+            self.path_style(),
+        );
+        discard(self.tree.replace(Arc::new(node)));
+        self.clear_filter();
+        self.cache = None;
+        self.transition = None;
+        self.forget_hover();
+        self.git.clear();
+        self.git_pending.clear();
+        self.refresh_insights();
+        let style = self.path_style();
+        self.crumbs = style
+            .ancestors(directory)
+            .find_map(|path| self.crumbs_for_path(path))
+            .unwrap_or_default();
+        self.selected = selected
+            .and_then(|path| self.crumbs_for_path(&path))
+            .filter(|crumbs| crumbs.starts_with(&self.crumbs));
+        self.prune_history();
+        cx.notify();
     }
 
     fn keep_selection_valid(&mut self) {
@@ -1976,6 +2240,12 @@ impl Disktree {
         self.view = View::IDENTITY;
         self.transition = None;
         self.cache = None;
+        // Entering a directory while a background SWR refresh is running
+        // prioritizes that subtree first.
+        if let Some(scan) = &self.scan {
+            let target = self.current_path();
+            scan.prioritize(&target);
+        }
         cx.notify();
     }
 
@@ -2935,6 +3205,20 @@ impl Disktree {
             self.run = None;
             self.marks.clear();
             self.screen = Screen::Done;
+            // Invalidate every removed path in the cache DB so the follow-up
+            // scan refreshes them immediately while keeping untouched siblings
+            // fast.
+            let removed: Vec<PathBuf> = self
+                .run_log
+                .iter()
+                .filter(|(_, outcome)| outcome.is_ok())
+                .map(|(path, _)| path.clone())
+                .collect();
+            if !removed.is_empty() {
+                let _ = self
+                    .scanner
+                    .invalidate(&disktree_scanner::HostKey::Local, &removed);
+            }
             // The tree on screen is now wrong; start over rather than leaving
             // numbers that include what was just removed.
             self.start_scan(cx);
@@ -3461,17 +3745,11 @@ impl Disktree {
             "t" if !control => {
                 self.set_mode((self.mode_index() + 1) % 3, cx);
             }
-            "r" if !control => self.start_scan(cx),
+            "r" if !control => self.refresh_scan(cx),
             "g" if !control => self.go_to_disk(cx),
             "v" if !control && !shift => self.open_volumes(cx),
-            "i" if !control => {
-                self.options.include_hidden = !self.options.include_hidden;
-                self.start_scan(cx);
-            }
-            "d" if !control => {
-                self.options.apparent_size = !self.options.apparent_size;
-                self.start_scan(cx);
-            }
+            "i" if !control => self.toggle_hidden(cx),
+            "d" if !control => self.toggle_apparent_size(cx),
             "p" if !control => {
                 self.show_selection = !self.show_selection;
                 cx.notify();
@@ -3871,25 +4149,10 @@ pub fn restart_args(
     if options.metric == Metric::Files {
         args.push("files".into());
     }
-    args.push("--scan-threads".into());
-    args.push(options.threads.max_threads.to_string().into());
-    args.push(if options.threads.adaptive {
-        "--adaptive-threads".into()
-    } else {
-        "--fixed-threads".into()
-    });
-    args.push("--thread-throughput-percent".into());
-    args.push(
-        format!("{:.0}", options.threads.retained_throughput * 100.0).into(),
-    );
-    args.push("--thread-system-cpu-percent".into());
-    args.push(
-        format!(
-            "{:.0}",
-            options.threads.system_cpu_limit.unwrap_or(0.0) * 100.0
-        )
-        .into(),
-    );
+    if let Some(threads) = options.threads {
+        args.push("--scan-threads".into());
+        args.push(threads.to_string().into());
+    }
     args.push("--depth".into());
     args.push(depth.to_string().into());
     args.push(root.as_os_str().to_owned());

@@ -7,79 +7,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A volume's capacity in bytes.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-pub struct SpaceInfo {
-    /// Total size of the volume.
-    pub total: u64,
-    /// Free blocks, including the reserve only root may write to.
-    pub free: u64,
-    /// Free blocks this user may actually write; what `df -h` reports.
-    pub available: u64,
-}
-
-impl SpaceInfo {
-    /// Space in use, computed from `free` rather than `available` so the figure
-    /// does not jump when a reserve is opened to root.
-    pub const fn used(&self) -> u64 {
-        self.total.saturating_sub(self.free)
-    }
-
-    /// Share of the volume in use, `0.0..=1.0`.
-    pub fn used_fraction(&self) -> f32 {
-        if self.total == 0 {
-            0.0
-        } else {
-            (self.used() as f64 / self.total as f64) as f32
-        }
-    }
-
-    /// Free space after `bytes` are removed, saturating at the volume size and
-    /// never counting the same byte twice.
-    #[must_use]
-    pub fn after_removing(&self, bytes: u64) -> Self {
-        let available = self.available.saturating_add(bytes).min(self.total);
-        let free = self.free.saturating_add(bytes).min(self.total);
-        Self {
-            total: self.total,
-            free,
-            available,
-        }
-    }
-}
+pub use disktree_scanner::SpaceInfo;
 
 /// Read the space on the volume containing `path`.
-#[cfg(windows)]
 pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
-    crate::windows::space_info(path)
-}
-
-/// Read the space on the volume containing `path`.
-#[cfg(not(windows))]
-pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
-    let stat = rustix::fs::statvfs(path)?;
-    // `f_frsize` is the fragment size the block counts are expressed in;
-    // `f_bsize` is only a hint for I/O. Some filesystems report zero for
-    // `f_frsize`, so fall back rather than claiming a zero-sized volume.
-    let block = if stat.f_frsize == 0 {
-        stat.f_bsize
-    } else {
-        stat.f_frsize
-    };
-    Ok(SpaceInfo {
-        total: stat.f_blocks.saturating_mul(block),
-        free: stat.f_bfree.saturating_mul(block),
-        available: stat.f_bavail.saturating_mul(block),
-    })
+    disktree_scanner::space_info(path)
 }
 
 /// The volume a path is on, as Windows names it: `C:\`, a share, or the
@@ -395,6 +327,69 @@ pub fn mount_boundaries(mounts: &[Mount], root: &Path) -> Vec<PathBuf> {
         .filter(|mount| mount.point != root && mount.point.starts_with(root))
         .map(|mount| mount.point.clone())
         .collect()
+}
+
+/// Boundaries for a local scan.
+///
+/// Distinct Btrfs subvolumes on the same filesystem contribute to the same
+/// disk and should be visible together. Overlapping filesystem roots remain
+/// boundaries: they may be bind mounts or another view of the same data.
+/// Other mounts and recognized snapshot mounts stay out. When mountinfo
+/// cannot identify a view, keep the stricter boundary.
+pub fn local_mount_boundaries(
+    mounts: &[Mount],
+    views: &[MountView],
+    root: &Path,
+) -> Vec<PathBuf> {
+    let boundaries = mount_boundaries(mounts, root);
+    let views: Vec<_> = views
+        .iter()
+        .map(|view| {
+            let mut matching = mounts.iter().filter(|m| m.point == view.point);
+            let mount = matching.next();
+            // If the two kernel tables disagree, do not open that mount.
+            let trusted = matching.next().is_none()
+                && mount.is_some_and(|mount| {
+                    mount.fstype == view.fstype && mount.source == view.source
+                });
+            disktree_scanner::mounts::MountView {
+                point: view.point.clone(),
+                fs_root: view.fs_root.clone(),
+                fstype: view.fstype.clone(),
+                source: view.source.clone(),
+                snapshot: !trusted || mount.is_some_and(is_snapshot),
+            }
+        })
+        .collect();
+    let strict: rustc_hash::FxHashSet<_> = boundaries.iter().cloned().collect();
+    let retained =
+        disktree_scanner::mounts::local_boundaries(strict, &views, root);
+    boundaries
+        .into_iter()
+        .filter(|path| retained.contains(path))
+        .collect()
+}
+
+/// Local scan boundaries from this machine's mount namespace.
+pub fn local_mount_boundaries_for(root: &Path) -> Option<Vec<PathBuf>> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let mounts = mount_table()?;
+        // Without the filesystem roots, a bind mount cannot be distinguished
+        // from a subvolume. Keep every mount boundary rather than guessing.
+        let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return Some(mount_boundaries(&mounts, root));
+        };
+        Some(local_mount_boundaries(
+            &mounts,
+            &parse_mountinfo(&table),
+            root,
+        ))
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        mount_boundaries_for(root)
+    }
 }
 
 /// Boundaries from this machine's own mount namespace.
@@ -1136,6 +1131,62 @@ portal /run/user/1000/doc fuse.portal rw 0 0
         assert!(
             !volumes.iter().any(|volume| volume.point
                 == Path::new("/untriggered-disktree-autofs"))
+        );
+    }
+
+    #[test]
+    fn local_btrfs_scan_keeps_distinct_subvolumes_but_not_aliases_or_network() {
+        let mounts = parse_mounts(
+            "/dev/root / btrfs rw,subvol=/@ 0 0\n\
+             /dev/root /home-copy btrfs rw,subvol=/@home 0 0\n\
+             /dev/root /home btrfs rw,subvol=/@home 0 0\n\
+             /dev/root /bind btrfs rw,subvol=/@ 0 0\n\
+             /dev/root /.snapshots btrfs rw,subvol=/@snapshots 0 0\n\
+             /dev/other /external btrfs rw,subvol=/@data 0 0\n\
+             server:/share /nas nfs rw 0 0\n\
+             user@host:/ /ssh fuse.sshfs rw 0 0\n",
+        );
+        let views = parse_mountinfo(
+            "1 0 0:1 /@ / rw - btrfs /dev/root rw\n\
+             2 1 0:1 /@home /home rw - btrfs /dev/root rw\n\
+             3 1 0:1 /@home /home-copy rw - btrfs /dev/root rw\n\
+             4 1 0:1 /@/data /bind rw - btrfs /dev/root rw\n\
+             5 1 0:1 /@snapshots /.snapshots rw - btrfs /dev/root rw\n\
+             6 1 0:2 /@data /external rw - btrfs /dev/other rw\n\
+             7 1 0:3 / /nas rw - nfs server:/share rw\n\
+             8 1 0:4 / /ssh rw - fuse.sshfs user@host:/ rw\n",
+        );
+        let boundaries =
+            local_mount_boundaries(&mounts, &views, Path::new("/"));
+        assert!(!boundaries.contains(&PathBuf::from("/home")));
+        for path in [
+            "/home-copy",
+            "/bind",
+            "/.snapshots",
+            "/external",
+            "/nas",
+            "/ssh",
+        ] {
+            assert!(boundaries.contains(&PathBuf::from(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn local_scan_is_strict_without_mountinfo_or_for_other_filesystems() {
+        let mounts = parse_mounts(
+            "/dev/root / ext4 rw 0 0\n\
+             /dev/root /bind ext4 rw 0 0\n\
+             nas /network nfs rw 0 0\n",
+        );
+        let views = parse_mountinfo("1 0 0:1 / / rw - ext4 /dev/root rw\n");
+        let expected = mount_boundaries(&mounts, Path::new("/"));
+        assert_eq!(
+            local_mount_boundaries(&mounts, &views, Path::new("/")),
+            expected
+        );
+        assert_eq!(
+            local_mount_boundaries(&mounts, &[], Path::new("/")),
+            expected
         );
     }
 

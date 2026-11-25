@@ -3,8 +3,6 @@
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use disktree_core::scan_threads::ScanThreads;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PowerEfficiency {
     Miser,
@@ -78,15 +76,6 @@ impl PowerEfficiency {
             .count()
             .max(1)
     }
-
-    pub fn policy(self, cpus: usize) -> ScanThreads {
-        ScanThreads {
-            max_threads: self.threads(cpus),
-            adaptive: false,
-            system_cpu_limit: None,
-            ..ScanThreads::default()
-        }
-    }
 }
 
 pub fn workers(count: usize) -> String {
@@ -149,10 +138,7 @@ mod tests {
         for (preset, expected) in
             PowerEfficiency::ALL.into_iter().zip([2, 4, 8, 18])
         {
-            let policy = preset.policy(18);
-            assert_eq!(policy.max_threads, expected);
-            assert!(!policy.adaptive);
-            assert_eq!(policy.system_cpu_limit, None);
+            assert_eq!(preset.threads(18), expected);
             assert_eq!(preset.threads(1), 1);
         }
         assert_eq!(PowerEfficiency::Balanced.threads(3), 3);

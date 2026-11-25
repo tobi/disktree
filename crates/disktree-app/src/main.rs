@@ -86,13 +86,6 @@ options:
       --power-efficiency PRESET
                         miser, balanced (default), aggressive, drain-my-battery
       --scan-threads N  fixed scan workers, capped by available CPU count
-      --adaptive-threads
-                        experimental adaptive admission (opt-in)
-      --fixed-threads   disable adaptive admission and CPU governor
-      --thread-throughput-percent N
-                        retain this percent of sampled initial throughput (80)
-      --thread-system-cpu-percent N
-                        best-effort host CPU budget; 0 disables it (80)
       --metric files    rank by file count instead of bytes
   -h, --help            show this help
 ";
@@ -192,7 +185,7 @@ fn run() -> Result<()> {
             if native_look {
                 appearance::apply(cx.window_appearance(), cx);
             }
-            let options = args.options.clone();
+            let options = args.options;
             let root_for_app = root.clone();
             let window = cx
                 .open_window(
@@ -235,7 +228,7 @@ fn run() -> Result<()> {
                         cx.new(|cx| {
                             let mut app = if args.choose_root {
                                 Disktree::choose(
-                                    options.clone(),
+                                    options,
                                     depth,
                                     args.remote.clone(),
                                     cx,
@@ -243,7 +236,7 @@ fn run() -> Result<()> {
                             } else {
                                 Disktree::open(
                                     root_for_app.clone(),
-                                    options.clone(),
+                                    options,
                                     depth,
                                     args.remote.clone(),
                                     args.remote_disk,
@@ -311,7 +304,7 @@ fn parse_args_with_power(
 ) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions {
-        threads: preset.policy(power::cpu_threads()),
+        threads: Some(preset.threads(power::cpu_threads())),
         ..ScanOptions::default()
     };
     let mut power = Some(preset);
@@ -365,54 +358,17 @@ fn parse_args_with_power(
                     text(args.next(), "--power-efficiency needs a preset")?;
                 let preset = power::PowerEfficiency::parse(&value)
                     .context("unknown Power Efficiency preset")?;
-                options.threads = preset.policy(power::cpu_threads());
+                options.threads = Some(preset.threads(power::cpu_threads()));
                 power = Some(preset);
             }
             "--scan-threads" => {
                 power = None;
                 let value = text(args.next(), "--scan-threads needs a number")?;
-                options.threads.max_threads = value
+                let threads: usize = value
                     .parse()
                     .context("--scan-threads needs a positive integer")?;
-                anyhow::ensure!(
-                    options.threads.max_threads > 0,
-                    "--scan-threads must be positive"
-                );
-            }
-            "--fixed-threads" => {
-                options.threads.adaptive = false;
-                power = None;
-            }
-            "--adaptive-threads" => {
-                options.threads.adaptive = true;
-                options.threads.system_cpu_limit = Some(0.80);
-                power = None;
-            }
-            "--thread-throughput-percent" => {
-                let value = text(
-                    args.next(),
-                    "--thread-throughput-percent needs a number",
-                )?;
-                let percent: u8 = value
-                    .parse()
-                    .context("throughput percent must be 1 to 100")?;
-                anyhow::ensure!(
-                    (1..=100).contains(&percent),
-                    "throughput percent must be 1 to 100"
-                );
-                options.threads.retained_throughput =
-                    f64::from(percent) / 100.0;
-            }
-            "--thread-system-cpu-percent" => {
-                let value = text(
-                    args.next(),
-                    "--thread-system-cpu-percent needs a number",
-                )?;
-                let percent: u8 =
-                    value.parse().context("CPU percent must be 0 to 100")?;
-                anyhow::ensure!(percent <= 100, "CPU percent must be 0 to 100");
-                options.threads.system_cpu_limit =
-                    (percent > 0).then(|| f64::from(percent) / 100.0);
+                anyhow::ensure!(threads > 0, "--scan-threads must be positive");
+                options.threads = Some(threads);
             }
             "--metric" => {
                 let value = text(args.next(), "--metric needs a value")?;
@@ -547,30 +503,13 @@ mod argument_tests {
     }
 
     #[test]
-    fn adaptive_budget_and_fixed_override_are_explicit() {
+    fn worker_budget_defaults_and_override_are_explicit() {
         let args = parse_args(arguments(&[])).expect("defaults");
-        assert_eq!(
-            args.options.threads.max_threads,
-            4.min(power::cpu_threads())
-        );
-        assert!(!args.options.threads.adaptive);
-        let args = parse_args(arguments(&[
-            "--scan-threads",
-            "4",
-            "--fixed-threads",
-            "--thread-throughput-percent",
-            "85",
-            "--thread-system-cpu-percent",
-            "0",
-        ]))
-        .expect("custom");
-        assert_eq!(args.options.threads.max_threads, 4);
-        assert!(!args.options.threads.adaptive);
-        assert!(
-            (args.options.threads.retained_throughput - 0.85).abs()
-                < f64::EPSILON
-        );
-        assert_eq!(args.options.threads.system_cpu_limit, None);
+        assert_eq!(args.options.threads, Some(4.min(power::cpu_threads())));
+        let args =
+            parse_args(arguments(&["--scan-threads", "4"])).expect("custom");
+        assert_eq!(args.options.threads, Some(4));
+        assert!(args.power.is_none());
     }
 
     #[test]
@@ -603,7 +542,7 @@ mod argument_tests {
         .expect("remote arguments");
         assert_eq!(args.remote.as_deref(), Some("dev"));
         assert!(args.check);
-        assert_eq!(args.options.threads.max_threads, 4);
+        assert_eq!(args.options.threads, Some(4));
         assert_eq!(args.root, PathBuf::from("/only-on-the-remote-machine"));
         assert!(args.power.is_none());
         for root in ["relative", r"C:\Users", r"\srv"] {
@@ -638,25 +577,19 @@ mod argument_tests {
         let saved = power::load(&path).expect("load");
         let args = parse_args_with_power(arguments(&[]), saved).expect("saved");
         assert_eq!(args.power, Some(Power::Miser));
-        assert_eq!(
-            args.options.threads.max_threads,
-            2.min(power::cpu_threads())
-        );
+        assert_eq!(args.options.threads, Some(2.min(power::cpu_threads())));
         let args = parse_args_with_power(
             arguments(&["--power-efficiency", "drain-my-battery"]),
             saved,
         )
         .expect("override");
         assert_eq!(args.power, Some(Power::DrainMyBattery));
-        assert_eq!(args.options.threads.max_threads, power::cpu_threads());
-        let args = parse_args_with_power(
-            arguments(&["--scan-threads", "8", "--adaptive-threads"]),
-            saved,
-        )
-        .expect("experiment");
+        assert_eq!(args.options.threads, Some(power::cpu_threads()));
+        let args =
+            parse_args_with_power(arguments(&["--scan-threads", "8"]), saved)
+                .expect("override");
         assert!(args.power.is_none());
-        assert!(args.options.threads.adaptive);
-        assert_eq!(args.options.threads.max_threads, 8);
+        assert_eq!(args.options.threads, Some(8));
         assert_eq!(power::load(&path).expect("unchanged"), saved);
         assert!(
             parse_args(arguments(&["--power-efficiency", "invalid"])).is_err()
@@ -684,18 +617,13 @@ mod argument_tests {
         )
         .expect("native path");
         assert_eq!(args.root, dunce::canonicalize(root).expect("root"));
-        assert_eq!(args.options.threads.max_threads, 4);
+        assert_eq!(args.options.threads, Some(4));
     }
 
     #[test]
     fn invalid_worker_budgets_are_rejected() {
-        for extra in [
-            vec!["--scan-threads", "0"],
-            vec!["--scan-threads", "-1"],
-            vec!["--thread-throughput-percent", "0"],
-            vec!["--thread-throughput-percent", "101"],
-            vec!["--thread-system-cpu-percent", "101"],
-        ] {
+        for extra in [vec!["--scan-threads", "0"], vec!["--scan-threads", "-1"]]
+        {
             assert!(parse_args(arguments(&extra)).is_err());
         }
     }

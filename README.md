@@ -5,9 +5,9 @@
 Find what is filling a disk, mark what should go, and remove it — with the
 volume's free space in view the whole time.
 
-disktree is a treemap for Omarchy. Choose a local or SSH source, then a
-mounted volume or directory; no scan starts until you explicitly accept.
-It draws every directory as a nested mosaic sized by its real disk cost,
+disktree is a treemap for Omarchy. It starts by scanning your home directory;
+the location picker switches to another folder, volume or SSH source.
+It draws every directory as a nested mosaic sized by its disk usage,
 and lets you walk into it with the keyboard or the mouse. Mark as much as you
 like; nothing happens until you review the list and commit, and the permanent
 path always asks first.
@@ -300,7 +300,9 @@ tool-owned data. The remote helper itself has no delete operation.
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
   there (see below).
-- **Under it:** the scan totals, the filter when one is typed, and the legend.
+- **Under it:** the scan totals, **Refresh**, the filter when one is typed,
+  and the legend. Refresh rescans the whole scanned root in the background,
+  keeps the previous view visible, and updates marks when the scan lands.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches — at one muted
   level, lighter with depth. A diagonal hatch is space that can be had back
@@ -381,7 +383,7 @@ and shows how much free space was actually gained.
 | `t` | size, files or age: what areas and colours say |
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
-| `r` | scan again |
+| `r` | refresh the scanned root in the background |
 | `esc` while scanning | stop the scan |
 | `v` | choose a local/SSH source and root |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
@@ -409,9 +411,10 @@ escaped in the prompt, so it cannot pass for another path.
 
 ## What it measures
 
-- **Disk usage** by default: `st_blocks × 512`, the number `du` reports and the
-  space that actually comes back when a file is deleted. Apparent size (what
-  `ls -l` shows) is one toggle away.
+- **Disk usage** by default: `st_blocks × 512`, the number `du` reports.
+  Apparent size (what `ls -l` shows) is one toggle away. On Btrfs, compression,
+  reflinks and snapshots mean these totals and the removal projection can
+  differ from actual physical usage and the space freed by a deletion.
 - **Hardlinks once.** Two names for one inode cost one file.
 - **Hidden entries included**, because `~/.cache` is often the biggest thing in
   a home directory. Symlinks are not followed.
@@ -470,11 +473,12 @@ outside `~` (on this machine, seconds instead of a full rescan). The current
 view stays on screen until the wider tree lands, which then opens with the
 directory you came from selected. Going back down is just navigation.
 
-By default a scan stops at **every nested mount point**, including bind
-mounts and same-device btrfs subvolumes. Boundaries are checked by path,
-before metadata or directory reads, so an automounted NAS is not activated
-just to measure its parent. Choose `/home`, `/var/log`, or another mount as
-its own root rather than implicitly traversing it from `/`.
+Local Linux scans include distinct Btrfs subvolumes on the same filesystem,
+so a `/` scan includes Omarchy's `/home`. Overlapping mount views, known
+snapshot mounts, other disks and network filesystems remain excluded. Mount
+boundaries are checked by path before reading a directory, so an automounted
+NAS is not activated just to measure its parent. Remote scans still stop at
+every nested mount; select another mount as its own root.
 
 Local `-X` explicitly crosses mounts; remote streaming scans reject it.
 A local mark on another volume is still removed, but is not added to the

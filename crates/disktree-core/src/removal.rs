@@ -1739,7 +1739,7 @@ mod tests {
             one_filesystem: false,
             ..crate::scan::ScanOptions::default()
         };
-        let tree = crate::scan::scan(scan_root, options.clone()).expect("scan");
+        let tree = crate::scan::scan(scan_root, options).expect("scan");
         for name in ["one", "two", "original"] {
             assert!(
                 tree.children.iter().any(|child| &*child.name == name),

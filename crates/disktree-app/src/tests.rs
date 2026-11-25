@@ -1777,6 +1777,111 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     assert_eq!(hatched, 1, "exactly the marked tile is hatched");
 }
 
+#[gpui_kit::test]
+fn refresh_button_rescans_and_keeps_the_view_and_marks_by_path(
+    cx: &mut TestAppContext,
+) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let junk = temp.path().join("junk");
+    let blob = junk.join("blob.bin");
+    update(&view, cx, |app, cx| {
+        let directory = app.crumbs_for_path(&junk).unwrap();
+        app.go_to(directory, cx);
+        let selected = app.crumbs_for_path(&blob).unwrap();
+        app.select(Some(selected), cx);
+        app.toggle_mark_selected(cx);
+    });
+    std::fs::write(&blob, vec![b'x'; 400_000]).unwrap();
+    std::fs::write(junk.join("new.bin"), vec![b'x'; 500_000]).unwrap();
+    std::fs::write(temp.path().join("keep/new.bin"), b"outside view").unwrap();
+    draw(cx);
+    let button = cx.debug_bounds("refresh-scan").expect("refresh button");
+    cx.simulate_click(button.center(), Modifiers::none());
+    read(&view, cx, |app| {
+        assert!(app.scan.is_some());
+        assert!(app.refresh_metric.is_some());
+        assert!(app.tree().is_some(), "the previous tree stays visible");
+        assert_eq!(app.current_path(), junk);
+    });
+    finish_scan(&view, cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.current_path(), junk);
+        let selected = app.selected.as_deref().and_then(|c| app.path_at(c));
+        assert_eq!(selected.as_deref(), Some(blob.as_path()));
+        assert_eq!(app.marks.items()[0].path, blob);
+        assert_eq!(app.marks.items()[0].bytes, 400_000);
+        assert!(app.crumbs_for_path(&junk.join("new.bin")).is_some());
+        assert!(
+            app.crumbs_for_path(&temp.path().join("keep/new.bin"))
+                .is_some(),
+            "refresh rescans the whole root, not just the visible directory"
+        );
+        assert!(app.refresh_metric.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn toggling_hidden_and_apparent_reprojects_arena_without_rescanning(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    assert!(read(&view, cx, |app| app
+        .tree()
+        .unwrap()
+        .child_named(".cache")
+        .is_some()));
+
+    update(&view, cx, Disktree::toggle_hidden);
+    read(&view, cx, |app| {
+        assert!(!app.options.include_hidden);
+        assert_eq!(app.scan_epoch, epoch, "no rescan triggered");
+        assert!(app.scan.is_none());
+        assert!(app.tree().unwrap().child_named(".cache").is_none());
+    });
+
+    update(&view, cx, Disktree::toggle_hidden);
+    read(&view, cx, |app| {
+        assert!(app.options.include_hidden);
+        assert_eq!(app.scan_epoch, epoch, "still no rescan");
+        assert!(app.tree().unwrap().child_named(".cache").is_some());
+    });
+
+    update(&view, cx, Disktree::toggle_apparent_size);
+    read(&view, cx, |app| {
+        assert!(!app.options.apparent_size);
+        assert_eq!(app.scan_epoch, epoch, "apparent toggle needs no rescan");
+        assert!(app.scan.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn cancelling_a_refresh_keeps_the_previous_complete_tree(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let before = read(&view, cx, |app| app.tree().unwrap().bytes);
+    std::fs::write(temp.path().join("new.bin"), b"new").unwrap();
+    update(&view, cx, |app, cx| {
+        app.refresh_scan(cx);
+        assert!(app.scan.is_some());
+        app.cancel_scan(cx);
+        assert!(app.refresh_metric.is_none());
+    });
+    read(&view, cx, |app| {
+        assert_eq!(app.tree().unwrap().bytes, before);
+        assert!(app.crumbs_for_path(&temp.path().join("new.bin")).is_none());
+    });
+}
+
 /// Drive the scan the view started until its outcome has been applied.
 ///
 /// The scan is what is waited on, not the tree: widening keeps the old tree
@@ -2363,32 +2468,20 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         include_hidden: false,
         one_filesystem: false,
         metric: Metric::Files,
-        threads: disktree_core::scan_threads::ScanThreads {
-            max_threads: 8,
-            adaptive: true,
-            retained_throughput: 0.85,
-            system_cpu_limit: Some(0.70),
-        },
+        threads: Some(8),
         ..ScanOptions::default()
     };
-    for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
+    let default_with_threads = ScanOptions {
+        threads: Some(4.min(crate::power::cpu_threads())),
+        ..ScanOptions::default()
+    };
+    for (options, depth) in [(changed, 5), (default_with_threads, 1)] {
         let args = crate::state::restart_args(&options, depth, &root);
         let parsed = crate::parse_args(args.into_iter()).expect("parses");
         assert_eq!(parsed.root, root);
         assert_eq!(parsed.depth, depth);
         let got = &parsed.options;
-        assert_eq!(got.threads.max_threads, options.threads.max_threads);
-        assert_eq!(got.threads.adaptive, options.threads.adaptive);
-        assert!(
-            (got.threads.retained_throughput
-                - options.threads.retained_throughput)
-                .abs()
-                < f64::EPSILON
-        );
-        assert_eq!(
-            got.threads.system_cpu_limit,
-            options.threads.system_cpu_limit
-        );
+        assert_eq!(got.threads, options.threads);
         assert_eq!(
             (
                 got.apparent_size,
@@ -2439,10 +2532,9 @@ fn power_efficiency_menu_saves_without_discarding_the_tree(
         read(&view, cx, |app| {
             assert_eq!(app.power_choice, Some(preset));
             assert_eq!(
-                app.options.threads.max_threads,
-                preset.threads(app.cpu_threads)
+                app.options.threads,
+                Some(preset.threads(app.cpu_threads))
             );
-            assert!(!app.options.threads.adaptive);
             assert!(app.power_menu.is_none());
             assert_eq!(app.scan_epoch, epoch);
             assert!(app.tree.is_some());
@@ -2515,7 +2607,7 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     press(cx, "enter");
     read(&view, cx, |app| {
         assert_eq!(app.power_choice, Some(Power::Miser));
-        assert_eq!(app.options.threads.max_threads, 2);
+        assert_eq!(app.options.threads, Some(2));
         assert!(app.power_menu.is_none());
     });
 

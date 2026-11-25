@@ -40,7 +40,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
 };
 
-use crate::space::SpaceInfo;
+use crate::types::SpaceInfo;
 
 /// Bytes the file system fills per call: some hundreds of entries.
 const BUFFER_BYTES: usize = 64 * 1024;

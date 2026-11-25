@@ -1,0 +1,27 @@
+[package]
+name = "disktree-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fast terminal disk usage explorer (Ratatui TUI + JSON) backed by disktree-scanner"
+
+[[bin]]
+name = "disktree-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+disktree-scanner = { workspace = true }
+ratatui = "0.29"
+rustc-hash = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

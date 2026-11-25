@@ -1,0 +1,75 @@
+// Canonical Protobuf schema reference for disktree-scanner's cache DB and
+// wire frames. Hand-mirrored in `src/proto.rs` via `#[derive(prost::Message)]`
+// so builds never require `protoc` or `build.rs` codegen.
+
+syntax = "proto3";
+package disktree.scanner.v1;
+
+message DbHeader {
+  uint32 format_version = 1;
+  uint64 created_at_unix = 2;
+  uint32 codec = 3; // 0 = raw, 1 = lz4
+}
+
+message HostRecord {
+  string host_key = 1;
+  string hostname = 2;
+  string machine_id = 3;
+  string platform = 4;
+  uint32 path_style = 5; // 0 = Posix, 1 = Windows
+  uint64 updated_at_unix = 6;
+}
+
+// Lightweight whole-FS directory catalog entry for O(1) skip checks,
+// partial-scan grafting, and instant stale summaries.
+message DirIndexEntry {
+  uint64 dir_id = 1;
+  uint64 parent_id = 2;          // 0 for filesystem root
+  string name = 3;               // single path component
+  uint64 scanned_at_unix = 4;    // 0 if unscanned stub or invalidated
+  uint32 coverage = 5;           // 0=Stub, 1=Complete, 2=Shallow, 3=MountBoundary, 4=ReadError
+  uint32 scanned_max_depth = 6;  // 0 = unlimited
+  uint32 options_mask = 7;       // follow_links, one_filesystem, etc.
+  uint64 mount_dev = 8;
+  int64  dir_mtime = 9;
+  uint64 chunk_id = 10;          // 0 if stub or packed inside an ancestor chunk
+  // Derived rollups for instant summary queries:
+  uint64 allocated_bytes = 11;
+  uint64 apparent_bytes = 12;
+  uint64 files = 13;
+  uint32 dirs = 14;
+  int64  newest_mtime = 15;
+}
+
+// Prefix-trie linearized (front-coded) string table.
+// Entries are sorted lexicographically and stored as repeated:
+//   (shared_prefix_len: varint, suffix_len: varint, suffix_bytes)
+message FrontCodedStrings {
+  uint32 count = 1;
+  bytes  encoded = 2;
+}
+
+// Columnar (SoA) subtree chunk in DFS preorder.
+message SubtreeChunk {
+  uint64 chunk_id = 1;
+  uint64 root_dir_id = 2;
+  uint64 scanned_at_unix = 3;
+  int64  base_mtime = 4;
+  FrontCodedStrings strings = 5;
+
+  repeated uint32 name_ids = 6 [packed = true];
+  repeated uint32 child_counts = 7 [packed = true];
+  repeated uint32 flags = 8 [packed = true];
+  repeated uint64 allocated_bytes = 9 [packed = true];
+  repeated sint64 apparent_deltas = 10 [packed = true];
+  repeated sint64 mtime_deltas = 11 [packed = true];
+
+  // Sparse multi-link files only (nlink > 1).
+  repeated uint32 hardlink_node_idx = 12 [packed = true];
+  repeated uint64 hardlink_devs = 13 [packed = true];
+  repeated uint64 hardlink_inos = 14 [packed = true];
+
+  // External child shard references matching preorder nodes whose
+  // external_shard_ref flag bit is set.
+  repeated uint64 external_dir_ids = 15 [packed = true];
+}

@@ -1,0 +1,38 @@
+[package]
+name = "disktree-scanner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "High-efficiency disk space scanner with Protobuf cache DB, prefix-trie string compression, and priority-interruptible SWR"
+
+[lints]
+workspace = true
+
+[features]
+default = ["cache-db"]
+cache-db = ["dep:redb"]
+
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
+prost = "0.13"
+rayon = { workspace = true }
+redb = { version = "2", optional = true }
+rustc-hash = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(not(windows))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
