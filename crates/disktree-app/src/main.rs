@@ -66,12 +66,13 @@ Remote sessions are read-only: mark, export list/prompt/delete script.
 Use --check with ssh to deploy and scan without opening a window.
 
 arguments:
-  PATH              explicit directory to scan; omitted opens root selection
+  PATH              directory to scan (default: your home directory)
 
-Without PATH, choose this computer or SSH, then a mount or directory.
-No scan starts before explicit acceptance. Nested mounts are excluded.
-With PATH the window scans it directly, largest first. Space marks the
-selected tile, Enter opens it, c reviews the marked list, ? lists every key.
+Without PATH, disktree scans your home directory directly, largest first.
+Press v (or click the source button) to switch folders, disks, or an SSH host.
+With `disktree ssh HOST` and no PATH, root selection opens for that host.
+Space marks the selected tile, Enter opens it, c reviews the marked list,
+? lists every key.
 
 options:
   -a, --apparent-size   measure apparent length instead of allocated blocks
@@ -81,7 +82,7 @@ options:
   -X, --cross-filesystems
                         also measure other disks, network shares and pseudo
                         filesystems mounted below PATH (local only; off by default)
-  -d, --depth N         how many levels to draw at once (1-6, default 3)
+  -d, --depth N         how many levels to draw at once (1-6, default 4)
       --power-efficiency PRESET
                         miser, balanced (default), aggressive, drain-my-battery
       --scan-threads N  fixed scan workers, capped by available CPU count
@@ -314,7 +315,7 @@ fn parse_args_with_power(
         ..ScanOptions::default()
     };
     let mut power = Some(preset);
-    let mut depth = 3_u32;
+    let mut depth = 4_u32;
     let mut disk = false;
     // `std::env::args` panics on a name that is not Unicode, and a path is
     // any name: a restart as administrator hands the root back exactly as
@@ -440,7 +441,7 @@ fn parse_args_with_power(
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let choose_root = root.is_none() && !disk && !check;
+    let choose_root = remote.is_some() && root.is_none() && !disk && !check;
     if remote.is_some() {
         // SSH hosts are Unix: a root such as `C:\x` names nothing there, and
         // a relative one would be resolved against an unknown directory.
@@ -573,11 +574,11 @@ mod argument_tests {
     }
 
     #[test]
-    fn no_implicit_root_requires_selection_but_explicit_scans_do_not() {
+    fn local_defaults_to_home_while_bare_ssh_asks_for_a_root() {
         let parse = |args: &[&str]| {
             parse_args(args.iter().map(std::ffi::OsString::from)).unwrap()
         };
-        assert!(parse(&[]).choose_root);
+        assert!(!parse(&[]).choose_root);
         assert!(parse(&["ssh", "dev"]).choose_root);
         assert!(!parse(&["."]).choose_root);
         assert!(!parse(&["--disk"]).choose_root);

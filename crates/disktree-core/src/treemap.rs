@@ -127,7 +127,7 @@ pub struct LayoutOptions {
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
-            max_depth: 3,
+            max_depth: 4,
             padding: 1.0,
             min_tile: 5.0,
             max_children: 96,

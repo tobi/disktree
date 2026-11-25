@@ -565,7 +565,7 @@ windowrule = size 1400 900, class:^(disktree)$
 ## Develop
 
 ```sh
-make run      # release build, opening the source/root chooser
+make run      # release build, scanning your home directory
 make lint     # rustfmt --check, then clippy with every warning an error
 make test     # scanner, layout and removal tests, plus window-harness tests
 make test-ssh # real localhost SSH scans/errors; Linux, bun + openssh required

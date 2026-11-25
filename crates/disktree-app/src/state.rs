@@ -28,9 +28,10 @@ use disktree_core::treemap::{
 };
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, NavigationDirection, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, Size, Window, px, size,
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    NavigationDirection, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    Size, Window, px, size,
 };
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -467,6 +468,7 @@ pub struct Disktree {
     pub volumes_open: bool,
     pub volumes_loading: bool,
     pub awaiting_root: bool,
+    pub picker_remote_tab: bool,
     pub volumes_source: Option<String>,
     pub volumes_error: Option<String>,
     pub picker_error: Option<String>,
@@ -623,6 +625,7 @@ impl Disktree {
             volumes_open: false,
             volumes_loading: false,
             awaiting_root: !start,
+            picker_remote_tab: false,
             volumes_source: None,
             volumes_error: None,
             picker_error: None,
@@ -761,6 +764,7 @@ impl Disktree {
             return;
         }
         self.volumes_open = true;
+        self.picker_remote_tab = self.remote.is_some();
         self.picker_host = None;
         self.picker_path = None;
         self.focus_request = Some(FocusTarget::Dialog);
@@ -778,6 +782,7 @@ impl Disktree {
         self.volume_epoch += 1;
         let epoch = self.volume_epoch;
         self.roots_job = None;
+        self.picker_remote_tab = host.is_some();
         self.volumes_source.clone_from(&host);
         self.volumes.clear();
         self.volume_highlight = 0;
@@ -901,12 +906,13 @@ impl Disktree {
         }
         if self.picker_path.is_none() {
             let path = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("/absolute/path")
+                InputState::new(window, cx).placeholder("/path/to/folder")
             });
             cx.subscribe(&path, |this, _, event, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.choose_picker_path(cx);
                 }
+                cx.notify();
             })
             .detach();
             self.picker_path = Some(path);
@@ -914,10 +920,62 @@ impl Disktree {
     }
 
     pub fn picker_source_matches(&self, cx: &Context<'_, Self>) -> bool {
+        if self.picker_remote_tab && self.volumes_source.is_none() {
+            return false;
+        }
         self.picker_host.as_ref().is_none_or(|input| {
             input.read(cx).value().trim()
                 == self.volumes_source.as_deref().unwrap_or_default()
         })
+    }
+
+    pub fn picker_path_value(&self, cx: &Context<'_, Self>) -> String {
+        self.picker_path
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn picker_has_path(&self, cx: &Context<'_, Self>) -> bool {
+        !self.picker_path_value(cx).is_empty()
+    }
+
+    pub fn set_picker_tab(
+        &mut self,
+        remote: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.picker_remote_tab == remote {
+            return;
+        }
+        if !remote {
+            self.choose_local_source(window, cx);
+            return;
+        }
+        self.picker_remote_tab = true;
+        self.picker_error = None;
+        self.volumes_error = None;
+        if let Some(current_remote) = self.remote.clone() {
+            if let Some(host) = self.picker_host.clone() {
+                host.update(cx, |host, cx| {
+                    host.set_value(current_remote.clone(), window, cx);
+                });
+            }
+            self.load_volume_source(Some(current_remote), cx);
+        } else {
+            self.volume_epoch += 1;
+            self.roots_job = None;
+            self.volumes_loading = false;
+            self.volumes_source = None;
+            self.volumes.clear();
+            self.volume_highlight = 0;
+            if let Some(host) = self.picker_host.as_ref() {
+                let focus = host.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            cx.notify();
+        }
     }
 
     pub fn choose_local_source(
@@ -932,6 +990,7 @@ impl Disktree {
     }
 
     pub fn connect_picker(&mut self, cx: &mut Context<'_, Self>) {
+        self.picker_remote_tab = true;
         let host = self
             .picker_host
             .as_ref()
@@ -940,14 +999,48 @@ impl Disktree {
         self.load_volume_source(Some(host), cx);
     }
 
-    pub fn choose_picker_path(&mut self, cx: &mut Context<'_, Self>) {
-        let path = self
-            .picker_path
-            .as_ref()
-            .map(|input| PathBuf::from(input.read(cx).value().as_str()));
-        if let Some(path) = path {
-            self.choose_source_root(path, cx);
+    pub fn accept_picker(&mut self, cx: &mut Context<'_, Self>) {
+        if self.picker_has_path(cx) {
+            self.choose_picker_path(cx);
+        } else {
+            self.choose_volume(cx);
         }
+    }
+
+    pub fn browse_local_folder(&mut self, cx: &mut Context<'_, Self>) {
+        self.close_volumes(cx);
+        self.open_folder(cx);
+    }
+
+    pub fn choose_picker_path(&mut self, cx: &mut Context<'_, Self>) {
+        let raw = self.picker_path_value(cx);
+        if raw.is_empty() {
+            self.choose_source_root(PathBuf::new(), cx);
+            return;
+        }
+        let path = if self.volumes_source.is_none() {
+            expand_tilde(&raw)
+        } else {
+            PathBuf::from(raw)
+        };
+        self.choose_source_root(path, cx);
+    }
+
+    fn clear_machine_state(&mut self, local: bool) {
+        // Absolute paths only identify marks within one machine.
+        self.marks.clear();
+        self.history = History::default();
+        self.remote_identity = None;
+        self.remote_platform.clear();
+        self.git.clear();
+        self.git_pending.clear();
+        self.space = None;
+        self.space_baseline = None;
+        self.disk_root = None;
+        self.device = None;
+        self.full_disk_access = None;
+        self.file_table = false;
+        self.home = if local { std::env::home_dir() } else { None };
     }
 
     pub fn choose_source_root(
@@ -962,9 +1055,8 @@ impl Disktree {
             return;
         }
         if !self.picker_source_matches(cx) {
-            self.picker_error = Some(
-                "Connect SSH or choose This computer before scanning.".into(),
-            );
+            self.picker_error =
+                Some("Connect to the SSH host before scanning.".into());
             cx.notify();
             return;
         }
@@ -992,24 +1084,7 @@ impl Disktree {
         }
         self.picker_error = None;
         if self.remote != self.volumes_source {
-            // Absolute paths only identify marks within one machine.
-            self.marks.clear();
-            self.history = History::default();
-            self.remote_identity = None;
-            self.remote_platform.clear();
-            self.git.clear();
-            self.git_pending.clear();
-            self.space = None;
-            self.space_baseline = None;
-            self.disk_root = None;
-            self.device = None;
-            self.full_disk_access = None;
-            self.file_table = false;
-            self.home = if self.volumes_source.is_none() {
-                std::env::home_dir()
-            } else {
-                None
-            };
+            self.clear_machine_state(self.volumes_source.is_none());
         }
         self.remote.clone_from(&self.volumes_source);
         if self.remote.is_some() {
@@ -2983,10 +3058,11 @@ impl Disktree {
             && !self.volumes_open
     }
 
-    /// Ask for a directory and scan it: an app opened from the Dock has no
-    /// command line to name one.
+    /// Ask for a local directory and scan it: an app opened from the launcher
+    /// or Dock has no command line to name one, and this also switches back
+    /// from an SSH session cleanly.
     pub fn open_folder(&self, cx: &Context<'_, Self>) {
-        if self.remote.is_some() {
+        if !self.can_start_over() {
             return;
         }
         let chosen = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
@@ -3004,11 +3080,16 @@ impl Disktree {
             };
             // Canonical, like a root from the command line, so a later
             // widening recognises this tree in the wider walk.
-            let path = path.canonicalize().unwrap_or(path);
+            let path = dunce::canonicalize(&path).unwrap_or(path);
             // The panel does not block the window: the review list or a
             // removal may have started while it was open.
             let _ = this.update(cx, |this, cx| {
                 if this.can_start_over() {
+                    if this.remote.is_some() {
+                        this.clear_machine_state(true);
+                        this.remote = None;
+                    }
+                    this.awaiting_root = false;
                     this.set_root(path, cx);
                 }
             });
@@ -3822,6 +3903,22 @@ pub fn now_seconds() -> i64 {
         .map_or(0, |since| {
             i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+/// Expand a leading `~` or `~/` against the local home directory.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if raw == "~"
+        && let Some(home) = std::env::home_dir()
+    {
+        return home;
+    }
+    if let Some(rest) =
+        raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"))
+        && let Some(home) = std::env::home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(raw)
 }
 
 /// Let go of a tree off the UI thread: freeing a disk's millions of nodes

@@ -885,8 +885,10 @@ fn is_volume_candidate(mount: &Mount) -> bool {
             | "devpts"
             | "devtmpfs"
             | "efivarfs"
+            | "fuse.gvfsd-fuse"
             | "fuse.portal"
             | "fusectl"
+            | "gvfsd-fuse"
             | "hugetlbfs"
             | "mqueue"
             | "nsfs"
@@ -1200,6 +1202,7 @@ bpf /sys/fs/bpf bpf rw 0 0
 efivarfs /sys/firmware/efi/efivars efivarfs rw 0 0
 devtmpfs /dev devtmpfs rw 0 0
 devpts /dev/pts devpts rw 0 0
+gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse rw 0 0
 none /mnt/ramdisk ramfs rw 0 0
 ";
         let points: Vec<PathBuf> = volumes_in(&parse_mounts(table))

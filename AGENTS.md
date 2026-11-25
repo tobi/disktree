@@ -15,7 +15,7 @@ the removal mode, the confirmation). Marking is never destructive.
 
 ```sh
 make build                      # release build
-make run                        # build and open the source/root chooser
+make run                        # build and scan your home directory
 make install                    # ~/.local: binary, desktop entry, icon
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
@@ -117,11 +117,12 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    added to this volume's free space; see `space::attribution`. The final number
    comes from `statvfs` before and after.
 
-10. **Discovery is not a scan.** No implicit home walk at startup. List
-    mounts in the selected machine's namespace without probing them; scans
-    stop at nested mounts, including bind mounts and same-device subvolumes.
-    Switching machines clears marks and identity. The Unix SSH helper streams
-    records and never retains the tree. SSH hosts are Unix, so remote paths
+10. **Discovery is not a scan.** Local launch scans `$HOME` directly, while
+    bare `disktree ssh HOST` and the location dialog list mounts in the
+    selected machine's namespace without probing them; scans stop at nested
+    mounts, including bind mounts and same-device subvolumes. Switching
+    machines clears marks and identity. The Unix SSH helper streams records
+    and never retains the tree. SSH hosts are Unix, so remote paths
     are POSIX on every client: join, split and compare them through
     `PathStyle`, never `std::path`, which uses `\` on Windows.
 

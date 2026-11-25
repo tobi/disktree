@@ -134,66 +134,45 @@ pub fn root(
 /// Discovery is lightweight; a separate, explicit action starts the walk.
 fn volumes_dialog(
     app: &Disktree,
-    window: &Window,
+    window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
-    let cancel = cx.entity().downgrade();
+    let entity = cx.entity().downgrade();
+    let cancel = entity.clone();
     let source_ready = app.picker_source_matches(cx);
-    let source = app.volumes_source.as_ref().map_or_else(
-        || "This computer".to_owned(),
-        |host| format!("{host} · SSH · read-only"),
-    );
-    let mut rows = div()
-        .id("volume-rows")
-        .debug_selector(|| "volume-rows".into())
-        .flex()
-        .flex_col()
-        .gap(space::XS)
-        .max_h(size::SOURCE_LIST_HEIGHT)
-        .overflow_y_scroll();
-    if app.volumes_loading {
-        rows = rows.child(dialog_description(
-            "Listing mounts, not scanning files…",
+    let has_path = app.picker_has_path(cx);
+    let can_scan = source_ready
+        && !app.volumes_loading
+        && app.volumes_error.is_none()
+        && (has_path || !app.volumes.is_empty());
+    let show_locations = !app.picker_remote_tab
+        || app.volumes_source.is_some()
+        || app.volumes_loading
+        || app.volumes_error.is_some();
+
+    let source_tabs = {
+        let entity = entity.clone();
+        button_group(
+            "source-tabs",
+            vec![
+                ChoiceItem::new("source-local", "This computer"),
+                ChoiceItem::new("source-remote", "SSH remote"),
+            ],
+            Some(usize::from(app.picker_remote_tab)),
+            move |index, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.set_picker_tab(index == 1, window, cx);
+                });
+            },
+            window,
             cx,
-        ));
-    } else if let Some(error) = &app.volumes_error {
-        rows = rows.child(div().text_color(theme.danger).child(error.clone()));
-    } else if app.volumes.is_empty() {
-        rows = rows.child(dialog_description(
-            "No mounts listed. Enter a directory below.",
-            cx,
-        ));
-    }
-    for (index, volume) in app.volumes.iter().enumerate() {
-        let highlighted = index == app.volume_highlight;
-        let label = format!(
-            "{}  ·  {}",
-            volume.point.display(),
-            volume.device.as_deref().unwrap_or("Mounted volume")
-        );
-        rows = rows.child(
-            div()
-                .id(ElementId::Name(format!("volume-{index}").into()))
-                .debug_selector(move || format!("volume-{index}"))
-                .px(space::MD)
-                .py(space::SM)
-                .text_size(text::BODY)
-                .text_color(if highlighted {
-                    theme.bright
-                } else {
-                    theme.foreground
-                })
-                .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
-                .hover(|row| row.bg(theme.accent.opacity(0.1)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.volume_highlight = index;
-                    window.focus(&this.confirm_focus, cx);
-                    cx.notify();
-                })),
-        );
-    }
+        )
+        .debug_selector(|| "source-tabs".into())
+        .w_full()
+        .p(space::XXS)
+    };
+
     let host = app
         .picker_host
         .as_ref()
@@ -202,39 +181,290 @@ fn volumes_dialog(
         .picker_path
         .as_ref()
         .expect("picker prepared before rendering");
-    let popup = dialog_popup(cx).w_full()
-        .child(dialog_title("Choose what to scan", cx))
-        .child(dialog_description(
-            "Connect, then select a mount or directory. No new scan starts until you choose Scan.",
-            cx))
-        .child(div().flex().flex_row().gap(space::SM)
-            .child(button("source-local", "This computer", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, window, cx| this.choose_local_source(window, cx))))
-            .child(gpui_omarchy::input("source-host", host, window, cx)
-                .debug_selector(|| "source-host".into()).flex_1())
-            .child(button("source-connect", "Connect SSH", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, _, cx| this.connect_picker(cx)))))
-        .child(div().text_color(theme.bright).child(source))
-        .child(rows)
-        .child(dialog_description(
-            "Nested mounts and symlinks are not traversed. Space is measured only after selection.", cx))
-        .child(div().flex().flex_row().gap(space::SM)
-            .child(gpui_omarchy::input("source-path", path, window, cx)
-                .debug_selector(|| "source-path".into()).flex_1())
-            .child(button("source-scan-path", "Scan directory", ButtonVariant::Secondary, cx)
-                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some())
-                .on_click(cx.listener(|this, _, _, cx| this.choose_picker_path(cx)))))
-        .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(error.clone())))
-        .child(div().flex().flex_row().justify_end().gap(space::SM)
-            .child(dialog_button("source-cancel", "Cancel", ButtonVariant::Secondary, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.close_volumes(cx); this.apply_focus(window, cx);
-                })))
-            .child(dialog_button("source-scan", "Scan selected root", ButtonVariant::Primary, cx)
-                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.choose_volume(cx); this.apply_focus(window, cx);
-                }))));
+
+    let mut rows = div()
+        .id("volume-rows")
+        .debug_selector(|| "volume-rows".into())
+        .flex()
+        .flex_col()
+        .max_h(size::SOURCE_LIST_HEIGHT)
+        .overflow_y_scroll()
+        .bg(theme.inset)
+        .border_1()
+        .border_color(theme.divider());
+    if app.volumes_loading {
+        rows = rows.child(
+            div()
+                .p(space::MD)
+                .child(dialog_description("Listing mounts…", cx)),
+        );
+    } else if let Some(error) = &app.volumes_error {
+        rows = rows.child(
+            div()
+                .p(space::MD)
+                .text_color(theme.danger)
+                .child(error.clone()),
+        );
+    } else if app.volumes.is_empty() {
+        rows = rows.child(div().p(space::MD).child(dialog_description(
+            "No mounts listed. Enter a folder path below.",
+            cx,
+        )));
+    } else {
+        let count = app.volumes.len();
+        for (index, volume) in app.volumes.iter().enumerate() {
+            let highlighted = index == app.volume_highlight;
+            let is_home = volume.device.as_deref() == Some("Home directory");
+            let primary = if is_home {
+                "Home".to_owned()
+            } else {
+                volume.point.display().to_string()
+            };
+            let secondary = if is_home {
+                volume.point.display().to_string()
+            } else {
+                volume.device.clone().unwrap_or_default()
+            };
+            let glyph = if is_home {
+                gpui_omarchy::IconName::FolderOpen
+            } else {
+                gpui_omarchy::IconName::HardDrive
+            };
+            rows = rows.child(
+                div()
+                    .id(ElementId::Name(format!("volume-{index}").into()))
+                    .debug_selector(move || format!("volume-{index}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(space::SM)
+                    .px(space::MD)
+                    .py(space::SM)
+                    .cursor_pointer()
+                    .when(index + 1 < count, |row| {
+                        row.border_b_1()
+                            .border_color(theme.divider().opacity(0.45))
+                    })
+                    .when(highlighted, |row| row.bg(theme.accent.opacity(0.16)))
+                    .hover(|row| row.bg(theme.accent.opacity(0.1)))
+                    .child(
+                        gpui_omarchy::icon(glyph)
+                            .size(icon::SM)
+                            .text_color(if highlighted {
+                                theme.accent
+                            } else {
+                                theme.secondary
+                            })
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(text::BODY)
+                            .font_weight(if highlighted {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if highlighted {
+                                theme.bright
+                            } else {
+                                theme.foreground
+                            })
+                            .child(primary),
+                    )
+                    .when(!secondary.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(secondary),
+                        )
+                    })
+                    .on_click(cx.listener(
+                        move |this, event: &ClickEvent, window, cx| {
+                            this.volume_highlight = index;
+                            if event.click_count() >= 2 {
+                                this.choose_volume(cx);
+                                this.apply_focus(window, cx);
+                            } else {
+                                window.focus(&this.confirm_focus, cx);
+                                cx.notify();
+                            }
+                        },
+                    )),
+            );
+        }
+    }
+
+    let mut popup = dialog_popup(cx)
+        .w_full()
+        .gap(space::MD)
+        .child(dialog_title("Open location", cx))
+        .child(source_tabs);
+
+    if app.picker_remote_tab {
+        let connect_variant = if source_ready {
+            ButtonVariant::Outline
+        } else {
+            ButtonVariant::Primary
+        };
+        popup = popup.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .child(
+                    gpui_omarchy::input("source-host", host, window, cx)
+                        .debug_selector(|| "source-host".into())
+                        .flex_1(),
+                )
+                .child(
+                    button("source-connect", "Connect", connect_variant, cx)
+                        .debug_selector(|| "source-connect".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.connect_picker(cx);
+                        })),
+                ),
+        );
+    }
+
+    if show_locations {
+        let list_header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .child(widgets::eyebrow(
+                if app.picker_remote_tab {
+                    "Remote mounts"
+                } else {
+                    "Locations"
+                },
+                cx,
+            ))
+            .when_some(
+                app.volumes_source.as_ref().filter(|_| {
+                    app.picker_remote_tab
+                        && !app.volumes_loading
+                        && app.volumes_error.is_none()
+                }),
+                |header, connected_host| {
+                    header.child(
+                        div()
+                            .text_size(text::CAPTION)
+                            .text_color(theme.secondary)
+                            .child(format!("{connected_host} · read-only")),
+                    )
+                },
+            );
+        popup = popup.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(space::XS)
+                .child(list_header)
+                .child(rows),
+        );
+    } else {
+        popup = popup.child(dialog_description(
+            "Enter an SSH alias or user@host and connect to list its mounts. Remote scans are read-only.",
+            cx,
+        ));
+    }
+
+    if !app.picker_remote_tab || source_ready {
+        popup =
+            popup.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .child(widgets::eyebrow("Folder path", cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::SM)
+                            .child(
+                                gpui_omarchy::input(
+                                    "source-path",
+                                    path,
+                                    window,
+                                    cx,
+                                )
+                                .debug_selector(|| "source-path".into())
+                                .flex_1(),
+                            )
+                            .when(!app.picker_remote_tab, |row| {
+                                row.child(
+                                    button(
+                                        "source-browse",
+                                        "Browse…",
+                                        ButtonVariant::Outline,
+                                        cx,
+                                    )
+                                    .debug_selector(|| "source-browse".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.browse_local_folder(cx);
+                                    })),
+                                )
+                            }),
+                    ),
+            );
+    }
+
+    popup = popup
+        .children(app.picker_error.as_ref().map(|error| {
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.danger)
+                .child(error.clone())
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap(space::SM)
+                .pt(space::XS)
+                .child(
+                    dialog_button(
+                        "source-cancel",
+                        "Cancel",
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.close_volumes(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                )
+                .child(
+                    dialog_button(
+                        "source-scan",
+                        "Scan",
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .disabled(!can_scan)
+                    .on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.accept_picker(cx);
+                            this.apply_focus(window, cx);
+                        },
+                    )),
+                ),
+        );
+
     let popup = div()
         .id("source-picker-scroll")
         .debug_selector(|| "source-picker".into())
@@ -258,7 +488,7 @@ fn volumes_dialog(
             });
         }
     });
-    let accept = cx.entity().downgrade();
+    let accept = entity;
     alert_dialog(&app.confirm_focus, cx)
         .open(true)
         .on_ok(move |_, window, cx| {
@@ -277,7 +507,7 @@ fn volumes_dialog(
                     } else if path_focused {
                         this.choose_picker_path(cx);
                     } else {
-                        this.choose_volume(cx);
+                        this.accept_picker(cx);
                     }
                 }
                 this.apply_focus(window, cx);
@@ -657,26 +887,73 @@ fn top_bar(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::LG)
-        .px(space::LG)
-        .py(space::MD)
-        .border_b_1()
-        .border_color(theme.divider())
-        .child(with_tooltip(
-            logo(theme).id("choose-source").cursor_pointer()
+    let source_button = {
+        let (glyph, label, variant, icon_color) =
+            if let Some(host) = &app.remote {
+                (
+                    gpui_omarchy::IconName::Globe,
+                    Some(host.clone()),
+                    ButtonVariant::Primary,
+                    theme.accent,
+                )
+            } else {
+                (
+                    gpui_omarchy::IconName::FolderOpen,
+                    None,
+                    ButtonVariant::Outline,
+                    theme.secondary,
+                )
+            };
+        with_tooltip(
+            button("choose-source", "", variant, cx)
+                .debug_selector(|| "choose-source".into())
+                .tab_stop(false)
+                .flex_shrink_0()
+                .px(space::XS)
+                .py(space::XS)
+                .gap(space::XS)
+                .child(
+                    gpui_omarchy::icon(glyph)
+                        .size(icon::SM)
+                        .text_color(icon_color),
+                )
+                .when_some(label, |btn, host| {
+                    btn.child(
+                        div().max_w(size::KEY_LANE).truncate().child(host),
+                    )
+                })
+                .child(
+                    gpui_omarchy::icon(gpui_omarchy::IconName::ChevronsUpDown)
+                        .size(icon::SM)
+                        .text_color(theme.secondary),
+                )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_volumes(cx);
                     this.apply_focus(window, cx);
                 })),
-            "Choose local or SSH source · v",
-        ))
+            "Open folder, disk or SSH remote · v",
+        )
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .px(space::LG)
+        .py(space::MD)
+        .border_b_1()
+        .border_color(theme.divider())
+        .child(logo(theme))
+        .child(source_button)
         // Where you are is navigation, and it belongs to the whole window.
-        .child(trail(app, theme, cx))
-        .child(div().flex_1())
+        .child(
+            div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(trail(app, theme, cx)),
+        )
         .child(view_settings(app, window, cx))
 }
 
@@ -2251,7 +2528,7 @@ fn disk_section(
         )
         .child(div().flex_1())
         .child(
-            button("volumes", "Source…", ButtonVariant::Secondary, cx)
+            button("volumes", "Switch…", ButtonVariant::Outline, cx)
                 .tab_stop(false)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_volumes(cx);

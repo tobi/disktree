@@ -247,7 +247,9 @@ fn startup_chooser_never_scans_before_explicit_acceptance(
     cx.run_until_parked();
     draw(cx);
     assert!(cx.debug_bounds("choose-root-idle").is_some());
-    assert!(cx.debug_bounds("source-host").is_some());
+    assert!(cx.debug_bounds("source-tabs").is_some());
+    assert!(cx.debug_bounds("source-path").is_some());
+    assert!(cx.debug_bounds("source-browse").is_some());
     read(&view, cx, |app| {
         assert!(app.awaiting_root);
         assert_eq!(app.scan_epoch, 0);
@@ -308,6 +310,10 @@ fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
     let (view, cx) =
         cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
     cx.run_until_parked();
+    update(&view, cx, |app, cx| {
+        app.picker_remote_tab = true;
+        cx.notify();
+    });
     draw(cx);
     let input = cx.debug_bounds("source-host").expect("host editor");
     cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
@@ -386,6 +392,10 @@ fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, Disktree::open_volumes);
     cx.run_until_parked();
+    update(&view, cx, |app, cx| {
+        app.picker_remote_tab = true;
+        cx.notify();
+    });
     draw(cx);
     let before = read(&view, cx, |app| app.scan_epoch);
     let input = cx.debug_bounds("source-host").unwrap();
