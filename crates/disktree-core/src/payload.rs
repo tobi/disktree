@@ -43,7 +43,18 @@ pub fn digest(bytes: &[u8]) -> String {
 
 impl Archive {
     pub fn current() -> io::Result<Option<Self>> {
-        Self::open(&std::env::current_exe()?)
+        // On Linux, `current_exe()` returns `... (deleted)` after an in-place
+        // upgrade (`make install` or package update) while the app is open,
+        // causing `File::open` to fail with ENOENT. Opening `/proc/self/exe`
+        // directly resolves the live running inode instead.
+        #[cfg(target_os = "linux")]
+        {
+            Self::open(Path::new("/proc/self/exe"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open(&std::env::current_exe()?)
+        }
     }
 
     pub fn open(path: &Path) -> io::Result<Option<Self>> {

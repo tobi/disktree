@@ -193,11 +193,38 @@ fn volumes_dialog(
         .border_color(theme.divider());
     match &app.discovery.phase {
         crate::state::discovery_machine::Phase::Loading { .. } => {
-            rows = rows.child(
-                div()
-                    .p(space::MD)
-                    .child(dialog_description("Listing mounts…", cx)),
-            );
+            if let Some(url) = app.auth_url.clone() {
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::SM)
+                        .p(space::MD)
+                        .child(dialog_description(
+                            "Waiting for Tailscale SSH approval in your browser…",
+                            cx,
+                        ))
+                        .child(
+                            div().flex().flex_row().child(
+                                button(
+                                    "source-auth-link",
+                                    "Open login link",
+                                    ButtonVariant::Outline,
+                                    cx,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&url);
+                                }),
+                            ),
+                        ),
+                );
+            } else {
+                rows = rows.child(
+                    div()
+                        .p(space::MD)
+                        .child(dialog_description("Listing mounts…", cx)),
+                );
+            }
         }
         crate::state::discovery_machine::Phase::Installing { host } => {
             rows = rows.child(div().p(space::MD).child(dialog_description(
@@ -1425,8 +1452,6 @@ fn view_settings(
         }
     };
     let hidden = {
-        let entity = entity.clone();
-        let focus = focus.clone();
         checkbox(
             "hidden",
             "Hidden files",
@@ -1437,21 +1462,6 @@ fn view_settings(
         .on_change(move |_, _, window, cx| {
             let _ = entity.update(cx, |this, cx| {
                 this.toggle_hidden(cx);
-            });
-            window.focus(&focus, cx);
-        })
-    };
-    let apparent = {
-        checkbox(
-            "apparent",
-            "Apparent size",
-            check(app.options.apparent_size),
-            cx,
-        )
-        .tab_stop(false)
-        .on_change(move |_, _, window, cx| {
-            let _ = entity.update(cx, |this, cx| {
-                this.toggle_apparent_size(cx);
             });
             window.focus(&focus, cx);
         })
@@ -1578,7 +1588,6 @@ fn view_settings(
         .child(history)
         .child(mode)
         .child(hidden)
-        .child(apparent)
         .child(depth_control)
 }
 
@@ -1700,25 +1709,15 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         Some(disktree_scanner::Freshness::Stale { .. })
     );
     let stale_swatch = div()
-        .relative()
         .flex_shrink_0()
         .size(size::SWATCH)
-        .bg(palette::mix(ground, theme.inset, 0.44))
-        .child(
-            div()
-                .absolute()
-                .top(px(1.))
-                .right(px(1.))
-                .size(px(3.))
-                .bg(theme.secondary.opacity(0.75)),
-        );
+        .bg(palette::mix(ground, theme.inset, 0.28));
     let queued_swatch = div()
         .flex_shrink_0()
         .size(size::SWATCH)
-        .bg(palette::mix(ground, theme.inset, 0.22))
+        .bg(palette::mix(ground, theme.inset, 0.42))
         .border_1()
-        .border_dashed()
-        .border_color(theme.accent.opacity(0.8));
+        .border_color(theme.control_border());
     div()
         .flex()
         .flex_row()
@@ -1856,21 +1855,18 @@ fn selection_section(
     } else {
         gpui_omarchy::IconName::Delete
     };
-    let mark_filled = can_mark && !unmark_mode;
     let mark_icon_color = if !can_mark {
         theme.secondary
     } else if unmark_mode {
         theme.danger
     } else {
-        palette::on_highlight(theme)
+        theme.foreground
     };
     let mark_btn_inner = button(
         "mark",
         "",
-        if unmark_mode {
+        if unmark_mode && can_mark {
             ButtonVariant::Danger
-        } else if mark_filled {
-            ButtonVariant::Primary
         } else {
             ButtonVariant::Outline
         },
@@ -1895,13 +1891,7 @@ fn selection_section(
         }
         window.focus(&this.focus, cx);
     }));
-    let mark_btn_inner = if mark_filled {
-        mark_btn_inner.bg(highlight).border_color(highlight).hover(
-            move |style| {
-                style.bg(highlight.opacity(0.85)).border_color(highlight)
-            },
-        )
-    } else if unmark_mode && can_mark {
+    let mark_btn_inner = if unmark_mode && can_mark {
         mark_btn_inner.border_color(theme.danger)
     } else {
         mark_btn_inner
@@ -1941,9 +1931,9 @@ fn selection_section(
                 .flex_row()
                 .items_center()
                 .gap(space::XS)
+                .child(refresh_btn)
                 .child(open_btn)
-                .child(mark_btn)
-                .child(refresh_btn),
+                .child(mark_btn),
         );
 
     let section = div()
@@ -2015,10 +2005,10 @@ fn selection_section(
             chips.push(widgets::chip("Stale", theme.secondary, cx));
         }
         treemap_view::TileFreshness::Scheduled => {
-            chips.push(widgets::chip("Queued", theme.accent, cx));
+            chips.push(widgets::chip("Queued", theme.secondary, cx));
         }
         treemap_view::TileFreshness::Updating => {
-            chips.push(widgets::chip("Refreshing…", theme.accent, cx));
+            chips.push(widgets::chip("Refreshing…", theme.foreground, cx));
         }
     }
     if marked {
@@ -2985,6 +2975,19 @@ fn indexing_progress(
                 "Reading this computer"
             },
         ))
+        .when_some(app.auth_url.clone(), |panel, url| {
+            panel.child(
+                button(
+                    "indexing-auth-link",
+                    "Open login link",
+                    ButtonVariant::Outline,
+                    cx,
+                )
+                .on_click(move |_, _, cx| {
+                    cx.open_url(&url);
+                }),
+            )
+        })
         .child(row(
             "Files",
             widgets::human_count(app.progress.files),
@@ -4139,13 +4142,16 @@ fn node_card(
         treemap_view::TileFreshness::Scheduled => {
             badges = badges.child(widgets::chip(
                 "Queued for refresh",
-                theme.accent,
+                theme.secondary,
                 cx,
             ));
         }
         treemap_view::TileFreshness::Updating => {
-            badges =
-                badges.child(widgets::chip("Refreshing…", theme.accent, cx));
+            badges = badges.child(widgets::chip(
+                "Refreshing…",
+                theme.foreground,
+                cx,
+            ));
         }
     }
     if hidden {

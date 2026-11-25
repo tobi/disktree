@@ -130,15 +130,6 @@ pub const fn highlight(theme: &Theme) -> Hsla {
     theme.warning
 }
 
-/// Text on a filled highlight.
-pub const fn on_highlight(theme: &Theme) -> Hsla {
-    if dark(theme) {
-        theme.background
-    } else {
-        theme.bright
-    }
-}
-
 /// The diagonal hatch over reclaimable space: quiet enough to leave the hue
 /// readable, visible on every fill.
 pub fn hatch(theme: &Theme) -> Hsla {

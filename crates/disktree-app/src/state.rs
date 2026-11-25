@@ -949,6 +949,8 @@ pub struct Disktree {
     pub remote: Option<String>,
     remote_disk: bool,
     pub remote_progress: disktree_core::remote_progress::Progress,
+    /// Tailscale SSH check URL opened in the browser while waiting for approval.
+    pub auth_url: Option<String>,
     pub scan_preview: Option<Arc<disktree_core::scan_preview::Preview>>,
     preview_updated: Option<Instant>,
     remote_platform: String,
@@ -1139,6 +1141,7 @@ impl Disktree {
             preview_updated: None,
             remote_progress: disktree_core::remote_progress::Progress::default(
             ),
+            auth_url: None,
             remote_platform: String::new(),
             remote_identity: None,
             home,
@@ -1376,6 +1379,7 @@ impl Disktree {
         self.volumes.clear();
         self.volume_highlight = 0;
         self.picker_error = None;
+        self.auth_url = None;
         let event = match host {
             Some(host) => discovery_machine::Event::StartRemote { host },
             None => discovery_machine::Event::StartLocal,
@@ -1516,15 +1520,35 @@ impl Disktree {
         else {
             return false;
         };
-        let Some(result) = job.poll() else {
+        let auth_url = job.progress().auth_url;
+        let polled = job.poll();
+        self.handle_auth_url(auth_url, cx);
+        let Some(result) = polled else {
             return true;
         };
+        self.auth_url = None;
         self.finish_volume_listing_for(
             epoch,
             result.map(|roots| (roots.volumes, roots.home)),
             cx,
         );
         false
+    }
+
+    fn handle_auth_url(
+        &mut self,
+        url: Option<String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(url) = url {
+            if self.auth_url.as_deref() != Some(url.as_str()) {
+                self.auth_url = Some(url.clone());
+                cx.open_url(&url);
+                cx.notify();
+            }
+        } else if self.auth_url.take().is_some() {
+            cx.notify();
+        }
     }
 
     #[cfg(test)]
@@ -1791,6 +1815,7 @@ impl Disktree {
     /// Closing cancels discovery, not the scan already on screen.
     pub fn close_volumes(&mut self, cx: &mut Context<'_, Self>) {
         self.step_discovery(discovery_machine::Event::Reset, cx);
+        self.auth_url = None;
         self.volumes_open = false;
         self.focus_request = Some(FocusTarget::Root);
         cx.notify();
@@ -1899,6 +1924,7 @@ impl Disktree {
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
         self.scan_preview = None;
+        self.auth_url = None;
         self.updating_paths.clear();
         self.refreshed_paths.clear();
         self.active_scan_path = None;
@@ -2138,16 +2164,18 @@ impl Disktree {
         match active {
             ActiveScan::Remote { handle, intent } => {
                 let outcome = handle.poll();
+                let refresh_metric = match intent {
+                    ScanIntent::Refresh { metric, .. } => Some(*metric),
+                    ScanIntent::Initial | ScanIntent::Widening { .. } => None,
+                };
                 self.remote_progress = handle.progress();
+                let auth_url = self.remote_progress.auth_url.clone();
+                self.handle_auth_url(auth_url, cx);
                 self.scan_preview.clone_from(&self.remote_progress.preview);
                 self.progress.files = self.remote_progress.files;
                 self.progress.dirs = self.remote_progress.dirs;
                 self.progress.bytes = self.remote_progress.bytes;
                 self.progress.errors = self.remote_progress.errors;
-                let refresh_metric = match intent {
-                    ScanIntent::Refresh { metric, .. } => Some(*metric),
-                    ScanIntent::Initial | ScanIntent::Widening { .. } => None,
-                };
                 let Some(outcome) = outcome else {
                     cx.notify();
                     return true;
@@ -2198,6 +2226,7 @@ impl Disktree {
                     }
                 }
                 self.active_scan = None;
+                self.auth_url = None;
                 self.scan_preview = None;
                 self.progress.finished = true;
                 cx.notify();

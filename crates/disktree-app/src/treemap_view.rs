@@ -27,21 +27,20 @@ use crate::appearance;
 use crate::palette;
 use crate::state::{Disktree, Filtered, Label, View};
 
-/// Freshness & refresh-queue state of a tile, painted independently of
-/// category colour and reclaimable hatching.
+/// Freshness & refresh-queue state of a tile, communicated through subtle
+/// fades toward the inset surface so category hues stay calm and intact.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TileFreshness {
     /// Freshly scanned or within the cache TTL.
     #[default]
     Fresh,
-    /// Cached older than TTL and not currently scheduled for refresh:
-    /// gently washed toward the inset surface with a muted corner dot.
+    /// Cached older than TTL and idle: gently faded toward `inset`.
     Stale,
-    /// Queued in an active background refresh / SWR pass: lightly veiled
-    /// with a dashed accent border.
+    /// Queued for refresh in an active pass: stepped back slightly further
+    /// until it refreshes back into full colour.
     Scheduled,
-    /// Actively being scanned right now (current worker or prioritized):
-    /// subtle accent wash with a solid accent border.
+    /// Actively being scanned right now: nearly full colour with a subtle
+    /// neutral hairline outline.
     Updating,
 }
 
@@ -239,8 +238,7 @@ struct Colors {
     selected_border: Hsla,
     marked_border: Hsla,
     marked_label: Hsla,
-    accent: Hsla,
-    stale_pip: Hsla,
+    updating_border: Hsla,
     warning: Hsla,
     hatch: Hsla,
     /// Fills per category, then per depth.
@@ -292,8 +290,7 @@ impl Colors {
             selected_border: palette::highlight(theme),
             marked_border: theme.danger,
             marked_label: theme.danger,
-            accent: theme.accent,
-            stale_pip: theme.secondary.opacity(0.65),
+            updating_border: theme.foreground.opacity(0.24),
             warning: theme.warning,
             hatch: palette::hatch(theme),
             fill: CATEGORIES
@@ -328,14 +325,14 @@ impl Colors {
             Some(bucket) => self.age[bucket.min(self.age.len() - 1)][depth],
             None => self.fill[category_index(tile.category)][depth],
         };
-        // Freshness shading sits beneath find-filtering so stale folders read
-        // as softly washed out, queued folders lightly veiled, and actively
-        // refreshing folders softly tinted with the accent.
+        // Freshness uses subtle fades toward `inset` so category hues stay
+        // calm: queued folders step back slightly, stale folders soften a bit,
+        // and actively updating folders lift back toward full colour.
         let fill = match tile.freshness {
             TileFreshness::Fresh => fill,
-            TileFreshness::Stale => palette::mix(fill, self.inset, 0.44),
-            TileFreshness::Scheduled => palette::mix(fill, self.inset, 0.22),
-            TileFreshness::Updating => palette::mix(fill, self.accent, 0.14),
+            TileFreshness::Updating => palette::mix(fill, self.inset, 0.14),
+            TileFreshness::Stale => palette::mix(fill, self.inset, 0.28),
+            TileFreshness::Scheduled => palette::mix(fill, self.inset, 0.42),
         };
         // Only what matches keeps its colour; a directory holding matches
         // steps back less, so the way to them stays readable.
@@ -360,18 +357,11 @@ fn paint_tiles(
 ) {
     let none = Edges::all(px(0.));
     let solid = gpui_kit::BorderStyle::Solid;
-    let dashed = gpui_kit::BorderStyle::Dashed;
     let scale = window.scale_factor();
     // Outlines are drawn after every fill: a directory's children paint over
     // its body, and would otherwise cover its selection ring, leaving only
     // slivers of it showing in the gaps between them.
-    let mut outlines: Vec<(
-        u8,
-        Bounds<Pixels>,
-        f32,
-        Hsla,
-        gpui_kit::BorderStyle,
-    )> = Vec::new();
+    let mut outlines: Vec<(u8, Bounds<Pixels>, f32, Hsla)> = Vec::new();
     for tile in tiles {
         let rect = view.project(tile.rect);
         if rect.w <= 0.5 || rect.h <= 0.5 {
@@ -410,9 +400,8 @@ fn paint_tiles(
         }
 
         // A top-level directory carries a thin strip of its colour, so the
-        // first level of structure reads before any detail. Freshness modulates
-        // the strip: stale dims it, scheduled tints it softly with the accent,
-        // and actively updating lights it up in the accent.
+        // first level of structure reads before any detail. Stale and queued
+        // directories dim their strip softly without changing hue.
         if tile.depth == 0
             && tile.age_bucket.is_none()
             && tile.filtered != Filtered::Out
@@ -426,10 +415,9 @@ fn paint_tiles(
             );
             let base = colors.strip[category_index(tile.category)];
             let strip_color = match tile.freshness {
-                TileFreshness::Fresh => base,
-                TileFreshness::Stale => base.opacity(0.32),
-                TileFreshness::Scheduled => colors.accent.opacity(0.50),
-                TileFreshness::Updating => colors.accent,
+                TileFreshness::Fresh | TileFreshness::Updating => base,
+                TileFreshness::Stale => base.opacity(0.55),
+                TileFreshness::Scheduled => base.opacity(0.38),
             };
             window.paint_quad(quad(
                 strip,
@@ -458,67 +446,37 @@ fn paint_tiles(
                 colors.warning,
                 solid,
             ));
-        } else if tile.freshness == TileFreshness::Stale
-            && tile.depth <= 1
-            && rect.w > 18.0
-            && rect.h > 14.0
-        {
-            // A quiet muted corner dot on stale cached directories so even
-            // low-chroma categories visibly read as stale.
-            let mark = Bounds::new(
-                Point::new(
-                    quad_bounds.origin.x + quad_bounds.size.width - px(6.),
-                    quad_bounds.origin.y + px(4.),
-                ),
-                Size::new(px(3.), px(3.)),
-            );
-            window.paint_quad(quad(
-                mark,
-                Corners::default(),
-                colors.stale_pip,
-                none,
-                colors.stale_pip,
-                solid,
-            ));
         }
 
         // Ranked so the most important ring is painted last, on top.
-        // Scheduled refresh tiles get a dashed accent border (rank 0) and
-        // actively updating tiles get a solid accent border (rank 1), always
-        // yielding to marked/hover/selected rings.
         let outline = if tile.selected {
-            Some((4, 2.0, colors.selected_border, solid))
+            Some((3, 2.0, colors.selected_border))
         } else if tile.hovered {
-            Some((3, 1.0, colors.hover_border, solid))
+            Some((2, 1.0, colors.hover_border))
         } else if tile.marked {
-            Some((2, 2.0, colors.marked_border, solid))
+            Some((1, 2.0, colors.marked_border))
         } else if tile.freshness == TileFreshness::Updating
+            && tile.depth <= 1
             && rect.w > 14.0
             && rect.h > 12.0
         {
-            Some((1, 2.0, colors.accent, solid))
-        } else if tile.freshness == TileFreshness::Scheduled
-            && tile.depth <= 1
-            && rect.w > 18.0
-            && rect.h > 14.0
-        {
-            Some((0, 1.0, colors.accent.opacity(0.70), dashed))
+            Some((0, 1.0, colors.updating_border))
         } else {
             None
         };
-        if let Some((rank, width, color, style)) = outline {
-            outlines.push((rank, quad_bounds, width, color, style));
+        if let Some((rank, width, color)) = outline {
+            outlines.push((rank, quad_bounds, width, color));
         }
     }
     outlines.sort_by_key(|(rank, ..)| *rank);
-    for (_, ring, width, color, style) in outlines {
+    for (_, ring, width, color) in outlines {
         window.paint_quad(quad(
             ring,
             Corners::default(),
             gpui_kit::transparent_black(),
             Edges::all(px(width)),
             color,
-            style,
+            solid,
         ));
     }
 }

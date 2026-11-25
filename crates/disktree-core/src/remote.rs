@@ -579,9 +579,17 @@ pub fn validate_host(host: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn read_diagnostics(mut input: impl io::Read) -> String {
+fn read_diagnostics(input: impl io::Read) -> String {
+    read_diagnostics_watching(input, None)
+}
+
+fn read_diagnostics_watching(
+    mut input: impl io::Read,
+    progress: Option<&Shared>,
+) -> String {
     let mut tail = Vec::new();
     let mut chunk = [0_u8; 4096];
+    let mut auth_seen = false;
     while let Ok(length) = input.read(&mut chunk) {
         if length == 0 {
             break;
@@ -589,6 +597,16 @@ fn read_diagnostics(mut input: impl io::Read) -> String {
         tail.extend_from_slice(&chunk[..length]);
         if tail.len() > MAX_DIAGNOSTICS {
             tail.drain(..tail.len() - MAX_DIAGNOSTICS);
+        }
+        if !auth_seen
+            && let Some(shared) = progress
+            && let Some(url) =
+                crate::remote_progress::extract_tailscale_auth_url(
+                    &String::from_utf8_lossy(&tail),
+                )
+        {
+            crate::remote_progress::auth_required(shared, url);
+            auth_seen = true;
         }
     }
     // Diagnostics are remote-controlled too; keep text, not terminal escapes.
@@ -739,15 +757,19 @@ impl<T: Send + 'static> RemoteJob<T> {
             .stderr(Stdio::piped())
             .spawn()?;
         let stderr = child.stderr.take().expect("piped stderr");
-        // Drain concurrently so noisy login scripts cannot block discovery.
-        let diagnostics = std::thread::spawn(move || read_diagnostics(stderr));
+        let progress = Shared::default();
+        let stderr_progress = progress.clone();
+        // Drain concurrently so noisy login scripts cannot block discovery,
+        // and surface Tailscale SSH approval links immediately while waiting.
+        let diagnostics = std::thread::spawn(move || {
+            read_diagnostics_watching(stderr, Some(&stderr_progress))
+        });
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let child = Arc::new(Mutex::new(child));
         let worker = child.clone();
         let host = host.to_owned();
         let (tx, result) = mpsc::channel();
-        let progress = Shared::default();
         let live = progress.clone();
         std::thread::spawn(move || {
             let mut input = BufReader::new(stdout);
@@ -923,6 +945,23 @@ mod tests {
             assert!(cmd.contains("~/.local/bin/disktree-cli"), "{cmd}");
         }
         assert!(install_cli_command("Permission denied").is_none());
+    }
+
+    #[test]
+    fn tailscale_ssh_auth_url_is_extracted_and_restricted_to_tailscale() {
+        let stderr = "# Tailscale SSH requires an additional check.\n\
+                      # To authenticate, visit: https://login.tailscale.com/a/l10f3362d3b2b77\n";
+        assert_eq!(
+            crate::remote_progress::extract_tailscale_auth_url(stderr)
+                .as_deref(),
+            Some("https://login.tailscale.com/a/l10f3362d3b2b77")
+        );
+        assert_eq!(
+            crate::remote_progress::extract_tailscale_auth_url(
+                "visit https://evil.example/a/123"
+            ),
+            None
+        );
     }
 
     #[cfg(unix)]
