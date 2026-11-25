@@ -220,9 +220,20 @@ fn place_children(
     if ranked.is_empty() {
         return;
     }
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
-
+    // Largest first, and of two equals the earlier child, which is the
+    // order a stable sort of the children would give.
+    let by_value = |left: &(usize, f64), right: &(usize, f64)| {
+        right.1.total_cmp(&left.1).then(left.0.cmp(&right.0))
+    };
     let kept = ranked.len().min(options.max_children);
+    // Only the children that get a tile need ordering. The rest are
+    // summed, so a directory of a million files is partitioned around
+    // the cut rather than sorted, on every resize.
+    if kept < ranked.len() {
+        ranked.select_nth_unstable_by(kept, by_value);
+    }
+    ranked[..kept].sort_unstable_by(by_value);
+
     let mut values: Vec<f64> =
         ranked[..kept].iter().map(|(_, value)| *value).collect();
     let mut sources: Vec<Option<usize>> = ranked[..kept]

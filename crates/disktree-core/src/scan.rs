@@ -1041,7 +1041,8 @@ impl Tally {
             // though the tree does not count it.
             self.files += 1;
         }
-        self.bytes += node.bytes;
+        // Saturating: see `tree::aggregate`.
+        self.bytes = node.bytes.saturating_add(self.bytes);
     }
 
     fn flush(&mut self, progress: &ScanProgress, path: &Path) {

@@ -23,6 +23,7 @@ use std::io;
 use std::num::NonZeroU64;
 use std::os::windows::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -211,6 +212,7 @@ pub fn scan(
         starts,
         options,
         progress,
+        directories: AtomicUsize::new(0),
     };
     let tree = table.directory(ROOT, crate::scan::file_name(root), 0);
     // Hundreds of megabytes, whose freeing the caller would otherwise
@@ -333,9 +335,18 @@ fn table_layout(volume: &File, geometry: &Geometry) -> Option<(Runs, Vec<u8>)> {
         {
             let number = reference & 0xFFFF_FFFF_FFFF;
             if number != 0 && !numbers.contains(&number) {
+                // A real table spreads over a handful of records. A list
+                // naming thousands is a crafted one, and each is searched
+                // for here and read below.
+                if numbers.len() >= MOST_LIST_RECORDS {
+                    return None;
+                }
                 numbers.push(number);
             }
-            if length == 0 {
+            // An entry is never shorter than its own fixed part; one that
+            // says so would have this loop step through 64 MiB a byte at
+            // a time.
+            if usize::from(length) < LIST_ENTRY_BYTES {
                 break;
             }
             at += usize::from(length);
@@ -364,9 +375,30 @@ fn table_layout(volume: &File, geometry: &Geometry) -> Option<(Runs, Vec<u8>)> {
     {
         return None;
     }
+    // The volume's size above is the boot sector's own claim, and a crafted
+    // one claims anything. What can be read is not: the table's last
+    // cluster has to be there, and runs that do not overlap cannot hold
+    // more than lies before their end. Without this, one bit set far into
+    // an imaginary table sized `table`'s slots in the tens of gigabytes.
+    let end = runs.iter().map(|&(offset, length)| offset + length).max()?;
+    if listed > end {
+        return None;
+    }
+    read_at(
+        volume,
+        end.checked_sub(geometry.cluster)?,
+        usize::try_from(geometry.cluster).ok()?,
+    )?;
     let bitmap = contents(volume, geometry, &records, BITMAP)?;
     Some((runs, bitmap))
 }
+
+/// Records an `$ATTRIBUTE_LIST` may name before the table is taken for a
+/// crafted one: a table's own attributes fit in a few.
+const MOST_LIST_RECORDS: usize = 4096;
+
+/// The fixed part of an `$ATTRIBUTE_LIST` entry, before its name.
+const LIST_ENTRY_BYTES: usize = 0x18;
 
 /// The unnamed attribute `kind` across `records`: the piece that starts
 /// it, which carries its sizes, and the runs of every piece in order.
@@ -1032,6 +1064,11 @@ struct Table<'a> {
     starts: Vec<u32>,
     options: &'a ScanOptions,
     progress: &'a ScanProgress,
+    /// Directories built so far. Each is built from one entry, so more of
+    /// them than there are entries means one was reached twice: a crafted
+    /// table that gives directories several names doubles the tree at
+    /// every level, and forty levels of that is all the memory there is.
+    directories: AtomicUsize,
 }
 
 impl Table<'_> {
@@ -1060,7 +1097,11 @@ impl Table<'_> {
         name: Box<str>,
         depth: usize,
     ) -> Result<Node, Stop> {
-        if depth >= MOST_LEVELS || self.progress.is_cancelled() {
+        if depth >= MOST_LEVELS
+            || self.progress.is_cancelled()
+            || self.directories.fetch_add(1, Ordering::Relaxed)
+                > self.names.len()
+        {
             return Err(Stop);
         }
         let descend = self.options.max_depth.is_none_or(|max| depth < max);
@@ -1566,6 +1607,7 @@ mod tests {
             starts,
             options,
             progress,
+            directories: AtomicUsize::new(0),
         }
     }
 
