@@ -143,13 +143,12 @@ fn volumes_dialog(
     let source_ready = app.picker_source_matches(cx);
     let has_path = app.picker_has_path(cx);
     let can_scan = source_ready
-        && !app.volumes_loading
-        && app.volumes_error.is_none()
+        && !app.discovery.is_loading()
+        && app.discovery.error().is_none()
         && (has_path || !app.volumes.is_empty());
     let show_locations = !app.picker_remote_tab
         || app.volumes_source.is_some()
-        || app.volumes_loading
-        || app.volumes_error.is_some();
+        || !app.discovery.is_idle();
 
     let source_tabs = {
         let entity = entity.clone();
@@ -192,111 +191,123 @@ fn volumes_dialog(
         .bg(theme.inset)
         .border_1()
         .border_color(theme.divider());
-    if app.volumes_loading {
-        rows = rows.child(
-            div()
-                .p(space::MD)
-                .child(dialog_description("Listing mounts…", cx)),
-        );
-    } else if let Some(error) = &app.volumes_error {
-        rows = rows.child(
-            div()
-                .p(space::MD)
-                .text_color(theme.danger)
-                .child(error.clone()),
-        );
-    } else if app.volumes.is_empty() {
-        rows = rows.child(div().p(space::MD).child(dialog_description(
-            "No mounts listed. Enter a folder path below.",
-            cx,
-        )));
-    } else {
-        let count = app.volumes.len();
-        for (index, volume) in app.volumes.iter().enumerate() {
-            let highlighted = index == app.volume_highlight;
-            let is_home = volume.device.as_deref() == Some("Home directory");
-            let primary = if is_home {
-                "Home".to_owned()
-            } else {
-                volume.point.display().to_string()
-            };
-            let secondary = if is_home {
-                volume.point.display().to_string()
-            } else {
-                volume.device.clone().unwrap_or_default()
-            };
-            let glyph = if is_home {
-                gpui_omarchy::IconName::FolderOpen
-            } else {
-                gpui_omarchy::IconName::HardDrive
-            };
+    match &app.discovery.phase {
+        crate::state::discovery_machine::Phase::Loading { .. } => {
             rows = rows.child(
                 div()
-                    .id(ElementId::Name(format!("volume-{index}").into()))
-                    .debug_selector(move || format!("volume-{index}"))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(space::SM)
-                    .px(space::MD)
-                    .py(space::SM)
-                    .cursor_pointer()
-                    .when(index + 1 < count, |row| {
-                        row.border_b_1()
-                            .border_color(theme.divider().opacity(0.45))
-                    })
-                    .when(highlighted, |row| row.bg(theme.accent.opacity(0.16)))
-                    .hover(|row| row.bg(theme.accent.opacity(0.1)))
-                    .child(
-                        gpui_omarchy::icon(glyph)
-                            .size(icon::SM)
-                            .text_color(if highlighted {
-                                theme.accent
-                            } else {
-                                theme.secondary
-                            })
-                            .flex_shrink_0(),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(text::BODY)
-                            .font_weight(if highlighted {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(if highlighted {
-                                theme.bright
-                            } else {
-                                theme.foreground
-                            })
-                            .child(primary),
-                    )
-                    .when(!secondary.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(text::CAPTION)
-                                .text_color(theme.secondary)
-                                .child(secondary),
-                        )
-                    })
-                    .on_click(cx.listener(
-                        move |this, event: &ClickEvent, window, cx| {
-                            this.volume_highlight = index;
-                            if event.click_count() >= 2 {
-                                this.choose_volume(cx);
-                                this.apply_focus(window, cx);
-                            } else {
-                                window.focus(&this.confirm_focus, cx);
-                                cx.notify();
-                            }
-                        },
-                    )),
+                    .p(space::MD)
+                    .child(dialog_description("Listing mounts…", cx)),
             );
+        }
+        crate::state::discovery_machine::Phase::Failed(error) => {
+            rows = rows.child(
+                div()
+                    .p(space::MD)
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
+        crate::state::discovery_machine::Phase::Idle
+        | crate::state::discovery_machine::Phase::Ready
+            if app.volumes.is_empty() =>
+        {
+            rows = rows.child(div().p(space::MD).child(dialog_description(
+                "No mounts listed. Enter a folder path below.",
+                cx,
+            )));
+        }
+        crate::state::discovery_machine::Phase::Idle
+        | crate::state::discovery_machine::Phase::Ready => {
+            let count = app.volumes.len();
+            for (index, volume) in app.volumes.iter().enumerate() {
+                let highlighted = index == app.volume_highlight;
+                let is_home =
+                    volume.device.as_deref() == Some("Home directory");
+                let primary = if is_home {
+                    "Home".to_owned()
+                } else {
+                    volume.point.display().to_string()
+                };
+                let secondary = if is_home {
+                    volume.point.display().to_string()
+                } else {
+                    volume.device.clone().unwrap_or_default()
+                };
+                let glyph = if is_home {
+                    gpui_omarchy::IconName::FolderOpen
+                } else {
+                    gpui_omarchy::IconName::HardDrive
+                };
+                rows = rows.child(
+                    div()
+                        .id(ElementId::Name(format!("volume-{index}").into()))
+                        .debug_selector(move || format!("volume-{index}"))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::SM)
+                        .px(space::MD)
+                        .py(space::SM)
+                        .cursor_pointer()
+                        .when(index + 1 < count, |row| {
+                            row.border_b_1()
+                                .border_color(theme.divider().opacity(0.45))
+                        })
+                        .when(highlighted, |row| {
+                            row.bg(theme.accent.opacity(0.16))
+                        })
+                        .hover(|row| row.bg(theme.accent.opacity(0.1)))
+                        .child(
+                            gpui_omarchy::icon(glyph)
+                                .size(icon::SM)
+                                .text_color(if highlighted {
+                                    theme.accent
+                                } else {
+                                    theme.secondary
+                                })
+                                .flex_shrink_0(),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(text::BODY)
+                                .font_weight(if highlighted {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::NORMAL
+                                })
+                                .text_color(if highlighted {
+                                    theme.bright
+                                } else {
+                                    theme.foreground
+                                })
+                                .child(primary),
+                        )
+                        .when(!secondary.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(text::CAPTION)
+                                    .text_color(theme.secondary)
+                                    .child(secondary),
+                            )
+                        })
+                        .on_click(cx.listener(
+                            move |this, event: &ClickEvent, window, cx| {
+                                this.volume_highlight = index;
+                                if event.click_count() >= 2 {
+                                    this.choose_volume(cx);
+                                    this.apply_focus(window, cx);
+                                } else {
+                                    window.focus(&this.confirm_focus, cx);
+                                    cx.notify();
+                                }
+                            },
+                        )),
+                );
+            }
         }
     }
 
@@ -349,9 +360,7 @@ fn volumes_dialog(
             ))
             .when_some(
                 app.volumes_source.as_ref().filter(|_| {
-                    app.picker_remote_tab
-                        && !app.volumes_loading
-                        && app.volumes_error.is_none()
+                    app.picker_remote_tab && app.discovery.is_ready()
                 }),
                 |header, connected_host| {
                     header.child(
@@ -963,7 +972,7 @@ fn top_bar(
 fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
     let steps = app.breadcrumbs();
     let last = steps.len().saturating_sub(1);
-    let widening = app.scan.is_some() && app.scan_root != app.root_path;
+    let widening_target = app.widening_target();
     let hidden = if steps.len() > TRAIL_STEPS {
         2..steps.len() - (TRAIL_STEPS - 3)
     } else {
@@ -999,7 +1008,7 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
         let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
         let crumb = match step {
             Crumb::Above(path) => {
-                let pending = widening && app.scan_root == path;
+                let pending = widening_target == Some(path.as_path());
                 with_tooltip(
                     widgets::crumb(id, label, false, cx)
                         .text_color(if pending {
@@ -1705,7 +1714,7 @@ fn trail_and_legend(
                 })),
             "Refresh the scanned root · r",
         ));
-    if app.find_open || !app.find.is_empty() {
+    if app.find.is_visible() {
         row = row.child(find_field(app, theme));
     }
     row.child(div().flex_1()).child(legend(app, theme, cx))
@@ -1718,7 +1727,7 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
         return div()
             .text_size(text::CAPTION)
             .text_color(theme.secondary)
-            .child(if app.refresh_metric.is_some() {
+            .child(if app.is_refreshing() {
                 "Refreshing · showing the previous scan"
             } else {
                 "Live overview · incomplete · top-level contributions"
@@ -2781,7 +2790,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 .child(format!("{:.1}\u{00d7}", app.view.scale)),
         );
     }
-    let scan = if app.scan.is_some() || app.remote_scan.is_some() {
+    let scan = if app.is_indexing() {
         "Indexing · incomplete".to_string()
     } else if app.progress.cancelled {
         format!(
@@ -2952,7 +2961,7 @@ fn indexing_progress(
         .text_size(text::BODY)
         .text_color(theme.foreground)
         .child(widgets::eyebrow(
-            if app.refresh_metric.is_some() {
+            if app.is_refreshing() {
                 "Refreshing"
             } else {
                 "Indexing"
@@ -3021,12 +3030,13 @@ fn indexing_progress(
 }
 
 fn find_field(app: &Disktree, theme: &Theme) -> Div {
+    let applied = app.find.is_applied();
+    let editing = app.find.is_editing();
+    let query = app.find.query();
     // What the text matches, said beside it as it is typed, and what Enter
     // and Escape will do with it.
-    let (summary, hint) = match app.matches.as_deref() {
-        _ if app.finding && app.matches.is_none() => {
-            ("searching…".to_string(), "")
-        }
+    let (summary, hint) = match app.find.matches() {
+        None if app.find.is_searching() => ("searching…".to_string(), ""),
         None => (String::new(), "type to filter"),
         Some(matches) if matches.count == 0 => {
             ("no matches".to_string(), "esc clears")
@@ -3038,7 +3048,7 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
                 if matches.count == 1 { "" } else { "es" },
                 human_bytes(matches.bytes)
             ),
-            if app.filter_applied {
+            if applied {
                 "esc clears"
             } else {
                 "enter shows only these"
@@ -3055,9 +3065,9 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         .py(space::XS)
         .min_w_0()
         .border_1()
-        .border_color(if app.find_open {
+        .border_color(if editing {
             theme.accent
-        } else if app.filter_applied {
+        } else if applied {
             highlight
         } else {
             theme.control_border()
@@ -3067,24 +3077,20 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         .child(
             gpui_omarchy::icon(gpui_omarchy::IconName::Search)
                 .size(icon::SM)
-                .text_color(if app.filter_applied {
-                    highlight
-                } else {
-                    theme.secondary
-                }),
+                .text_color(if applied { highlight } else { theme.secondary }),
         )
-        .child(if app.find.is_empty() {
+        .child(if query.is_empty() {
             div()
                 .text_color(theme.secondary.opacity(0.7))
                 .child("Filter by name")
         } else {
-            div().text_color(theme.bright).child(app.find.clone())
+            div().text_color(theme.bright).child(query.to_owned())
         })
         .when(!summary.is_empty(), |this| {
             this.child(
                 div()
                     .text_size(text::CAPTION)
-                    .text_color(if app.filter_applied {
+                    .text_color(if applied {
                         highlight
                     } else {
                         theme.secondary
@@ -3838,7 +3844,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
     if let Some(space) = app.space {
         body = body.child(widgets::space_meter(space, 0, cx));
     }
-    if app.scan.is_some() {
+    if app.is_indexing() {
         body = body.child(widgets::meter_row(
             "re-scanning",
             format!("{} files", widgets::human_count(app.progress.files)),

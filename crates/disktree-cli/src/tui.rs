@@ -61,6 +61,22 @@ impl SortBy {
     }
 }
 
+/// Explicit modal/input state machine for the TUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputMode {
+    #[default]
+    Normal,
+    Filter,
+    Help,
+}
+
+/// Explicit exit transition for the TUI event loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitAction {
+    Quit,
+    ExportMarked,
+}
+
 /// Interactive application state (decoupled from terminal I/O for unit tests).
 pub struct App {
     pub root_path: PathBuf,
@@ -79,13 +95,11 @@ pub struct App {
     pub active_scan_path: Option<PathBuf>,
     pub updating_paths: FxHashSet<PathBuf>,
     pub marks: FxHashSet<PathBuf>,
-    pub filter_mode: bool,
+    pub mode: InputMode,
     pub filter_text: String,
-    pub show_help: bool,
     pub status_message: Option<String>,
     pub selected: usize,
-    pub export_on_exit: bool,
-    pub should_quit: bool,
+    pub exit: Option<ExitAction>,
     pub tick: usize,
 }
 
@@ -112,13 +126,11 @@ impl App {
             active_scan_path: None,
             updating_paths: FxHashSet::default(),
             marks: FxHashSet::default(),
-            filter_mode: false,
+            mode: InputMode::Normal,
             filter_text: String::new(),
-            show_help: false,
             status_message: None,
             selected: 0,
-            export_on_exit: false,
-            should_quit: false,
+            exit: None,
             tick: 0,
         }
     }
@@ -300,47 +312,49 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c')
         {
-            self.should_quit = true;
+            self.exit = Some(ExitAction::Quit);
             return None;
         }
 
-        if self.show_help {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
-                self.show_help = false;
+        match self.mode {
+            InputMode::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?' | 'q')) {
+                    self.mode = InputMode::Normal;
+                }
+                return None;
             }
-            return None;
-        }
-
-        if self.filter_mode {
-            match key.code {
-                KeyCode::Esc => {
-                    self.filter_mode = false;
-                    self.filter_text.clear();
-                    self.clamp_selection();
+            InputMode::Filter => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mode = InputMode::Normal;
+                        self.filter_text.clear();
+                        self.clamp_selection();
+                    }
+                    KeyCode::Enter => {
+                        self.mode = InputMode::Normal;
+                        self.clamp_selection();
+                    }
+                    KeyCode::Backspace => {
+                        self.filter_text.pop();
+                        self.clamp_selection();
+                    }
+                    KeyCode::Char(c) => {
+                        self.filter_text.push(c);
+                        self.clamp_selection();
+                    }
+                    _ => {}
                 }
-                KeyCode::Enter => {
-                    self.filter_mode = false;
-                    self.clamp_selection();
-                }
-                KeyCode::Backspace => {
-                    self.filter_text.pop();
-                    self.clamp_selection();
-                }
-                KeyCode::Char(c) => {
-                    self.filter_text.push(c);
-                    self.clamp_selection();
-                }
-                _ => {}
+                return None;
             }
-            return None;
+            InputMode::Normal => {}
         }
 
         match key.code {
             KeyCode::Char('q') => {
-                self.should_quit = true;
+                self.exit = Some(ExitAction::Quit);
             }
             KeyCode::Char('?') => {
-                self.show_help = true;
+                self.mode = InputMode::Help;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 let len = self.visible_children().len();
@@ -432,7 +446,7 @@ impl App {
                     Some(format!("Sorted by {}", self.sort_by.label()));
             }
             KeyCode::Char('/') => {
-                self.filter_mode = true;
+                self.mode = InputMode::Filter;
             }
             KeyCode::Char(' ') => {
                 let kids = self.visible_children();
@@ -451,8 +465,7 @@ impl App {
                         "No paths marked (press Space to mark)".to_owned(),
                     );
                 } else {
-                    self.export_on_exit = true;
-                    self.should_quit = true;
+                    self.exit = Some(ExitAction::ExportMarked);
                 }
             }
             KeyCode::Char('r') => {
@@ -498,7 +511,7 @@ impl App {
         self.draw_table(frame, chunks[2]);
         self.draw_footer(frame, chunks[3]);
 
-        if self.show_help {
+        if self.mode == InputMode::Help {
             draw_help_overlay(frame, frame.area());
         }
     }
@@ -757,7 +770,7 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let title = if self.filter_mode {
+        let title = if self.mode == InputMode::Filter {
             format!("Filter: {}_", self.filter_text)
         } else if !self.filter_text.is_empty() {
             format!("Entries (filter: {})", self.filter_text)
@@ -893,7 +906,7 @@ pub fn run_tui(
     );
 
     let loop_res = (|| -> io::Result<()> {
-        while !app.should_quit {
+        while app.exit.is_none() {
             // Drain all ready scanner events without blocking.
             while let Ok(ev) = session.try_recv() {
                 app.apply_event(ev);
@@ -924,7 +937,7 @@ pub fn run_tui(
 
     loop_res?;
 
-    if app.export_on_exit {
+    if app.exit == Some(ExitAction::ExportMarked) {
         let mut exported: Vec<PathBuf> = app.marks.into_iter().collect();
         exported.sort();
         Ok(exported)
@@ -1041,7 +1054,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(app.options.apparent_size);
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-        assert!(app.show_help);
+        assert_eq!(app.mode, InputMode::Help);
         terminal.draw(|f| app.draw(f)).expect("draw help");
     }
 }

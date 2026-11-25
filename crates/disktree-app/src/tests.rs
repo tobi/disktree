@@ -19,7 +19,9 @@ use gpui_kit::{
 use gpui_omarchy::{ActiveTheme, Theme};
 
 use crate::appearance;
-use crate::state::{Disktree, Screen};
+use crate::state::{
+    ActiveScan, Disktree, ScanIntent, Screen, discovery_machine,
+};
 
 /// A small tree on disk: two directories, a nested file, and a hidden one.
 ///
@@ -127,10 +129,13 @@ fn remote_indexing_draws_live_activity_and_the_sampled_directory(
     update(&view, cx, |app, _| {
         app.tree = None;
         app.remote = Some("fixture-only".into());
-        app.scan = Some(disktree_core::scan::ScanHandle::spawn(
-            temp.path().into(),
-            options(),
-        ));
+        app.active_scan = Some(ActiveScan::Local {
+            handle: disktree_core::scan::ScanHandle::spawn(
+                temp.path().into(),
+                options(),
+            ),
+            intent: ScanIntent::Initial,
+        });
         app.scan_started = Some(std::time::Instant::now());
         app.progress.files = 1234;
         app.progress.bytes = 123_456;
@@ -156,10 +161,13 @@ fn loading_values_and_paths_do_not_move_the_sidebar(cx: &mut TestAppContext) {
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, _| {
         app.tree = None;
-        app.scan = Some(disktree_core::scan::ScanHandle::spawn(
-            temp.path().into(),
-            options(),
-        ));
+        app.active_scan = Some(ActiveScan::Local {
+            handle: disktree_core::scan::ScanHandle::spawn(
+                temp.path().into(),
+                options(),
+            ),
+            intent: ScanIntent::Initial,
+        });
         app.scan_preview =
             Some(std::sync::Arc::new(disktree_core::scan_preview::Preview {
                 entries: vec![disktree_core::scan_preview::Entry {
@@ -211,10 +219,13 @@ fn narrow_indexing_keeps_a_preview_and_compact_progress_in_bounds(
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, _| {
         app.tree = None;
-        app.scan = Some(disktree_core::scan::ScanHandle::spawn(
-            temp.path().into(),
-            options(),
-        ));
+        app.active_scan = Some(ActiveScan::Local {
+            handle: disktree_core::scan::ScanHandle::spawn(
+                temp.path().into(),
+                options(),
+            ),
+            intent: ScanIntent::Initial,
+        });
         app.scan_preview =
             Some(std::sync::Arc::new(disktree_core::scan_preview::Preview {
                 entries: vec![disktree_core::scan_preview::Entry {
@@ -253,14 +264,14 @@ fn startup_chooser_never_scans_before_explicit_acceptance(
     read(&view, cx, |app| {
         assert!(app.awaiting_root);
         assert_eq!(app.scan_epoch, 0);
-        assert!(app.scan.is_none() && app.remote_scan.is_none());
+        assert!(!app.is_indexing());
     });
     press(cx, "escape");
     assert!(!read(&view, cx, |app| app.volumes_open));
     press(cx, "r");
     assert!(read(&view, cx, |app| app.volumes_open
         && app.awaiting_root
-        && app.scan.is_none()));
+        && !app.is_indexing()));
 }
 
 #[gpui_kit::test]
@@ -277,7 +288,7 @@ fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
             device: None,
             space: None,
         }];
-        app.volumes_loading = false;
+        app.discovery.phase = discovery_machine::Phase::Ready;
     });
     draw(cx);
     let input = cx.debug_bounds("source-path").expect("path editor");
@@ -320,9 +331,9 @@ fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
     cx.simulate_input("invalid host");
     press(cx, "enter");
     read(&view, cx, |app| {
-        assert!(app.volumes_error.is_some());
+        assert!(app.discovery.error().is_some());
         assert!(app.remote.is_none());
-        assert!(app.scan.is_none() && app.remote_scan.is_none());
+        assert!(!app.is_indexing());
         assert_eq!(app.scan_epoch, 0);
     });
     press(cx, "escape");
@@ -448,7 +459,7 @@ fn stale_local_discovery_cannot_overwrite_a_new_source_error(
     draw(cx);
     read(&view, cx, |app| {
         assert_eq!(app.volumes_source.as_deref(), Some("-invalid"));
-        assert!(app.volumes_error.is_some());
+        assert!(app.discovery.error().is_some());
         assert!(app.volumes.is_empty());
         assert!(app.remote.is_none());
     });
@@ -491,11 +502,7 @@ fn remote_root_acceptance_never_stats_the_path_locally(
         assert_eq!(app.remote.as_deref(), Some("-test-fixture"));
         assert_eq!(app.root_path, PathBuf::from("/only-on-the-remote-host"));
         assert!(app.marks.is_empty() && app.remote_identity.is_none());
-        assert!(
-            app.tree.is_none()
-                && app.scan.is_none()
-                && app.remote_scan.is_none()
-        );
+        assert!(app.tree.is_none() && !app.is_indexing());
         assert!(
             app.scan_error
                 .as_ref()
@@ -589,7 +596,7 @@ fn a_failed_remote_scan_stops_showing_the_reading_screen(
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, _| {
         app.tree = None;
-        app.scan = None;
+        app.active_scan = None;
         app.remote = Some("dev".into());
         app.scan_error =
             Some("SSH dev: Permission denied (publickey,password).".into());
@@ -966,7 +973,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
     draw(cx);
     // Live: two matches, nothing hidden yet, the rest only dimmed.
     let (count, applied, keep_filtered) = read(&view, cx, |app| {
-        let matches = app.matches.as_deref().expect("matching as it is typed");
+        let matches = app.find.matches().expect("matching as it is typed");
         let keep = app.tree().and_then(|tree| {
             tree.children
                 .iter()
@@ -974,7 +981,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
         });
         (
             matches.count,
-            app.filter_applied,
+            app.find.is_applied(),
             keep.is_some_and(|index| matches.keep(&[index]).is_none()),
         )
     });
@@ -987,7 +994,7 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
     // Enter: only the matches, and the largest selected for marking.
     press(cx, "enter");
     let drawn = names_drawn(&view, cx);
-    assert!(read(&view, cx, |app| app.filter_applied));
+    assert!(read(&view, cx, |app| app.find.is_applied()));
     assert!(
         !drawn.iter().any(|name| name == "keep" || name == "deeper"),
         "{drawn:?}"
@@ -1006,8 +1013,8 @@ fn typing_filters_live_and_enter_shows_only_the_matches(
 
     // Escape gives everything back.
     press(cx, "escape");
-    assert!(read(&view, cx, |app| app.matches.is_none()
-        && !app.filter_applied));
+    assert!(read(&view, cx, |app| app.find.matches().is_none()
+        && !app.find.is_applied()));
     assert!(names_drawn(&view, cx).contains(&"deeper".to_string()));
 }
 
@@ -1802,8 +1809,8 @@ fn refresh_button_rescans_and_keeps_the_view_and_marks_by_path(
     let button = cx.debug_bounds("refresh-scan").expect("refresh button");
     cx.simulate_click(button.center(), Modifiers::none());
     read(&view, cx, |app| {
-        assert!(app.scan.is_some());
-        assert!(app.refresh_metric.is_some());
+        assert!(app.is_indexing());
+        assert!(app.is_refreshing());
         assert!(app.tree().is_some(), "the previous tree stays visible");
         assert_eq!(app.current_path(), junk);
     });
@@ -1820,7 +1827,7 @@ fn refresh_button_rescans_and_keeps_the_view_and_marks_by_path(
                 .is_some(),
             "refresh rescans the whole root, not just the visible directory"
         );
-        assert!(app.refresh_metric.is_none());
+        assert!(!app.is_refreshing());
     });
 }
 
@@ -1842,7 +1849,7 @@ fn toggling_hidden_and_apparent_reprojects_arena_without_rescanning(
     read(&view, cx, |app| {
         assert!(!app.options.include_hidden);
         assert_eq!(app.scan_epoch, epoch, "no rescan triggered");
-        assert!(app.scan.is_none());
+        assert!(!app.is_indexing());
         assert!(app.tree().unwrap().child_named(".cache").is_none());
     });
 
@@ -1857,7 +1864,7 @@ fn toggling_hidden_and_apparent_reprojects_arena_without_rescanning(
     read(&view, cx, |app| {
         assert!(!app.options.apparent_size);
         assert_eq!(app.scan_epoch, epoch, "apparent toggle needs no rescan");
-        assert!(app.scan.is_none());
+        assert!(!app.is_indexing());
     });
 }
 
@@ -1872,9 +1879,9 @@ fn cancelling_a_refresh_keeps_the_previous_complete_tree(
     std::fs::write(temp.path().join("new.bin"), b"new").unwrap();
     update(&view, cx, |app, cx| {
         app.refresh_scan(cx);
-        assert!(app.scan.is_some());
+        assert!(app.is_indexing());
         app.cancel_scan(cx);
-        assert!(app.refresh_metric.is_none());
+        assert!(!app.is_refreshing());
     });
     read(&view, cx, |app| {
         assert_eq!(app.tree().unwrap().bytes, before);
@@ -1890,10 +1897,7 @@ fn cancelling_a_refresh_keeps_the_previous_complete_tree(
 fn finish_scan(view: &Entity<Disktree>, cx: &mut Window) {
     // Without a scan in flight the poller reports "stopped" at once, and the
     // wait would pass without having waited for anything.
-    assert!(
-        read(view, cx, |app| app.scan.is_some()),
-        "no scan to finish"
-    );
+    assert!(read(view, cx, Disktree::is_indexing), "no scan to finish");
     let epoch = read(view, cx, |app| app.scan_epoch);
     for _ in 0..600 {
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2037,9 +2041,9 @@ fn enter_before_the_search_lands_applies_it_when_it_does(
     draw(cx);
     let (applied, count, open) = read(&view, cx, |app| {
         (
-            app.filter_applied,
-            app.matches.as_deref().map(|matches| matches.count),
-            app.find_open,
+            app.find.is_applied(),
+            app.find.matches().map(|matches| matches.count),
+            app.find.is_editing(),
         )
     });
     assert!(applied, "Enter was not lost to a search in flight");
@@ -2358,9 +2362,8 @@ fn escape_cancels_the_first_scan_and_r_starts_it_again(
     let epoch = read(&view, cx, |app| app.scan_epoch);
 
     press(cx, "escape");
-    let (scanning, cancelled) = read(&view, cx, |app| {
-        (app.scan.is_some(), app.progress.cancelled)
-    });
+    let (scanning, cancelled) =
+        read(&view, cx, |app| (app.is_indexing(), app.progress.cancelled));
     assert!(!scanning, "the walk was dropped");
     assert!(cancelled, "the panel can say it stopped");
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2389,19 +2392,19 @@ fn escape_cancels_widening_and_keeps_the_tree_on_screen(
     let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
 
     press(cx, "g");
-    assert!(read(&view, cx, |app| app.scan.is_some()));
+    assert!(read(&view, cx, Disktree::is_indexing));
     press(cx, "escape");
-    let (scanning, root, scan_root, files) = read(&view, cx, |app| {
+    let (scanning, root, widening, files) = read(&view, cx, |app| {
         (
-            app.scan.is_some(),
+            app.is_indexing(),
             app.root_path.clone(),
-            app.scan_root.clone(),
+            app.widening_target().map(Path::to_path_buf),
             app.tree().map(|tree| tree.files),
         )
     });
     assert!(!scanning);
     assert_eq!(root, inner);
-    assert_eq!(scan_root, inner, "the trail stops showing a widening");
+    assert_eq!(widening, None, "the trail stops showing a widening");
     assert_eq!(files, before, "the tree on screen is unchanged");
 }
 

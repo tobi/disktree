@@ -43,19 +43,76 @@ pub type ShardLoader =
 /// Maximum number of per-path error strings retained on [`WalkProgress`].
 const MAX_ERROR_DETAIL: usize = 50;
 
+/// Pure state machine for [`PauseGate`].
+///
+/// Atomic transition: `step(state, event) -> (state, Vec<Effect>)`.
+/// `Cancelled` is terminal: later `Pause` or `Resume` events are ignored.
+mod gate_machine {
+    use std::num::NonZeroUsize;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum State {
+        #[default]
+        Running,
+        Paused {
+            holds: NonZeroUsize,
+        },
+        Cancelled,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Event {
+        Pause,
+        Resume,
+        Cancel,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Effect {
+        WakeAll,
+    }
+
+    pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
+        match (state, event) {
+            (State::Running, Event::Pause) => (
+                State::Paused {
+                    holds: NonZeroUsize::MIN,
+                },
+                vec![],
+            ),
+            (State::Paused { holds }, Event::Pause) => (
+                State::Paused {
+                    holds: holds.saturating_add(1),
+                },
+                vec![],
+            ),
+            (State::Paused { holds }, Event::Resume) => {
+                match NonZeroUsize::new(holds.get() - 1) {
+                    Some(remaining) => {
+                        (State::Paused { holds: remaining }, vec![])
+                    }
+                    None => (State::Running, vec![Effect::WakeAll]),
+                }
+            }
+            (State::Running, Event::Resume) => (State::Running, vec![]),
+            (State::Running | State::Paused { .. }, Event::Cancel) => {
+                (State::Cancelled, vec![Effect::WakeAll])
+            }
+            (
+                State::Cancelled,
+                Event::Pause | Event::Resume | Event::Cancel,
+            ) => (State::Cancelled, vec![]),
+        }
+    }
+}
+
 /// Cooperative pause gate that lets `Priority::Immediate` scans preempt
 /// background directory workers cleanly between syscalls and resume them once
 /// immediate work finishes.
 #[derive(Debug, Default)]
 pub struct PauseGate {
-    state: Mutex<PauseState>,
+    state: Mutex<gate_machine::State>,
     cv: Condvar,
-}
-
-#[derive(Debug, Default)]
-struct PauseState {
-    immediate_active: usize,
-    cancelled: bool,
 }
 
 impl PauseGate {
@@ -63,40 +120,44 @@ impl PauseGate {
         Self::default()
     }
 
-    /// Pause background workers while an immediate subtree task runs.
-    pub fn pause(&self) {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.immediate_active += 1;
-    }
-
-    /// Release one immediate hold; wakes background workers when count hits 0.
-    pub fn resume(&self) {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.immediate_active = guard.immediate_active.saturating_sub(1);
-        if guard.immediate_active == 0 {
-            self.cv.notify_all();
-        }
-    }
-
-    /// Mark cancelled and wake any parked workers immediately.
-    pub fn cancel(&self) {
-        {
+    fn apply(&self, event: gate_machine::Event) {
+        let effects = {
             let mut guard = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.cancelled = true;
+            let (next, effects) = gate_machine::step(*guard, event);
+            *guard = next;
+            effects
+        };
+        for effect in effects {
+            self.perform(effect);
         }
-        self.cv.notify_all();
     }
 
-    /// Wait while any immediate task is active (returns early on cancellation).
+    fn perform(&self, effect: gate_machine::Effect) {
+        match effect {
+            gate_machine::Effect::WakeAll => self.cv.notify_all(),
+        }
+    }
+
+    /// Pause background workers while an immediate subtree task runs.
+    pub fn pause(&self) {
+        self.apply(gate_machine::Event::Pause);
+    }
+
+    /// Release one immediate hold; wakes background workers when returning to
+    /// `Running`.
+    pub fn resume(&self) {
+        self.apply(gate_machine::Event::Resume);
+    }
+
+    /// Transition to terminal `Cancelled` and wake any parked workers.
+    pub fn cancel(&self) {
+        self.apply(gate_machine::Event::Cancel);
+    }
+
+    /// Wait while in `Paused` (returns immediately on `Running` or `Cancelled`).
     pub fn wait_if_paused(&self, cancel: &AtomicBool) {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -105,8 +166,7 @@ impl PauseGate {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while guard.immediate_active > 0
-            && !guard.cancelled
+        while matches!(*guard, gate_machine::State::Paused { .. })
             && !cancel.load(Ordering::Relaxed)
         {
             guard = self
@@ -321,86 +381,15 @@ pub fn walk_parallel(
                 return Ok(());
             }
         }
-        rayon::scope(|scope| {
-            let ctx = Arc::clone(&ctx);
-            let root_pending = Arc::clone(&root_pending);
-            scope.spawn(move |s| {
-                scan_dir(s, &ctx, &root_pending);
-            });
-        });
-        // Every Unscanned (no-data) directory has now been walked. Drain
-        // deferred Stale directories last, oldest first, so blind spots always
-        // get data before cached areas are re-walked.
-        loop {
-            if ctx.cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let mut stale = std::mem::take(
-                &mut *ctx
-                    .deferred_stale
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-            if stale.is_empty() {
-                break;
-            }
-            // Oldest cached data refreshes first (`scope_fifo` preserves FIFO
-            // spawn order rather than Rayon's default LIFO deque).
-            stale.sort_by_key(|(scanned_at, _)| *scanned_at);
-            rayon::scope_fifo(|scope| {
-                for (_, sub) in stale {
-                    let ctx = Arc::clone(&ctx);
-                    scope.spawn_fifo(move |_| {
-                        // A user may have prioritized this stale subtree while
-                        // unscanned directories were walking: graft it without
-                        // walking twice.
-                        if let Some(oracle) = &ctx.skip_oracle
-                            && let Some(reused) = oracle.try_reuse(&sub.path)
-                        {
-                            let reused_root = reused.node(reused.root());
-                            ctx.progress.skipped_fresh_dirs.fetch_add(
-                                u64::from(reused_root.dirs),
-                                Ordering::Relaxed,
-                            );
-                            ctx.progress.dirs.fetch_add(
-                                u64::from(reused_root.dirs),
-                                Ordering::Relaxed,
-                            );
-                            ctx.progress.files.fetch_add(
-                                reused_root.files,
-                                Ordering::Relaxed,
-                            );
-                            ctx.progress.allocated_bytes.fetch_add(
-                                reused_root.allocated_bytes,
-                                Ordering::Relaxed,
-                            );
-                            ctx.progress.apparent_bytes.fetch_add(
-                                reused_root.apparent_bytes,
-                                Ordering::Relaxed,
-                            );
-                            if let Some(parent) = &sub.parent {
-                                parent
-                                    .children
-                                    .lock()
-                                    .unwrap_or_else(
-                                        std::sync::PoisonError::into_inner,
-                                    )
-                                    .push(BuiltChild::Grafted {
-                                        name: sub.name.clone(),
-                                        arena: reused,
-                                        hidden: sub.hidden,
-                                        lossy_name: sub.lossy_name,
-                                    });
-                                complete_one(&ctx, parent);
-                            }
-                            return;
-                        }
-                        rayon::scope(|inner| {
-                            scan_dir(inner, &ctx, &sub);
-                        });
-                    });
-                }
-            });
+        let (mut phase, mut effects) = walk_machine::step(
+            walk_machine::State::Idle,
+            walk_machine::Event::Start,
+        );
+        while let Some(effect) = effects.pop() {
+            let event = perform_walk_effect(&ctx, &root_pending, effect);
+            let (next, next_effects) = walk_machine::step(phase, event);
+            phase = next;
+            effects.extend(next_effects);
         }
         Ok(())
     };
@@ -444,6 +433,154 @@ pub fn walk_parallel(
         scanned_at,
         cancelled,
     })
+}
+
+/// Pure phase scheduler for [`walk_parallel`].
+///
+/// Ordering: every unscanned (no-data) directory runs first; deferred stale
+/// directories run last, sorted oldest `scanned_at` first.
+mod walk_machine {
+    use std::sync::Arc;
+
+    use super::PendingDir;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum State {
+        Idle,
+        WalkingUnscanned,
+        WalkingStale,
+        Done,
+    }
+
+    pub enum Event {
+        Start,
+        PhaseCompleted {
+            deferred_stale: Vec<(u64, Arc<PendingDir>)>,
+            cancelled: bool,
+        },
+    }
+
+    pub enum Effect {
+        WalkUnscannedRoot,
+        WalkStaleBatch(Vec<Arc<PendingDir>>),
+    }
+
+    pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
+        match (state, event) {
+            (State::Idle, Event::Start) => {
+                (State::WalkingUnscanned, vec![Effect::WalkUnscannedRoot])
+            }
+            (
+                State::WalkingUnscanned | State::WalkingStale,
+                Event::PhaseCompleted {
+                    mut deferred_stale,
+                    cancelled,
+                },
+            ) => {
+                if cancelled || deferred_stale.is_empty() {
+                    return (State::Done, vec![]);
+                }
+                // Oldest cached data refreshes first.
+                deferred_stale.sort_by_key(|(scanned_at, _)| *scanned_at);
+                let ordered =
+                    deferred_stale.into_iter().map(|(_, dir)| dir).collect();
+                (State::WalkingStale, vec![Effect::WalkStaleBatch(ordered)])
+            }
+            (
+                state @ (State::WalkingUnscanned
+                | State::WalkingStale
+                | State::Done),
+                Event::Start,
+            )
+            | (
+                state @ (State::Idle | State::Done),
+                Event::PhaseCompleted { .. },
+            ) => (state, vec![]),
+        }
+    }
+}
+
+fn perform_walk_effect(
+    ctx: &Arc<WalkContext>,
+    root_pending: &Arc<PendingDir>,
+    effect: walk_machine::Effect,
+) -> walk_machine::Event {
+    match effect {
+        walk_machine::Effect::WalkUnscannedRoot => {
+            rayon::scope(|scope| {
+                let ctx = Arc::clone(ctx);
+                let root_pending = Arc::clone(root_pending);
+                scope.spawn(move |s| {
+                    scan_dir(s, &ctx, &root_pending);
+                });
+            });
+        }
+        walk_machine::Effect::WalkStaleBatch(batch) => {
+            // `scope_fifo` preserves oldest-first spawn order rather than
+            // Rayon's default LIFO deque.
+            rayon::scope_fifo(|scope| {
+                for sub in batch {
+                    let ctx = Arc::clone(ctx);
+                    scope.spawn_fifo(move |_| {
+                        run_deferred_stale(&ctx, &sub);
+                    });
+                }
+            });
+        }
+    }
+    let cancelled = ctx.cancel.load(Ordering::Relaxed);
+    let deferred_stale = std::mem::take(
+        &mut *ctx
+            .deferred_stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    walk_machine::Event::PhaseCompleted {
+        deferred_stale,
+        cancelled,
+    }
+}
+
+fn run_deferred_stale(ctx: &Arc<WalkContext>, sub: &Arc<PendingDir>) {
+    // A user may have prioritized this stale subtree while unscanned
+    // directories were walking: graft it without walking twice.
+    if let Some(oracle) = &ctx.skip_oracle
+        && let Some(reused) = oracle.try_reuse(&sub.path)
+    {
+        let reused_root = reused.node(reused.root());
+        ctx.progress
+            .skipped_fresh_dirs
+            .fetch_add(u64::from(reused_root.dirs), Ordering::Relaxed);
+        ctx.progress
+            .dirs
+            .fetch_add(u64::from(reused_root.dirs), Ordering::Relaxed);
+        ctx.progress
+            .files
+            .fetch_add(reused_root.files, Ordering::Relaxed);
+        ctx.progress
+            .allocated_bytes
+            .fetch_add(reused_root.allocated_bytes, Ordering::Relaxed);
+        ctx.progress
+            .apparent_bytes
+            .fetch_add(reused_root.apparent_bytes, Ordering::Relaxed);
+        if let Some(parent) = &sub.parent {
+            parent
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(BuiltChild::Grafted {
+                    name: sub.name.clone(),
+                    arena: reused,
+                    hidden: sub.hidden,
+                    lossy_name: sub.lossy_name,
+                });
+            complete_one(ctx, parent);
+        }
+        return;
+    }
+    rayon::scope(|inner| {
+        scan_dir(inner, ctx, sub);
+    });
 }
 
 struct WalkContext {
@@ -1258,6 +1395,103 @@ mod tests {
                 DirFreshness::Unscanned
             }
         }
+    }
+
+    #[test]
+    fn gate_machine_nested_holds_and_terminal_cancel() {
+        use gate_machine::{Effect, Event, State, step};
+
+        let (state, effects) = step(State::Running, Event::Pause);
+        assert!(matches!(state, State::Paused { holds } if holds.get() == 1));
+        assert!(effects.is_empty());
+
+        let (state, effects) = step(state, Event::Pause);
+        assert!(matches!(state, State::Paused { holds } if holds.get() == 2));
+        assert!(effects.is_empty());
+
+        let (state, effects) = step(state, Event::Resume);
+        assert!(matches!(state, State::Paused { holds } if holds.get() == 1));
+        assert!(effects.is_empty());
+
+        let (state, effects) = step(state, Event::Resume);
+        assert_eq!(state, State::Running);
+        assert_eq!(effects, vec![Effect::WakeAll]);
+
+        // Duplicate resume in Running is a safe no-op.
+        let (state, effects) = step(state, Event::Resume);
+        assert_eq!(state, State::Running);
+        assert!(effects.is_empty());
+
+        // Cancel wakes parked workers and is terminal.
+        let (state, _) = step(state, Event::Pause);
+        let (state, effects) = step(state, Event::Cancel);
+        assert_eq!(state, State::Cancelled);
+        assert_eq!(effects, vec![Effect::WakeAll]);
+
+        let (state, effects) = step(state, Event::Pause);
+        assert_eq!(state, State::Cancelled);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn walk_machine_orders_unscanned_then_oldest_stale_and_stops_on_cancel() {
+        use walk_machine::{Effect, Event, State, step};
+
+        let (state, effects) = step(State::Idle, Event::Start);
+        assert_eq!(state, State::WalkingUnscanned);
+        assert!(matches!(effects.as_slice(), [Effect::WalkUnscannedRoot]));
+
+        let newer = Arc::new(PendingDir::new(
+            "newer".into(),
+            PathBuf::from("/newer"),
+            None,
+            1,
+            0,
+            false,
+            false,
+        ));
+        let older = Arc::new(PendingDir::new(
+            "older".into(),
+            PathBuf::from("/older"),
+            None,
+            1,
+            0,
+            false,
+            false,
+        ));
+        let (state, effects) = step(
+            state,
+            Event::PhaseCompleted {
+                deferred_stale: vec![(2000, newer), (1000, older)],
+                cancelled: false,
+            },
+        );
+        assert_eq!(state, State::WalkingStale);
+        let [Effect::WalkStaleBatch(batch)] = effects.as_slice() else {
+            panic!("expected WalkStaleBatch");
+        };
+        let names: Vec<&str> = batch.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["older", "newer"]);
+
+        // Cancellation terminates immediately even if more stale dirs remain.
+        let extra = Arc::new(PendingDir::new(
+            "extra".into(),
+            PathBuf::from("/extra"),
+            None,
+            1,
+            0,
+            false,
+            false,
+        ));
+        let (state, effects) = step(
+            state,
+            Event::PhaseCompleted {
+                deferred_stale: vec![(500, extra)],
+                cancelled: true,
+            },
+        );
+        assert_eq!(state, State::Done);
+        assert!(effects.is_empty());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::db::{CacheDb, InvalidateReport, normalize_path};
+use crate::db::{CacheDb, InvalidateReport};
 use crate::mounts::default_cache_db_path;
 use crate::stream::{StreamItem, stream_walk};
 use crate::tree::TreeArena;
@@ -70,20 +70,237 @@ pub enum ScanEvent {
     Finished,
 }
 
-#[derive(Debug)]
-struct RuntimeStorage {
-    db: Option<Arc<CacheDb>>,
-    active_mode: ActiveStorageMode,
-    fallback_reason: Option<FallbackReason>,
-    /// In-memory cache used when running in `InMemory` mode (either requested
-    /// or after automatic fallback).
-    mem_cache: FxHashMap<(String, PathBuf), (Arc<TreeArena>, u64, u32)>,
+/// Pure state machine for [`Scanner`]'s storage backend transitions.
+///
+/// Atomic transition: `step(state, event) -> (state, Vec<Effect>)`.
+/// Disk-backed modes (`Persistent`, `TempDb`) downgrade to `InMemory` on any
+/// I/O, headroom, or corruption failure and carry forward any in-memory entries.
+mod storage_machine {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rustc_hash::FxHashMap;
+
+    use crate::db::{CacheDb, normalize_path};
+    use crate::tree::TreeArena;
+    use crate::types::{ActiveStorageMode, FallbackReason};
+
+    pub type MemCache =
+        FxHashMap<(String, PathBuf), (Arc<TreeArena>, u64, u32)>;
+
+    #[derive(Debug)]
+    pub enum State {
+        Persistent {
+            db: Arc<CacheDb>,
+            mem_cache: MemCache,
+        },
+        TempDb {
+            db: Arc<CacheDb>,
+            mem_cache: MemCache,
+        },
+        InMemory {
+            fallback_reason: Option<FallbackReason>,
+            mem_cache: MemCache,
+        },
+        Streaming,
+    }
+
+    #[derive(Debug)]
+    pub enum Event {
+        StorageFailed(FallbackReason),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Effect {
+        EmitFallback {
+            from: ActiveStorageMode,
+            to: ActiveStorageMode,
+            reason: FallbackReason,
+        },
+    }
+
+    pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
+        match (state, event) {
+            (
+                State::Persistent { mem_cache, .. },
+                Event::StorageFailed(reason),
+            ) => (
+                State::InMemory {
+                    fallback_reason: Some(reason.clone()),
+                    mem_cache,
+                },
+                vec![Effect::EmitFallback {
+                    from: ActiveStorageMode::Persistent,
+                    to: ActiveStorageMode::InMemory,
+                    reason,
+                }],
+            ),
+            (State::TempDb { mem_cache, .. }, Event::StorageFailed(reason)) => {
+                (
+                    State::InMemory {
+                        fallback_reason: Some(reason.clone()),
+                        mem_cache,
+                    },
+                    vec![Effect::EmitFallback {
+                        from: ActiveStorageMode::TempDb,
+                        to: ActiveStorageMode::InMemory,
+                        reason,
+                    }],
+                )
+            }
+            (
+                State::InMemory { mem_cache, .. },
+                Event::StorageFailed(reason),
+            ) => (
+                State::InMemory {
+                    fallback_reason: Some(reason.clone()),
+                    mem_cache,
+                },
+                vec![Effect::EmitFallback {
+                    from: ActiveStorageMode::InMemory,
+                    to: ActiveStorageMode::InMemory,
+                    reason,
+                }],
+            ),
+            (State::Streaming, Event::StorageFailed(_)) => {
+                (State::Streaming, vec![])
+            }
+        }
+    }
+
+    impl State {
+        pub const fn active_mode(&self) -> ActiveStorageMode {
+            match self {
+                Self::Persistent { .. } => ActiveStorageMode::Persistent,
+                Self::TempDb { .. } => ActiveStorageMode::TempDb,
+                Self::InMemory { .. } => ActiveStorageMode::InMemory,
+                Self::Streaming => ActiveStorageMode::Streaming,
+            }
+        }
+
+        pub fn fallback_reason(&self) -> Option<FallbackReason> {
+            match self {
+                Self::InMemory {
+                    fallback_reason, ..
+                } => fallback_reason.clone(),
+                Self::Persistent { .. }
+                | Self::TempDb { .. }
+                | Self::Streaming => None,
+            }
+        }
+
+        pub fn db(&self) -> Option<Arc<CacheDb>> {
+            match self {
+                Self::Persistent { db, .. } | Self::TempDb { db, .. } => {
+                    Some(Arc::clone(db))
+                }
+                Self::InMemory { .. } | Self::Streaming => None,
+            }
+        }
+
+        pub const fn mem_cache(&self) -> Option<&MemCache> {
+            match self {
+                Self::Persistent { mem_cache, .. }
+                | Self::TempDb { mem_cache, .. }
+                | Self::InMemory { mem_cache, .. } => Some(mem_cache),
+                Self::Streaming => None,
+            }
+        }
+
+        pub const fn mem_cache_mut(&mut self) -> Option<&mut MemCache> {
+            match self {
+                Self::Persistent { mem_cache, .. }
+                | Self::TempDb { mem_cache, .. }
+                | Self::InMemory { mem_cache, .. } => Some(mem_cache),
+                Self::Streaming => None,
+            }
+        }
+
+        pub fn invalidate_memory(&mut self, host_key: &str, paths: &[PathBuf]) {
+            let Some(cache) = self.mem_cache_mut() else {
+                return;
+            };
+            for path in paths {
+                let norm = PathBuf::from(normalize_path(path));
+                cache.retain(|(h, cached_path), _| {
+                    if h != host_key {
+                        return true;
+                    }
+                    !(cached_path.starts_with(&norm)
+                        || norm.starts_with(cached_path))
+                });
+            }
+        }
+    }
+}
+
+use storage_machine::State as StorageState;
+
+impl StorageState {
+    fn open(mode: StorageMode, headroom: u64) -> io::Result<Self> {
+        let state = match mode {
+            StorageMode::Auto => match default_cache_db_path() {
+                Some(path) => match CacheDb::open(path, headroom, false) {
+                    Ok(db) => Self::Persistent {
+                        db: Arc::new(db),
+                        mem_cache: FxHashMap::default(),
+                    },
+                    Err(reason) => Self::InMemory {
+                        fallback_reason: Some(reason),
+                        mem_cache: FxHashMap::default(),
+                    },
+                },
+                None => Self::InMemory {
+                    fallback_reason: Some(
+                        FallbackReason::DatabaseUnavailable {
+                            detail: "could not determine user cache directory"
+                                .to_owned(),
+                        },
+                    ),
+                    mem_cache: FxHashMap::default(),
+                },
+            },
+            StorageMode::Persistent { path, strict } => {
+                match CacheDb::open(path, headroom, false) {
+                    Ok(db) => Self::Persistent {
+                        db: Arc::new(db),
+                        mem_cache: FxHashMap::default(),
+                    },
+                    Err(reason) if strict => {
+                        return Err(io::Error::other(format!(
+                            "failed to open cache DB in strict mode: {reason:?}"
+                        )));
+                    }
+                    Err(reason) => Self::InMemory {
+                        fallback_reason: Some(reason),
+                        mem_cache: FxHashMap::default(),
+                    },
+                }
+            }
+            StorageMode::TempDb => match CacheDb::open_temp(headroom) {
+                Ok(db) => Self::TempDb {
+                    db: Arc::new(db),
+                    mem_cache: FxHashMap::default(),
+                },
+                Err(reason) => Self::InMemory {
+                    fallback_reason: Some(reason),
+                    mem_cache: FxHashMap::default(),
+                },
+            },
+            StorageMode::InMemory => Self::InMemory {
+                fallback_reason: None,
+                mem_cache: FxHashMap::default(),
+            },
+            StorageMode::Streaming => Self::Streaming,
+        };
+        Ok(state)
+    }
 }
 
 /// Reusable scanner facade owning the cache DB handle and default policy.
 #[derive(Clone, Debug)]
 pub struct Scanner {
-    storage: Arc<Mutex<RuntimeStorage>>,
+    storage: Arc<Mutex<StorageState>>,
     default_policy: CachePolicy,
 }
 
@@ -98,84 +315,8 @@ impl Scanner {
         mode: StorageMode,
         default_policy: CachePolicy,
     ) -> io::Result<Self> {
-        let headroom = default_policy.min_free_headroom;
-        let runtime = match mode {
-            StorageMode::Auto => match default_cache_db_path() {
-                Some(path) => match CacheDb::open(path, headroom, false) {
-                    Ok(db) => RuntimeStorage {
-                        db: Some(Arc::new(db)),
-                        active_mode: ActiveStorageMode::Persistent,
-                        fallback_reason: None,
-                        mem_cache: FxHashMap::default(),
-                    },
-                    Err(reason) => RuntimeStorage {
-                        db: None,
-                        active_mode: ActiveStorageMode::InMemory,
-                        fallback_reason: Some(reason),
-                        mem_cache: FxHashMap::default(),
-                    },
-                },
-                None => RuntimeStorage {
-                    db: None,
-                    active_mode: ActiveStorageMode::InMemory,
-                    fallback_reason: Some(
-                        FallbackReason::DatabaseUnavailable {
-                            detail: "could not determine user cache directory"
-                                .to_owned(),
-                        },
-                    ),
-                    mem_cache: FxHashMap::default(),
-                },
-            },
-            StorageMode::Persistent { path, strict } => {
-                match CacheDb::open(path, headroom, false) {
-                    Ok(db) => RuntimeStorage {
-                        db: Some(Arc::new(db)),
-                        active_mode: ActiveStorageMode::Persistent,
-                        fallback_reason: None,
-                        mem_cache: FxHashMap::default(),
-                    },
-                    Err(reason) if strict => {
-                        return Err(io::Error::other(format!(
-                            "failed to open cache DB in strict mode: {reason:?}"
-                        )));
-                    }
-                    Err(reason) => RuntimeStorage {
-                        db: None,
-                        active_mode: ActiveStorageMode::InMemory,
-                        fallback_reason: Some(reason),
-                        mem_cache: FxHashMap::default(),
-                    },
-                }
-            }
-            StorageMode::TempDb => match CacheDb::open_temp(headroom) {
-                Ok(db) => RuntimeStorage {
-                    db: Some(Arc::new(db)),
-                    active_mode: ActiveStorageMode::TempDb,
-                    fallback_reason: None,
-                    mem_cache: FxHashMap::default(),
-                },
-                Err(reason) => RuntimeStorage {
-                    db: None,
-                    active_mode: ActiveStorageMode::InMemory,
-                    fallback_reason: Some(reason),
-                    mem_cache: FxHashMap::default(),
-                },
-            },
-            StorageMode::InMemory => RuntimeStorage {
-                db: None,
-                active_mode: ActiveStorageMode::InMemory,
-                fallback_reason: None,
-                mem_cache: FxHashMap::default(),
-            },
-            StorageMode::Streaming => RuntimeStorage {
-                db: None,
-                active_mode: ActiveStorageMode::Streaming,
-                fallback_reason: None,
-                mem_cache: FxHashMap::default(),
-            },
-        };
-
+        let runtime =
+            StorageState::open(mode, default_policy.min_free_headroom)?;
         Ok(Self {
             storage: Arc::new(Mutex::new(runtime)),
             default_policy,
@@ -186,15 +327,14 @@ impl Scanner {
         self.storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_mode
+            .active_mode()
     }
 
     pub fn fallback_reason(&self) -> Option<FallbackReason> {
         self.storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fallback_reason
-            .clone()
+            .fallback_reason()
     }
 
     pub const fn default_policy(&self) -> &CachePolicy {
@@ -247,11 +387,7 @@ impl Scanner {
                 .storage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                guard.db.clone(),
-                guard.active_mode,
-                guard.fallback_reason.clone(),
-            )
+            (guard.db(), guard.active_mode(), guard.fallback_reason())
         };
 
         // 1. Instant cache check (sub-10ms fast path).
@@ -288,7 +424,7 @@ impl Scanner {
                             .storage
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        (guard.active_mode, guard.fallback_reason.clone())
+                        (guard.active_mode(), guard.fallback_reason())
                     };
                     let _ = event_tx.send(ScanEvent::Snapshot(ScanSnapshot {
                         arena: Arc::new(cached.arena),
@@ -455,17 +591,8 @@ impl Scanner {
                 .storage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for path in paths {
-                let norm = PathBuf::from(normalize_path(path));
-                guard.mem_cache.retain(|(h, cached_path), _| {
-                    if h != &host_key {
-                        return true;
-                    }
-                    !(cached_path.starts_with(&norm)
-                        || norm.starts_with(cached_path))
-                });
-            }
-            guard.db.clone()
+            guard.invalidate_memory(&host_key, paths);
+            guard.db()
         };
 
         let Some(db) = db_opt else {
@@ -486,8 +613,7 @@ impl Scanner {
             .storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .db
-            .clone();
+            .db();
         let Some(db) = db_opt else {
             return Ok(CacheStats::default());
         };
@@ -502,8 +628,10 @@ impl Scanner {
                 .storage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.mem_cache.clear();
-            guard.db.clone()
+            if let Some(cache) = guard.mem_cache_mut() {
+                cache.clear();
+            }
+            guard.db()
         };
         if let Some(db) = db_opt {
             db.clear()
@@ -518,8 +646,7 @@ impl Scanner {
             .storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .db
-            .clone();
+            .db();
         let Some(db) = db_opt else {
             return Ok(0);
         };
@@ -560,8 +687,10 @@ impl Scanner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard
-                .mem_cache
-                .get(&(host_key, canonical_root.to_path_buf()))
+                .mem_cache()
+                .and_then(|cache| {
+                    cache.get(&(host_key, canonical_root.to_path_buf()))
+                })
                 .cloned()
         };
         let (arena, scanned_at, mask) = entry?;
@@ -608,7 +737,7 @@ pub struct ScanSession {
     cancel: Arc<AtomicBool>,
     pause_gate: Arc<PauseGate>,
     progress: Arc<WalkProgress>,
-    storage: Arc<Mutex<RuntimeStorage>>,
+    storage: Arc<Mutex<StorageState>>,
 }
 
 impl std::fmt::Debug for ScanSession {
@@ -695,17 +824,8 @@ impl ScanSession {
                 .storage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for path in paths {
-                let norm = PathBuf::from(normalize_path(path));
-                guard.mem_cache.retain(|(h, cached_path), _| {
-                    if h != &host_key {
-                        return true;
-                    }
-                    !(cached_path.starts_with(&norm)
-                        || norm.starts_with(cached_path))
-                });
-            }
-            guard.db.clone()
+            guard.invalidate_memory(&host_key, paths);
+            guard.db()
         };
         let Some(db) = db_opt else {
             return Ok(InvalidateReport::default());
@@ -728,7 +848,7 @@ impl ScanSession {
 
 #[allow(clippy::too_many_arguments, reason = "worker thread parameters")]
 fn run_background_walk(
-    storage: &Arc<Mutex<RuntimeStorage>>,
+    storage: &Arc<Mutex<StorageState>>,
     host: &HostKey,
     walk_root: &Path,
     options: &ScanOptions,
@@ -746,8 +866,7 @@ fn run_background_walk(
     let db_opt = storage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .db
-        .clone();
+        .db();
 
     // Preload fresh (skip) and stale (defer-last, oldest-first) subtrees
     // strictly beneath `walk_root`. Even on `force_refresh`, loading stale
@@ -866,7 +985,7 @@ fn run_background_walk(
         let guard = storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (guard.active_mode, guard.fallback_reason.clone())
+        (guard.active_mode(), guard.fallback_reason())
     };
 
     // Deliver the live tree to interactive UIs immediately before committing
@@ -888,7 +1007,7 @@ fn run_background_walk(
 #[allow(clippy::too_many_arguments, reason = "priority worker loop state")]
 fn run_priority_loop(
     cmd_rx: &Receiver<SessionCmd>,
-    storage: &Weak<Mutex<RuntimeStorage>>,
+    storage: &Weak<Mutex<StorageState>>,
     host: &HostKey,
     options: &ScanOptions,
     cancel: &Arc<AtomicBool>,
@@ -979,7 +1098,7 @@ fn run_priority_loop(
 }
 
 fn persist_arena(
-    storage: &Arc<Mutex<RuntimeStorage>>,
+    storage: &Arc<Mutex<StorageState>>,
     host: &HostKey,
     arena: &Arc<TreeArena>,
     options: &ScanOptions,
@@ -990,11 +1109,13 @@ fn persist_arena(
         let mut guard = storage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.mem_cache.insert(
-            (host.as_db_key(), arena.root_path().to_path_buf()),
-            (Arc::clone(arena), scanned_at, options.cache_topology_mask()),
-        );
-        guard.db.clone()
+        if let Some(cache) = guard.mem_cache_mut() {
+            cache.insert(
+                (host.as_db_key(), arena.root_path().to_path_buf()),
+                (Arc::clone(arena), scanned_at, options.cache_topology_mask()),
+            );
+        }
+        guard.db()
     };
 
     if let Some(db) = db_opt
@@ -1010,17 +1131,59 @@ fn persist_arena(
 }
 
 fn downgrade_storage(
-    storage: &Arc<Mutex<RuntimeStorage>>,
+    storage: &Arc<Mutex<StorageState>>,
     reason: FallbackReason,
 ) -> ActiveStorageMode {
     let mut guard = storage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let from = guard.active_mode;
-    guard.db = None;
-    guard.active_mode = ActiveStorageMode::InMemory;
-    guard.fallback_reason = Some(reason);
-    from
+    let current = std::mem::replace(&mut *guard, StorageState::Streaming);
+    let (next, effects) = storage_machine::step(
+        current,
+        storage_machine::Event::StorageFailed(reason),
+    );
+    *guard = next;
+    drop(guard);
+    effects
+        .into_iter()
+        .next()
+        .map_or(ActiveStorageMode::Streaming, |effect| match effect {
+            storage_machine::Effect::EmitFallback { from, .. } => from,
+        })
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::storage_machine::{Effect, Event, State, step};
+    use super::*;
+
+    #[test]
+    fn storage_machine_downgrades_and_keeps_streaming_pure() {
+        let (state, effects) = step(
+            State::InMemory {
+                fallback_reason: None,
+                mem_cache: FxHashMap::default(),
+            },
+            Event::StorageFailed(FallbackReason::DiskFull),
+        );
+        assert_eq!(state.active_mode(), ActiveStorageMode::InMemory);
+        assert_eq!(state.fallback_reason(), Some(FallbackReason::DiskFull));
+        assert_eq!(
+            effects,
+            vec![Effect::EmitFallback {
+                from: ActiveStorageMode::InMemory,
+                to: ActiveStorageMode::InMemory,
+                reason: FallbackReason::DiskFull,
+            }]
+        );
+
+        let (state, effects) = step(
+            State::Streaming,
+            Event::StorageFailed(FallbackReason::DiskFull),
+        );
+        assert_eq!(state.active_mode(), ActiveStorageMode::Streaming);
+        assert!(effects.is_empty());
+    }
 }
 
 #[cfg(all(test, feature = "cache-db"))]

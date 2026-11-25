@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use disktree_core::access::file_table_readable;
-use disktree_core::filter::{Keep, Matches, filter};
+use disktree_core::filter::{Keep, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::path_style::PathStyle;
 use disktree_core::removal::{
@@ -342,13 +342,560 @@ pub struct RunSummary {
     pub failed: usize,
 }
 
+/// Pure state machine for the Explore screen's find/filter bar.
+///
+/// Atomic transition: `step(state, event) -> (state, Vec<Effect>)`.
+/// Emitted effects execute sequentially in the order returned; stale search
+/// completions whose `epoch` does not match `state.epoch` are ignored.
+pub mod find_machine {
+    use std::sync::Arc;
+
+    use disktree_core::filter::Matches;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct State {
+        pub epoch: u64,
+        pub phase: Phase,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub enum Phase {
+        #[default]
+        Closed,
+        Editing {
+            query: String,
+            matches: Option<Arc<Matches>>,
+            searching: bool,
+        },
+        /// Enter was pressed while a background search was still running.
+        Applying {
+            query: String,
+            matches: Option<Arc<Matches>>,
+        },
+        /// Filter is applied: only matching tiles are laid out.
+        Applied {
+            query: String,
+            matches: Arc<Matches>,
+        },
+    }
+
+    #[derive(Debug)]
+    pub enum Event {
+        Open,
+        PushText(String),
+        Backspace,
+        Submit,
+        SearchFinished {
+            epoch: u64,
+            found: Option<Arc<Matches>>,
+        },
+        Clear,
+    }
+
+    #[derive(Debug)]
+    pub enum Effect {
+        StartSearch { epoch: u64, query: String },
+        SelectBestMatch(Arc<Matches>),
+        WarnNoMatches(String),
+        ClearNotice,
+        InvalidateLayout,
+    }
+
+    impl State {
+        pub fn query(&self) -> &str {
+            match &self.phase {
+                Phase::Closed => "",
+                Phase::Editing { query, .. }
+                | Phase::Applying { query, .. }
+                | Phase::Applied { query, .. } => query,
+            }
+        }
+
+        pub const fn is_visible(&self) -> bool {
+            !matches!(self.phase, Phase::Closed)
+        }
+
+        pub const fn is_editing(&self) -> bool {
+            matches!(self.phase, Phase::Editing { .. })
+        }
+
+        pub const fn is_applied(&self) -> bool {
+            matches!(self.phase, Phase::Applied { .. })
+        }
+
+        pub const fn is_searching(&self) -> bool {
+            matches!(
+                self.phase,
+                Phase::Editing {
+                    searching: true,
+                    ..
+                } | Phase::Applying { .. }
+            )
+        }
+
+        pub fn matches(&self) -> Option<&Matches> {
+            match &self.phase {
+                Phase::Closed => None,
+                Phase::Editing { matches, .. }
+                | Phase::Applying { matches, .. } => matches.as_deref(),
+                Phase::Applied { matches, .. } => Some(matches),
+            }
+        }
+    }
+
+    /// Pure transition: no background tasks, no GPUI context, no clocks.
+    pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
+        let State { epoch, phase } = state;
+        match (phase, event) {
+            // Clear is valid from every phase and invalidates any in-flight search.
+            (
+                Phase::Closed
+                | Phase::Editing { .. }
+                | Phase::Applying { .. }
+                | Phase::Applied { .. },
+                Event::Clear,
+            ) => (
+                State {
+                    epoch: epoch + 1,
+                    phase: Phase::Closed,
+                },
+                vec![Effect::InvalidateLayout],
+            ),
+
+            // Open enters Editing from Closed or Applied; already-open phases stay put.
+            (Phase::Closed, Event::Open) => (
+                State {
+                    epoch,
+                    phase: Phase::Editing {
+                        query: String::new(),
+                        matches: None,
+                        searching: false,
+                    },
+                },
+                vec![],
+            ),
+            (Phase::Applied { query, matches }, Event::Open) => (
+                State {
+                    epoch,
+                    phase: Phase::Editing {
+                        query,
+                        matches: Some(matches),
+                        searching: false,
+                    },
+                },
+                vec![Effect::InvalidateLayout],
+            ),
+            // Text edits only apply while Editing; ignored in other phases.
+            (
+                Phase::Editing {
+                    mut query, matches, ..
+                },
+                Event::PushText(text),
+            ) => {
+                query.push_str(&text);
+                begin_search(epoch, query, matches)
+            }
+            (
+                Phase::Editing {
+                    mut query, matches, ..
+                },
+                Event::Backspace,
+            ) => {
+                query.pop();
+                begin_search(epoch, query, matches)
+            }
+
+            // Submit commits ready matches, defers while searching, or closes empty.
+            (
+                Phase::Editing {
+                    query,
+                    matches,
+                    searching: true,
+                },
+                Event::Submit,
+            ) => (
+                State {
+                    epoch,
+                    phase: Phase::Applying { query, matches },
+                },
+                vec![],
+            ),
+            (
+                Phase::Editing {
+                    query,
+                    matches: Some(matches),
+                    searching: false,
+                },
+                Event::Submit,
+            ) => finish_apply(epoch, query, matches),
+            (
+                Phase::Editing {
+                    matches: None,
+                    searching: false,
+                    ..
+                },
+                Event::Submit,
+            ) => (
+                State {
+                    epoch,
+                    phase: Phase::Closed,
+                },
+                vec![],
+            ),
+
+            // Async search results are accepted only for the current epoch.
+            (
+                Phase::Editing { query, .. },
+                Event::SearchFinished {
+                    epoch: done_epoch,
+                    found,
+                },
+            ) if done_epoch == epoch => (
+                State {
+                    epoch,
+                    phase: Phase::Editing {
+                        query,
+                        matches: found,
+                        searching: false,
+                    },
+                },
+                vec![Effect::InvalidateLayout],
+            ),
+            (
+                Phase::Applying { query, .. },
+                Event::SearchFinished {
+                    epoch: done_epoch,
+                    found: Some(matches),
+                },
+            ) if done_epoch == epoch => finish_apply(epoch, query, matches),
+            (
+                Phase::Applying { .. },
+                Event::SearchFinished {
+                    epoch: done_epoch,
+                    found: None,
+                },
+            ) if done_epoch == epoch => (
+                State {
+                    epoch,
+                    phase: Phase::Closed,
+                },
+                vec![Effect::InvalidateLayout],
+            ),
+
+            // Explicitly ignored events: non-applicable inputs or stale epochs.
+            (
+                phase @ (Phase::Editing { .. } | Phase::Applying { .. }),
+                Event::Open,
+            )
+            | (
+                phase @ (Phase::Closed
+                | Phase::Applying { .. }
+                | Phase::Applied { .. }),
+                Event::PushText(_) | Event::Backspace | Event::Submit,
+            )
+            | (
+                phase @ (Phase::Closed
+                | Phase::Editing { .. }
+                | Phase::Applying { .. }
+                | Phase::Applied { .. }),
+                Event::SearchFinished { .. },
+            ) => (State { epoch, phase }, vec![]),
+        }
+    }
+
+    fn begin_search(
+        epoch: u64,
+        query: String,
+        matches: Option<Arc<Matches>>,
+    ) -> (State, Vec<Effect>) {
+        let next_epoch = epoch + 1;
+        if query.trim().is_empty() {
+            return (
+                State {
+                    epoch: next_epoch,
+                    phase: Phase::Editing {
+                        query,
+                        matches: None,
+                        searching: false,
+                    },
+                },
+                vec![Effect::InvalidateLayout],
+            );
+        }
+        let needle = query.clone();
+        (
+            State {
+                epoch: next_epoch,
+                phase: Phase::Editing {
+                    query,
+                    matches,
+                    searching: true,
+                },
+            },
+            vec![Effect::StartSearch {
+                epoch: next_epoch,
+                query: needle,
+            }],
+        )
+    }
+
+    fn finish_apply(
+        epoch: u64,
+        query: String,
+        matches: Arc<Matches>,
+    ) -> (State, Vec<Effect>) {
+        if matches.count == 0 {
+            let needle = matches.needle.clone();
+            return (
+                State {
+                    epoch,
+                    phase: Phase::Editing {
+                        query,
+                        matches: Some(matches),
+                        searching: false,
+                    },
+                },
+                vec![Effect::WarnNoMatches(needle), Effect::InvalidateLayout],
+            );
+        }
+        let selected_matches = Arc::clone(&matches);
+        (
+            State {
+                epoch,
+                phase: Phase::Applied { query, matches },
+            },
+            vec![
+                Effect::SelectBestMatch(selected_matches),
+                Effect::ClearNotice,
+                Effect::InvalidateLayout,
+            ],
+        )
+    }
+}
+
+/// What an in-flight scan is doing to the current tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanIntent {
+    /// First scan or new root: replaces the tree on completion.
+    Initial,
+    /// Widening to an ancestor while keeping the narrower tree on screen.
+    Widening { target: PathBuf },
+    /// Background refresh (`r`, Refresh button, or SWR revalidation): keeps
+    /// the current directory and selection by path when the new tree lands.
+    Refresh { metric: Metric },
+}
+
+/// Exclusive handle to at most one in-flight scan: local OR remote, never both.
+#[derive(Debug)]
+pub enum ActiveScan {
+    Local {
+        handle: ScanHandle,
+        intent: ScanIntent,
+    },
+    Remote {
+        handle: disktree_core::remote::RemoteScan,
+        intent: ScanIntent,
+    },
+}
+
+impl ActiveScan {
+    pub const fn intent(&self) -> &ScanIntent {
+        match self {
+            Self::Local { intent, .. } | Self::Remote { intent, .. } => intent,
+        }
+    }
+
+    pub fn widening_target(&self) -> Option<&Path> {
+        match self.intent() {
+            ScanIntent::Widening { target } => Some(target),
+            ScanIntent::Initial | ScanIntent::Refresh { .. } => None,
+        }
+    }
+
+    pub fn set_intent(&mut self, next: ScanIntent) {
+        match self {
+            Self::Local { intent, .. } | Self::Remote { intent, .. } => {
+                *intent = next;
+            }
+        }
+    }
+}
+
+/// Pure state machine for mount/volume discovery in the location picker.
+///
+/// Atomic transition: `step(state, event) -> (state, Vec<Effect>)`.
+/// Each start or reset increments `epoch`; completions carrying an older epoch
+/// are ignored so a slow local listing can never overwrite a newer remote error.
+pub mod discovery_machine {
+    #[derive(Debug, Default)]
+    pub struct State {
+        pub epoch: u64,
+        pub phase: Phase,
+    }
+
+    #[derive(Debug, Default)]
+    pub enum Phase {
+        #[default]
+        Idle,
+        Loading {
+            job: Option<disktree_core::remote::RemoteRoots>,
+        },
+        Ready,
+        Failed(String),
+    }
+
+    #[derive(Debug)]
+    pub enum Event {
+        StartLocal,
+        StartRemote {
+            host: String,
+        },
+        RemoteSpawned {
+            epoch: u64,
+            job: disktree_core::remote::RemoteRoots,
+        },
+        Completed {
+            epoch: u64,
+            outcome: Result<(), String>,
+        },
+        Reset,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Effect {
+        SpawnLocalListing { epoch: u64 },
+        DiscoverRemote { epoch: u64, host: String },
+        PollRemote { epoch: u64 },
+    }
+
+    impl State {
+        pub const fn is_idle(&self) -> bool {
+            matches!(self.phase, Phase::Idle)
+        }
+
+        pub const fn is_loading(&self) -> bool {
+            matches!(self.phase, Phase::Loading { .. })
+        }
+
+        pub const fn is_ready(&self) -> bool {
+            matches!(self.phase, Phase::Ready)
+        }
+
+        pub fn error(&self) -> Option<&str> {
+            match &self.phase {
+                Phase::Failed(error) => Some(error),
+                Phase::Idle | Phase::Loading { .. } | Phase::Ready => None,
+            }
+        }
+    }
+
+    /// Pure transition for mount discovery; every `(phase, event)` is handled
+    /// explicitly so no missing transition can hide behind a catch-all.
+    pub fn step(state: State, event: Event) -> (State, Vec<Effect>) {
+        let State { epoch, phase } = state;
+        match (phase, event) {
+            (
+                Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Ready
+                | Phase::Failed(_),
+                Event::Reset,
+            ) => (
+                State {
+                    epoch: epoch + 1,
+                    phase: Phase::Idle,
+                },
+                vec![],
+            ),
+            (
+                Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Ready
+                | Phase::Failed(_),
+                Event::StartLocal,
+            ) => {
+                let next_epoch = epoch + 1;
+                (
+                    State {
+                        epoch: next_epoch,
+                        phase: Phase::Loading { job: None },
+                    },
+                    vec![Effect::SpawnLocalListing { epoch: next_epoch }],
+                )
+            }
+            (
+                Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Ready
+                | Phase::Failed(_),
+                Event::StartRemote { host },
+            ) => {
+                let next_epoch = epoch + 1;
+                (
+                    State {
+                        epoch: next_epoch,
+                        phase: Phase::Loading { job: None },
+                    },
+                    vec![Effect::DiscoverRemote {
+                        epoch: next_epoch,
+                        host,
+                    }],
+                )
+            }
+            (
+                Phase::Loading { .. },
+                Event::RemoteSpawned {
+                    epoch: job_epoch,
+                    job,
+                },
+            ) if job_epoch == epoch => (
+                State {
+                    epoch,
+                    phase: Phase::Loading { job: Some(job) },
+                },
+                vec![Effect::PollRemote { epoch }],
+            ),
+            (
+                Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Ready
+                | Phase::Failed(_),
+                Event::Completed {
+                    epoch: done_epoch,
+                    outcome,
+                },
+            ) if done_epoch == epoch => {
+                let next_phase = match outcome {
+                    Ok(()) => Phase::Ready,
+                    Err(message) => Phase::Failed(message),
+                };
+                (
+                    State {
+                        epoch,
+                        phase: next_phase,
+                    },
+                    vec![],
+                )
+            }
+            // Stale spawns/completions from superseded epochs or non-loading
+            // phases are ignored explicitly.
+            (
+                phase @ (Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Ready
+                | Phase::Failed(_)),
+                Event::RemoteSpawned { .. } | Event::Completed { .. },
+            ) => (State { epoch, phase }, vec![]),
+        }
+    }
+}
+
 /// Everything the app knows and everything it can do.
 pub struct Disktree {
     /// The directory the tree was scanned from.
     pub root_path: PathBuf,
     pub remote: Option<String>,
     remote_disk: bool,
-    pub remote_scan: Option<disktree_core::remote::RemoteScan>,
     pub remote_progress: disktree_core::remote_progress::Progress,
     pub scan_preview: Option<Arc<disktree_core::scan_preview::Preview>>,
     preview_updated: Option<Instant>,
@@ -369,10 +916,8 @@ pub struct Disktree {
     pub arena: Option<Arc<TreeArena>>,
     pub freshness: Option<Freshness>,
     pub tree: Option<Arc<Node>>,
-    pub scan: Option<ScanHandle>,
+    pub active_scan: Option<ActiveScan>,
     pub scan_epoch: u64,
-    /// Metric of a background refresh, or `None` for a normal scan.
-    pub refresh_metric: Option<Metric>,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
 
@@ -429,20 +974,8 @@ pub struct Disktree {
     pub space_baseline: Option<SpaceInfo>,
     pub notice: Option<(String, Status)>,
 
-    pub find: String,
-    pub find_open: bool,
-    /// What the find text matches in the directory on screen, recomputed
-    /// on every keystroke. While typing it only dims what does not match.
-    pub matches: Option<Arc<Matches>>,
-    /// Enter was pressed: the mosaic lays out only the matches.
-    pub filter_applied: bool,
+    pub find: find_machine::State,
     filter_epoch: u64,
-    /// Bumped per keystroke; only the newest search's result is kept.
-    find_epoch: u64,
-    /// A search is running off the UI thread.
-    pub finding: bool,
-    /// Enter was pressed before the search finished: apply on arrival.
-    apply_pending: bool,
     pub show_help: bool,
     pub show_selection: bool,
     pub focus: FocusHandle,
@@ -477,24 +1010,18 @@ pub struct Disktree {
     /// on. `None` when closed; empty when no volume besides the current one
     /// could be read.
     pub volumes_open: bool,
-    pub volumes_loading: bool,
+    pub discovery: discovery_machine::State,
     pub awaiting_root: bool,
     pub picker_remote_tab: bool,
     pub volumes_source: Option<String>,
-    pub volumes_error: Option<String>,
     pub picker_error: Option<String>,
     pub picker_host: Option<Entity<InputState>>,
     pub picker_path: Option<Entity<InputState>>,
-    roots_job: Option<disktree_core::remote::RemoteRoots>,
-    volume_epoch: u64,
     pub volumes: Vec<disktree_core::space::Volume>,
     pub volume_highlight: usize,
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
     pub scan_started: Option<Instant>,
-    /// Where the scan in flight is rooted. Differs from `root_path` while
-    /// widening, when the old tree stays on screen until the wider one lands.
-    pub scan_root: PathBuf,
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
@@ -562,7 +1089,6 @@ impl Disktree {
             root_path,
             remote,
             remote_disk,
-            remote_scan: None,
             scan_preview: None,
             preview_updated: None,
             remote_progress: disktree_core::remote_progress::Progress::default(
@@ -580,9 +1106,8 @@ impl Disktree {
             arena: None,
             freshness: None,
             tree: None,
-            scan: None,
+            active_scan: None,
             scan_epoch: 0,
-            refresh_metric: None,
             progress: ScanSnapshot::default(),
             scan_error: None,
             screen: Screen::Explore,
@@ -624,14 +1149,8 @@ impl Disktree {
             space,
             space_baseline: None,
             notice: None,
-            find: String::new(),
-            find_open: false,
-            matches: None,
-            filter_applied: false,
+            find: find_machine::State::default(),
             filter_epoch: 0,
-            find_epoch: 0,
-            finding: false,
-            apply_pending: false,
             show_help: false,
             show_selection: true,
             focus: cx.focus_handle(),
@@ -647,21 +1166,17 @@ impl Disktree {
             restarting: false,
             disk_root: None,
             volumes_open: false,
-            volumes_loading: false,
+            discovery: discovery_machine::State::default(),
             awaiting_root: !start,
             picker_remote_tab: false,
             volumes_source: None,
-            volumes_error: None,
             picker_error: None,
             picker_host: None,
             picker_path: None,
-            roots_job: None,
-            volume_epoch: 0,
             volumes: Vec::new(),
             volume_highlight: 0,
             panel_rems: PANEL_REMS,
             scan_started: None,
-            scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
         };
@@ -701,8 +1216,8 @@ impl Disktree {
     ) -> Self {
         let mut app = Self::new(root_path, options, depth, cx);
         // `new` started a walk; this tree stands in for its result.
-        if let Some(scan) = app.scan.take() {
-            scan.cancel();
+        if let Some(ActiveScan::Local { handle, .. }) = app.active_scan.take() {
+            handle.cancel();
         }
         app.scan_epoch += 1;
         app.marks.refresh(
@@ -757,17 +1272,16 @@ impl Disktree {
         if !self.root_path.starts_with(&above) || self.root_path == above {
             return;
         }
-        if let Some(scan) = &self.scan {
-            scan.cancel();
+        if let Some(ActiveScan::Local { handle, .. }) = self.active_scan.take()
+        {
+            handle.cancel();
         }
         self.scan_epoch += 1;
-        self.refresh_metric = None;
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
         self.scan_error = None;
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
-        self.scan_root.clone_from(&above);
         self.remember();
         let known_path = self
             .root_path
@@ -780,8 +1294,12 @@ impl Disktree {
             path: known_path,
             arena,
         };
-        self.scan =
-            Some(ScanHandle::spawn_with(above, self.options, Some(known)));
+        let handle =
+            ScanHandle::spawn_with(above.clone(), self.options, Some(known));
+        self.active_scan = Some(ActiveScan::Local {
+            handle,
+            intent: ScanIntent::Widening { target: above },
+        });
         Self::poll_scan(epoch, cx);
         cx.notify();
     }
@@ -809,55 +1327,83 @@ impl Disktree {
         if !self.volumes_open {
             return;
         }
-        self.volume_epoch += 1;
-        let epoch = self.volume_epoch;
-        self.roots_job = None;
         self.picker_remote_tab = host.is_some();
         self.volumes_source.clone_from(&host);
         self.volumes.clear();
         self.volume_highlight = 0;
-        self.volumes_error = None;
         self.picker_error = None;
-        self.volumes_loading = true;
-        if let Some(host) = host {
-            match disktree_core::remote::RemoteRoots::discover(&host) {
-                Ok(job) => {
-                    self.roots_job = Some(job);
-                    cx.spawn(async move |this, cx| {
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(110))
-                                .await;
-                            let keep = this
-                                .update(cx, |this, cx| {
-                                    this.poll_roots_once(epoch, cx)
-                                })
-                                .unwrap_or(false);
-                            if !keep {
-                                break;
-                            }
-                        }
-                    })
-                    .detach();
-                }
-                Err(error) => self.finish_volume_listing(Err(error), cx),
-            }
-        } else {
-            let task = cx.background_executor().spawn(async {
-                disktree_core::space::volume_roots()
-                    .map(|volumes| (volumes, std::env::home_dir()))
-            });
-            cx.spawn(async move |this, cx| {
-                let result = task.await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.volumes_open && this.volume_epoch == epoch {
-                        this.finish_volume_listing(result, cx);
-                    }
-                });
-            })
-            .detach();
-        }
+        let event = match host {
+            Some(host) => discovery_machine::Event::StartRemote { host },
+            None => discovery_machine::Event::StartLocal,
+        };
+        self.step_discovery(event, cx);
         cx.notify();
+    }
+
+    fn step_discovery(
+        &mut self,
+        event: discovery_machine::Event,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let state = std::mem::take(&mut self.discovery);
+        let (next, effects) = discovery_machine::step(state, event);
+        self.discovery = next;
+        for effect in effects {
+            self.perform_discovery(effect, cx);
+        }
+    }
+
+    fn perform_discovery(
+        &mut self,
+        effect: discovery_machine::Effect,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match effect {
+            discovery_machine::Effect::DiscoverRemote { epoch, host } => {
+                match disktree_core::remote::RemoteRoots::discover(&host) {
+                    Ok(job) => self.step_discovery(
+                        discovery_machine::Event::RemoteSpawned { epoch, job },
+                        cx,
+                    ),
+                    Err(error) => {
+                        self.finish_volume_listing_for(epoch, Err(error), cx);
+                    }
+                }
+            }
+            discovery_machine::Effect::PollRemote { epoch } => {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(110))
+                            .await;
+                        let keep = this
+                            .update(cx, |this, cx| {
+                                this.poll_roots_once(epoch, cx)
+                            })
+                            .unwrap_or(false);
+                        if !keep {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            discovery_machine::Effect::SpawnLocalListing { epoch } => {
+                let task = cx.background_executor().spawn(async {
+                    disktree_core::space::volume_roots()
+                        .map(|volumes| (volumes, std::env::home_dir()))
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = task.await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.volumes_open {
+                            this.finish_volume_listing_for(epoch, result, cx);
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     pub(crate) fn poll_roots_once(
@@ -865,24 +1411,26 @@ impl Disktree {
         epoch: u64,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        if !self.volumes_open || self.volume_epoch != epoch {
+        if !self.volumes_open || self.discovery.epoch != epoch {
             return false;
         }
-        let Some(result) = self
-            .roots_job
-            .as_ref()
-            .and_then(disktree_core::remote::RemoteJob::poll)
+        let discovery_machine::Phase::Loading { job: Some(job) } =
+            &self.discovery.phase
         else {
-            return self.roots_job.is_some();
+            return false;
         };
-        self.roots_job = None;
-        self.finish_volume_listing(
+        let Some(result) = job.poll() else {
+            return true;
+        };
+        self.finish_volume_listing_for(
+            epoch,
             result.map(|roots| (roots.volumes, roots.home)),
             cx,
         );
         false
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_volume_listing(
         &mut self,
         result: std::io::Result<(
@@ -891,8 +1439,23 @@ impl Disktree {
         )>,
         cx: &mut Context<'_, Self>,
     ) {
-        self.volumes_loading = false;
-        match result {
+        let epoch = self.discovery.epoch;
+        self.finish_volume_listing_for(epoch, result, cx);
+    }
+
+    fn finish_volume_listing_for(
+        &mut self,
+        epoch: u64,
+        result: std::io::Result<(
+            Vec<disktree_core::space::Volume>,
+            Option<PathBuf>,
+        )>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if epoch != self.discovery.epoch {
+            return;
+        }
+        let outcome = match result {
             Ok((mut volumes, home)) => {
                 if let Some(home) = home
                     && !volumes.iter().any(|volume| volume.point == home)
@@ -907,9 +1470,14 @@ impl Disktree {
                     );
                 }
                 self.volumes = volumes;
+                Ok(())
             }
-            Err(error) => self.volumes_error = Some(error.to_string()),
-        }
+            Err(error) => Err(error.to_string()),
+        };
+        self.step_discovery(
+            discovery_machine::Event::Completed { epoch, outcome },
+            cx,
+        );
         cx.notify();
     }
 
@@ -985,7 +1553,6 @@ impl Disktree {
         }
         self.picker_remote_tab = true;
         self.picker_error = None;
-        self.volumes_error = None;
         if let Some(current_remote) = self.remote.clone() {
             if let Some(host) = self.picker_host.clone() {
                 host.update(cx, |host, cx| {
@@ -994,9 +1561,7 @@ impl Disktree {
             }
             self.load_volume_source(Some(current_remote), cx);
         } else {
-            self.volume_epoch += 1;
-            self.roots_job = None;
-            self.volumes_loading = false;
+            self.step_discovery(discovery_machine::Event::Reset, cx);
             self.volumes_source = None;
             self.volumes.clear();
             self.volume_highlight = 0;
@@ -1079,8 +1644,8 @@ impl Disktree {
         cx: &mut Context<'_, Self>,
     ) {
         if !self.volumes_open
-            || self.volumes_loading
-            || self.volumes_error.is_some()
+            || self.discovery.is_loading()
+            || self.discovery.error().is_some()
         {
             return;
         }
@@ -1128,9 +1693,7 @@ impl Disktree {
 
     /// Closing cancels discovery, not the scan already on screen.
     pub fn close_volumes(&mut self, cx: &mut Context<'_, Self>) {
-        self.volume_epoch += 1;
-        self.roots_job = None;
-        self.volumes_loading = false;
+        self.step_discovery(discovery_machine::Event::Reset, cx);
         self.volumes_open = false;
         self.focus_request = Some(FocusTarget::Root);
         cx.notify();
@@ -1239,24 +1802,21 @@ impl Disktree {
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
         self.scan_preview = None;
-        self.refresh_metric = None;
-        if self.remote_scan.take().is_some() {
-            self.scan_epoch += 1;
-            self.progress.cancelled = true;
-            self.progress.finished = true;
-            self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
-            cx.notify();
-            return;
-        }
-        let Some(scan) = self.scan.take() else {
+        let Some(active) = self.active_scan.take() else {
             return;
         };
-        scan.cancel();
-        // The poller stops at its next tick instead of taking the result.
         self.scan_epoch += 1;
-        self.progress = scan.progress.snapshot();
+        match active {
+            ActiveScan::Remote { .. } => {
+                self.progress.cancelled = true;
+                self.progress.finished = true;
+            }
+            ActiveScan::Local { handle, .. } => {
+                handle.cancel();
+                self.progress = handle.progress.snapshot();
+            }
+        }
         self.scan_elapsed = self.scan_started.map(|started| started.elapsed());
-        self.scan_root.clone_from(&self.root_path);
         cx.notify();
     }
 
@@ -1381,7 +1941,9 @@ impl Disktree {
         }
         self.scan_epoch += 1;
         let epoch = self.scan_epoch;
-        self.refresh_metric = Some(self.options.metric);
+        let intent = ScanIntent::Refresh {
+            metric: self.options.metric,
+        };
         self.progress = ScanSnapshot::default();
         self.remote_progress =
             disktree_core::remote_progress::Progress::default();
@@ -1390,7 +1952,6 @@ impl Disktree {
         self.preview_updated = None;
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
-        self.scan_root.clone_from(&self.root_path);
         if let Some(host) = &self.remote {
             let request = disktree_core::remote::Request {
                 root: Some(self.root_path.clone()),
@@ -1398,9 +1959,11 @@ impl Disktree {
                 options: self.options,
             };
             match disktree_core::remote::RemoteScan::spawn(host, &request) {
-                Ok(scan) => self.remote_scan = Some(scan),
+                Ok(handle) => {
+                    self.active_scan =
+                        Some(ActiveScan::Remote { handle, intent });
+                }
                 Err(error) => {
-                    self.refresh_metric = None;
                     self.scan_error = Some(error.to_string());
                     cx.notify();
                     return;
@@ -1417,9 +1980,11 @@ impl Disktree {
                 self.options,
                 policy,
             ) {
-                Ok(scan) => self.scan = Some(scan),
+                Ok(handle) => {
+                    self.active_scan =
+                        Some(ActiveScan::Local { handle, intent });
+                }
                 Err(error) => {
-                    self.refresh_metric = None;
                     self.scan_error = Some(error.to_string());
                     cx.notify();
                     return;
@@ -1441,13 +2006,13 @@ impl Disktree {
         policy: CachePolicy,
         cx: &mut Context<'_, Self>,
     ) {
-        self.refresh_metric = None;
         if self.awaiting_root {
             self.open_volumes(cx);
             return;
         }
-        if let Some(scan) = self.scan.take() {
-            scan.cancel();
+        if let Some(ActiveScan::Local { handle, .. }) = self.active_scan.take()
+        {
+            handle.cancel();
         }
         self.scan_epoch += 1;
         let epoch = self.scan_epoch;
@@ -1475,8 +2040,6 @@ impl Disktree {
         self.clear_filter();
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
-        self.scan_root.clone_from(&self.root_path);
-        self.remote_scan = None;
         if let Some(host) = &self.remote {
             let request = disktree_core::remote::Request {
                 root: (!self.root_path.as_os_str().is_empty())
@@ -1485,8 +2048,11 @@ impl Disktree {
                 options: self.options,
             };
             match disktree_core::remote::RemoteScan::spawn(host, &request) {
-                Ok(scan) => {
-                    self.remote_scan = Some(scan);
+                Ok(handle) => {
+                    self.active_scan = Some(ActiveScan::Remote {
+                        handle,
+                        intent: ScanIntent::Initial,
+                    });
                     Self::poll_scan(epoch, cx);
                 }
                 Err(error) => self.scan_error = Some(error.to_string()),
@@ -1500,8 +2066,11 @@ impl Disktree {
             self.options,
             policy,
         ) {
-            Ok(scan) => {
-                self.scan = Some(scan);
+            Ok(handle) => {
+                self.active_scan = Some(ActiveScan::Local {
+                    handle,
+                    intent: ScanIntent::Initial,
+                });
                 // Drain any instant cache hit so warm launches paint on frame 1.
                 if self.poll_scan_once(epoch, cx) {
                     Self::poll_scan(epoch, cx);
@@ -1558,172 +2127,197 @@ impl Disktree {
         if epoch != self.scan_epoch {
             return false;
         }
-        if let Some(scan) = &self.remote_scan {
-            let outcome = scan.poll();
-            self.remote_progress = scan.progress();
-            self.scan_preview.clone_from(&self.remote_progress.preview);
-            self.progress.files = self.remote_progress.files;
-            self.progress.dirs = self.remote_progress.dirs;
-            self.progress.bytes = self.remote_progress.bytes;
-            self.progress.errors = self.remote_progress.errors;
-            let Some(outcome) = outcome else {
-                cx.notify();
-                return true;
-            };
-            match outcome {
-                Ok(snapshot) => {
-                    let refresh_paths = self.refresh_metric.map(|_| {
-                        (
-                            self.current_path(),
-                            self.selected
-                                .as_deref()
-                                .and_then(|c| self.path_at(c)),
-                        )
-                    });
-                    self.root_path = snapshot.header.root;
-                    self.home = snapshot.header.home;
-                    self.disk_root = snapshot.header.disk_root;
-                    self.space = snapshot.header.space;
-                    self.remote_platform = snapshot.header.platform;
-                    self.update_remote_identity(snapshot.header.identity);
-                    self.device = self.remote.as_ref().map(|host| {
-                        format!("{host} · read-only · space at scan")
-                    });
-                    let node = snapshot.tree;
-                    if let Some((directory, selected)) = refresh_paths {
-                        self.install_refresh(node, &directory, selected, cx);
-                    } else {
-                        self.marks.refresh(
-                            &self.root_path,
-                            &node,
-                            self.options.metric,
-                            self.path_style(),
-                        );
-                        self.tree = Some(Arc::new(node));
-                        self.refresh_insights();
-                        self.select_largest(cx);
-                    }
-                    self.scan_elapsed = self.scan_started.map(|t| t.elapsed());
-                }
-                Err(error) => {
-                    self.scan_error = Some(error.to_string());
-                }
-            }
-            self.remote_scan = None;
-            self.refresh_metric = None;
-            self.scan_preview = None;
-            self.progress.finished = true;
-            cx.notify();
-            return false;
-        }
-        let Some(scan) = &self.scan else {
+        let Some(active) = &self.active_scan else {
             return false;
         };
-        self.progress = scan.progress.snapshot();
-        if self
-            .preview_updated
-            .is_none_or(|at| at.elapsed().as_secs() >= 1)
-        {
-            let preview = scan.progress.preview();
-            if !preview.entries.is_empty() {
-                self.scan_preview = Some(Arc::new(preview));
-                self.preview_updated = Some(Instant::now());
-            }
-        }
-        let Some(update) = scan.poll_update() else {
-            cx.notify();
-            return true;
-        };
-        match update {
-            ScanUpdate::Cached {
-                arena,
-                node,
-                freshness,
-            } => {
-                let is_fresh = matches!(freshness, Freshness::Fresh { .. });
-                self.arena = Some(arena);
-                self.freshness = Some(freshness);
-                self.install_tree(node, false, cx);
-                if is_fresh {
-                    self.scan = None;
-                    self.refresh_metric = None;
-                    self.scan_preview = None;
-                    self.progress.finished = true;
+        match active {
+            ActiveScan::Remote { handle, intent } => {
+                let outcome = handle.poll();
+                self.remote_progress = handle.progress();
+                self.scan_preview.clone_from(&self.remote_progress.preview);
+                self.progress.files = self.remote_progress.files;
+                self.progress.dirs = self.remote_progress.dirs;
+                self.progress.bytes = self.remote_progress.bytes;
+                self.progress.errors = self.remote_progress.errors;
+                let refresh_metric = match intent {
+                    ScanIntent::Refresh { metric } => Some(*metric),
+                    ScanIntent::Initial | ScanIntent::Widening { .. } => None,
+                };
+                let Some(outcome) = outcome else {
                     cx.notify();
-                    return false;
-                }
-                // Stale/partial SWR hit: paint immediately and keep polling
-                // for the live background revalidation.
-                self.refresh_metric = Some(self.options.metric);
-                cx.notify();
-                return true;
-            }
-            ScanUpdate::SubtreeRefreshed { path, arena: sub } => {
-                if let Some(current_arena) = self.arena.as_mut() {
-                    let root = current_arena.root_path().to_path_buf();
-                    let updated = if path == root {
-                        Some((*sub).clone())
-                    } else if let Ok(rel) = path.strip_prefix(&root) {
-                        let parts: Vec<String> = rel
-                            .components()
-                            .map(|c| {
-                                c.as_os_str().to_string_lossy().into_owned()
-                            })
-                            .collect();
-                        let mut next = (**current_arena).clone();
-                        if let Some(target_id) =
-                            next.find_relative(parts.iter().map(String::as_str))
+                    return true;
+                };
+                match outcome {
+                    Ok(snapshot) => {
+                        let refresh_paths = refresh_metric.map(|metric| {
+                            (
+                                metric,
+                                self.current_path(),
+                                self.selected
+                                    .as_deref()
+                                    .and_then(|c| self.path_at(c)),
+                            )
+                        });
+                        self.root_path = snapshot.header.root;
+                        self.home = snapshot.header.home;
+                        self.disk_root = snapshot.header.disk_root;
+                        self.space = snapshot.header.space;
+                        self.remote_platform = snapshot.header.platform;
+                        self.update_remote_identity(snapshot.header.identity);
+                        self.device = self.remote.as_ref().map(|host| {
+                            format!("{host} · read-only · space at scan")
+                        });
+                        let node = snapshot.tree;
+                        if let Some((metric, directory, selected)) =
+                            refresh_paths
                         {
-                            next.replace_node_contents(target_id, &sub);
-                            next.aggregate(
-                                self.options.dedup_hardlinks,
-                                self.options.include_hidden,
+                            self.install_refresh(
+                                node, metric, &directory, selected, cx,
                             );
-                            Some(next)
                         } else {
-                            None
+                            self.marks.refresh(
+                                &self.root_path,
+                                &node,
+                                self.options.metric,
+                                self.path_style(),
+                            );
+                            self.tree = Some(Arc::new(node));
+                            self.refresh_insights();
+                            self.select_largest(cx);
                         }
-                    } else {
-                        None
-                    };
-                    if let Some(next) = updated {
-                        let next = Arc::new(next);
-                        self.arena = Some(Arc::clone(&next));
-                        self.reproject_arena(&next, cx);
+                        self.scan_elapsed =
+                            self.scan_started.map(|t| t.elapsed());
+                    }
+                    Err(error) => {
+                        self.scan_error = Some(error.to_string());
                     }
                 }
+                self.active_scan = None;
+                self.scan_preview = None;
+                self.progress.finished = true;
                 cx.notify();
-                return true;
+                return false;
             }
-            ScanUpdate::Live { arena, node }
-                if self.refresh_metric.is_some() =>
-            {
-                let directory = self.current_path();
-                let selected =
-                    self.selected.as_deref().and_then(|c| self.path_at(c));
-                self.arena = Some(arena);
-                self.freshness = Some(Freshness::Live {
-                    scanned_at: disktree_scanner::unix_now(),
-                });
-                self.install_refresh(node, &directory, selected, cx);
-                self.scan_elapsed =
-                    self.scan_started.map(|started| started.elapsed());
+            ActiveScan::Local { handle, intent } => {
+                let intent = intent.clone();
+                self.progress = handle.progress.snapshot();
+                if self
+                    .preview_updated
+                    .is_none_or(|at| at.elapsed().as_secs() >= 1)
+                {
+                    let preview = handle.progress.preview();
+                    if !preview.entries.is_empty() {
+                        self.scan_preview = Some(Arc::new(preview));
+                        self.preview_updated = Some(Instant::now());
+                    }
+                }
+                let Some(update) = handle.poll_update() else {
+                    cx.notify();
+                    return true;
+                };
+                match update {
+                    ScanUpdate::Cached {
+                        arena,
+                        node,
+                        freshness,
+                    } => {
+                        let is_fresh =
+                            matches!(freshness, Freshness::Fresh { .. });
+                        self.arena = Some(arena);
+                        self.freshness = Some(freshness);
+                        self.install_tree(node, None, cx);
+                        if is_fresh {
+                            self.active_scan = None;
+                            self.scan_preview = None;
+                            self.progress.finished = true;
+                            cx.notify();
+                            return false;
+                        }
+                        // Stale SWR hit: paint immediately and transition the
+                        // active scan's intent to Refresh so the live landing
+                        // preserves navigation by path.
+                        if let Some(active) = &mut self.active_scan {
+                            active.set_intent(ScanIntent::Refresh {
+                                metric: self.options.metric,
+                            });
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                    ScanUpdate::SubtreeRefreshed { path, arena: sub } => {
+                        if let Some(current_arena) = self.arena.as_mut() {
+                            let root = current_arena.root_path().to_path_buf();
+                            let updated = if path == root {
+                                Some((*sub).clone())
+                            } else if let Ok(rel) = path.strip_prefix(&root) {
+                                let parts: Vec<String> = rel
+                                    .components()
+                                    .map(|c| {
+                                        c.as_os_str()
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    })
+                                    .collect();
+                                let mut next = (**current_arena).clone();
+                                if let Some(target_id) = next.find_relative(
+                                    parts.iter().map(String::as_str),
+                                ) {
+                                    next.replace_node_contents(target_id, &sub);
+                                    next.aggregate(
+                                        self.options.dedup_hardlinks,
+                                        self.options.include_hidden,
+                                    );
+                                    Some(next)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(next) = updated {
+                                let next = Arc::new(next);
+                                self.arena = Some(Arc::clone(&next));
+                                self.reproject_arena(&next, cx);
+                            }
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                    ScanUpdate::Live { arena, node } => {
+                        self.arena = Some(arena);
+                        self.freshness = Some(Freshness::Live {
+                            scanned_at: disktree_scanner::unix_now(),
+                        });
+                        match intent {
+                            ScanIntent::Refresh { metric } => {
+                                let directory = self.current_path();
+                                let selected = self
+                                    .selected
+                                    .as_deref()
+                                    .and_then(|c| self.path_at(c));
+                                self.install_refresh(
+                                    node, metric, &directory, selected, cx,
+                                );
+                                self.scan_elapsed = self
+                                    .scan_started
+                                    .map(|started| started.elapsed());
+                            }
+                            ScanIntent::Widening { target } => {
+                                self.install_tree(node, Some(target), cx);
+                            }
+                            ScanIntent::Initial => {
+                                self.install_tree(node, None, cx);
+                            }
+                        }
+                    }
+                    ScanUpdate::Error(error) => {
+                        self.scan_error = Some(error.to_string());
+                    }
+                    ScanUpdate::Finished => {}
+                }
             }
-            ScanUpdate::Live { arena, node } => {
-                let came_from = self.scan_root != self.root_path;
-                self.arena = Some(arena);
-                self.freshness = Some(Freshness::Live {
-                    scanned_at: disktree_scanner::unix_now(),
-                });
-                self.install_tree(node, came_from, cx);
-            }
-            ScanUpdate::Error(error) => {
-                self.scan_error = Some(error.to_string());
-            }
-            ScanUpdate::Finished => {}
         }
-        self.scan = None;
-        self.refresh_metric = None;
+        self.active_scan = None;
         self.scan_preview = None;
         self.progress.finished = true;
         cx.notify();
@@ -1733,13 +2327,13 @@ impl Disktree {
     fn install_tree(
         &mut self,
         node: Node,
-        widening: bool,
+        widened_to: Option<PathBuf>,
         cx: &mut Context<'_, Self>,
     ) {
-        let came_from = widening.then(|| self.root_path.clone());
-        if came_from.is_some() {
+        let came_from = widened_to.as_ref().map(|_| self.root_path.clone());
+        if let Some(target) = widened_to {
             self.clear_filter();
-            self.root_path.clone_from(&self.scan_root);
+            self.root_path = target;
             self.space = space_info(&self.root_path).ok();
             self.device = device_for(&self.root_path);
             self.file_table = file_table_readable(&self.root_path);
@@ -1805,7 +2399,13 @@ impl Disktree {
             self.options.dedup_hardlinks,
             self.options.metric,
         );
-        self.install_refresh(node, &directory, selected, cx);
+        self.install_refresh(
+            node,
+            self.options.metric,
+            &directory,
+            selected,
+            cx,
+        );
         self.select_largest(cx);
     }
 
@@ -1814,11 +2414,12 @@ impl Disktree {
     fn install_refresh(
         &mut self,
         mut node: Node,
+        scanned_metric: Metric,
         directory: &Path,
         selected: Option<PathBuf>,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.refresh_metric != Some(self.options.metric) {
+        if scanned_metric != self.options.metric {
             disktree_core::tree::aggregate(&mut node, self.options.metric);
         }
         self.marks.refresh(
@@ -1926,7 +2527,28 @@ impl Disktree {
     // ── navigation ──────────────────────────────────────────────────────
 
     pub const fn is_indexing(&self) -> bool {
-        self.scan.is_some() || self.remote_scan.is_some()
+        self.active_scan.is_some()
+    }
+
+    pub const fn is_refreshing(&self) -> bool {
+        matches!(
+            &self.active_scan,
+            Some(
+                ActiveScan::Local {
+                    intent: ScanIntent::Refresh { .. },
+                    ..
+                } | ActiveScan::Remote {
+                    intent: ScanIntent::Refresh { .. },
+                    ..
+                }
+            )
+        )
+    }
+
+    pub fn widening_target(&self) -> Option<&Path> {
+        self.active_scan
+            .as_ref()
+            .and_then(ActiveScan::widening_target)
     }
 
     pub fn tree(&self) -> Option<&Node> {
@@ -2279,9 +2901,9 @@ impl Disktree {
         self.cache = None;
         // Entering a directory while a background SWR refresh is running
         // prioritizes that subtree first.
-        if let Some(scan) = &self.scan {
+        if let Some(ActiveScan::Local { handle, .. }) = &self.active_scan {
             let target = self.current_path();
-            scan.prioritize(&target);
+            handle.prioritize(&target);
         }
         cx.notify();
     }
@@ -2729,8 +3351,7 @@ impl Disktree {
                         (now - node.map_or(now, |n| n.modified)) / 86_400;
                     crate::palette::age_bucket(days)
                 });
-            let filtered = match self.matches.as_deref().map(|m| m.keep(crumbs))
-            {
+            let filtered = match self.find.matches().map(|m| m.keep(crumbs)) {
                 None | Some(Some(Keep::Whole)) => Filtered::Shown,
                 Some(Some(Keep::Partial { .. })) => Filtered::Holds,
                 Some(None) => Filtered::Out,
@@ -2773,7 +3394,7 @@ impl Disktree {
                     (0, filtered == Filtered::Out)
                 }
                 TileKind::Others { count, .. } => {
-                    (*count, self.matches.is_some())
+                    (*count, self.find.matches().is_some())
                 }
             };
             slots.push(LabelSlot {
@@ -2886,8 +3507,8 @@ impl Disktree {
         // A filter is about the directory it was typed in: above it, it
         // would hide everything beside that directory, so it lapses.
         if self
-            .matches
-            .as_ref()
+            .find
+            .matches()
             .is_some_and(|matches| !self.crumbs.starts_with(&matches.base))
         {
             self.clear_filter();
@@ -2908,8 +3529,7 @@ impl Disktree {
             let tree = self.tree.clone()?;
             let node = tree.resolve(&self.crumbs)?;
             let rect = Rect::new(0.0, 0.0, key.width, key.height);
-            let filter =
-                self.matches.as_deref().filter(|_| self.filter_applied);
+            let filter = self.find.matches().filter(|_| self.find.is_applied());
             let tiles = layout_filtered(
                 node,
                 &key.crumbs,
@@ -3264,99 +3884,100 @@ impl Disktree {
         !finished
     }
 
-    /// Descend to a path found by the search field.
-    /// Recompute what the find text matches in the directory on screen.
-    ///
-    /// Off the UI thread: a whole disk is millions of names, a few hundred
-    /// milliseconds to search, and typing must not wait for it. Each
-    /// keystroke supersedes the search before it.
-    pub fn refresh_matches(&mut self, cx: &Context<'_, Self>) {
-        self.find_epoch += 1;
-        let epoch = self.find_epoch;
-        let needle = self.find.clone();
-        let Some(tree) =
-            self.tree.clone().filter(|_| !needle.trim().is_empty())
-        else {
-            self.matches = None;
-            self.filter_applied = false;
-            self.finding = false;
-            self.filter_epoch += 1;
-            return;
-        };
-        self.finding = true;
-        let base = self.crumbs.clone();
-        let task = cx.background_executor().spawn(async move {
-            tree.resolve(&base)
-                .and_then(|node| filter(node, &base, &needle))
-        });
-        cx.spawn(async move |this, cx| {
-            let found = task.await;
-            let _ = this.update(cx, |this, cx| {
-                if epoch != this.find_epoch {
-                    return;
-                }
-                this.finding = false;
-                this.matches = found.map(Arc::new);
-                this.filter_epoch += 1;
-                if std::mem::take(&mut this.apply_pending) {
-                    this.apply_filter(cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+    /// Drive the pure [`find_machine`] and execute any emitted effects.
+    fn step_find(
+        &mut self,
+        event: find_machine::Event,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let state = std::mem::take(&mut self.find);
+        let (next, effects) = find_machine::step(state, event);
+        self.find = next;
+        for effect in effects {
+            self.perform_find(effect, cx);
+        }
     }
 
-    /// Enter in the find field: lay out only the matches, with the largest
-    /// selected so Space marks it.
-    pub fn apply_filter(&mut self, cx: &mut Context<'_, Self>) {
-        self.find_open = false;
-        if self.finding {
-            self.apply_pending = true;
-            return;
+    fn perform_find(
+        &mut self,
+        effect: find_machine::Effect,
+        cx: &mut Context<'_, Self>,
+    ) {
+        match effect {
+            find_machine::Effect::StartSearch { epoch, query } => {
+                let Some(tree) = self.tree.clone() else {
+                    self.step_find(
+                        find_machine::Event::SearchFinished {
+                            epoch,
+                            found: None,
+                        },
+                        cx,
+                    );
+                    return;
+                };
+                let base = self.crumbs.clone();
+                let task = cx.background_executor().spawn(async move {
+                    tree.resolve(&base)
+                        .and_then(|node| filter(node, &base, &query))
+                });
+                cx.spawn(async move |this, cx| {
+                    let found = task.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.step_find(
+                            find_machine::Event::SearchFinished {
+                                epoch,
+                                found: found.map(Arc::new),
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            find_machine::Effect::SelectBestMatch(matches) => {
+                self.view = View::IDENTITY;
+                self.transition = None;
+                self.forget_hover();
+                self.pointer_active = false;
+                let tree = self.tree.clone();
+                self.selected = matches
+                    .keep
+                    .iter()
+                    .filter(|(_, keep)| **keep == Keep::Whole)
+                    .filter_map(|(crumbs, _)| {
+                        let node = tree.as_deref()?.resolve(crumbs)?;
+                        Some((node.bytes, crumbs))
+                    })
+                    .max_by_key(|(bytes, _)| *bytes)
+                    .map(|(_, crumbs)| crumbs.clone());
+            }
+            find_machine::Effect::WarnNoMatches(needle) => {
+                self.notice = Some((
+                    format!("nothing here matches {needle}"),
+                    Status::Warning,
+                ));
+            }
+            find_machine::Effect::ClearNotice => {
+                self.notice = None;
+            }
+            find_machine::Effect::InvalidateLayout => {
+                self.filter_epoch += 1;
+            }
         }
-        let Some(matches) = self.matches.clone() else {
-            return;
-        };
-        if matches.count == 0 {
-            self.notice = Some((
-                format!("nothing here matches {}", matches.needle),
-                Status::Warning,
-            ));
-            cx.notify();
-            return;
-        }
-        self.filter_applied = true;
-        self.filter_epoch += 1;
-        self.view = View::IDENTITY;
-        self.transition = None;
-        self.forget_hover();
-        self.pointer_active = false;
-        let tree = self.tree.clone();
-        self.selected = matches
-            .keep
-            .iter()
-            .filter(|(_, keep)| **keep == Keep::Whole)
-            .filter_map(|(crumbs, _)| {
-                let node = tree.as_deref()?.resolve(crumbs)?;
-                Some((node.bytes, crumbs))
-            })
-            .max_by_key(|(bytes, _)| *bytes)
-            .map(|(_, crumbs)| crumbs.clone());
-        self.notice = None;
-        cx.notify();
     }
 
     /// Drop the find text and the filter with it.
     pub fn clear_filter(&mut self) {
-        self.find_epoch += 1;
-        self.finding = false;
-        self.apply_pending = false;
-        self.find.clear();
-        self.find_open = false;
-        self.matches = None;
-        self.filter_applied = false;
-        self.filter_epoch += 1;
+        let state = std::mem::take(&mut self.find);
+        let (next, effects) =
+            find_machine::step(state, find_machine::Event::Clear);
+        self.find = next;
+        for effect in effects {
+            if matches!(effect, find_machine::Effect::InvalidateLayout) {
+                self.filter_epoch += 1;
+            }
+        }
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -3633,13 +4254,12 @@ impl Disktree {
         // The search field takes the keyboard while it is open. It is a field
         // of three keys on purpose: no editor state to keep in sync with the
         // tree, and Escape always means "give the keyboard back".
-        if self.screen == Screen::Explore && self.find_open {
+        if self.screen == Screen::Explore && self.find.is_editing() {
             match key {
-                "escape" => self.clear_filter(),
-                "enter" => self.apply_filter(cx),
+                "escape" => self.step_find(find_machine::Event::Clear, cx),
+                "enter" => self.step_find(find_machine::Event::Submit, cx),
                 "backspace" => {
-                    self.find.pop();
-                    self.refresh_matches(cx);
+                    self.step_find(find_machine::Event::Backspace, cx);
                 }
                 _ => {
                     // Some platforms report only `key` for a character and
@@ -3651,8 +4271,10 @@ impl Disktree {
                         .as_deref()
                         .unwrap_or(event.keystroke.key.as_str());
                     if !control && typed.chars().count() == 1 {
-                        self.find.push_str(typed);
-                        self.refresh_matches(cx);
+                        self.step_find(
+                            find_machine::Event::PushText(typed.to_owned()),
+                            cx,
+                        );
                     }
                 }
             }
@@ -3715,7 +4337,7 @@ impl Disktree {
         }
         match key {
             "/" | "s" if !control => {
-                self.find_open = true;
+                self.step_find(find_machine::Event::Open, cx);
                 cx.notify();
             }
             "enter" => self.descend(cx),
@@ -3731,8 +4353,11 @@ impl Disktree {
             }
             "backspace" | "u" if !control => self.ascend(cx),
             // A filter is the first thing Escape takes away.
-            "escape" if self.matches.is_some() => self.clear_filter(),
-            "escape" if self.scan.is_some() || self.remote_scan.is_some() => {
+            "escape" if self.find.matches().is_some() => {
+                self.step_find(find_machine::Event::Clear, cx);
+                cx.notify();
+            }
+            "escape" if self.is_indexing() => {
                 self.cancel_scan(cx);
             }
             "escape" => {
@@ -4129,13 +4754,8 @@ impl Disktree {
         cx.notify();
         // While a widening scan runs, the wider root is where this window
         // ends up, and the drive the offer is about: reopening the folder
-        // still on screen would walk it again. `scan_root` equals
-        // `root_path` for any other scan, and is stale once none runs.
-        let root = if self.scan.is_some() {
-            &self.scan_root
-        } else {
-            &self.root_path
-        };
+        // still on screen would walk it again.
+        let root = self.widening_target().unwrap_or(&self.root_path);
         let mut args =
             restart_args(&self.options, self.layout_options.max_depth, root);
         if let Some(preset) = self.power_choice {
@@ -4404,5 +5024,136 @@ mod tests {
                 .offset(&from, &Rect::new(200.0, 160.0, 20.0, 20.0))
                 > 0.0
         );
+    }
+
+    #[test]
+    fn find_machine_ignores_stale_epochs_and_applies_pending_submit() {
+        use find_machine::{Effect, Event, Phase, State, step};
+
+        let sample_matches = |needle: &str, count: usize| {
+            Arc::new(disktree_core::filter::Matches {
+                needle: needle.to_owned(),
+                base: Vec::new(),
+                keep: FxHashMap::default(),
+                count,
+                bytes: count as u64 * 100,
+                files: count as u64,
+            })
+        };
+
+        let (state, effects) = step(State::default(), Event::Open);
+        assert!(state.is_editing());
+        assert!(effects.is_empty());
+
+        let (state, effects) = step(state, Event::PushText("b".into()));
+        let epoch_b = state.epoch;
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartSearch { epoch, query }] if *epoch == epoch_b && query == "b"
+        ));
+
+        let (state, effects) = step(state, Event::PushText("lob".into()));
+        let epoch_blob = state.epoch;
+        assert!(epoch_blob > epoch_b);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartSearch { epoch, query }] if *epoch == epoch_blob && query == "blob"
+        ));
+
+        // Enter before the search lands enters Applying.
+        let (state, effects) = step(state, Event::Submit);
+        assert!(matches!(state.phase, Phase::Applying { .. }));
+        assert!(effects.is_empty());
+
+        // Stale completion for "b" is ignored.
+        let (state, effects) = step(
+            state,
+            Event::SearchFinished {
+                epoch: epoch_b,
+                found: Some(sample_matches("b", 9)),
+            },
+        );
+        assert!(matches!(state.phase, Phase::Applying { .. }));
+        assert!(effects.is_empty());
+
+        // Current completion for "blob" transitions straight to Applied.
+        let (state, effects) = step(
+            state,
+            Event::SearchFinished {
+                epoch: epoch_blob,
+                found: Some(sample_matches("blob", 2)),
+            },
+        );
+        assert!(state.is_applied());
+        assert_eq!(state.matches().map(|m| m.count), Some(2));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SelectBestMatch(_)))
+        );
+
+        // Clear resets to Closed and invalidates the epoch.
+        let (state, effects) = step(state, Event::Clear);
+        assert!(matches!(state.phase, Phase::Closed));
+        assert!(state.epoch > epoch_blob);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::InvalidateLayout))
+        );
+    }
+
+    #[test]
+    fn discovery_machine_rejects_stale_local_completion_after_remote_error() {
+        use discovery_machine::{Effect, Event, Phase, State, step};
+
+        let (state, effects) = step(State::default(), Event::StartLocal);
+        let local_epoch = state.epoch;
+        assert!(state.is_loading());
+        assert_eq!(
+            effects,
+            vec![Effect::SpawnLocalListing { epoch: local_epoch }]
+        );
+
+        let (state, effects) = step(
+            state,
+            Event::StartRemote {
+                host: "-bad".into(),
+            },
+        );
+        let remote_epoch = state.epoch;
+        assert!(remote_epoch > local_epoch);
+        assert_eq!(
+            effects,
+            vec![Effect::DiscoverRemote {
+                epoch: remote_epoch,
+                host: "-bad".into(),
+            }]
+        );
+
+        let (state, effects) = step(
+            state,
+            Event::Completed {
+                epoch: remote_epoch,
+                outcome: Err("invalid SSH".into()),
+            },
+        );
+        assert_eq!(state.error(), Some("invalid SSH"));
+        assert!(effects.is_empty());
+
+        // Late local completion cannot overwrite the remote error.
+        let (state, effects) = step(
+            state,
+            Event::Completed {
+                epoch: local_epoch,
+                outcome: Ok(()),
+            },
+        );
+        assert_eq!(state.error(), Some("invalid SSH"));
+        assert!(effects.is_empty());
+
+        let (state, effects) = step(state, Event::Reset);
+        assert!(matches!(state.phase, Phase::Idle));
+        assert!(effects.is_empty());
     }
 }
