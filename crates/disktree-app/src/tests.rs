@@ -2557,3 +2557,86 @@ fn selection_section_keeps_static_height_across_hover_and_marks(
         "height must not jump on covered file"
     );
 }
+
+#[gpui_kit::test]
+fn tiles_distinguish_fresh_stale_scheduled_and_updating_states(
+    cx: &mut TestAppContext,
+) {
+    use crate::treemap_view::TileFreshness;
+    use disktree_scanner::SubtreeStatus;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let junk = temp.path().join("junk");
+    let keep = temp.path().join("keep");
+    let (junk_crumbs, keep_crumbs) = read(&view, cx, |app| {
+        (
+            app.crumbs_for_path(&junk).unwrap(),
+            app.crumbs_for_path(&keep).unwrap(),
+        )
+    });
+
+    // 1. Mark `junk` stale in the arena while `keep` stays fresh.
+    update(&view, cx, |app, _| {
+        let mut arena = (**app.arena.as_ref().unwrap()).clone();
+        let now = disktree_scanner::unix_now();
+        let junk_id = arena.find_relative(["junk"]).unwrap();
+        arena
+            .node_mut(junk_id)
+            .set_status(SubtreeStatus::Stale { scanned_at: 100 });
+        let keep_id = arena.find_relative(["keep"]).unwrap();
+        arena
+            .node_mut(keep_id)
+            .set_status(SubtreeStatus::Fresh { scanned_at: now });
+        app.arena = Some(std::sync::Arc::new(arena));
+        app.freshness = Some(disktree_scanner::Freshness::Stale {
+            oldest_at: 100,
+            newest_at: now,
+            stale_dirs: 1,
+        });
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.tile_freshness(&junk_crumbs), TileFreshness::Stale);
+        assert_eq!(app.tile_freshness(&keep_crumbs), TileFreshness::Fresh);
+    });
+
+    // 2. Start an SWR background refresh: stale `junk` becomes Scheduled while
+    //    fresh `keep` stays Fresh; active `updating_paths` flips to Updating.
+    update(&view, cx, |app, _| {
+        app.active_scan = Some(ActiveScan::Local {
+            handle: disktree_core::scan::ScanHandle::spawn(
+                temp.path().into(),
+                options(),
+            ),
+            intent: ScanIntent::Refresh {
+                metric: app.options.metric,
+                forced: false,
+            },
+        });
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.tile_freshness(&junk_crumbs), TileFreshness::Scheduled);
+        assert_eq!(app.tile_freshness(&keep_crumbs), TileFreshness::Fresh);
+    });
+
+    update(&view, cx, |app, _| {
+        app.updating_paths.insert(junk.clone());
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.tile_freshness(&junk_crumbs), TileFreshness::Updating);
+    });
+
+    // 3. Once `junk` finishes refreshing, it returns to Fresh immediately.
+    update(&view, cx, |app, _| {
+        app.updating_paths.remove(&junk);
+        app.refreshed_paths.insert(junk.clone());
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.tile_freshness(&junk_crumbs), TileFreshness::Fresh);
+    });
+}

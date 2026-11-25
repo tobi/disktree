@@ -30,7 +30,8 @@ use disktree_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
 };
 use disktree_scanner::{
-    CachePolicy, Freshness, Scanner, StorageMode, TreeArena,
+    CachePolicy, DEFAULT_CACHE_TTL, Freshness, Scanner, StorageMode,
+    SubtreeStatus, TreeArena,
 };
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::{
@@ -682,7 +683,7 @@ pub enum ScanIntent {
     Widening { target: PathBuf },
     /// Background refresh (`r`, Refresh button, or SWR revalidation): keeps
     /// the current directory and selection by path when the new tree lands.
-    Refresh { metric: Metric },
+    Refresh { metric: Metric, forced: bool },
 }
 
 /// Exclusive handle to at most one in-flight scan: local OR remote, never both.
@@ -959,6 +960,9 @@ pub struct Disktree {
     pub freshness: Option<Freshness>,
     pub tree: Option<Arc<Node>>,
     pub active_scan: Option<ActiveScan>,
+    pub updating_paths: FxHashSet<PathBuf>,
+    pub refreshed_paths: FxHashSet<PathBuf>,
+    pub active_scan_path: Option<PathBuf>,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
@@ -1144,6 +1148,9 @@ impl Disktree {
             freshness: None,
             tree: None,
             active_scan: None,
+            updating_paths: FxHashSet::default(),
+            refreshed_paths: FxHashSet::default(),
+            active_scan_path: None,
             scan_epoch: 0,
             progress: ScanSnapshot::default(),
             scan_error: None,
@@ -1892,6 +1899,9 @@ impl Disktree {
     /// and a widening scan leaves the tree it started from on screen.
     pub fn cancel_scan(&mut self, cx: &mut Context<'_, Self>) {
         self.scan_preview = None;
+        self.updating_paths.clear();
+        self.refreshed_paths.clear();
+        self.active_scan_path = None;
         let Some(active) = self.active_scan.take() else {
             return;
         };
@@ -1931,7 +1941,11 @@ impl Disktree {
         let epoch = self.scan_epoch;
         let intent = ScanIntent::Refresh {
             metric: self.options.metric,
+            forced: true,
         };
+        self.updating_paths.clear();
+        self.refreshed_paths.clear();
+        self.active_scan_path = None;
         self.progress = ScanSnapshot::default();
         self.remote_progress =
             disktree_core::remote_progress::Progress::default();
@@ -2017,6 +2031,9 @@ impl Disktree {
         discard(self.tree.take());
         self.arena = None;
         self.freshness = None;
+        self.updating_paths.clear();
+        self.refreshed_paths.clear();
+        self.active_scan_path = None;
         self.crumbs.clear();
         self.selected = None;
         self.hovered = None;
@@ -2128,7 +2145,7 @@ impl Disktree {
                 self.progress.bytes = self.remote_progress.bytes;
                 self.progress.errors = self.remote_progress.errors;
                 let refresh_metric = match intent {
-                    ScanIntent::Refresh { metric } => Some(*metric),
+                    ScanIntent::Refresh { metric, .. } => Some(*metric),
                     ScanIntent::Initial | ScanIntent::Widening { .. } => None,
                 };
                 let Some(outcome) = outcome else {
@@ -2189,6 +2206,7 @@ impl Disktree {
             ActiveScan::Local { handle, intent } => {
                 let intent = intent.clone();
                 self.progress = handle.progress.snapshot();
+                self.active_scan_path = handle.active_path();
                 if self
                     .preview_updated
                     .is_none_or(|at| at.elapsed().as_secs() >= 1)
@@ -2216,6 +2234,9 @@ impl Disktree {
                         self.install_tree(node, None, cx);
                         if is_fresh {
                             self.active_scan = None;
+                            self.updating_paths.clear();
+                            self.refreshed_paths.clear();
+                            self.active_scan_path = None;
                             self.scan_preview = None;
                             self.progress.finished = true;
                             cx.notify();
@@ -2227,12 +2248,20 @@ impl Disktree {
                         if let Some(active) = &mut self.active_scan {
                             active.set_intent(ScanIntent::Refresh {
                                 metric: self.options.metric,
+                                forced: false,
                             });
                         }
                         cx.notify();
                         return true;
                     }
+                    ScanUpdate::SubtreeUpdating { path } => {
+                        self.updating_paths.insert(path);
+                        cx.notify();
+                        return true;
+                    }
                     ScanUpdate::SubtreeRefreshed { path, arena: sub } => {
+                        self.updating_paths.remove(&path);
+                        self.refreshed_paths.insert(path.clone());
                         if let Some(current_arena) = self.arena.as_mut() {
                             let root = current_arena.root_path().to_path_buf();
                             let updated = if path == root {
@@ -2277,7 +2306,7 @@ impl Disktree {
                             scanned_at: disktree_scanner::unix_now(),
                         });
                         match intent {
-                            ScanIntent::Refresh { metric } => {
+                            ScanIntent::Refresh { metric, .. } => {
                                 let directory = self.current_path();
                                 let selected = self
                                     .selected
@@ -2306,6 +2335,9 @@ impl Disktree {
             }
         }
         self.active_scan = None;
+        self.updating_paths.clear();
+        self.refreshed_paths.clear();
+        self.active_scan_path = None;
         self.scan_preview = None;
         self.progress.finished = true;
         cx.notify();
@@ -3289,6 +3321,124 @@ impl Disktree {
 
     // ── layout and hit-testing ──────────────────────────────────────────
 
+    /// When a background refresh is running, returns `Some(forced)`:
+    /// `true` for an explicit `r` / Refresh button rescan, `false` for SWR.
+    pub const fn refresh_mode(&self) -> Option<bool> {
+        match &self.active_scan {
+            Some(
+                ActiveScan::Local {
+                    intent: ScanIntent::Refresh { forced, .. },
+                    ..
+                }
+                | ActiveScan::Remote {
+                    intent: ScanIntent::Refresh { forced, .. },
+                    ..
+                },
+            ) => Some(*forced),
+            _ => None,
+        }
+    }
+
+    /// Freshness / refresh-queue state of the tile at `crumbs`.
+    pub fn tile_freshness(
+        &self,
+        crumbs: &[usize],
+    ) -> crate::treemap_view::TileFreshness {
+        self.tile_freshness_at(
+            crumbs,
+            disktree_scanner::unix_now(),
+            self.refresh_mode(),
+        )
+    }
+
+    fn tile_freshness_at(
+        &self,
+        crumbs: &[usize],
+        now_unix: u64,
+        refresh_mode: Option<bool>,
+    ) -> crate::treemap_view::TileFreshness {
+        use crate::treemap_view::TileFreshness;
+
+        let ttl = DEFAULT_CACHE_TTL.as_secs();
+        if let Some(forced) = refresh_mode {
+            let Some(path) = self.path_at(crumbs) else {
+                return TileFreshness::Fresh;
+            };
+            let is_updating = self
+                .updating_paths
+                .iter()
+                .any(|u| path.starts_with(u) || u.starts_with(&path))
+                || self.active_scan_path.as_ref().is_some_and(|active| {
+                    active.starts_with(&path) || path.starts_with(active)
+                });
+            if is_updating {
+                return TileFreshness::Updating;
+            }
+            if self.refreshed_paths.iter().any(|r| path.starts_with(r)) {
+                return TileFreshness::Fresh;
+            }
+            if forced || self.arena_path_is_stale(&path, now_unix, ttl) {
+                return TileFreshness::Scheduled;
+            }
+            return TileFreshness::Fresh;
+        }
+
+        // Fast path: a freshly completed live scan is within TTL everywhere.
+        if let Some(Freshness::Live { scanned_at }) = self.freshness
+            && now_unix.saturating_sub(scanned_at) <= ttl
+        {
+            return TileFreshness::Fresh;
+        }
+        let Some(path) = self.path_at(crumbs) else {
+            return TileFreshness::Fresh;
+        };
+        if self.arena_path_is_stale(&path, now_unix, ttl) {
+            TileFreshness::Stale
+        } else {
+            TileFreshness::Fresh
+        }
+    }
+
+    /// Whether the directory at (or holding) `path` in `self.arena` is stale
+    /// relative to `now_unix` and `ttl`.
+    fn arena_path_is_stale(
+        &self,
+        path: &Path,
+        now_unix: u64,
+        ttl: u64,
+    ) -> bool {
+        let Some(arena) = &self.arena else {
+            return false;
+        };
+        let root = arena.root_path();
+        let Ok(rel) = path.strip_prefix(root) else {
+            return false;
+        };
+        let parts: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let Some(mut id) =
+            arena.find_relative(parts.iter().map(String::as_str))
+        else {
+            return false;
+        };
+        // A leaf inherits its containing directory's freshness.
+        if !arena.node(id).is_dir()
+            && let Some(parent) = arena.node(id).parent
+        {
+            id = parent;
+        }
+        let node = arena.node(id);
+        match node.status() {
+            SubtreeStatus::Stale { .. } | SubtreeStatus::Unscanned => true,
+            SubtreeStatus::Fresh { scanned_at } => {
+                scanned_at > 0 && now_unix.saturating_sub(scanned_at) > ttl
+            }
+            SubtreeStatus::Updating { .. } => false,
+        }
+    }
+
     /// Resolve everything the mosaic needs for this frame.
     ///
     /// Runs once per render, before the paint callbacks: painting then only has
@@ -3324,6 +3474,8 @@ impl Disktree {
         // view, so the first level always reads as the first level.
         let age = self.color_mode == ColorMode::Age;
         let now = self.scanned_at;
+        let now_unix = disktree_scanner::unix_now();
+        let refresh_mode = self.refresh_mode();
         let mut decorations = Vec::with_capacity(tiles.len());
         let mut slots: Vec<LabelSlot<'_>> = Vec::new();
         for tile in tiles {
@@ -3344,6 +3496,8 @@ impl Disktree {
                 Some(Some(Keep::Partial { .. })) => Filtered::Holds,
                 Some(None) => Filtered::Out,
             };
+            let freshness =
+                self.tile_freshness_at(crumbs, now_unix, refresh_mode);
             let is_marked = marked.contains(crumbs);
             // Everything inside a marked directory goes with it, so it is
             // drawn marked too.
@@ -3358,6 +3512,7 @@ impl Disktree {
                 age_bucket,
                 reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
                 filtered,
+                freshness,
                 unreadable: node.is_some_and(|n| n.read_error),
                 marked: is_marked,
                 covered: is_covered,

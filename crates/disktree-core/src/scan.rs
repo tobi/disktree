@@ -211,6 +211,8 @@ pub enum ScanUpdate {
         node: Node,
         freshness: Freshness,
     },
+    /// A directory has started actively walking during a refresh.
+    SubtreeUpdating { path: PathBuf },
     /// A prioritized subtree finished scanning while background revalidation
     /// continues on the rest of the root.
     SubtreeRefreshed {
@@ -399,6 +401,16 @@ impl ScanHandle {
         }
     }
 
+    /// Most recently started directory path in the background walk, if any.
+    pub fn active_path(&self) -> Option<PathBuf> {
+        self.progress
+            .walk
+            .active_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Drain the next incremental update from an SWR session or one-shot walk.
     pub fn poll_update(&self) -> Option<ScanUpdate> {
         match &self.backend {
@@ -445,6 +457,9 @@ impl ScanHandle {
                         self.progress.finish();
                         return Some(ScanUpdate::Finished);
                     }
+                    Ok(ScanEvent::SubtreeUpdating { path, .. }) => {
+                        return Some(ScanUpdate::SubtreeUpdating { path });
+                    }
                     Ok(ScanEvent::SubtreeRefreshed { path, arena, .. }) => {
                         return Some(ScanUpdate::SubtreeRefreshed {
                             path,
@@ -453,7 +468,6 @@ impl ScanHandle {
                     }
                     Ok(
                         ScanEvent::Progress { .. }
-                        | ScanEvent::SubtreeUpdating { .. }
                         | ScanEvent::StorageFallback { .. },
                     ) => {}
                     Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -496,9 +510,9 @@ impl ScanHandle {
                 freshness: Freshness::Fresh { .. },
                 ..
             } => Some(Ok(node)),
-            ScanUpdate::Cached { .. } | ScanUpdate::SubtreeRefreshed { .. } => {
-                None
-            }
+            ScanUpdate::Cached { .. }
+            | ScanUpdate::SubtreeUpdating { .. }
+            | ScanUpdate::SubtreeRefreshed { .. } => None,
             ScanUpdate::Error(err) => Some(Err(err)),
             ScanUpdate::Finished => Some(Err(io::Error::other(
                 "the scan finished without producing a tree",

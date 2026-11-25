@@ -1694,6 +1694,31 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
     }
     let ground = palette::category_fill(theme, Category::Other, 0);
     let hatch = cx.omarchy().bright.opacity(0.5);
+    let show_queued = app.is_refreshing();
+    let show_stale = matches!(
+        app.freshness,
+        Some(disktree_scanner::Freshness::Stale { .. })
+    );
+    let stale_swatch = div()
+        .relative()
+        .flex_shrink_0()
+        .size(size::SWATCH)
+        .bg(palette::mix(ground, theme.inset, 0.44))
+        .child(
+            div()
+                .absolute()
+                .top(px(1.))
+                .right(px(1.))
+                .size(px(3.))
+                .bg(theme.secondary.opacity(0.75)),
+        );
+    let queued_swatch = div()
+        .flex_shrink_0()
+        .size(size::SWATCH)
+        .bg(palette::mix(ground, theme.inset, 0.22))
+        .border_1()
+        .border_dashed()
+        .border_color(theme.accent.opacity(0.8));
     div()
         .flex()
         .flex_row()
@@ -1702,6 +1727,8 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .min_w_0()
         .overflow_hidden()
         .child(item(widgets::hatch_swatch(hatch, ground), "Reclaimable"))
+        .when(show_stale, |row| row.child(item(stale_swatch, "Stale")))
+        .when(show_queued, |row| row.child(item(queued_swatch, "Queued")))
         .child(lane)
 }
 
@@ -1815,7 +1842,7 @@ fn selection_section(
     );
 
     let ancestor = path.as_deref().and_then(|path| app.marked_ancestor(path));
-    let mark_crumbs = target;
+    let mark_crumbs = target.clone();
     let unmark_mode = marked || covered_by.is_some();
     let mark_tip = match &ancestor {
         Some(ancestor) if !marked => {
@@ -1982,6 +2009,18 @@ fn selection_section(
             );
 
     let mut chips = Vec::new();
+    match app.tile_freshness(&target) {
+        treemap_view::TileFreshness::Fresh => {}
+        treemap_view::TileFreshness::Stale => {
+            chips.push(widgets::chip("Stale", theme.secondary, cx));
+        }
+        treemap_view::TileFreshness::Scheduled => {
+            chips.push(widgets::chip("Queued", theme.accent, cx));
+        }
+        treemap_view::TileFreshness::Updating => {
+            chips.push(widgets::chip("Refreshing…", theme.accent, cx));
+        }
+    }
     if marked {
         chips.push(widgets::chip("Marked", theme.danger, cx));
     } else if let Some(ancestor) = &covered_by {
@@ -4092,6 +4131,23 @@ fn node_card(
             );
 
     let mut badges = div().flex().flex_row().gap(space::XS).flex_wrap();
+    match app.tile_freshness(crumbs) {
+        treemap_view::TileFreshness::Fresh => {}
+        treemap_view::TileFreshness::Stale => {
+            badges = badges.child(widgets::chip("Stale", theme.secondary, cx));
+        }
+        treemap_view::TileFreshness::Scheduled => {
+            badges = badges.child(widgets::chip(
+                "Queued for refresh",
+                theme.accent,
+                cx,
+            ));
+        }
+        treemap_view::TileFreshness::Updating => {
+            badges =
+                badges.child(widgets::chip("Refreshing…", theme.accent, cx));
+        }
+    }
     if hidden {
         badges = badges.child(widgets::chip("Hidden", theme.secondary, cx));
     }
