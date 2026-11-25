@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "disktree-app"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "disktree-cli"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "disktree-core"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "disktree-scanner",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "disktree-scanner"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "lz4_flex",
  "prost",
@@ -9094,7 +9094,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.11.0"
+version = "1.0.0"
 dependencies = [
  "disktree-core",
 ]

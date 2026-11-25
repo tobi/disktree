@@ -126,6 +126,7 @@ else
 install: build
 	install -d $(BINDIR) $(APPDIR) $(ICONDIR)
 	install -m755 $(TARGET) $(BINDIR)/disktree
+	install -m755 target/$$(uname -m)-unknown-linux-musl/release/disktree-cli $(BINDIR)/disktree-cli
 	install -m644 $(ICON) $(ICONDIR)/disktree.svg
 	VERSION=$$(sed -n 's/^version = "\(.*\)"/\1/p' $(MANIFEST) | head -1) && \
 	sed -e 's|@BINDIR@|$(BINDIR)|' -e "s|@VERSION@|$$VERSION|" \
@@ -137,15 +138,17 @@ install: build
 	@echo
 	@echo "installed:"
 	@echo "  $(BINDIR)/disktree"
+	@echo "  $(BINDIR)/disktree-cli"
 	@echo "  $(APPDIR)/disktree.desktop"
 	@echo "  $(ICONDIR)/disktree.svg"
 	@if command -v desktop-file-validate >/dev/null 2>&1; then \
 	    desktop-file-validate $(APPDIR)/disktree.desktop || true; \
 	fi
 	$(call check_install_path,disktree)
+	$(call check_install_path,disktree-cli)
 
 uninstall:
-	rm -f $(BINDIR)/disktree $(APPDIR)/disktree.desktop $(ICONDIR)/disktree.svg
+	rm -f $(BINDIR)/disktree $(BINDIR)/disktree-cli $(APPDIR)/disktree.desktop $(ICONDIR)/disktree.svg
 	@if command -v update-desktop-database >/dev/null 2>&1; then \
 	    update-desktop-database $(APPDIR) 2>/dev/null || true; \
 	fi
