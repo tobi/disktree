@@ -1915,8 +1915,12 @@ mod tests {
             .iter()
             .position(|child| child.name.as_ref() == "ambiguous-\u{fffd}-name")
             .expect("scanned ambiguous name");
-        let scanned_path =
-            crate::tree::path_of(temp.path(), &scanned, &[index]);
+        let scanned_path = crate::tree::path_of(
+            temp.path(),
+            &scanned,
+            &[index],
+            crate::path_style::PathStyle::Native,
+        );
         assert_eq!(
             scanned_path, sibling,
             "lossy display maps to valid sibling"
@@ -1986,6 +1990,7 @@ mod tests {
             temp.path(),
             &scanned,
             &[dir_index, child_index],
+            crate::path_style::PathStyle::Native,
         );
         assert_eq!(scanned_path, sibling_child);
         assert_eq!(scanned_path.file_name().expect("filename"), "witness.bin");
@@ -2034,8 +2039,12 @@ mod tests {
             .iter()
             .position(|child| child.name.as_ref() == "café")
             .expect("scanned Unicode entry");
-        let scanned_path =
-            crate::tree::path_of(temp.path(), &scanned, &[index]);
+        let scanned_path = crate::tree::path_of(
+            temp.path(),
+            &scanned,
+            &[index],
+            crate::path_style::PathStyle::Native,
+        );
         assert_eq!(scanned_path, marked);
 
         let plan = plan(
