@@ -4,22 +4,28 @@
 //! re-scanned after a removal, and a mark must survive that (or be reported as
 //! gone) rather than silently pointing at a different node.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::Path;
 
+use disktree_core::path_style::PathStyle;
 use disktree_core::removal::Target;
 use disktree_core::tree::{Metric, Node};
 use rustc_hash::FxHashSet;
 
 /// Marked paths, in the order they were marked.
+///
+/// The index holds the exact text of each path. `PathBuf` equality on
+/// Windows compares components and treats `\` as a separator, so a Unix
+/// host's `/a/b\c` would equal `/a/b/c` there.
 #[derive(Debug, Default)]
 pub struct Marks {
     items: Vec<Target>,
-    index: FxHashSet<PathBuf>,
+    index: FxHashSet<OsString>,
 }
 
 impl Marks {
     pub fn contains(&self, path: &Path) -> bool {
-        self.index.contains(path)
+        self.index.contains(path.as_os_str())
     }
 
     pub fn items(&self) -> &[Target] {
@@ -38,19 +44,22 @@ impl Marks {
     ///
     /// Returns `true` when the path ended up marked.
     pub fn toggle(&mut self, target: Target) -> bool {
-        if self.index.remove(&target.path) {
-            self.items.retain(|item| item.path != target.path);
+        if self.index.remove(target.path.as_os_str()) {
+            self.items.retain(|item| {
+                item.path.as_os_str() != target.path.as_os_str()
+            });
             false
         } else {
-            self.index.insert(target.path.clone());
+            self.index.insert(target.path.clone().into_os_string());
             self.items.push(target);
             true
         }
     }
 
     pub fn remove(&mut self, path: &Path) {
-        if self.index.remove(path) {
-            self.items.retain(|item| item.path != path);
+        if self.index.remove(path.as_os_str()) {
+            self.items
+                .retain(|item| item.path.as_os_str() != path.as_os_str());
         }
     }
 
@@ -61,14 +70,20 @@ impl Marks {
 
     /// Re-read sizes from a freshly scanned tree and drop marks whose path no
     /// longer exists, so the tally never claims space that is already gone.
-    pub fn refresh(&mut self, root_path: &Path, root: &Node, _metric: Metric) {
+    pub fn refresh(
+        &mut self,
+        root_path: &Path,
+        root: &Node,
+        _metric: Metric,
+        style: PathStyle,
+    ) {
         let mut resolved = Vec::with_capacity(self.items.len());
         for item in &self.items {
-            match find(root_path, root, &item.path) {
+            match find(root_path, root, &item.path, style) {
                 Some(node) => resolved.push(Target {
                     bytes: node.bytes,
                     is_dir: node.is_dir(),
-                    hidden: is_hidden(&item.path),
+                    hidden: is_hidden(&item.path, style),
                     path: item.path.clone(),
                 }),
                 None => resolved.push(Target {
@@ -81,17 +96,17 @@ impl Marks {
     }
 }
 
-/// Walk the tree to the node at an absolute path. Path components are compared
-/// one at a time, so a name containing a path separator cannot confuse it.
+/// Walk the tree to the node at an absolute path. Names are compared one at a
+/// time, split by the scanned machine's rules, so a name containing another
+/// platform's separator cannot confuse it.
 pub fn find<'a>(
     root_path: &Path,
     root: &'a Node,
     path: &Path,
+    style: PathStyle,
 ) -> Option<&'a Node> {
-    let relative = path.strip_prefix(root_path).ok()?;
     let mut node = root;
-    for component in relative.components() {
-        let name = component.as_os_str().to_string_lossy();
+    for name in style.relative(root_path, path)? {
         node = node
             .children
             .iter()
@@ -101,22 +116,29 @@ pub fn find<'a>(
 }
 
 /// A dotfile or dot-directory by name.
-pub fn is_hidden(path: &Path) -> bool {
-    path.file_name()
+pub fn is_hidden(path: &Path, style: PathStyle) -> bool {
+    style
+        .file_name(path)
         .is_some_and(|name| name.to_string_lossy().starts_with('.'))
 }
 
 /// Shorten a path for display: `~` for the home directory, and the path with
-/// the home prefix replaced when it is below it. The separator after `~` is
-/// the platform's, so Windows shows `~\AppData\Local`, not `~/AppData\Local`.
-pub fn display_path(path: &Path, home: Option<&Path>) -> String {
-    match home
-        .and_then(|home| path.strip_prefix(home).ok().map(|rest| (home, rest)))
-    {
-        Some((_, rest)) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some((_, rest)) => {
-            format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
-        }
+/// the home prefix replaced when it is below it. The separator is the scanned
+/// machine's, so Windows shows `~\AppData\Local`, not `~/AppData\Local`, and
+/// a Unix host shows `~/.cache` on every client.
+pub fn display_path(
+    path: &Path,
+    home: Option<&Path>,
+    style: PathStyle,
+) -> String {
+    let separator = style.separator();
+    match home.and_then(|home| style.relative(home, path)) {
+        Some(names) if names.is_empty() => "~".to_string(),
+        Some(names) => names.iter().fold("~".to_string(), |mut text, name| {
+            text.push(separator);
+            text.push_str(name);
+            text
+        }),
         None => path.display().to_string(),
     }
 }
@@ -125,6 +147,9 @@ pub fn display_path(path: &Path, home: Option<&Path>) -> String {
 mod tests {
     use super::*;
     use disktree_core::tree::{NodeKind, aggregate};
+    use std::path::PathBuf;
+
+    const NATIVE: PathStyle = PathStyle::Native;
 
     fn file(name: &str, bytes: u64) -> Node {
         Node::entry(name, NodeKind::File, bytes)
@@ -176,7 +201,7 @@ mod tests {
         marks.toggle(target("/home/tobi/.cache", 0));
         marks.toggle(target("/home/tobi/gone", 500));
 
-        marks.refresh(root_path, &root, Metric::Bytes);
+        marks.refresh(root_path, &root, Metric::Bytes, NATIVE);
         assert_eq!(marks.items()[0].bytes, 900);
         assert!(marks.items()[0].is_dir);
         assert!(marks.items()[0].hidden, "the .cache mark is hidden");
@@ -190,7 +215,8 @@ mod tests {
             find(
                 Path::new("/home/tobi"),
                 &root,
-                Path::new("/home/tobi/.cache")
+                Path::new("/home/tobi/.cache"),
+                NATIVE
             )
             .is_some()
         );
@@ -198,7 +224,8 @@ mod tests {
             find(
                 Path::new("/home/tobi"),
                 &root,
-                Path::new("/home/tobi/.cache/blob.bin")
+                Path::new("/home/tobi/.cache/blob.bin"),
+                NATIVE
             )
             .is_some()
         );
@@ -206,7 +233,8 @@ mod tests {
             find(
                 Path::new("/home/tobi"),
                 &root,
-                Path::new("/home/tobi/cache")
+                Path::new("/home/tobi/cache"),
+                NATIVE
             )
             .is_none()
         );
@@ -214,7 +242,8 @@ mod tests {
             find(
                 Path::new("/elsewhere"),
                 &root,
-                Path::new("/home/tobi/notes.bin")
+                Path::new("/home/tobi/notes.bin"),
+                NATIVE
             )
             .is_none()
         );
@@ -225,11 +254,56 @@ mod tests {
         let home = Path::new("/home/tobi");
         let separator = std::path::MAIN_SEPARATOR;
         assert_eq!(
-            display_path(&home.join(".cache").join("npm"), Some(home)),
+            display_path(&home.join(".cache").join("npm"), Some(home), NATIVE),
             format!("~{separator}.cache{separator}npm")
         );
-        assert_eq!(display_path(home, Some(home)), "~");
-        assert_eq!(display_path(Path::new("/var/log"), Some(home)), "/var/log");
-        assert_eq!(display_path(Path::new("/var/log"), None), "/var/log");
+        assert_eq!(display_path(home, Some(home), NATIVE), "~");
+        assert_eq!(
+            display_path(Path::new("/var/log"), Some(home), NATIVE),
+            "/var/log"
+        );
+        assert_eq!(
+            display_path(Path::new("/var/log"), None, NATIVE),
+            "/var/log"
+        );
+    }
+
+    /// A Unix host's paths read the same on every client: `/` after `~`, and
+    /// a name holding `\` is one name, not two.
+    #[test]
+    fn remote_paths_display_and_resolve_by_posix_rules() {
+        let posix = PathStyle::Posix;
+        let home = Path::new("/home/tobi");
+        assert_eq!(
+            display_path(Path::new("/home/tobi/.cache/npm"), Some(home), posix),
+            "~/.cache/npm"
+        );
+        assert_eq!(
+            display_path(Path::new("/home/tobix"), Some(home), posix),
+            "/home/tobix"
+        );
+        let mut root = Node::directory("home");
+        root.children.push(file(r"a\b", 7));
+        assert!(
+            find(home, &root, Path::new(r"/home/tobi/a\b"), posix).is_some()
+        );
+        assert!(
+            find(home, &root, Path::new("/home/tobi/a/b"), posix).is_none()
+        );
+        assert!(!is_hidden(Path::new(r"/srv/x\.hidden"), posix));
+        assert!(is_hidden(Path::new("/srv/.cache"), posix));
+    }
+
+    /// Marks are keyed by the exact path text, so `/a/b\c` and `/a/b/c`
+    /// stay two marks even where `PathBuf` would call them equal.
+    #[test]
+    fn marks_compare_the_exact_path() {
+        let mut marks = Marks::default();
+        marks.toggle(target(r"/srv/b\c", 1));
+        assert!(!marks.contains(Path::new("/srv/b/c")));
+        assert!(marks.toggle(target("/srv/b/c", 1)));
+        assert_eq!(marks.len(), 2);
+        marks.remove(Path::new("/srv/b/c"));
+        assert!(marks.contains(Path::new(r"/srv/b\c")));
     }
 }

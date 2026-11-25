@@ -2,9 +2,13 @@
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 use disktree_core::remote::{Request, read_snapshot};
 use disktree_core::scan::ScanOptions;
 
+// The helper runs here, so this machine is the host, and clients only
+// accept Unix hosts.
+#[cfg(unix)]
 #[test]
 fn executable_returns_a_read_only_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -101,6 +105,9 @@ fn disconnect_stops_a_helper_even_when_its_output_is_blocked() {
     wait_bounded(&mut helper.0);
 }
 
+// The helper runs here, so this machine is the host, and clients only
+// accept Unix hosts.
+#[cfg(unix)]
 #[test]
 fn a_live_supervised_client_receives_a_complete_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -239,6 +246,9 @@ fn assert_bounded_stream_memory(root: &std::path::Path) {
     drop(input);
 }
 
+// The helper runs here, so this machine is the host, and clients only
+// accept Unix hosts.
+#[cfg(unix)]
 #[test]
 fn executable_discovers_roots_without_scanning_a_path() {
     let mut helper = supervised_helper();

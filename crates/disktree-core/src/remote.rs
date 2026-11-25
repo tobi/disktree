@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use serde::{Deserialize, Serialize};
 
+use crate::path_style::PathStyle;
 use crate::remote_progress::{INTERVAL, Progress, Shared, Stage, stage};
 use crate::scan::ScanOptions;
 #[cfg(not(unix))]
@@ -23,17 +24,23 @@ const VERSION: u32 = 1;
 const MAX_LINE: u64 = 1 << 20;
 const MAX_DIAGNOSTICS: usize = 16 << 10;
 
-/// Whether `path` names a directory from the remote host's root.
-///
-/// `serve` runs on Windows as well as Unix, so a remote path is either
-/// `/`-rooted or absolute the Windows way. On Windows
-/// `Path::is_absolute` wants a drive letter, which rejects every Unix path,
-/// and `Path::has_root` also accepts `\x`, which is neither. On Unix this
-/// agrees with `is_absolute`.
+/// Whether `path` names a directory from the remote host's root. Hosts are
+/// Unix, so this is POSIX on every client; see `path_style`.
 #[must_use]
 pub fn is_remote_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        || path.as_os_str().as_encoded_bytes().first() == Some(&b'/')
+    PathStyle::Posix.is_absolute(path)
+}
+
+/// The remote command, the scanners and the delete script are POSIX shell
+/// and Linux tools, and remote paths are joined as POSIX paths. A Windows
+/// host's `C:\` paths would be joined wrongly, so refuse it by name.
+fn check_platform(platform: &str) -> io::Result<()> {
+    if platform == "windows" {
+        return Err(io::Error::other(
+            "SSH hosts must run Unix; Windows hosts are not supported",
+        ));
+    }
+    Ok(())
 }
 
 // Non-interactive shells often omit ~/.local/bin. Do not require users to
@@ -93,6 +100,7 @@ pub struct Roots {
 
 pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
     let roots: Roots = receive(input)?;
+    check_platform(&roots.platform)?;
     if roots.version != VERSION
         || roots
             .volumes
@@ -328,7 +336,14 @@ fn read_snapshot_with_progress(
     shared: &Shared,
 ) -> io::Result<Snapshot> {
     let header: Header = receive(input)?;
-    if header.version != VERSION || !is_remote_absolute(&header.root) {
+    check_platform(&header.platform)?;
+    if header.version != VERSION
+        || !is_remote_absolute(&header.root)
+        || [&header.home, &header.disk_root]
+            .into_iter()
+            .flatten()
+            .any(|path| !is_remote_absolute(path))
+    {
         return Err(io::Error::other("incompatible remote helper protocol"));
     }
     let mut progress = Progress {
@@ -360,8 +375,7 @@ fn read_snapshot_with_progress(
                     && (name.is_empty()
                         || name == "."
                         || name == ".."
-                        || name.contains(['/', '\0'])
-                        || (cfg!(windows) && name.contains(['\\', ':'])))
+                        || name.contains(['/', '\0']))
                 {
                     return Err(io::Error::other("invalid preview directory"));
                 }
@@ -399,11 +413,12 @@ fn read_snapshot_with_progress(
         let Record(name, kind, bytes, files, modified, read_error, count) =
             record;
         // Names must remain single components when joined to marked paths.
+        // Remote paths are joined as POSIX paths on every client, so `\` and
+        // `:` are ordinary characters in a name, as they are on the host.
         if name.is_empty()
             || name == "."
             || name == ".."
             || name.contains(['/', '\0'])
-            || (cfg!(windows) && name.contains(['\\', ':']))
         {
             return Err(io::Error::other(format!(
                 "remote name cannot be represented safely: {name:?}"
@@ -826,6 +841,8 @@ mod tests {
         }
     }
 
+    // The helper runs on this machine, which must be a Unix host.
+    #[cfg(unix)]
     #[test]
     fn discovery_is_not_a_legacy_scan_request() {
         let session = SessionRequest {
@@ -849,6 +866,8 @@ mod tests {
         assert!(roots.identity.is_some());
     }
 
+    // The helper runs on this machine, which must be a Unix host.
+    #[cfg(unix)]
     #[test]
     fn discovery_never_resolves_a_scan_path_and_rejects_unknown_versions() {
         let mut output = Vec::new();
@@ -1104,17 +1123,59 @@ mod tests {
         );
     }
 
-    /// A Windows client must accept a Unix host's paths without a drive
-    /// letter, and every client accepts its own platform's absolute paths.
+    fn unix_stream(platform: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        let header = Header {
+            version: VERSION,
+            root: PathBuf::from("/srv"),
+            home: Some(PathBuf::from("/home/someone")),
+            disk_root: Some(PathBuf::from("/")),
+            space: None,
+            platform: platform.into(),
+            identity: None,
+        };
+        send(&mut data, &header).unwrap();
+        for name in [r"a\b", "c:d"] {
+            send(&mut data, &Record(name.into(), 1, 5, 1, 0, false, 0))
+                .unwrap();
+        }
+        send(&mut data, &Record("root".into(), 0, 0, 0, 0, false, 2)).unwrap();
+        send(&mut data, &"done").unwrap();
+        data
+    }
+
+    /// Every client reads a Unix host's names as the host wrote them: `\`
+    /// and `:` are ordinary characters there, and the joined path uses `/`.
     #[test]
-    fn remote_paths_are_absolute_without_a_drive_letter() {
-        assert!(is_remote_absolute(Path::new("/")));
-        assert!(is_remote_absolute(Path::new("/home/someone")));
-        assert!(!is_remote_absolute(Path::new("home/someone")));
-        assert!(!is_remote_absolute(Path::new("")));
-        // Rooted without a drive is absolute nowhere.
-        assert!(!is_remote_absolute(Path::new(r"\home\someone")));
-        assert_eq!(is_remote_absolute(Path::new(r"C:\Users")), cfg!(windows));
+    fn unix_names_with_backslashes_and_colons_reach_every_client() {
+        let snapshot = read_snapshot(&mut unix_stream("linux").as_slice())
+            .expect("a Unix host's names are accepted");
+        assert_eq!(snapshot.tree.files, 2);
+        let style = PathStyle::Posix;
+        for name in [r"a\b", "c:d"] {
+            assert!(snapshot.tree.child_named(name).is_some());
+            let path = style.join(&snapshot.header.root, name);
+            assert_eq!(path.to_str().unwrap(), format!("/srv/{name}"));
+        }
+    }
+
+    /// Remote paths are joined as POSIX paths, so a Windows host is refused
+    /// by name rather than half-read with the wrong separator.
+    #[test]
+    fn windows_hosts_and_non_posix_roots_are_refused() {
+        let error = read_snapshot(&mut unix_stream("windows").as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Windows hosts"), "{error}");
+        for value in [
+            serde_json::json!({"version":1,"home":null,"platform":"windows","identity":null,"volumes":[]}),
+            serde_json::json!({"version":1,"home":"C:\\Users\\x","platform":"linux","identity":null,"volumes":[]}),
+            serde_json::json!({"version":1,"home":null,"platform":"linux","identity":null,"volumes":[{"point":"C:\\","device":null,"space":null}]}),
+        ] {
+            let mut data = serde_json::to_vec(&value).unwrap();
+            data.push(b'\n');
+            assert!(read_roots(&mut data.as_slice()).is_err(), "{value}");
+        }
     }
 
     #[test]
@@ -1258,6 +1319,8 @@ mod tests {
         }
     }
 
+    // The helper runs on this machine, which must be a Unix host.
+    #[cfg(unix)]
     #[test]
     fn desktop_dedup_accepts_more_than_the_old_pending_link_limit() {
         let mut data = Vec::new();
@@ -1305,6 +1368,8 @@ mod tests {
         assert_eq!(snapshot.tree.bytes, count);
     }
 
+    // The helper runs on this machine, which must be a Unix host.
+    #[cfg(unix)]
     #[test]
     fn protocol_roundtrip_and_truncation() {
         let dir = tempfile::tempdir().unwrap();
