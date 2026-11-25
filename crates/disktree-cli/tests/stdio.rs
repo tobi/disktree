@@ -14,7 +14,7 @@ fn executable_returns_a_read_only_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("data");
     std::fs::write(&file, b"hello").unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_disktree-scan"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_disktree-cli"))
         .arg("--stdio-v1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -54,7 +54,7 @@ impl Drop for Helper {
 
 fn supervised_helper() -> Helper {
     Helper(
-        Command::new(env!("CARGO_BIN_EXE_disktree-scan"))
+        Command::new(env!("CARGO_BIN_EXE_disktree-cli"))
             .arg("--stdio-v1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -45,11 +45,11 @@ try {
     const root = process.env.DISKTREE_PROFILE_ROOT;
     if (!root.startsWith(join(tmpdir(), 'disktree-profile-'))) throw new Error('Only disposable profile fixtures allowed');
     const binary = join(process.cwd(), 'target/release/examples/profile_remote');
-    const helper = join(process.cwd(), `target/${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-unknown-linux-musl/release/disktree-scan`);
+    const helper = join(process.cwd(), `target/${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-unknown-linux-musl/release/disktree-cli`);
     for (const mode of ['ssh-plain', 'ssh']) {
       for (let trial=0; trial<5; trial++) run(binary, [mode,root,client,helper]);
     }
-  } else run('cargo',['test','-p','disktree-core','real_ssh_transport_','--','--ignored','--nocapture'], {...process.env,DISKTREE_TEST_SSH_CONFIG:client,DISKTREE_TEST_HELPER:join(process.cwd(),`target/${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-unknown-linux-musl/release/disktree-scan`),DISKTREE_TEST_ARCHIVE:join(process.cwd(),'target/portable/disktree')});
+  } else run('cargo',['test','-p','disktree-core','real_ssh_transport_','--','--ignored','--nocapture'], {...process.env,DISKTREE_TEST_SSH_CONFIG:client,DISKTREE_TEST_HELPER:join(process.cwd(),`target/${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}-unknown-linux-musl/release/disktree-cli`),DISKTREE_TEST_ARCHIVE:join(process.cwd(),'target/portable/disktree')});
   console.log(`${process.env.DISKTREE_PROFILE_ROOT ? 'SSH PROFILING COMPLETE' : 'REAL SSH SCAN PASSED'}. Temporary host key, client key and server will be removed.`);
 } finally {
   if (server && server.exitCode === null) {

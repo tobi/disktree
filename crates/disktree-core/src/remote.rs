@@ -43,17 +43,83 @@ fn check_platform(platform: &str) -> io::Result<()> {
     Ok(())
 }
 
-// Non-interactive shells often omit ~/.local/bin. Do not require users to
-// edit the server's startup files after the documented user-local install.
-const REMOTE_COMMAND: &str = r#"if command -v disktree-scan >/dev/null 2>&1; then
+// Non-interactive shells often omit ~/.local/bin. Try disktree-cli first,
+// falling back to legacy disktree-scan if already present on an older server.
+const REMOTE_COMMAND: &str = r#"if command -v disktree-cli >/dev/null 2>&1; then
+exec disktree-cli --stdio-v1
+elif [ -x "$HOME/.local/bin/disktree-cli" ]; then
+exec "$HOME/.local/bin/disktree-cli" --stdio-v1
+elif command -v disktree-scan >/dev/null 2>&1; then
 exec disktree-scan --stdio-v1
 elif [ -x "$HOME/.local/bin/disktree-scan" ]; then
 exec "$HOME/.local/bin/disktree-scan" --stdio-v1
 else
-echo 'disktree-scan is not installed on this server.' >&2
-echo 'On the server, run make install-scan from the disktree checkout.' >&2
+printf 'disktree-cli is not installed on this server (%s %s).\n' "$(uname -s)" "$(uname -m)" >&2
 exit 127
 fi"#;
+
+/// Base URL where predictable raw `disktree-cli-<os>-<arch>` binaries live.
+pub const RELEASE_DOWNLOAD_BASE: &str =
+    "https://github.com/tobi/disktree/releases/latest/download";
+
+/// When `reason` indicates `disktree-cli` is missing on an SSH server, return
+/// the exact one-line command to install it into `~/.local/bin/disktree-cli`
+/// for that server's OS and architecture.
+#[must_use]
+pub fn install_cli_command(reason: &str) -> Option<String> {
+    if !reason.contains("not installed") && !reason.contains("not found") {
+        return None;
+    }
+    let asset = detected_release_asset(reason);
+    let url = match asset {
+        Some(name) => format!("{RELEASE_DOWNLOAD_BASE}/{name}"),
+        None => format!(
+            "{RELEASE_DOWNLOAD_BASE}/disktree-cli-$(uname -s | tr A-Z a-z | sed 's/darwin/macos/')-$(uname -m | sed 's/arm64/aarch64/')"
+        ),
+    };
+    Some(format!(
+        "mkdir -p ~/.local/bin && curl -fsSL {url} -o ~/.local/bin/disktree-cli && chmod +x ~/.local/bin/disktree-cli"
+    ))
+}
+
+fn detected_release_asset(reason: &str) -> Option<&'static str> {
+    let start = reason.find('(')?;
+    let end = reason[start + 1..].find(')')? + start + 1;
+    let mut parts = reason[start + 1..end].split_whitespace();
+    let os = parts.next()?;
+    let arch = parts.next()?;
+    match (os, arch) {
+        ("Linux", "x86_64" | "amd64") => Some("disktree-cli-linux-x86_64"),
+        ("Linux", "aarch64" | "arm64") => Some("disktree-cli-linux-aarch64"),
+        ("Darwin", "arm64" | "aarch64") => Some("disktree-cli-macos-aarch64"),
+        ("Darwin", "x86_64") => Some("disktree-cli-macos-x86_64"),
+        _ => None,
+    }
+}
+
+/// Install `disktree-cli` into `~/.local/bin/disktree-cli` on `host` over SSH
+/// using the exact command produced by [`install_cli_command`].
+pub fn install_remote_cli(host: &str, command: &str) -> io::Result<()> {
+    validate_host(host)?;
+    let output = Command::new("ssh")
+        .args(["-T", "--", host, command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = read_diagnostics(output.stderr.as_slice());
+    let detail = if stderr.is_empty() {
+        format!("ssh exited with {}", output.status)
+    } else {
+        stderr
+    };
+    Err(io::Error::other(format!(
+        "Could not install disktree-cli on {host}: {detail}"
+    )))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -550,11 +616,8 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
         )
     } else if reason.contains("Host key verification failed") {
         format!("Run ssh {host} in a terminal and verify its host key first.")
-    } else if reason.contains("not installed") || reason.contains("not found") {
-        format!(
-            "Install disktree-scan ON {host}, not on this computer. \
-             Run make install-scan from the checkout on the server."
-        )
+    } else if let Some(cmd) = install_cli_command(&reason) {
+        format!("Install disktree-cli on {host}:\n{cmd}")
     } else {
         "No incomplete scan is shown. Retry, or choose another root.".into()
     };
@@ -815,19 +878,51 @@ mod tests {
         assert!(error.contains("Permission denied"), "{error}");
         assert!(error.contains("verify your credentials"), "{error}");
         assert!(!error.contains("truncated"), "{error}");
-        assert!(!error.contains("Install disktree-scan"), "{error}");
+        assert!(!error.contains("install disktree-cli"), "{error}");
     }
 
     #[cfg(unix)]
     #[test]
     fn missing_helper_diagnostics_name_the_server() {
         let error = failing_process(
-            "read -r request; echo 'disktree-scan: command not found' \
-             >&2; exit 127",
+            "read -r request; echo 'disktree-cli is not installed on this \
+             server (Linux x86_64).' >&2; exit 127",
         )
         .to_string();
-        assert!(error.contains("command not found"), "{error}");
-        assert!(error.contains("ON dev, not on this computer"), "{error}");
+        assert!(error.contains("not installed"), "{error}");
+        assert!(error.contains("Install disktree-cli on dev"), "{error}");
+        assert!(
+            error
+                .contains("releases/latest/download/disktree-cli-linux-x86_64"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn install_cli_command_picks_the_servers_os_and_arch() {
+        for (reason, asset) in [
+            (
+                "disktree-cli is not installed on this server (Linux x86_64).",
+                "disktree-cli-linux-x86_64",
+            ),
+            (
+                "disktree-cli is not installed on this server (Linux aarch64).",
+                "disktree-cli-linux-aarch64",
+            ),
+            (
+                "disktree-cli is not installed on this server (Darwin arm64).",
+                "disktree-cli-macos-aarch64",
+            ),
+            (
+                "disktree-cli is not installed on this server (Darwin x86_64).",
+                "disktree-cli-macos-x86_64",
+            ),
+        ] {
+            let cmd = install_cli_command(reason).expect("install command");
+            assert!(cmd.contains(asset), "{cmd}");
+            assert!(cmd.contains("~/.local/bin/disktree-cli"), "{cmd}");
+        }
+        assert!(install_cli_command("Permission denied").is_none());
     }
 
     #[cfg(unix)]
@@ -919,7 +1014,7 @@ mod tests {
         let bin = home.path().join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let helper = std::env::var("DISKTREE_TEST_HELPER").unwrap();
-        std::os::unix::fs::symlink(helper, bin.join("disktree-scan")).unwrap();
+        std::os::unix::fs::symlink(helper, bin.join("disktree-cli")).unwrap();
         // Force the documented ~/.local/bin fallback, not the ambient PATH.
         let remote = format!(
             "HOME={} PATH=/nonexistent; export HOME PATH;\n{REMOTE_COMMAND}",
@@ -1013,7 +1108,7 @@ mod tests {
         let cached = cache
             .join("disktree/ssh")
             .join(&entry.sha256)
-            .join("disktree-scan");
+            .join("disktree-cli");
         let request = Request {
             root: Some(data.path().into()),
             options: ScanOptions {
@@ -1045,7 +1140,7 @@ mod tests {
                 std::fs::rename(damaged, &cached).unwrap();
             }
         }
-        assert!(!home.path().join(".local/bin/disktree-scan").exists());
+        assert!(!home.path().join(".local/bin/disktree-cli").exists());
     }
 
     #[cfg(unix)]

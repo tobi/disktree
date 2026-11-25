@@ -17,6 +17,9 @@ VERSION=$(cat "$here/VERSION")
 
 install -d "$BINDIR" "$APPDIR" "$ICONDIR"
 install -m755 "$here/disktree" "$BINDIR/disktree"
+if [ -f "$here/disktree-cli" ]; then
+    install -m755 "$here/disktree-cli" "$BINDIR/disktree-cli"
+fi
 install -m644 "$here/disktree.svg" "$ICONDIR/disktree.svg"
 sed -e "s|@BINDIR@|$BINDIR|" -e "s|@VERSION@|$VERSION|" \
     "$here/disktree.desktop.in" > "$APPDIR/disktree.desktop"

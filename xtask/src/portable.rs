@@ -43,7 +43,7 @@ pub fn build() -> Result<(), String> {
                 "--release",
                 "--locked",
                 "-p",
-                "disktree-scan",
+                "disktree-cli",
                 "--target",
                 &triple,
             ])
@@ -58,7 +58,7 @@ pub fn build() -> Result<(), String> {
         }
         helpers.push((
             arch.into(),
-            target.join(triple).join("release/disktree-scan"),
+            target.join(triple).join("release/disktree-cli"),
         ));
     }
     let output = target.join("portable/disktree");

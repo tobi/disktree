@@ -47,14 +47,14 @@ define check_install_path
 	fi
 endef
 
-.PHONY: help build run install install-scan uninstall bundle lint test test-ssh ci fmt clean
+.PHONY: help build run install install-cli install-scan uninstall bundle lint test test-ssh ci fmt clean
 
 help:
 	@echo "disktree"
 	@echo
-	@echo "  make build       release build"
+	@echo "  make build       release build (with embedded static SSH helpers on Linux)"
 	@echo "  make run         build and scan your home directory"
-	@echo "  make install-scan  build/install the headless SSH helper only"
+	@echo "  make install-cli build/install disktree-cli (TUI, JSON, SSH helper)"
 	@echo "  make install     install to $(PREFIX): binary, desktop entry, icon"
 	@echo "                   (macOS: disktree.app into $(APPS))"
 	@echo "  make bundle      macOS: build target/bundle/disktree.app and its zip"
@@ -77,11 +77,13 @@ else
 endif
 
 # For servers: no desktop, GPU, GPUI build, or elevated permissions needed.
-install-scan:
-	$(CARGO) build --release -p disktree-scan
+install-cli:
+	$(CARGO) build --release -p disktree-cli
 	install -d "$(BINDIR)"
-	install -m755 target/release/disktree-scan "$(BINDIR)/disktree-scan"
-	$(call check_install_path,disktree-scan)
+	install -m755 target/release/disktree-cli "$(BINDIR)/disktree-cli"
+	$(call check_install_path,disktree-cli)
+
+install-scan: install-cli
 
 run: build
 	$(TARGET)

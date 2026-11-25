@@ -4,6 +4,7 @@
 mod cli;
 mod format;
 mod json_out;
+mod stdio;
 mod tui;
 
 use std::io::{self, IsTerminal as _, Write as _};
@@ -21,6 +22,14 @@ use crate::format::{human_age, human_bytes};
 use crate::json_out::{build_document, write_ndjson_line, write_pretty};
 
 fn main() -> Result<()> {
+    // Fast-path SSH remote protocol mode: skips clap/TUI startup and installs
+    // kernel resource limits before reading stdin.
+    let raw_args: Vec<std::ffi::OsString> =
+        std::env::args_os().skip(1).collect();
+    if raw_args.len() == 1 && raw_args[0] == "--stdio-v1" {
+        return stdio::serve_stdio_v1().map_err(Into::into);
+    }
+
     let args = Cli::parse();
     let policy = args.cache_policy();
     let mode = args.storage_mode();

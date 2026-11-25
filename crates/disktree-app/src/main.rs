@@ -56,8 +56,8 @@ usage: disktree [OPTIONS] [PATH]
        disktree ssh HOST [OPTIONS] [PATH]
        disktree extract-scanner ARCH OUTPUT
 
-Linux packaged builds deploy an embedded static scanner over SSH on demand.
-Unbundled development builds need disktree-scan on the remote PATH or in
+Linux packaged builds deploy an embedded static disktree-cli over SSH on demand.
+Unbundled development builds need disktree-cli on the remote PATH or in
 ~/.local/bin. ARCH for extraction is x86_64 or aarch64.
 SSH uses your config, keys and agent; password prompts use the terminal.
 Remote sessions are read-only: mark, export list/prompt/delete script.

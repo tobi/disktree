@@ -740,6 +740,9 @@ pub mod discovery_machine {
         Loading {
             job: Option<disktree_core::remote::RemoteRoots>,
         },
+        Installing {
+            host: String,
+        },
         Ready,
         Failed(String),
     }
@@ -749,6 +752,10 @@ pub mod discovery_machine {
         StartLocal,
         StartRemote {
             host: String,
+        },
+        StartInstall {
+            host: String,
+            command: String,
         },
         RemoteSpawned {
             epoch: u64,
@@ -763,9 +770,21 @@ pub mod discovery_machine {
 
     #[derive(Debug, PartialEq, Eq)]
     pub enum Effect {
-        SpawnLocalListing { epoch: u64 },
-        DiscoverRemote { epoch: u64, host: String },
-        PollRemote { epoch: u64 },
+        SpawnLocalListing {
+            epoch: u64,
+        },
+        DiscoverRemote {
+            epoch: u64,
+            host: String,
+        },
+        InstallRemote {
+            epoch: u64,
+            host: String,
+            command: String,
+        },
+        PollRemote {
+            epoch: u64,
+        },
     }
 
     impl State {
@@ -774,7 +793,10 @@ pub mod discovery_machine {
         }
 
         pub const fn is_loading(&self) -> bool {
-            matches!(self.phase, Phase::Loading { .. })
+            matches!(
+                self.phase,
+                Phase::Loading { .. } | Phase::Installing { .. }
+            )
         }
 
         pub const fn is_ready(&self) -> bool {
@@ -784,7 +806,10 @@ pub mod discovery_machine {
         pub fn error(&self) -> Option<&str> {
             match &self.phase {
                 Phase::Failed(error) => Some(error),
-                Phase::Idle | Phase::Loading { .. } | Phase::Ready => None,
+                Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Installing { .. }
+                | Phase::Ready => None,
             }
         }
     }
@@ -797,6 +822,7 @@ pub mod discovery_machine {
             (
                 Phase::Idle
                 | Phase::Loading { .. }
+                | Phase::Installing { .. }
                 | Phase::Ready
                 | Phase::Failed(_),
                 Event::Reset,
@@ -810,6 +836,7 @@ pub mod discovery_machine {
             (
                 Phase::Idle
                 | Phase::Loading { .. }
+                | Phase::Installing { .. }
                 | Phase::Ready
                 | Phase::Failed(_),
                 Event::StartLocal,
@@ -826,6 +853,7 @@ pub mod discovery_machine {
             (
                 Phase::Idle
                 | Phase::Loading { .. }
+                | Phase::Installing { .. }
                 | Phase::Ready
                 | Phase::Failed(_),
                 Event::StartRemote { host },
@@ -839,6 +867,27 @@ pub mod discovery_machine {
                     vec![Effect::DiscoverRemote {
                         epoch: next_epoch,
                         host,
+                    }],
+                )
+            }
+            (
+                Phase::Idle
+                | Phase::Loading { .. }
+                | Phase::Installing { .. }
+                | Phase::Ready
+                | Phase::Failed(_),
+                Event::StartInstall { host, command },
+            ) => {
+                let next_epoch = epoch + 1;
+                (
+                    State {
+                        epoch: next_epoch,
+                        phase: Phase::Installing { host: host.clone() },
+                    },
+                    vec![Effect::InstallRemote {
+                        epoch: next_epoch,
+                        host,
+                        command,
                     }],
                 )
             }
@@ -858,6 +907,7 @@ pub mod discovery_machine {
             (
                 Phase::Idle
                 | Phase::Loading { .. }
+                | Phase::Installing { .. }
                 | Phase::Ready
                 | Phase::Failed(_),
                 Event::Completed {
@@ -882,6 +932,7 @@ pub mod discovery_machine {
             (
                 phase @ (Phase::Idle
                 | Phase::Loading { .. }
+                | Phase::Installing { .. }
                 | Phase::Ready
                 | Phase::Failed(_)),
                 Event::RemoteSpawned { .. } | Event::Completed { .. },
@@ -1339,6 +1390,25 @@ impl Disktree {
         }
     }
 
+    /// Install `disktree-cli` into `~/.local/bin/disktree-cli` on `host` over
+    /// SSH and automatically reconnect once installed.
+    pub fn install_remote_cli(
+        &mut self,
+        host: String,
+        command: String,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.volumes_open {
+            return;
+        }
+        self.picker_error = None;
+        self.step_discovery(
+            discovery_machine::Event::StartInstall { host, command },
+            cx,
+        );
+        cx.notify();
+    }
+
     fn perform_discovery(
         &mut self,
         effect: discovery_machine::Effect,
@@ -1355,6 +1425,40 @@ impl Disktree {
                         self.finish_volume_listing_for(epoch, Err(error), cx);
                     }
                 }
+            }
+            discovery_machine::Effect::InstallRemote {
+                epoch,
+                host,
+                command,
+            } => {
+                let target = host.clone();
+                let task = cx.background_executor().spawn(async move {
+                    disktree_core::remote::install_remote_cli(&target, &command)
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = task.await;
+                    let _ = this.update(cx, |this, cx| {
+                        if !this.volumes_open || this.discovery.epoch != epoch {
+                            return;
+                        }
+                        match result {
+                            Ok(()) => {
+                                this.load_volume_source(Some(host), cx);
+                            }
+                            Err(error) => {
+                                this.step_discovery(
+                                    discovery_machine::Event::Completed {
+                                        epoch,
+                                        outcome: Err(error.to_string()),
+                                    },
+                                    cx,
+                                );
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
             }
             discovery_machine::Effect::PollRemote { epoch } => {
                 cx.spawn(async move |this, cx| {

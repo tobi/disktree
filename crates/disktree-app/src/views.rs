@@ -199,13 +199,111 @@ fn volumes_dialog(
                     .child(dialog_description("Listing mounts…", cx)),
             );
         }
+        crate::state::discovery_machine::Phase::Installing { host } => {
+            rows = rows.child(div().p(space::MD).child(dialog_description(
+                format!("Installing disktree-cli on {host}…"),
+                cx,
+            )));
+        }
         crate::state::discovery_machine::Phase::Failed(error) => {
-            rows = rows.child(
-                div()
-                    .p(space::MD)
-                    .text_color(theme.danger)
-                    .child(error.clone()),
-            );
+            if let Some(cmd) = disktree_core::remote::install_cli_command(error)
+            {
+                let host_name = app
+                    .volumes_source
+                    .clone()
+                    .unwrap_or_else(|| "the server".to_owned());
+                let install_host = app.volumes_source.clone();
+                let install_cmd = cmd.clone();
+                let copy_cmd = cmd.clone();
+                rows = rows.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(space::SM)
+                        .p(space::MD)
+                        .child(
+                            div().text_color(theme.foreground).child(format!(
+                                "disktree-cli is not installed on {host_name}."
+                            )),
+                        )
+                        .child(
+                            div()
+                                .p(space::SM)
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.divider())
+                                .font_family(theme.mono_font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(cmd),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(space::SM)
+                                .when_some(install_host, |row, host| {
+                                    let label = format!("Install on {host}");
+                                    let cmd = install_cmd.clone();
+                                    row.child(
+                                        button(
+                                            "source-install-cli",
+                                            label,
+                                            ButtonVariant::Primary,
+                                            cx,
+                                        )
+                                        .debug_selector(|| {
+                                            "source-install-cli".into()
+                                        })
+                                        .on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.install_remote_cli(
+                                                    host.clone(),
+                                                    cmd.clone(),
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                    )
+                                })
+                                .child(
+                                    button(
+                                        "source-copy-install",
+                                        "Copy command",
+                                        ButtonVariant::Outline,
+                                        cx,
+                                    )
+                                    .debug_selector(|| {
+                                        "source-copy-install".into()
+                                    })
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.write_to_clipboard(
+                                                gpui_kit::ClipboardItem::new_string(
+                                                    copy_cmd.clone(),
+                                                ),
+                                            );
+                                            this.picker_error = None;
+                                            this.notice = Some((
+                                                "Copied remote install command"
+                                                    .into(),
+                                                gpui_omarchy::Status::Success,
+                                            ));
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        ),
+                );
+            } else {
+                rows = rows.child(
+                    div()
+                        .p(space::MD)
+                        .text_color(theme.danger)
+                        .child(error.clone()),
+                );
+            }
         }
         crate::state::discovery_machine::Phase::Idle
         | crate::state::discovery_machine::Phase::Ready

@@ -16,7 +16,7 @@ case "$size" in ''|*[!0-9]*) exit 2;; esac
 umask 077
 dir="${XDG_CACHE_HOME:-$HOME/.cache}/disktree/ssh/$digest"
 mkdir -p "$dir"
-helper="$dir/disktree-scan"
+helper="$dir/disktree-cli"
 valid() {
   [ -x "$helper" ] || return 1
   actual=$(sha256sum "$helper") || return 1

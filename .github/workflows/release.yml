@@ -108,22 +108,32 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           name="disktree-$VERSION-$ARCH-linux"
+          cli_bin="target/$ARCH-unknown-linux-musl/release/disktree-cli"
           mkdir -p "dist/$name"
           # portable strips before appending; stripping again loses helpers.
           cp target/portable/disktree "dist/$name/"
+          cp "$cli_bin" "dist/$name/disktree-cli"
           cp packaging/install.sh packaging/disktree.desktop.in \
              assets/disktree.svg README.md LICENSE "dist/$name/"
           echo "$VERSION" > "dist/$name/VERSION"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          cli_asset="disktree-cli-linux-$ARCH"
+          cp "$cli_bin" "dist/$cli_asset"
+          (cd dist && sha256sum "$cli_asset" > "$cli_asset.sha256")
           echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "cli=dist/$cli_asset" >> "$GITHUB_OUTPUT"
 
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          CLI: ${{ steps.package.outputs.cli }}
+        run: |
+          gh release upload "$TAG" \
+            "$ARCHIVE" "$ARCHIVE.sha256" \
+            "$CLI" "$CLI.sha256" --clobber
 
   macos:
     name: Build (macOS ${{ matrix.arch }})
@@ -203,6 +213,7 @@ jobs:
             fi
           fi
           cargo xtask bundle "${args[@]}"
+          cargo build --release --locked -p disktree-cli
 
       - name: Upload
         env:
@@ -214,7 +225,14 @@ jobs:
           zip="target/bundle/disktree-$VERSION-$ARCH-macos.zip"
           (cd "$(dirname "$zip")" && shasum -a 256 "$(basename "$zip")" \
             > "$(basename "$zip").sha256")
-          gh release upload "$TAG" "$zip" "$zip.sha256" --clobber
+          mkdir -p dist
+          cli="dist/disktree-cli-macos-$ARCH"
+          cp target/release/disktree-cli "$cli"
+          (cd dist && shasum -a 256 "$(basename "$cli")" \
+            > "$(basename "$cli").sha256")
+          gh release upload "$TAG" \
+            "$zip" "$zip.sha256" \
+            "$cli" "$cli.sha256" --clobber
 
   windows:
     name: Build (Windows ${{ matrix.arch }})
@@ -248,7 +266,7 @@ jobs:
         run: cargo xtask test
 
       - name: Build
-        run: cargo build --release --locked -p disktree-app
+        run: cargo build --release --locked -p disktree-app -p disktree-cli
 
       - name: Package
         id: package
@@ -259,12 +277,17 @@ jobs:
         run: |
           $name = "disktree-$env:VERSION-$env:ARCH-windows"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/disktree.exe, README.md, LICENSE "dist/$name/"
+          Copy-Item target/release/disktree.exe, target/release/disktree-cli.exe, README.md, LICENSE "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           # The format `sha256sum -c` reads, with a Unix line ending.
           [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
+          $cli = "disktree-cli-windows-$env:ARCH.exe"
+          Copy-Item target/release/disktree-cli.exe "dist/$cli"
+          $cliHash = (Get-FileHash "dist/$cli" -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("dist/$cli.sha256", "$cliHash  $cli`n")
           "archive=dist/$name.zip" >> $env:GITHUB_OUTPUT
+          "cli=dist/$cli" >> $env:GITHUB_OUTPUT
 
       - name: Install Inno Setup
         shell: pwsh
@@ -291,9 +314,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
+          CLI: ${{ steps.package.outputs.cli }}
           SETUP: ${{ steps.installer.outputs.setup }}
         run: |
-          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+          gh release upload "$TAG" \
+            "$ARCHIVE" "$ARCHIVE.sha256" \
+            "$CLI" "$CLI.sha256" \
             "$SETUP" "$SETUP.sha256" --clobber
 
   publish:
