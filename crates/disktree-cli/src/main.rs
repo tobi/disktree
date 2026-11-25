@@ -255,9 +255,7 @@ fn print_plain_summary(
     };
     let now = disktree_scanner::unix_now();
     let freshness_label = match &snapshot.freshness {
-        Freshness::Fresh { newest_at, .. } => {
-            format!("cached {}", human_age(now.saturating_sub(*newest_at)))
-        }
+        Freshness::Fresh { .. } => "fresh".to_owned(),
         Freshness::Stale { newest_at, .. } => {
             format!("stale {}", human_age(now.saturating_sub(*newest_at)))
         }

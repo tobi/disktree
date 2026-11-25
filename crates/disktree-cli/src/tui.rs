@@ -539,13 +539,9 @@ impl App {
             }
         } else {
             match &self.freshness {
-                Some(Freshness::Fresh { newest_at, .. }) => (
-                    format!(
-                        "CACHED · {}",
-                        human_age(now.saturating_sub(*newest_at))
-                    ),
-                    Color::Green,
-                ),
+                Some(Freshness::Fresh { .. }) => {
+                    ("FRESH".to_owned(), Color::Green)
+                }
                 Some(Freshness::Live { .. }) => {
                     ("LIVE".to_owned(), Color::Green)
                 }
@@ -692,13 +688,9 @@ impl App {
                     ("updating…".to_owned(), Color::Cyan)
                 } else {
                     match node.status() {
-                        SubtreeStatus::Fresh { scanned_at } => (
-                            format!(
-                                "fresh {}",
-                                human_age(now.saturating_sub(scanned_at))
-                            ),
-                            Color::Green,
-                        ),
+                        SubtreeStatus::Fresh { .. } => {
+                            ("fresh".to_owned(), Color::Green)
+                        }
                         SubtreeStatus::Stale { scanned_at } => (
                             format!(
                                 "stale {}",

@@ -417,37 +417,6 @@ pub fn bar(fraction: f32, color: Hsla, cx: &App) -> Div {
         )
 }
 
-/// Four rising bars with `filled` of them lit, as a signal meter reads:
-/// how hard a scan is allowed to work, without a word in the bar.
-pub fn signal(filled: usize, cx: &App) -> Div {
-    let theme = cx.omarchy();
-    let mut bars = div()
-        .flex()
-        .flex_row()
-        .items_end()
-        .gap(space::XXS)
-        .h(crate::ui::icon::SM);
-    for step in 1..=SIGNAL_STEPS {
-        // Heights step by quarters of the icon slot, so the tallest bar is
-        // the height of the text beside it.
-        let height = crate::ui::icon::SM.0 * step as f32 / SIGNAL_STEPS as f32;
-        bars = bars.child(
-            div()
-                .w(crate::ui::size::SIGNAL_BAR)
-                .h(gpui_kit::Rems(height))
-                .bg(if step <= filled {
-                    theme.bright
-                } else {
-                    theme.control_border()
-                }),
-        );
-    }
-    bars
-}
-
-/// One bar per Power Efficiency preset.
-const SIGNAL_STEPS: usize = crate::power::PowerEfficiency::ALL.len();
-
 /// A square of colour, for a legend or an identity.
 pub fn swatch(color: Hsla) -> Div {
     div()

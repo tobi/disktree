@@ -293,6 +293,25 @@ pub struct WalkOutcome {
     pub cancelled: bool,
 }
 
+/// Choose a balanced worker count from the host's logical CPU count when the
+/// caller does not pass an explicit `--scan-threads` override.
+///
+/// Metadata walks scale strongly up to ~6–8 workers; past 8, VFS lock
+/// contention adds CPU heat and fan noise without meaningful wall-time gains.
+#[must_use]
+pub const fn default_worker_threads(cpus: usize) -> usize {
+    if cpus <= 1 {
+        1
+    } else if cpus <= 4 {
+        cpus
+    } else if cpus <= 8 {
+        4
+    } else {
+        let half = cpus / 2;
+        if half > 8 { 8 } else { half }
+    }
+}
+
 /// Walk `root` in parallel, grafting any fresh subtrees returned by
 /// `config.skip_oracle`, and returning the aggregated, sorted [`TreeArena`].
 pub fn walk_parallel(
@@ -394,15 +413,16 @@ pub fn walk_parallel(
         Ok(())
     };
 
-    if let Some(threads) = config.options.threads {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads.max(1))
-            .build()
-            .map_err(io::Error::other)?;
-        pool.install(run_walk)?;
-    } else {
-        run_walk()?;
-    }
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let threads = config
+        .options
+        .threads
+        .map_or_else(|| default_worker_threads(cpus), |n| n.clamp(1, cpus));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(io::Error::other)?;
+    pool.install(run_walk)?;
 
     let scanned_at = unix_now();
     let cancelled = ctx.cancel.load(Ordering::Relaxed);
@@ -1395,6 +1415,17 @@ mod tests {
                 DirFreshness::Unscanned
             }
         }
+    }
+
+    #[test]
+    fn default_worker_heuristic_scales_and_caps_quietly() {
+        assert_eq!(default_worker_threads(0), 1);
+        assert_eq!(default_worker_threads(1), 1);
+        assert_eq!(default_worker_threads(4), 4);
+        assert_eq!(default_worker_threads(8), 4);
+        assert_eq!(default_worker_threads(12), 6);
+        assert_eq!(default_worker_threads(18), 8);
+        assert_eq!(default_worker_threads(64), 8);
     }
 
     #[test]

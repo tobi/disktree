@@ -16,7 +16,6 @@ mod appearance;
 mod git;
 mod marks;
 mod palette;
-mod power;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -48,7 +47,6 @@ struct Args {
     choose_root: bool,
     options: ScanOptions,
     depth: u32,
-    power: Option<power::PowerEfficiency>,
 }
 
 const USAGE: &str = "\
@@ -83,9 +81,7 @@ options:
                         also measure other disks, network shares and pseudo
                         filesystems mounted below PATH (local only; off by default)
   -d, --depth N         how many levels to draw at once (1-6, default 4)
-      --power-efficiency PRESET
-                        miser, balanced (default), aggressive, drain-my-battery
-      --scan-threads N  fixed scan workers, capped by available CPU count
+      --scan-threads N  fixed scan workers (default: automatic heuristic)
       --metric files    rank by file count instead of bytes
   -h, --help            show this help
 ";
@@ -103,16 +99,7 @@ fn run() -> Result<()> {
     if extract_scanner()? {
         return Ok(());
     }
-    let saved = power::settings_path()
-        .map_or_else(
-            || Ok(power::PowerEfficiency::default()),
-            |path| power::load(&path),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("Cannot load Power Efficiency: {error}; using Balanced");
-            power::PowerEfficiency::default()
-        });
-    let args = parse_args_with_power(std::env::args_os().skip(1), saved)?;
+    let args = parse_args(std::env::args_os().skip(1))?;
 
     if args.check {
         let host = args
@@ -226,7 +213,7 @@ fn run() -> Result<()> {
                             appearance::follow(window);
                         }
                         cx.new(|cx| {
-                            let mut app = if args.choose_root {
+                            if args.choose_root {
                                 Disktree::choose(
                                     options,
                                     depth,
@@ -242,9 +229,7 @@ fn run() -> Result<()> {
                                     args.remote_disk,
                                     cx,
                                 )
-                            };
-                            app.power_choice = args.power;
-                            app
+                            }
                         })
                     },
                 )
@@ -293,21 +278,9 @@ fn extract_scanner() -> Result<bool> {
 }
 
 /// Read the command line, program name already skipped.
-#[cfg(test)]
 fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args> {
-    parse_args_with_power(args, power::PowerEfficiency::default())
-}
-
-fn parse_args_with_power(
-    args: impl Iterator<Item = std::ffi::OsString>,
-    preset: power::PowerEfficiency,
-) -> Result<Args> {
     let mut root: Option<PathBuf> = None;
-    let mut options = ScanOptions {
-        threads: Some(preset.threads(power::cpu_threads())),
-        ..ScanOptions::default()
-    };
-    let mut power = Some(preset);
+    let mut options = ScanOptions::default();
     let mut depth = 4_u32;
     let mut disk = false;
     // `std::env::args` panics on a name that is not Unicode, and a path is
@@ -353,16 +326,7 @@ fn parse_args_with_power(
                     "--depth must be 1 to 6"
                 );
             }
-            "--power-efficiency" => {
-                let value =
-                    text(args.next(), "--power-efficiency needs a preset")?;
-                let preset = power::PowerEfficiency::parse(&value)
-                    .context("unknown Power Efficiency preset")?;
-                options.threads = Some(preset.threads(power::cpu_threads()));
-                power = Some(preset);
-            }
             "--scan-threads" => {
-                power = None;
                 let value = text(args.next(), "--scan-threads needs a number")?;
                 let threads: usize = value
                     .parse()
@@ -413,7 +377,6 @@ fn parse_args_with_power(
             remote_disk: disk,
             check,
             choose_root,
-            power,
             options,
             depth,
         });
@@ -454,7 +417,6 @@ fn parse_args_with_power(
         choose_root,
         options,
         depth: depth.clamp(1, 6),
-        power,
     })
 }
 
@@ -503,13 +465,12 @@ mod argument_tests {
     }
 
     #[test]
-    fn worker_budget_defaults_and_override_are_explicit() {
+    fn worker_budget_defaults_to_heuristic_and_allows_override() {
         let args = parse_args(arguments(&[])).expect("defaults");
-        assert_eq!(args.options.threads, Some(4.min(power::cpu_threads())));
+        assert_eq!(args.options.threads, None);
         let args =
             parse_args(arguments(&["--scan-threads", "4"])).expect("custom");
         assert_eq!(args.options.threads, Some(4));
-        assert!(args.power.is_none());
     }
 
     #[test]
@@ -544,7 +505,6 @@ mod argument_tests {
         assert!(args.check);
         assert_eq!(args.options.threads, Some(4));
         assert_eq!(args.root, PathBuf::from("/only-on-the-remote-machine"));
-        assert!(args.power.is_none());
         for root in ["relative", r"C:\Users", r"\srv"] {
             assert!(
                 parse_args(
@@ -565,35 +525,7 @@ mod argument_tests {
         .expect("remote volume");
         assert!(args.remote_disk);
         assert!(args.root.as_os_str().is_empty());
-        assert!(args.power.is_some());
-    }
-
-    #[test]
-    fn saved_power_is_loaded_before_cli_overrides() {
-        use power::PowerEfficiency as Power;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("power-efficiency");
-        power::save(&path, Power::Miser).expect("save");
-        let saved = power::load(&path).expect("load");
-        let args = parse_args_with_power(arguments(&[]), saved).expect("saved");
-        assert_eq!(args.power, Some(Power::Miser));
-        assert_eq!(args.options.threads, Some(2.min(power::cpu_threads())));
-        let args = parse_args_with_power(
-            arguments(&["--power-efficiency", "drain-my-battery"]),
-            saved,
-        )
-        .expect("override");
-        assert_eq!(args.power, Some(Power::DrainMyBattery));
-        assert_eq!(args.options.threads, Some(power::cpu_threads()));
-        let args =
-            parse_args_with_power(arguments(&["--scan-threads", "8"]), saved)
-                .expect("override");
-        assert!(args.power.is_none());
-        assert_eq!(args.options.threads, Some(8));
-        assert_eq!(power::load(&path).expect("unchanged"), saved);
-        assert!(
-            parse_args(arguments(&["--power-efficiency", "invalid"])).is_err()
-        );
+        assert_eq!(args.options.threads, None);
     }
 
     // APFS rejects these filename bytes; Linux filesystems permit them.
