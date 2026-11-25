@@ -211,6 +211,12 @@ pub enum ScanUpdate {
         node: Node,
         freshness: Freshness,
     },
+    /// A prioritized subtree finished scanning while background revalidation
+    /// continues on the rest of the root.
+    SubtreeRefreshed {
+        path: PathBuf,
+        arena: Arc<TreeArena>,
+    },
     /// Completed live scan (all subtrees up to date and persisted to cache).
     Live { arena: Arc<TreeArena>, node: Node },
     /// Non-fatal or fatal scan error.
@@ -439,10 +445,15 @@ impl ScanHandle {
                         self.progress.finish();
                         return Some(ScanUpdate::Finished);
                     }
+                    Ok(ScanEvent::SubtreeRefreshed { path, arena, .. }) => {
+                        return Some(ScanUpdate::SubtreeRefreshed {
+                            path,
+                            arena,
+                        });
+                    }
                     Ok(
                         ScanEvent::Progress { .. }
                         | ScanEvent::SubtreeUpdating { .. }
-                        | ScanEvent::SubtreeRefreshed { .. }
                         | ScanEvent::StorageFallback { .. },
                     ) => {}
                     Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -485,7 +496,9 @@ impl ScanHandle {
                 freshness: Freshness::Fresh { .. },
                 ..
             } => Some(Ok(node)),
-            ScanUpdate::Cached { .. } => None,
+            ScanUpdate::Cached { .. } | ScanUpdate::SubtreeRefreshed { .. } => {
+                None
+            }
             ScanUpdate::Error(err) => Some(Err(err)),
             ScanUpdate::Finished => Some(Err(io::Error::other(
                 "the scan finished without producing a tree",

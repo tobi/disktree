@@ -75,6 +75,17 @@ pub struct CachedSubtree {
     pub freshness: Freshness,
 }
 
+/// Partition of cached subdirectories below a scan root into fresh (skip) and
+/// stale (defer behind unscanned/missing directories, oldest first).
+#[derive(Clone, Debug, Default)]
+pub struct SubtreeCatalog {
+    /// Fresh cached shards (`path -> dir_id`), safe to graft without walking.
+    pub fresh: FxHashMap<PathBuf, u64>,
+    /// Stale cached shards (`path -> scanned_at_unix`), refreshed after
+    /// unscanned directories.
+    pub stale: FxHashMap<PathBuf, u64>,
+}
+
 /// Summary of an invalidation operation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InvalidateReport {
@@ -632,8 +643,11 @@ impl CacheDb {
 
     /// Preload the map of fresh cached shard paths strictly beneath `root_path`
     /// so a live walk can skip them with a lock-free O(1) lookup.
+    /// Classify all cached shards strictly beneath `root_path` into fresh
+    /// (<= TTL, skip via [`Self::load_shard_by_dir_id`]) and stale (> TTL,
+    /// defer behind unscanned directories and refresh oldest-first).
     #[cfg(feature = "cache-db")]
-    pub fn fresh_subtrees_below(
+    pub fn cached_subtrees_below(
         &self,
         host: &HostKey,
         root_path: &Path,
@@ -641,7 +655,7 @@ impl CacheDb {
         now: u64,
         ttl_secs: u64,
         exclude: &FxHashSet<PathBuf>,
-    ) -> Result<FxHashMap<PathBuf, u64>, FallbackReason> {
+    ) -> Result<SubtreeCatalog, FallbackReason> {
         let host_key = host.as_db_key();
         let normalized_root = normalize_path(root_path);
         let prefix = if normalized_root == "/" {
@@ -661,7 +675,7 @@ impl CacheDb {
             .open_table(DIR_INDEX_TABLE)
             .map_err(|e| classify_redb_error(&e.into()))?;
 
-        let mut fresh = FxHashMap::default();
+        let mut catalog = SubtreeCatalog::default();
         let start = (host_key.as_str(), prefix.as_str());
         let iter = path_to_dir
             .range(start..)
@@ -685,18 +699,21 @@ impl CacheDb {
             if let Some(entry) = read_dir_entry(&dir_index, &host_key, dir_id)?
                 && entry.chunk_id != 0
                 && entry.scanned_at_unix > 0
-                && now.saturating_sub(entry.scanned_at_unix) <= ttl_secs
                 && is_entry_compatible(&entry, options)
             {
-                fresh.insert(path_buf, dir_id);
+                if now.saturating_sub(entry.scanned_at_unix) <= ttl_secs {
+                    catalog.fresh.insert(path_buf, dir_id);
+                } else {
+                    catalog.stale.insert(path_buf, entry.scanned_at_unix);
+                }
             }
         }
 
-        Ok(fresh)
+        Ok(catalog)
     }
 
     #[cfg(not(feature = "cache-db"))]
-    pub fn fresh_subtrees_below(
+    pub fn cached_subtrees_below(
         &self,
         _host: &HostKey,
         _root_path: &Path,
@@ -704,8 +721,26 @@ impl CacheDb {
         _now: u64,
         _ttl_secs: u64,
         _exclude: &FxHashSet<PathBuf>,
+    ) -> Result<SubtreeCatalog, FallbackReason> {
+        Ok(SubtreeCatalog::default())
+    }
+
+    /// Preload the map of fresh (`<= ttl_secs`) cached shard `dir_id`s
+    /// strictly beneath `root_path` so the parallel walker can skip them
+    /// lock-free.
+    pub fn fresh_subtrees_below(
+        &self,
+        host: &HostKey,
+        root_path: &Path,
+        options: &ScanOptions,
+        now: u64,
+        ttl_secs: u64,
+        exclude: &FxHashSet<PathBuf>,
     ) -> Result<FxHashMap<PathBuf, u64>, FallbackReason> {
-        Ok(FxHashMap::default())
+        self.cached_subtrees_below(
+            host, root_path, options, now, ttl_secs, exclude,
+        )
+        .map(|catalog| catalog.fresh)
     }
 
     /// Load a single shard by `dir_id` (used when grafting a skipped fresh

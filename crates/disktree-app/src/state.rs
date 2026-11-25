@@ -1658,6 +1658,43 @@ impl Disktree {
                 cx.notify();
                 return true;
             }
+            ScanUpdate::SubtreeRefreshed { path, arena: sub } => {
+                if let Some(current_arena) = self.arena.as_mut() {
+                    let root = current_arena.root_path().to_path_buf();
+                    let updated = if path == root {
+                        Some((*sub).clone())
+                    } else if let Ok(rel) = path.strip_prefix(&root) {
+                        let parts: Vec<String> = rel
+                            .components()
+                            .map(|c| {
+                                c.as_os_str().to_string_lossy().into_owned()
+                            })
+                            .collect();
+                        let mut next = (**current_arena).clone();
+                        if let Some(target_id) =
+                            next.find_relative(parts.iter().map(String::as_str))
+                        {
+                            next.replace_node_contents(target_id, &sub);
+                            next.aggregate(
+                                self.options.dedup_hardlinks,
+                                self.options.include_hidden,
+                            );
+                            Some(next)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(next) = updated {
+                        let next = Arc::new(next);
+                        self.arena = Some(Arc::clone(&next));
+                        self.reproject_arena(&next, cx);
+                    }
+                }
+                cx.notify();
+                return true;
+            }
             ScanUpdate::Live { arena, node }
                 if self.refresh_metric.is_some() =>
             {

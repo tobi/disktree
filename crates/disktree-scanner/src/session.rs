@@ -749,33 +749,47 @@ fn run_background_walk(
         .db
         .clone();
 
-    // Preload fresh subtrees strictly beneath `walk_root` into a lock-free map.
-    let db_fresh = if policy.reuse_fresh_subtrees && !policy.force_refresh {
-        if let Some(db) = &db_opt {
-            match db.fresh_subtrees_below(
-                host,
-                walk_root,
-                options,
-                now,
-                ttl_secs,
-                &FxHashSet::default(),
-            ) {
-                Ok(map) => map,
-                Err(reason) => {
-                    let from = downgrade_storage(storage, reason.clone());
-                    let _ = event_tx.send(ScanEvent::StorageFallback {
-                        from,
-                        to: ActiveStorageMode::InMemory,
-                        reason,
-                    });
-                    FxHashMap::default()
+    // Preload fresh (skip) and stale (defer-last, oldest-first) subtrees
+    // strictly beneath `walk_root`. Even on `force_refresh`, loading stale
+    // timestamps lets brand-new unscanned directories walk ahead of cached ones.
+    let catalog = if let Some(db) = &db_opt {
+        let effective_ttl =
+            if policy.reuse_fresh_subtrees && !policy.force_refresh {
+                ttl_secs
+            } else {
+                0
+            };
+        match db.cached_subtrees_below(
+            host,
+            walk_root,
+            options,
+            now,
+            effective_ttl,
+            &FxHashSet::default(),
+        ) {
+            Ok(mut catalog) => {
+                if !policy.reuse_fresh_subtrees || policy.force_refresh {
+                    // Nothing is skipped on force_refresh; treat any
+                    // just-written `now` entries as stale too so unscanned
+                    // paths still run first.
+                    for (path, _) in catalog.fresh.drain() {
+                        catalog.stale.insert(path, now);
+                    }
                 }
+                catalog
             }
-        } else {
-            FxHashMap::default()
+            Err(reason) => {
+                let from = downgrade_storage(storage, reason.clone());
+                let _ = event_tx.send(ScanEvent::StorageFallback {
+                    from,
+                    to: ActiveStorageMode::InMemory,
+                    reason,
+                });
+                crate::db::SubtreeCatalog::default()
+            }
         }
     } else {
-        FxHashMap::default()
+        crate::db::SubtreeCatalog::default()
     };
 
     let loader: Option<ShardLoader> = db_opt.as_ref().map(|db| {
@@ -797,7 +811,8 @@ fn run_background_walk(
 
     let oracle: Arc<dyn SkipOracle> = Arc::new(MapSkipOracle {
         in_memory: Arc::clone(completed_immediate),
-        db_fresh,
+        db_fresh: catalog.fresh,
+        db_stale: catalog.stale,
         loader,
     });
 

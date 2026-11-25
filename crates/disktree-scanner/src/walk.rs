@@ -118,12 +118,37 @@ impl PauseGate {
     }
 }
 
-/// Callback oracle consulted before entering a subdirectory to reuse an
-/// already-fresh cached (or freshly prioritized) subtree without touching disk.
+/// Freshness tier of a subdirectory for priority-ordered traversal.
+///
+/// Scheduling order:
+/// 1. `Priority::Immediate` (user-requested, preempts via [`PauseGate`])
+/// 2. [`Self::Unscanned`] (no cached data at all — fill blind spots first)
+/// 3. [`Self::Stale`] (cached data exists, older than TTL — oldest first, last)
+/// 4. [`Self::Fresh`] (within TTL — grafted from cache without touching disk)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirFreshness {
+    /// Cached and within TTL: graft without walking disk.
+    Fresh,
+    /// No complete cached data (missing, stub, or invalidated): walk first.
+    Unscanned,
+    /// Complete cached data exists, older than TTL: defer and walk oldest-first.
+    Stale { scanned_at: u64 },
+}
+
+/// Oracle consulted before entering a subdirectory.
+///
+/// Reuses already-fresh cached (or freshly prioritized) subtrees without
+/// touching disk, and classifies remaining subdirectories as unscanned vs stale.
 pub trait SkipOracle: Send + Sync {
     /// If `path` is already fresh and compatible, return its ready
     /// [`TreeArena`] to graft directly into the walk.
     fn try_reuse(&self, path: &Path) -> Option<TreeArena>;
+
+    /// Classify `path` for priority ordering: unscanned (no data) walks before
+    /// stale (has cached data).
+    fn freshness(&self, _path: &Path) -> DirFreshness {
+        DirFreshness::Unscanned
+    }
 }
 
 /// Live atomic counters published while a walk is in progress.
@@ -264,6 +289,7 @@ pub fn walk_parallel(
         on_dir_tally: config.on_dir_tally,
         #[cfg(windows)]
         volume,
+        deferred_stale: Mutex::new(Vec::new()),
         finished_root: Mutex::new(None),
     });
 
@@ -302,6 +328,80 @@ pub fn walk_parallel(
                 scan_dir(s, &ctx, &root_pending);
             });
         });
+        // Every Unscanned (no-data) directory has now been walked. Drain
+        // deferred Stale directories last, oldest first, so blind spots always
+        // get data before cached areas are re-walked.
+        loop {
+            if ctx.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut stale = std::mem::take(
+                &mut *ctx
+                    .deferred_stale
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if stale.is_empty() {
+                break;
+            }
+            // Oldest cached data refreshes first (`scope_fifo` preserves FIFO
+            // spawn order rather than Rayon's default LIFO deque).
+            stale.sort_by_key(|(scanned_at, _)| *scanned_at);
+            rayon::scope_fifo(|scope| {
+                for (_, sub) in stale {
+                    let ctx = Arc::clone(&ctx);
+                    scope.spawn_fifo(move |_| {
+                        // A user may have prioritized this stale subtree while
+                        // unscanned directories were walking: graft it without
+                        // walking twice.
+                        if let Some(oracle) = &ctx.skip_oracle
+                            && let Some(reused) = oracle.try_reuse(&sub.path)
+                        {
+                            let reused_root = reused.node(reused.root());
+                            ctx.progress.skipped_fresh_dirs.fetch_add(
+                                u64::from(reused_root.dirs),
+                                Ordering::Relaxed,
+                            );
+                            ctx.progress.dirs.fetch_add(
+                                u64::from(reused_root.dirs),
+                                Ordering::Relaxed,
+                            );
+                            ctx.progress.files.fetch_add(
+                                reused_root.files,
+                                Ordering::Relaxed,
+                            );
+                            ctx.progress.allocated_bytes.fetch_add(
+                                reused_root.allocated_bytes,
+                                Ordering::Relaxed,
+                            );
+                            ctx.progress.apparent_bytes.fetch_add(
+                                reused_root.apparent_bytes,
+                                Ordering::Relaxed,
+                            );
+                            if let Some(parent) = &sub.parent {
+                                parent
+                                    .children
+                                    .lock()
+                                    .unwrap_or_else(
+                                        std::sync::PoisonError::into_inner,
+                                    )
+                                    .push(BuiltChild::Grafted {
+                                        name: sub.name.clone(),
+                                        arena: reused,
+                                        hidden: sub.hidden,
+                                        lossy_name: sub.lossy_name,
+                                    });
+                                complete_one(&ctx, parent);
+                            }
+                            return;
+                        }
+                        rayon::scope(|inner| {
+                            scan_dir(inner, &ctx, &sub);
+                        });
+                    });
+                }
+            });
+        }
         Ok(())
     };
 
@@ -360,6 +460,9 @@ struct WalkContext {
     on_dir_tally: Option<DirTallyHook>,
     #[cfg(windows)]
     volume: Option<u32>,
+    /// Stale subdirectories (already have cached data) deferred until every
+    /// Unscanned (no-data) subdirectory finishes.
+    deferred_stale: Mutex<Vec<(u64, Arc<PendingDir>)>>,
     finished_root: Mutex<Option<BuiltNode>>,
 }
 
@@ -924,15 +1027,29 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
             .extend(local_children);
     }
 
-    // Add every subdirectory to `pending` BEFORE spawning so the `+1` sentinel
-    // guarantees `dir` cannot complete prematurely.
+    // Add every subdirectory to `pending` BEFORE spawning or deferring so the
+    // `+1` sentinel guarantees `dir` cannot complete prematurely.
     if !subdirs.is_empty() {
         dir.pending.fetch_add(subdirs.len(), Ordering::AcqRel);
+        let mut stale_deferred: Vec<(u64, Arc<PendingDir>)> = Vec::new();
         for sub in subdirs {
+            if let Some(oracle) = &ctx.skip_oracle
+                && let DirFreshness::Stale { scanned_at } =
+                    oracle.freshness(&sub.path)
+            {
+                stale_deferred.push((scanned_at, sub));
+                continue;
+            }
             let ctx = Arc::clone(ctx);
             scope.spawn(move |s| {
                 scan_dir(s, &ctx, &sub);
             });
+        }
+        if !stale_deferred.is_empty() {
+            ctx.deferred_stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(stale_deferred);
         }
     }
 
@@ -1057,14 +1174,18 @@ fn materialize_arena(
     arena
 }
 
-/// Simple map-backed [`SkipOracle`] combining fresh DB shards and recently
-/// completed immediate priority revalidations.
+/// Simple map-backed [`SkipOracle`] combining fresh DB shards, stale DB
+/// timestamps (for defer-last ordering), and recently completed immediate
+/// priority revalidations.
 pub struct MapSkipOracle {
     /// Already-materialized subtrees (e.g. finished `Priority::Immediate`
     /// scans that the resumed background scan must not re-walk).
     pub in_memory: Arc<Mutex<FxHashMap<PathBuf, TreeArena>>>,
-    /// Fresh DB shard `dir_id`s preloaded before the walk began.
+    /// Fresh DB shard `dir_id`s preloaded before the walk began (skipped).
     pub db_fresh: FxHashMap<PathBuf, u64>,
+    /// Stale DB shard `scanned_at` timestamps preloaded before the walk began
+    /// (deferred behind unscanned directories, refreshed oldest-first).
+    pub db_stale: FxHashMap<PathBuf, u64>,
     /// Loader callback for `db_fresh` hits.
     pub loader: Option<ShardLoader>,
 }
@@ -1073,6 +1194,7 @@ impl std::fmt::Debug for MapSkipOracle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapSkipOracle")
             .field("db_fresh_len", &self.db_fresh.len())
+            .field("db_stale_len", &self.db_stale.len())
             .field("has_loader", &self.loader.is_some())
             .finish_non_exhaustive()
     }
@@ -1094,5 +1216,135 @@ impl SkipOracle for MapSkipOracle {
             return loader(dir_id, path);
         }
         None
+    }
+
+    fn freshness(&self, path: &Path) -> DirFreshness {
+        if self
+            .in_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(path)
+            || self.db_fresh.contains_key(path)
+        {
+            return DirFreshness::Fresh;
+        }
+        if let Some(&scanned_at) = self.db_stale.get(path) {
+            return DirFreshness::Stale { scanned_at };
+        }
+        DirFreshness::Unscanned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestOracle {
+        fresh: FxHashMap<PathBuf, TreeArena>,
+        stale: FxHashMap<PathBuf, u64>,
+    }
+
+    impl SkipOracle for TestOracle {
+        fn try_reuse(&self, path: &Path) -> Option<TreeArena> {
+            self.fresh.get(path).cloned()
+        }
+
+        fn freshness(&self, path: &Path) -> DirFreshness {
+            if self.fresh.contains_key(path) {
+                DirFreshness::Fresh
+            } else if let Some(&scanned_at) = self.stale.get(path) {
+                DirFreshness::Stale { scanned_at }
+            } else {
+                DirFreshness::Unscanned
+            }
+        }
+    }
+
+    #[test]
+    fn unscanned_dirs_walk_before_stale_and_oldest_stale_walks_first() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        let fresh_dir = root.join("a_fresh");
+        let stale_newer = root.join("b_stale_newer");
+        let stale_older = root.join("c_stale_older");
+        let unscanned = root.join("d_unscanned");
+        for dir in [&fresh_dir, &stale_newer, &stale_older, &unscanned] {
+            fs::create_dir(dir).expect("mkdir");
+            fs::write(dir.join("file.bin"), b"1234").expect("write");
+        }
+
+        let mut fresh_arena = TreeArena::new(fresh_dir.clone(), "a_fresh");
+        let fresh_root = fresh_arena.root();
+        fresh_arena.add_child(
+            fresh_root,
+            "file.bin",
+            NodeKind::File,
+            4096,
+            4,
+            0,
+            NodeFlags::new(NodeKind::File),
+        );
+        fresh_arena.aggregate(true, true);
+
+        let mut fresh = FxHashMap::default();
+        fresh.insert(fresh_dir.clone(), fresh_arena);
+        let mut stale = FxHashMap::default();
+        stale.insert(stale_newer.clone(), 2000);
+        stale.insert(stale_older.clone(), 1000);
+
+        let oracle: Arc<dyn SkipOracle> = Arc::new(TestOracle { fresh, stale });
+        let visited: Arc<Mutex<Vec<PathBuf>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let visited_hook = Arc::clone(&visited);
+        let on_dir_start: DirStartHook = Arc::new(move |dir: &Path| {
+            visited_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(dir.to_path_buf());
+        });
+
+        // Single worker guarantees deterministic FIFO ordering within each tier.
+        let options = ScanOptions {
+            apparent_size: true,
+            threads: Some(1),
+            ..ScanOptions::default()
+        };
+        let outcome = walk_parallel(
+            &root,
+            WalkConfig {
+                options: &options,
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: Arc::new(WalkProgress::default()),
+                pause_gate: None,
+                skip_oracle: Some(oracle),
+                on_dir_start: Some(on_dir_start),
+                on_dir_tally: None,
+            },
+        )
+        .expect("walk");
+
+        let order = visited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(!order.contains(&fresh_dir), "fresh dir must be skipped");
+        let pos_unscanned = order
+            .iter()
+            .position(|p| p == &unscanned)
+            .expect("unscanned walked");
+        let pos_older = order
+            .iter()
+            .position(|p| p == &stale_older)
+            .expect("older stale walked");
+        let pos_newer = order
+            .iter()
+            .position(|p| p == &stale_newer)
+            .expect("newer stale walked");
+        assert!(
+            pos_unscanned < pos_older && pos_older < pos_newer,
+            "expected unscanned < older_stale < newer_stale, got {order:?}"
+        );
+        assert_eq!(outcome.stats.apparent_bytes, 16);
+        assert_eq!(outcome.stats.files, 4);
     }
 }

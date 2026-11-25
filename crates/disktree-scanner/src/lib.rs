@@ -19,7 +19,7 @@ pub mod walk;
 #[cfg(windows)]
 pub mod windows;
 
-pub use db::{CacheDb, CachedSubtree, InvalidateReport};
+pub use db::{CacheDb, CachedSubtree, InvalidateReport, SubtreeCatalog};
 pub use mounts::{default_cache_db_path, space_info};
 pub use session::{ScanEvent, ScanSession, ScanSnapshot, Scanner};
 pub use stream::{
@@ -34,5 +34,6 @@ pub use types::{
     SpaceInfo, StorageMode, SubtreeStatus, unix_now,
 };
 pub use walk::{
-    DirTallyHook, PauseGate, SkipOracle, WalkConfig, WalkOutcome, WalkProgress,
+    DirFreshness, DirTallyHook, PauseGate, SkipOracle, WalkConfig, WalkOutcome,
+    WalkProgress,
 };
