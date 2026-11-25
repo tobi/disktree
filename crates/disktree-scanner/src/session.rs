@@ -401,11 +401,12 @@ impl Scanner {
         while let Ok(event) = session.recv() {
             match event {
                 ScanEvent::Snapshot(snap) => {
-                    if accept_stale
-                        || matches!(
-                            snap.freshness,
-                            Freshness::Fresh { .. } | Freshness::Live { .. }
-                        )
+                    let complete_cache = matches!(
+                        snap.freshness,
+                        Freshness::Fresh { .. } | Freshness::Stale { .. }
+                    );
+                    if matches!(snap.freshness, Freshness::Fresh { .. })
+                        || (accept_stale && complete_cache)
                     {
                         session.cancel();
                         return Ok(snap);
@@ -846,8 +847,6 @@ fn run_background_walk(
     }
 
     let arena = Arc::new(outcome.arena);
-    persist_arena(storage, host, &arena, options, outcome.scanned_at, event_tx);
-
     let (active_mode, fallback_reason) = {
         let guard = storage
             .lock()
@@ -855,8 +854,10 @@ fn run_background_walk(
         (guard.active_mode, guard.fallback_reason.clone())
     };
 
+    // Deliver the live tree to interactive UIs immediately before committing
+    // Protobuf shards to the cache DB on disk.
     let _ = event_tx.send(ScanEvent::Snapshot(ScanSnapshot {
-        arena,
+        arena: Arc::clone(&arena),
         freshness: Freshness::Live {
             scanned_at: outcome.scanned_at,
         },
@@ -864,6 +865,8 @@ fn run_background_walk(
         storage_mode: active_mode,
         fallback_reason,
     }));
+
+    persist_arena(storage, host, &arena, options, outcome.scanned_at, event_tx);
     let _ = event_tx.send(ScanEvent::Finished);
 }
 

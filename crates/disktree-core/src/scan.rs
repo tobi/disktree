@@ -399,6 +399,12 @@ impl ScanHandle {
             ScanBackend::Session(session) => loop {
                 match session.try_recv() {
                     Ok(ScanEvent::Snapshot(snap)) => {
+                        // Invariant #11: an incomplete ancestor stub (only a
+                        // nested child was scanned earlier) must never replace
+                        // the complete tree in the desktop UI.
+                        if matches!(snap.freshness, Freshness::Partial { .. }) {
+                            continue;
+                        }
                         let node = arena_to_node(
                             &snap.arena,
                             self.options.apparent_size,
@@ -916,6 +922,74 @@ mod tests {
         fs::write(&file, b"hi").expect("write");
         let err = scan(&file, apparent()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "cache-db")]
+    #[test]
+    fn partial_stub_from_narrow_child_is_never_emitted_as_parent_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("home");
+        let child = root.join("src/repo");
+        fs::create_dir_all(&child).expect("mkdir");
+        fs::write(child.join("code.rs"), [0_u8; 500]).expect("write");
+        fs::write(root.join("big.bin"), vec![0_u8; 50_000]).expect("write");
+
+        let db_path = temp.path().join("cache.redb");
+        let policy = CachePolicy {
+            min_free_headroom: 0,
+            ..CachePolicy::default()
+        };
+        let scanner = Scanner::new(
+            disktree_scanner::StorageMode::Persistent {
+                path: db_path,
+                strict: true,
+            },
+            policy,
+        )
+        .expect("scanner");
+
+        // Warm the cache with ONLY the narrow child directory.
+        let _ = scanner
+            .scan_blocking(&child, apparent().to_scanner(), policy, false)
+            .expect("narrow scan");
+
+        // Now open a session on the parent `root`: `ScanHandle` must skip the
+        // partial ancestor stub and only emit the complete Live tree.
+        let handle =
+            ScanHandle::spawn_session(&scanner, root, apparent(), policy)
+                .expect("session");
+        let mut updates = Vec::new();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(update) = handle.poll_update() {
+                let done = matches!(
+                    update,
+                    ScanUpdate::Live { .. } | ScanUpdate::Error(_)
+                );
+                updates.push(update);
+                if done {
+                    break;
+                }
+            } else {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert!(
+            !updates
+                .iter()
+                .any(|u| matches!(u, ScanUpdate::Cached { .. })),
+            "partial stub must not be emitted as a cached parent tree"
+        );
+        let live = updates
+            .into_iter()
+            .find_map(|u| match u {
+                ScanUpdate::Live { node, .. } => Some(node),
+                _ => None,
+            })
+            .expect("complete live tree");
+        assert!(live.child_named("big.bin").is_some());
+        assert_eq!(live.bytes, 50_500);
     }
 
     #[test]
