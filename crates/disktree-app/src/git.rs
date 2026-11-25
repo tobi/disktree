@@ -120,9 +120,9 @@ fn git_installed() -> bool {
 /// and a downloaded repository can name any program as one in `.git/config`
 /// and switch it on from its `.gitattributes`. No `-c` can turn off drivers
 /// whose names are not known in advance, so a checkout that defines any is
-/// not asked for its status at all. Filters from the user's own config, such
-/// as git-lfs, are theirs and still run. Reading config runs nothing; if it
-/// cannot be read, the answer is the cautious one.
+/// not asked for its status at all. Global and system config are disabled
+/// by `git()`, so their filters cannot run either. Reading config runs
+/// nothing; if it cannot be read, the answer is the cautious one.
 fn names_its_own_filters(path: &Path) -> bool {
     let Some(output) = git(
         path,
@@ -157,7 +157,24 @@ fn run(path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
+    git_command(path, args).output().ok()
+}
+
+fn git_command(path: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
+    // Command-scope config is inherited independently of global/system files.
+    if let Ok(count) = std::env::var("GIT_CONFIG_COUNT")
+        && let Ok(count) = count.parse::<usize>()
+    {
+        for index in 0..count {
+            command
+                .env_remove(format!("GIT_CONFIG_KEY_{index}"))
+                .env_remove(format!("GIT_CONFIG_VALUE_{index}"));
+        }
+    }
+    command
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS");
     // disktree is a GUI program on Windows, with no console to lend: without
     // this, every probe flashes a console window of its own.
     #[cfg(windows)]
@@ -176,12 +193,17 @@ fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
         // partial clone would run to fetch a missing object: nothing here
         // may reach the network either.
         .args([
+            "--no-optional-locks",
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
             "core.pager=cat",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "diff.ignoreSubmodules=all",
             "-c",
             "log.showSignature=false",
             "-c",
@@ -194,21 +216,150 @@ fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
             "core.sshCommand=false",
             "-c",
             "protocol.allow=never",
-        ])
-        .args(args)
-        // Never prompt, never page, never take a lock for the index refresh.
+        ]);
+    if args.first() == Some(&"diff") {
+        // A checkout can name executable external diff and textconv drivers.
+        command
+            .arg("diff")
+            .args(["--no-ext-diff", "--no-textconv"])
+            .args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    command
+        // Global/system configuration is not part of the checkout's summary,
+        // and can define executables without any repository-local setting.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // Never prompt, page, fetch lazily or take a lock for index refresh.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
+        .stderr(Stdio::null());
+    command
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_git(path: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(path)
+            // Fixture setup must not inherit executable user config or -c.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT");
+        command
+    }
+
+    fn fixture_git_available() -> bool {
+        if !git_installed() {
+            return false;
+        }
+        match fixture_git(&std::env::temp_dir()).arg("--version").output() {
+            Ok(output) => {
+                assert!(output.status.success(), "git --version succeeds");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => panic!("git --version failed: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(path: &Path) -> String {
+        let path = path.to_str().expect("temp path is UTF-8");
+        format!("'{}'", path.replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_command_scope_config_is_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD_ROOT: &str = "DISKTREE_GIT_CONFIG_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let checkout = root.join("checkout");
+            assert_eq!(std::env::var("GIT_CONFIG_COUNT").as_deref(), Ok("1"));
+            let command = git_command(&checkout, &["status", "--porcelain"]);
+            for name in [
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+            ] {
+                assert!(
+                    command.get_envs().any(|(key, value)| {
+                        key == std::ffi::OsStr::new(name) && value.is_none()
+                    }),
+                    "{name} must be explicitly removed"
+                );
+            }
+            assert!(state(&checkout).is_some(), "inspection succeeds");
+            assert!(
+                !root.join("inherited config's marker").exists(),
+                "the inherited fsmonitor ran"
+            );
+            return;
+        }
+        if !fixture_git_available() {
+            return; // no git on this machine
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("create checkout");
+        assert!(
+            fixture_git(&checkout)
+                .args(["init", "-q"])
+                .status()
+                .expect("git init")
+                .success(),
+            "git init succeeds"
+        );
+        let marker = dir.path().join("inherited config's marker");
+        let script = dir.path().join("inherited config's program");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}\n", shell_quote(&marker)),
+        )
+        .expect("write fsmonitor");
+        std::fs::set_permissions(
+            &script,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let output =
+            Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "git::tests::inherited_command_scope_config_is_removed",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, dir.path())
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+                .env("GIT_CONFIG_VALUE_0", shell_quote(&script))
+                .env("GIT_CONFIG_PARAMETERS", "'alias.fixture=unused'")
+                .output()
+                .expect("run child test");
+        assert!(
+            output.status.success(),
+            "child test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "the exact child regression must actually run"
+        );
+        assert!(!marker.exists(), "the inherited fsmonitor ran");
+    }
 
     #[test]
     fn summaries_say_what_would_be_lost() {
@@ -245,16 +396,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         assert_eq!(state(dir.path()), None, "not a checkout");
         let git = |args: &[&str]| {
-            Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
+            fixture_git(dir.path())
                 .args(args)
                 .output()
                 .is_ok_and(|output| output.status.success())
         };
-        if !git(&["init", "-q"]) {
+        if !fixture_git_available() {
             return; // no git on this machine
         }
+        assert!(git(&["init", "-q"]), "git init succeeds");
         std::fs::write(dir.path().join("a.txt"), "hi").expect("write");
         let state = state(dir.path()).expect("a checkout");
         assert_eq!(state.changed, Some(1), "one untracked file");
@@ -271,22 +421,21 @@ mod tests {
         let hook = dir.path().join("hook.sh");
         std::fs::write(
             &hook,
-            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+            format!("#!/bin/sh\ntouch {}\n", shell_quote(&marker)),
         )
         .expect("write hook");
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
         let git = |args: &[&str]| {
-            Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
+            fixture_git(dir.path())
                 .args(args)
                 .output()
                 .is_ok_and(|output| output.status.success())
         };
-        if !git_installed() || !git(&["init", "-q"]) {
+        if !fixture_git_available() {
             return; // no git on this machine
         }
+        assert!(git(&["init", "-q"]), "git init succeeds");
         let hook = hook.to_string_lossy();
         assert!(git(&["config", "core.fsmonitor", &hook]));
         assert!(state(dir.path()).is_some());
@@ -305,16 +454,14 @@ mod tests {
         let gpg = dir.path().join("gpg.sh");
         std::fs::write(
             &gpg,
-            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+            format!("#!/bin/sh\ntouch {}\nexit 1\n", shell_quote(&marker)),
         )
         .expect("write gpg");
         std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
         let git = |args: &[&str], input: Option<&str>| {
             use std::io::Write as _;
-            let mut child = Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
+            let mut child = fixture_git(dir.path())
                 .args(args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -328,9 +475,10 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout).trim().to_owned()
             })
         };
-        if !git_installed() || git(&["init", "-q"], None).is_none() {
+        if !fixture_git_available() {
             return; // no git on this machine
         }
+        git(&["init", "-q"], None).expect("git init succeeds");
         let tree = git(&["mktree"], None).expect("empty tree");
         let commit = format!(
             "tree {tree}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\
@@ -366,7 +514,7 @@ mod tests {
         // A clean filter reads the file on stdin and writes it back.
         std::fs::write(
             &filter,
-            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+            format!("#!/bin/sh\ntouch {}\ncat\n", shell_quote(&marker)),
         )
         .expect("write filter");
         std::fs::set_permissions(
@@ -375,17 +523,16 @@ mod tests {
         )
         .expect("chmod");
         let git = |args: &[&str]| {
-            Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
+            fixture_git(dir.path())
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(args)
                 .output()
                 .is_ok_and(|output| output.status.success())
         };
-        if !git_installed() || !git(&["init", "-q"]) {
+        if !fixture_git_available() {
             return; // no git on this machine
         }
+        assert!(git(&["init", "-q"]), "git init succeeds");
         std::fs::write(dir.path().join("file.txt"), "x").expect("write");
         std::fs::write(
             dir.path().join(".gitattributes"),
@@ -394,7 +541,7 @@ mod tests {
         .expect("write attributes");
         assert!(git(&["add", "."]) && git(&["commit", "-qm", "one"]));
         std::fs::remove_file(&marker).ok();
-        let filter = filter.to_string_lossy();
+        let filter = shell_quote(&filter);
         assert!(git(&["config", "filter.evil.clean", &filter]));
         // Same content, new timestamp: git must re-read the file, through
         // the filter, to know whether it changed.
@@ -403,5 +550,116 @@ mod tests {
         let state = state(dir.path()).expect("a checkout");
         assert_eq!(state.changed, None, "not asked");
         assert!(!marker.exists(), "the checkout's filter ran");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_cannot_run_its_external_diff_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !fixture_git_available() {
+            return; // no git on this machine
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("external diff's marker");
+        let external = dir.path().join("external diff's program");
+        std::fs::write(
+            &external,
+            format!("#!/bin/sh\ntouch {}\n", shell_quote(&marker)),
+        )
+        .expect("write external diff");
+        std::fs::set_permissions(
+            &external,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let init = fixture_git(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("git init");
+        assert!(init.success(), "git init succeeds");
+        let configured = fixture_git(dir.path())
+            .args(["config", "diff.external"])
+            .arg(shell_quote(&external))
+            .status()
+            .expect("git config");
+        assert!(configured.success(), "external diff is configured");
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "content\n").expect("write");
+
+        let output = git(
+            dir.path(),
+            &[
+                "diff",
+                "--no-index",
+                "/dev/null",
+                file.to_str().expect("temp path is UTF-8"),
+            ],
+        )
+        .expect("git diff ran");
+        assert_eq!(output.status.code(), Some(1), "files differ");
+        assert!(!marker.exists(), "the checkout's external diff ran");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_cannot_run_its_textconv_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !fixture_git_available() {
+            return; // no git on this machine
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("textconv's marker");
+        let filter = dir.path().join("textconv's program");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch {}\ncat\n", shell_quote(&marker)),
+        )
+        .expect("write textconv");
+        std::fs::set_permissions(
+            &filter,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        let git_command =
+            |args: &[&str]| fixture_git(dir.path()).args(args).status();
+        assert!(git_command(&["init", "-q"]).expect("git init").success());
+        assert!(
+            git_command(&["config", "user.name", "test"])
+                .expect("config user")
+                .success()
+        );
+        assert!(
+            git_command(&["config", "user.email", "test@example.invalid"])
+                .expect("config email")
+                .success()
+        );
+        std::fs::write(dir.path().join(".gitattributes"), "*.txt diff=evil\n")
+            .expect("attributes");
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "before\n").expect("write file");
+        assert!(git_command(&["add", "."]).expect("git add").success());
+        assert!(
+            git_command(&["commit", "-qm", "base"])
+                .expect("git commit")
+                .success()
+        );
+        assert!(
+            git_command(&[
+                "config",
+                "diff.evil.textconv",
+                &shell_quote(&filter),
+            ])
+            .expect("configure textconv")
+            .success()
+        );
+        std::fs::write(&file, "after\n").expect("modify file");
+
+        let output = git(
+            dir.path(),
+            &["diff", "--exit-code", "HEAD", "--", "file.txt"],
+        )
+        .expect("git diff");
+        assert!(!marker.exists(), "the checkout's textconv command ran");
+        assert_eq!(output.status.code(), Some(1), "files differ");
     }
 }
