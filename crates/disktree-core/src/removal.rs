@@ -461,6 +461,16 @@ fn refuse(
     if profiles_key().is_some_and(|profiles| is_profile(path, &key, profiles)) {
         return Some("a user profile cannot be removed".into());
     }
+    // The tree stores names for display as lossy UTF-8. A replacement
+    // character may therefore refer to a different, valid sibling.
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.contains('\u{fffd}'))
+    }) {
+        return Some("a lossy filename cannot be removed safely".into());
+    }
     // By spelling too: the Data volume's root keeps its name as a key, while
     // everything under it is keyed as under `/`.
     if !key.starts_with(&root_key) && !path.starts_with(root) {
@@ -1874,6 +1884,179 @@ mod tests {
             ),
             None,
             "a sibling of home is not above it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanned_lossy_name_cannot_remove_literal_replacement_sibling() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tree();
+        let raw_name =
+            std::ffi::OsString::from_vec(b"ambiguous-\xff-name".to_vec());
+        let raw_path = temp.path().join(raw_name);
+        fs::write(&raw_path, b"raw entry").expect("write raw entry");
+        let sibling = temp.path().join("ambiguous-\u{fffd}-name");
+        fs::write(&sibling, b"literal replacement character")
+            .expect("write sibling");
+
+        let scanned = crate::scan::scan(
+            temp.path(),
+            crate::scan::ScanOptions {
+                apparent_size: true,
+                one_filesystem: false,
+                ..crate::scan::ScanOptions::default()
+            },
+        )
+        .expect("scan lossy names");
+        let index = scanned
+            .children
+            .iter()
+            .position(|child| child.name.as_ref() == "ambiguous-\u{fffd}-name")
+            .expect("scanned ambiguous name");
+        let scanned_path =
+            crate::tree::path_of(temp.path(), &scanned, &[index]);
+        assert_eq!(
+            scanned_path, sibling,
+            "lossy display maps to valid sibling"
+        );
+
+        let plan = plan(&[target(&scanned_path, 1)], temp.path());
+        assert!(
+            plan.is_empty(),
+            "lossy scanned path must not authorize U+FFFD sibling removal"
+        );
+        assert!(plan.blocked[0].reason.contains("lossy filename"));
+        assert_eq!(
+            fs::read(&sibling).expect("sibling survives"),
+            b"literal replacement character"
+        );
+        assert_eq!(
+            fs::read(raw_path).expect("raw entry survives"),
+            b"raw entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanned_lossy_directory_cannot_remove_literal_replacement_child() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tree();
+        let raw_name =
+            std::ffi::OsString::from_vec(b"ambiguous-\xff-dir".to_vec());
+        let raw_dir = temp.path().join(raw_name);
+        let sibling_dir = temp.path().join("ambiguous-\u{fffd}-dir");
+        fs::create_dir(&raw_dir).expect("create raw directory");
+        fs::create_dir(&sibling_dir).expect("create sibling directory");
+        let raw_child = raw_dir.join("witness.bin");
+        let sibling_child = sibling_dir.join("witness.bin");
+        fs::write(&raw_child, b"raw entry").expect("write raw child");
+        fs::write(&sibling_child, b"literal replacement character")
+            .expect("write sibling child");
+
+        let scanned = crate::scan::scan(
+            temp.path(),
+            crate::scan::ScanOptions {
+                apparent_size: true,
+                one_filesystem: false,
+                ..crate::scan::ScanOptions::default()
+            },
+        )
+        .expect("scan lossy directories");
+        // Distinct apparent child sizes identify the raw directory despite
+        // the duplicate display names, without assuming scan order.
+        let dir_index = scanned
+            .children
+            .iter()
+            .position(|dir| {
+                dir.name.as_ref() == "ambiguous-\u{fffd}-dir"
+                    && dir.children.iter().any(|child| {
+                        child.name.as_ref() == "witness.bin" && child.bytes == 9
+                    })
+            })
+            .expect("scanned raw directory");
+        let child_index = scanned.children[dir_index]
+            .children
+            .iter()
+            .position(|child| child.name.as_ref() == "witness.bin")
+            .expect("scanned raw child");
+        let scanned_path = crate::tree::path_of(
+            temp.path(),
+            &scanned,
+            &[dir_index, child_index],
+        );
+        assert_eq!(scanned_path, sibling_child);
+        assert_eq!(scanned_path.file_name().expect("filename"), "witness.bin");
+
+        let plan = plan(&[target(&scanned_path, 9)], temp.path());
+        assert!(plan.is_empty());
+        assert_eq!(plan.blocked.len(), 1);
+        assert!(plan.blocked[0].reason.contains("lossy filename"));
+        let (sender, _events) = mpsc::channel();
+        run(
+            &plan,
+            RemovalMode::Permanent,
+            TrashBackend::Unavailable,
+            &AtomicBool::new(false),
+            &sender,
+        );
+        assert_eq!(
+            fs::read(&raw_child).expect("raw child survives"),
+            b"raw entry"
+        );
+        assert_eq!(
+            fs::read(&sibling_child).expect("sibling child survives"),
+            b"literal replacement character"
+        );
+    }
+
+    #[test]
+    fn scanned_ordinary_unicode_name_is_permanently_removed() {
+        let temp = tree();
+        let marked = temp.path().join("café");
+        let sibling = temp.path().join("unmarked.bin");
+        fs::write(&marked, b"marked entry").expect("write Unicode entry");
+        fs::write(&sibling, b"keep this entry").expect("write sibling");
+
+        let scanned = crate::scan::scan(
+            temp.path(),
+            crate::scan::ScanOptions {
+                apparent_size: true,
+                one_filesystem: false,
+                ..crate::scan::ScanOptions::default()
+            },
+        )
+        .expect("scan Unicode name");
+        let index = scanned
+            .children
+            .iter()
+            .position(|child| child.name.as_ref() == "café")
+            .expect("scanned Unicode entry");
+        let scanned_path =
+            crate::tree::path_of(temp.path(), &scanned, &[index]);
+        assert_eq!(scanned_path, marked);
+
+        let plan = plan(
+            &[target(&scanned_path, scanned.children[index].bytes)],
+            temp.path(),
+        );
+        assert!(plan.blocked.is_empty());
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].path, scanned_path);
+        let (sender, _events) = mpsc::channel();
+        run(
+            &plan,
+            RemovalMode::Permanent,
+            TrashBackend::Unavailable,
+            &AtomicBool::new(false),
+            &sender,
+        );
+        assert!(!marked.exists(), "the scanned Unicode entry is removed");
+        assert_eq!(
+            fs::read(&sibling).expect("unmarked sibling survives"),
+            b"keep this entry"
         );
     }
 
