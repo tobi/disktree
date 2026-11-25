@@ -1598,20 +1598,7 @@ fn trail_and_legend(
         .gap(space::LG)
         .px(space::LG)
         .py(space::SM)
-        .child(scan_totals(app, theme))
-        .child(with_tooltip(
-            button("refresh-scan", "Refresh", ButtonVariant::Outline, cx)
-                .debug_selector(|| "refresh-scan".into())
-                .tab_stop(false)
-                .px(space::SM)
-                .py(space::XS)
-                .disabled(app.is_indexing())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.refresh_scan(cx);
-                    window.focus(&this.focus, cx);
-                })),
-            "Refresh the scanned root · r",
-        ));
+        .child(scan_totals(app, theme));
     if app.find.is_visible() {
         row = row.child(find_field(app, theme));
     }
@@ -1785,39 +1772,177 @@ fn side_panel(
         .child(disk_section(app, theme, cx))
 }
 
-/// What the keys act on: its name and place, its size set large with its
-/// share of the scan, when it was last written, what git says, and the two
-/// things to do with it.
+/// What the keys act on: compact, static-height summary with Open, Mark and
+/// Refresh icon controls in the top right so the lists below never jump.
 fn selection_section(
     app: &Disktree,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
+    let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
+    let node = app.node_at(&target);
+    let path = app.path_at(&target);
+    let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
+    let covered_by = marks_ancestor(app, path.as_deref());
+    let is_current_root = target == app.crumbs;
+    let can_open = node.is_some_and(|n| n.is_dir() && !is_current_root);
+    let can_mark = node.is_some() && !is_current_root;
+    let highlight = palette::highlight(theme);
+
+    let open_crumbs = target.clone();
+    let open_btn = with_tooltip(
+        button("open", "", ButtonVariant::Outline, cx)
+            .accessibility_label("Open directory")
+            .debug_selector(|| "selection-open".into())
+            .tab_stop(false)
+            .px(space::XS)
+            .py(space::XS)
+            .disabled(!can_open)
+            .child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::FolderOpen)
+                    .size(icon::SM)
+                    .text_color(if can_open {
+                        theme.foreground
+                    } else {
+                        theme.secondary
+                    }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.go_to(open_crumbs.clone(), cx);
+                window.focus(&this.focus, cx);
+            })),
+        "Open directory · Enter",
+    );
+
+    let ancestor = path.as_deref().and_then(|path| app.marked_ancestor(path));
+    let mark_crumbs = target;
+    let unmark_mode = marked || covered_by.is_some();
+    let mark_tip = match &ancestor {
+        Some(ancestor) if !marked => {
+            format!("Unmark {} · Space", short_name(ancestor, app.path_style()))
+        }
+        _ if marked => "Unmark · Space".to_owned(),
+        _ => "Mark for removal · Space".to_owned(),
+    };
+    let mark_glyph = if unmark_mode {
+        gpui_omarchy::IconName::Close
+    } else {
+        gpui_omarchy::IconName::Delete
+    };
+    let mark_filled = can_mark && !unmark_mode;
+    let mark_icon_color = if !can_mark {
+        theme.secondary
+    } else if unmark_mode {
+        theme.danger
+    } else {
+        palette::on_highlight(theme)
+    };
+    let mark_btn_inner = button(
+        "mark",
+        "",
+        if unmark_mode {
+            ButtonVariant::Danger
+        } else if mark_filled {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Outline
+        },
+        cx,
+    )
+    .accessibility_label(mark_tip.clone())
+    .debug_selector(|| "selection-mark".into())
+    .tab_stop(false)
+    .px(space::XS)
+    .py(space::XS)
+    .disabled(!can_mark)
+    .child(
+        gpui_omarchy::icon(mark_glyph)
+            .size(icon::SM)
+            .text_color(mark_icon_color),
+    )
+    .on_click(cx.listener(move |this, _, window, cx| {
+        if let Some(ancestor) = ancestor.as_deref().filter(|_| !marked) {
+            this.unmark(ancestor, cx);
+        } else {
+            this.toggle_mark(&mark_crumbs.clone(), cx);
+        }
+        window.focus(&this.focus, cx);
+    }));
+    let mark_btn_inner = if mark_filled {
+        mark_btn_inner.bg(highlight).border_color(highlight).hover(
+            move |style| {
+                style.bg(highlight.opacity(0.85)).border_color(highlight)
+            },
+        )
+    } else if unmark_mode && can_mark {
+        mark_btn_inner.border_color(theme.danger)
+    } else {
+        mark_btn_inner
+    };
+    let mark_btn = with_tooltip(mark_btn_inner, mark_tip);
+
+    let refresh_btn = with_tooltip(
+        button("refresh-scan", "", ButtonVariant::Outline, cx)
+            .accessibility_label("Refresh scan")
+            .debug_selector(|| "refresh-scan".into())
+            .tab_stop(false)
+            .px(space::XS)
+            .py(space::XS)
+            .disabled(app.is_indexing())
+            .child(
+                gpui_omarchy::icon(gpui_omarchy::IconName::RotateCw)
+                    .size(icon::SM)
+                    .text_color(theme.foreground),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.refresh_scan(cx);
+                window.focus(&this.focus, cx);
+            })),
+        "Refresh scan · r",
+    );
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(space::SM)
+        .child(widgets::eyebrow("Selection", cx))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::XS)
+                .child(open_btn)
+                .child(mark_btn)
+                .child(refresh_btn),
+        );
+
     let section = div()
+        .debug_selector(|| "selection-section".into())
         .flex()
         .flex_col()
-        .gap(space::MD)
-        .child(widgets::eyebrow("Selection", cx));
-    let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
-    let Some(node) = app.node_at(&target) else {
+        .gap(space::SM)
+        .h(size::SELECTION_HEIGHT)
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(header);
+
+    let Some(node) = node else {
         return section.child(
             div()
                 .text_color(theme.secondary)
                 .child("Point at a tile or select one with the arrows"),
         );
     };
-    let path = app.path_at(&target);
     let root_value = app.tree().map_or(0, |tree| tree.bytes);
-    let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
-    let covered_by = marks_ancestor(app, path.as_deref());
-    let is_current_root = target == app.crumbs;
-    let highlight = palette::highlight(theme);
 
     let identity =
         div()
             .flex()
             .flex_col()
-            .gap(space::XS)
+            .gap(space::XXS)
             .min_w_0()
             .child(
                 div()
@@ -1856,6 +1981,20 @@ fn selection_section(
                     })),
             );
 
+    let mut chips = Vec::new();
+    if marked {
+        chips.push(widgets::chip("Marked", theme.danger, cx));
+    } else if let Some(ancestor) = &covered_by {
+        chips.push(widgets::chip(
+            format!("Goes with {ancestor}"),
+            theme.danger,
+            cx,
+        ));
+    }
+    if node.read_error {
+        chips.push(widgets::chip("Partly unreadable", theme.warning, cx));
+    }
+
     let (number, unit) = match app.options.metric {
         Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
         Metric::Files => (widgets::human_count(node.files), "files".into()),
@@ -1864,14 +2003,33 @@ fn selection_section(
     let measure = div()
         .flex()
         .flex_col()
-        .gap(space::SM)
-        .child(widgets::measure(
-            number,
-            text::DISPLAY,
-            unit,
-            text::TITLE,
-            cx,
-        ))
+        .gap(space::XS)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .justify_between()
+                .gap(space::SM)
+                .child(widgets::measure(
+                    number,
+                    text::FIGURE,
+                    unit,
+                    text::BODY,
+                    cx,
+                ))
+                .when(!chips.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::XS)
+                            .overflow_hidden()
+                            .children(chips),
+                    )
+                }),
+        )
         .child(widgets::bar(share, highlight, cx));
 
     let fourth = if app.remote.is_none()
@@ -1904,11 +2062,12 @@ fn selection_section(
     let grid = div()
         .flex()
         .flex_col()
-        .gap(space::MD)
+        .gap(space::SM)
         .child(
             div()
                 .flex()
                 .flex_row()
+                .gap(space::SM)
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Of scan",
                     widgets::percent(node.bytes, root_value),
@@ -1926,6 +2085,7 @@ fn selection_section(
             div()
                 .flex()
                 .flex_row()
+                .gap(space::SM)
                 .child(div().flex_1().min_w_0().child(widgets::figure(
                     "Last write",
                     widgets::ago(crate::state::now_seconds(), node.modified),
@@ -1935,94 +2095,7 @@ fn selection_section(
                 .child(div().flex_1().min_w_0().child(fourth)),
         );
 
-    // Only states that change the decision earn a badge.
-    let mut chips = Vec::new();
-    if marked {
-        chips.push(widgets::chip("Marked", theme.danger, cx));
-    }
-    if let Some(ancestor) = &covered_by {
-        chips.push(widgets::chip(
-            format!("Goes with {ancestor}"),
-            theme.danger,
-            cx,
-        ));
-    }
-    if node.read_error {
-        chips.push(widgets::chip("Partly unreadable", theme.warning, cx));
-    }
-    let badges = (!chips.is_empty()).then(|| {
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(space::XS)
-            .children(chips)
-    });
-
-    // Open is secondary: Enter already does it. Marking is the action this
-    // tool exists for, so it takes the highlight.
-    let mut actions = div().flex().flex_row().gap(space::SM);
-    if !is_current_root {
-        if node.is_dir() {
-            let crumbs = target.clone();
-            actions = actions.child(
-                button("open", "Open", ButtonVariant::Outline, cx)
-                    .tab_stop(false)
-                    .flex_1()
-                    .justify_center()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.go_to(crumbs.clone(), cx);
-                        window.focus(&this.focus, cx);
-                    })),
-            );
-        }
-        // Inside a marked directory there is nothing to mark on its own: it
-        // goes with that directory, so the button offers to keep it by
-        // unmarking the directory instead.
-        let ancestor =
-            path.as_deref().and_then(|path| app.marked_ancestor(path));
-        let crumbs = target;
-        let label = match &ancestor {
-            Some(ancestor) if !marked => {
-                format!("Unmark {}", short_name(ancestor, app.path_style()))
-            }
-            _ if marked => "Unmark".to_string(),
-            _ => "Mark for removal".to_string(),
-        };
-        let mark = button("mark", label, ButtonVariant::Primary, cx)
-            .tab_stop(false)
-            .flex_1()
-            .justify_center()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if let Some(ancestor) = ancestor.as_deref().filter(|_| !marked)
-                {
-                    this.unmark(ancestor, cx);
-                } else {
-                    this.toggle_mark(&crumbs.clone(), cx);
-                }
-                window.focus(&this.focus, cx);
-            }));
-        let filled = !marked && covered_by.is_none();
-        actions = actions.child(if filled {
-            let on = palette::on_highlight(theme);
-            mark.bg(highlight)
-                .border_color(highlight)
-                .text_color(on)
-                .font_weight(FontWeight::SEMIBOLD)
-                .hover(move |style| {
-                    style.bg(highlight.opacity(0.85)).border_color(highlight)
-                })
-        } else {
-            mark
-        });
-    }
-
-    section
-        .child(identity)
-        .child(measure)
-        .child(grid)
-        .children(badges)
-        .child(actions)
+    section.child(identity).child(measure).child(grid)
 }
 
 /// The biggest things that could plausibly go, with their total.

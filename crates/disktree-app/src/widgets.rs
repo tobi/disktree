@@ -362,6 +362,7 @@ pub fn figure(
                 .text_color(color)
                 .whitespace_nowrap()
                 .overflow_hidden()
+                .text_ellipsis()
                 .child(value.into()),
         )
 }

@@ -49,10 +49,8 @@ pub mod text {
     pub const TITLE: Rems = Rems(0.875);
     /// The app name and the selection's name.
     pub const HEADING: Rems = Rems(1.125);
-    /// A figure worth reading from across the room: the free space.
+    /// A figure worth reading from across the room: selection size and free space.
     pub const FIGURE: Rems = Rems(1.625);
-    /// The selection's size: the one number the panel exists to show.
-    pub const DISPLAY: Rems = Rems(2.5);
 }
 
 /// Icon slots, sized with the text they sit beside.
@@ -80,6 +78,9 @@ pub mod size {
     /// Fixed progress rows keep paths and changing counters from reflowing.
     pub const PROGRESS_ROW: Rems = Rems(1.375);
     pub const PROGRESS_VALUE: Rems = Rems(9.0);
+    /// Fixed height of the top-right Selection card so the lists below never
+    /// jump while hovering or selecting different tiles.
+    pub const SELECTION_HEIGHT: Rems = Rems(12.25);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.

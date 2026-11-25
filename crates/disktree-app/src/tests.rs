@@ -2499,3 +2499,61 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         );
     }
 }
+
+#[gpui_kit::test]
+fn selection_section_keeps_static_height_across_hover_and_marks(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+
+    // 1. No tile selected (shows current root).
+    update(&view, cx, |app, cx| app.select(None, cx));
+    draw(cx);
+    let root_bounds = cx
+        .debug_bounds("selection-section")
+        .expect("selection card at root");
+    assert!(cx.debug_bounds("selection-open").is_some());
+    assert!(cx.debug_bounds("selection-mark").is_some());
+    assert!(cx.debug_bounds("refresh-scan").is_some());
+
+    // 2. Selecting a directory.
+    let junk = temp.path().join("junk");
+    update(&view, cx, |app, cx| {
+        let crumbs = app.crumbs_for_path(&junk).unwrap();
+        app.select(Some(crumbs), cx);
+    });
+    draw(cx);
+    let dir_bounds = cx
+        .debug_bounds("selection-section")
+        .expect("selection card for dir");
+    assert_eq!(dir_bounds, root_bounds, "height must not jump on select");
+
+    // 3. Marking that directory (adds the Marked chip inline).
+    update(&view, cx, Disktree::toggle_mark_selected);
+    draw(cx);
+    let marked_bounds = cx
+        .debug_bounds("selection-section")
+        .expect("selection card when marked");
+    assert_eq!(
+        marked_bounds, root_bounds,
+        "height must not jump when marked"
+    );
+
+    // 4. Selecting a nested file covered by the marked directory.
+    let blob = junk.join("blob.bin");
+    update(&view, cx, |app, cx| {
+        let crumbs = app.crumbs_for_path(&blob).unwrap();
+        app.select(Some(crumbs), cx);
+    });
+    draw(cx);
+    let file_bounds = cx
+        .debug_bounds("selection-section")
+        .expect("selection card for covered file");
+    assert_eq!(
+        file_bounds, root_bounds,
+        "height must not jump on covered file"
+    );
+}
