@@ -21,7 +21,7 @@ jobs:
     name: Lint and test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # What GPUI links against: windowing (Wayland, X11), input, fonts,
       # and the Vulkan loader.
@@ -35,12 +35,12 @@ jobs:
 
       # Pinned: the lint gate denies clippy::all and ::pedantic, and a newer
       # clippy's new lints are a change to make on purpose, not by surprise.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97"
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Lint
         run: cargo xtask lint
@@ -55,14 +55,14 @@ jobs:
     # shaders compile when the app starts, not here.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97"
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Lint
         run: cargo xtask lint
@@ -82,16 +82,16 @@ jobs:
       # Check out with the repository's own line endings, as on Linux.
       - run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Pinned with the Linux job, for the same reason. GPUI needs nothing
       # beyond the Windows SDK the runner already has.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97"
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Lint
         run: cargo xtask lint
@@ -133,7 +133,7 @@ jobs:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: System libraries
         if: runner.os == 'Linux'
@@ -144,11 +144,11 @@ jobs:
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libasound2-dev libssl-dev libzstd-dev
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Test
         run: cargo xtask test
