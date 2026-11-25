@@ -14,7 +14,7 @@ path always asks first.
 
 Built with [GPUI](https://gpui-kit.com/) through
 [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
-Omarchy theme and behaves like the rest of the desktop.
+Omarchy theme and font, and behaves like the rest of the desktop.
 
 ## Install
 

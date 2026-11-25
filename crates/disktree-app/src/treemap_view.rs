@@ -23,6 +23,7 @@ use gpui_omarchy::{ActiveTheme, Theme};
 
 use disktree_core::classify::Category;
 
+use crate::appearance;
 use crate::palette;
 use crate::state::{Disktree, Filtered, Label, View};
 
@@ -142,7 +143,7 @@ fn mosaic_inner(
     let measured = Rc::clone(&app.treemap_size);
 
     let colors = Colors::new(&theme);
-    let font = theme.font.clone();
+    let font = appearance::font(&theme);
     let name_size = rem_px(0.75, rem);
     let size_size = rem_px(0.6875, rem);
 
