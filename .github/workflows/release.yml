@@ -252,13 +252,35 @@ jobs:
           [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
           "archive=dist/$name.zip" >> $env:GITHUB_OUTPUT
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: packaging/windows/install-inno.ps1 -Dir "$env:RUNNER_TEMP\inno"
+
+      - name: Installer
+        id: installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          ISCC.exe /Q "/DAppVersion=$env:VERSION" "/DArch=$env:ARCH" `
+            packaging/windows/disktree.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $name = "disktree-$env:VERSION-$env:ARCH-windows-setup.exe"
+          $hash = (Get-FileHash "target/bundle/$name" -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("target/bundle/$name.sha256", "$hash  $name`n")
+          "setup=target/bundle/$name" >> $env:GITHUB_OUTPUT
+
       - name: Upload
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
-        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          SETUP: ${{ steps.installer.outputs.setup }}
+        run: |
+          gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+            "$SETUP" "$SETUP.sha256" --clobber
 
   publish:
     name: Publish
