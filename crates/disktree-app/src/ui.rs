@@ -77,7 +77,6 @@ pub mod size {
     pub const METER: Rems = Rems(0.3125);
     /// Fixed progress rows keep paths and changing counters from reflowing.
     pub const PROGRESS_ROW: Rems = Rems(1.375);
-    pub const PROGRESS_VALUE: Rems = Rems(9.0);
     /// Fixed height of the top-right Selection card so the lists below never
     /// jump while hovering or selecting different tiles.
     pub const SELECTION_HEIGHT: Rems = Rems(12.25);

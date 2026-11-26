@@ -543,7 +543,8 @@ impl TreeArena {
     }
 
     /// Replace the children and metadata of an existing node `target` with
-    /// the contents of `replacement`.
+    /// the contents of `replacement` via a single linear index-shift pass
+    /// (zero DFS stack, zero `id_map`, zero hash-table probing).
     pub fn replace_node_contents(
         &mut self,
         target: NodeId,
@@ -563,49 +564,46 @@ impl TreeArena {
         }
         self.last_child[target.index()] = None;
 
-        let mut id_map: Vec<Option<NodeId>> =
-            vec![None; replacement.nodes.len()];
-        id_map[replacement.root().index()] = Some(target);
-
-        let mut stack: Vec<(NodeId, NodeId)> = replacement
-            .children(replacement.root())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|kid| (kid, target))
-            .collect();
-        let mut kids = Vec::new();
-
-        while let Some((src_id, dst_parent)) = stack.pop() {
-            let src = replacement.node(src_id);
-            let name_id = self.strings.intern(replacement.name(src_id));
-            let dst_id = NodeId::from_index(self.nodes.len())
-                .expect("arena node count fits in u32");
-            let mut copy = *src;
-            copy.name = name_id;
-            copy.parent = Some(dst_parent);
-            copy.first_child = None;
-            copy.next_sibling = None;
-            self.nodes.push(copy);
-            self.last_child.push(None);
-            self.link_child(dst_parent, dst_id);
-            id_map[src_id.index()] = Some(dst_id);
-
-            kids.clear();
-            kids.extend(replacement.children(src_id));
-            for &kid in kids.iter().rev() {
-                stack.push((kid, dst_id));
-            }
+        if replacement.nodes.len() <= 1 {
+            return;
         }
 
-        for link in &replacement.hardlinks {
-            if let Some(mapped) = id_map[link.node.index()] {
-                self.hardlinks.push(HardlinkEntry {
-                    node: mapped,
-                    dev: link.dev,
-                    ino: link.ino,
-                });
+        // Index 0 in `replacement` maps onto `target`; indices 1..len append
+        // contiguously starting at `base_node`.
+        let base_node = self.nodes.len();
+        let base_name = self.strings.append_raw(&replacement.strings);
+        let shift = |id: NodeId| {
+            if id == NodeId::ROOT {
+                target
+            } else {
+                NodeId::from_index(id.index() - 1 + base_node)
+                    .expect("arena node count fits in u32")
             }
+        };
+
+        self.nodes[target.index()].first_child =
+            src_root.first_child.map(shift);
+        self.last_child[target.index()] = replacement.last_child[0].map(shift);
+
+        self.nodes.reserve(replacement.nodes.len() - 1);
+        self.last_child.reserve(replacement.last_child.len() - 1);
+        for (i, src) in replacement.nodes.iter().enumerate().skip(1) {
+            let mut copy = *src;
+            copy.name = NameId(src.name.0 + base_name);
+            copy.parent = src.parent.map(shift);
+            copy.first_child = src.first_child.map(shift);
+            copy.next_sibling = src.next_sibling.map(shift);
+            self.nodes.push(copy);
+            self.last_child.push(replacement.last_child[i].map(shift));
+        }
+
+        self.hardlinks.reserve(replacement.hardlinks.len());
+        for link in &replacement.hardlinks {
+            self.hardlinks.push(HardlinkEntry {
+                node: shift(link.node),
+                dev: link.dev,
+                ino: link.ino,
+            });
         }
     }
 

@@ -159,6 +159,23 @@ pub struct SessionRequest {
     /// Ask the remote host to bypass its own 15m cache TTL and revalidate.
     #[serde(default)]
     pub force_refresh: bool,
+    /// Opt-in: keep stdin open for full-duplex [`ConnectedCommand`] messages
+    /// (`prioritize`, `focus`, `cancel`) while streaming snapshots on stdout.
+    #[serde(default)]
+    pub full_duplex: bool,
+}
+
+/// Client-to-server control message sent over `stdin` during a full-duplex
+/// `--connected` session.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum ConnectedCommand {
+    /// Preempt background walking on the remote host to refresh `path` first.
+    Prioritize { path: PathBuf },
+    /// Focus a depth-bounded view rooted at `path` (clamped to depth <= 4).
+    Focus { path: PathBuf, depth: usize },
+    /// Cancel the active remote scan cleanly.
+    Cancel,
 }
 
 /// The target's root candidates, without walking or probing any of them.
@@ -199,6 +216,10 @@ pub struct Header {
     pub platform: String,
     #[serde(default)]
     pub identity: Option<crate::identity::HostIdentity>,
+    /// Semantic version of the remote `disktree-cli` helper (e.g. `"1.0.0"`),
+    /// reported so the client can surface version mismatches cleanly.
+    #[serde(default)]
+    pub helper_version: Option<String>,
 }
 
 #[derive(Debug)]
@@ -336,6 +357,7 @@ pub fn write_header(
             home,
             platform: std::env::consts::OS.into(),
             identity: crate::identity::HostIdentity::current(),
+            helper_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         },
     )?;
     out.flush()
@@ -381,6 +403,213 @@ pub fn write_progress(
 pub fn write_marker(marker: &str, out: &mut impl Write) -> io::Result<()> {
     send(out, &marker)?;
     out.flush()
+}
+
+/// Node threshold above which `--connected` uses depth-pruned wire streaming.
+///
+/// Avoids shipping 25M+ JSON lines (>1 GiB) over SSH to render a depth-4
+/// treemap.
+pub const FULL_WIRE_NODE_LIMIT: usize = 4_000;
+
+/// Serialize a `disktree_scanner::TreeArena` over the wire.
+///
+/// Streams every node when `arena.len() <= FULL_WIRE_NODE_LIMIT`, or an exact
+/// depth-pruned tree (top `max_children` per directory down to `max_depth`,
+/// rolling deeper/tail entries into a summary leaf with exact byte and file
+/// totals).
+pub fn write_arena_pruned(
+    arena: &disktree_scanner::TreeArena,
+    options: &ScanOptions,
+    client_dedup: bool,
+    max_depth: usize,
+    max_children: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if arena.len() <= FULL_WIRE_NODE_LIMIT {
+        return write_arena(arena, options, client_dedup, out);
+    }
+    write_arena_summary(arena, options, max_depth, max_children, out)
+}
+
+fn write_arena_summary(
+    arena: &disktree_scanner::TreeArena,
+    options: &ScanOptions,
+    max_depth: usize,
+    max_children: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    use disktree_scanner::{NodeFlags, NodeId, NodeKind as ScannerKind};
+
+    struct Frame {
+        id: NodeId,
+        depth: usize,
+        emitted_children: usize,
+        tail_bytes: u64,
+        tail_files: u64,
+        tail_modified: i64,
+        children: Vec<NodeId>,
+        next_idx: usize,
+    }
+
+    let node_bytes = |id: NodeId| -> u64 {
+        let n = arena.node(id);
+        if options.apparent_size {
+            if n.is_dir() {
+                n.apparent_bytes
+            } else {
+                n.effective_apparent_bytes()
+            }
+        } else if n.is_dir() {
+            n.allocated_bytes
+        } else {
+            n.effective_allocated_bytes()
+        }
+    };
+
+    let make_frame = |id: NodeId, depth: usize| -> Frame {
+        let mut kids: Vec<NodeId> = Vec::new();
+        for cid in arena.children(id) {
+            let child = arena.node(cid);
+            if !options.include_hidden && child.flags.has(NodeFlags::HIDDEN) {
+                continue;
+            }
+            let name = arena.name(cid);
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains(['/', '\0'])
+            {
+                continue;
+            }
+            kids.push(cid);
+        }
+        kids.sort_unstable_by_key(|&b| std::cmp::Reverse(node_bytes(b)));
+        let mut tail_bytes = 0u64;
+        let mut tail_files = 0u64;
+        let mut tail_modified = 0i64;
+        if kids.len() > max_children {
+            for &cid in &kids[max_children..] {
+                let cn = arena.node(cid);
+                tail_bytes = tail_bytes.saturating_add(node_bytes(cid));
+                tail_files = tail_files.saturating_add(cn.files);
+                if cn.modified > tail_modified {
+                    tail_modified = cn.modified;
+                }
+            }
+            kids.truncate(max_children);
+        }
+        Frame {
+            id,
+            depth,
+            emitted_children: 0,
+            tail_bytes,
+            tail_files,
+            tail_modified,
+            children: kids,
+            next_idx: 0,
+        }
+    };
+
+    let mut frames = vec![make_frame(arena.root(), 0)];
+    while let Some(top) = frames.last_mut() {
+        if top.next_idx < top.children.len() {
+            let child_id = top.children[top.next_idx];
+            top.next_idx += 1;
+            let child = arena.node(child_id);
+            let child_depth = top.depth + 1;
+            let name = arena.name(child_id);
+
+            if child.kind() == ScannerKind::Directory {
+                if options.max_depth.is_some_and(|limit| child_depth > limit) {
+                    continue;
+                }
+                top.emitted_children += 1;
+                if child_depth >= max_depth {
+                    // Emit this directory with one rolled-up summary leaf so
+                    // its total size and file count stay 100% exact without
+                    // streaming millions of deep leaf records over SSH.
+                    let bytes = node_bytes(child_id);
+                    let files = child.files;
+                    let dir_children = if bytes > 0 || files > 0 {
+                        let summary = Record(
+                            "(deeper files)".to_owned(),
+                            1,
+                            bytes,
+                            files,
+                            child.modified,
+                            false,
+                            0,
+                        );
+                        send(out, &summary)?;
+                        1
+                    } else {
+                        0
+                    };
+                    let dir_record = Record(
+                        name.to_owned(),
+                        0,
+                        0,
+                        0,
+                        child.modified,
+                        child.read_error(),
+                        dir_children,
+                    );
+                    send(out, &dir_record)?;
+                } else {
+                    frames.push(make_frame(child_id, child_depth));
+                }
+                continue;
+            }
+
+            top.emitted_children += 1;
+            let kind_code = match child.kind() {
+                ScannerKind::Directory => 0,
+                ScannerKind::File => 1,
+                ScannerKind::Symlink => 2,
+                ScannerKind::Other => 3,
+            };
+            let bytes = node_bytes(child_id);
+            let files = u64::from(kind_code == 1);
+            let record = Record(
+                name.to_owned(),
+                kind_code,
+                bytes,
+                files,
+                child.modified,
+                child.read_error(),
+                0,
+            );
+            send(out, &record)?;
+            continue;
+        }
+
+        let done = frames.pop().expect("checked non-empty");
+        let mut count = done.emitted_children;
+        if done.tail_bytes > 0 || done.tail_files > 0 {
+            let tail_record = Record(
+                "(smaller entries)".to_owned(),
+                1,
+                done.tail_bytes,
+                done.tail_files,
+                done.tail_modified,
+                false,
+                0,
+            );
+            send(out, &tail_record)?;
+            count += 1;
+        }
+        let an = arena.node(done.id);
+        let wire_name = if done.depth == 0 {
+            "root".to_owned()
+        } else {
+            arena.name(done.id).to_owned()
+        };
+        let record =
+            Record(wire_name, 0, 0, 0, an.modified, an.read_error(), count);
+        send(out, &record)?;
+    }
+
+    Ok(())
 }
 
 /// Serialize a `disktree_scanner::TreeArena` in the postorder `Record` wire
@@ -571,6 +800,7 @@ fn serve_request_with_progress(
             home,
             platform: std::env::consts::OS.into(),
             identity: crate::identity::HostIdentity::current(),
+            helper_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         },
     )?;
     out.flush()?;
@@ -730,7 +960,7 @@ fn read_snapshot_with_progress(
             if marker == "done" {
                 break;
             }
-            if marker == "stale" {
+            if marker == "stale" || marker == "partial" {
                 if stack.len() != 1 {
                     return Err(io::Error::other(
                         "incomplete remote stale tree",
@@ -743,10 +973,7 @@ fn read_snapshot_with_progress(
                     header: header.clone(),
                     tree: stale_tree,
                 }));
-                progress.files = 0;
-                progress.dirs = 0;
-                progress.bytes = 0;
-                progress.errors = 0;
+                progress.stale_seq += 1;
                 progress.updated = Some(Instant::now());
                 *shared.lock().expect("remote progress lock") =
                     progress.clone();
@@ -931,6 +1158,7 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
 #[derive(Debug)]
 pub struct RemoteJob<T> {
     child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
     result: mpsc::Receiver<io::Result<T>>,
     progress: Shared,
 }
@@ -1061,6 +1289,9 @@ impl<T: Send + 'static> RemoteJob<T> {
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let child = Arc::new(Mutex::new(child));
+        let stdin_shared: Arc<Mutex<Option<std::process::ChildStdin>>> =
+            Arc::new(Mutex::new(None));
+        let stdin_worker = Arc::clone(&stdin_shared);
         let worker = child.clone();
         let host = host.to_owned();
         let (tx, result) = mpsc::channel();
@@ -1087,11 +1318,21 @@ impl<T: Send + 'static> RemoteJob<T> {
                         live_tree: true,
                         stream_stale: true,
                         force_refresh,
+                        full_duplex: true,
                     },
                 )?;
+                stdin.flush()?;
+                *stdin_worker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(stdin);
                 decode(&mut input, &live)
             })();
-            drop(stdin);
+            // Drop stdin cleanly so the remote helper observes EOF and exits.
+            let _ = stdin_worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             if response.is_err() {
                 let _ = worker.lock().expect("SSH process lock").kill();
             }
@@ -1123,9 +1364,30 @@ impl<T: Send + 'static> RemoteJob<T> {
         });
         Ok(Self {
             child,
+            stdin: stdin_shared,
             result,
             progress,
         })
+    }
+
+    /// Send a full-duplex [`ConnectedCommand`] to the running remote helper
+    /// over its open `stdin` pipe. Returns `false` if the pipe is closed.
+    pub fn send_command(&self, cmd: &ConnectedCommand) -> bool {
+        let mut guard = self
+            .stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(stdin) = guard.as_mut() else {
+            return false;
+        };
+        send(stdin, cmd).is_ok() && stdin.flush().is_ok()
+    }
+
+    /// Preempt background walking on the remote host to refresh `path` first.
+    pub fn prioritize(&self, path: &Path) {
+        let _ = self.send_command(&ConnectedCommand::Prioritize {
+            path: path.to_path_buf(),
+        });
     }
 
     pub fn progress(&self) -> Progress {
@@ -1285,6 +1547,7 @@ mod tests {
             live_tree: true,
             stream_stale: false,
             force_refresh: false,
+            full_duplex: false,
         };
         let bytes = serde_json::to_vec(&session).unwrap();
         assert!(serde_json::from_slice::<Request>(&bytes).is_err());
@@ -1567,6 +1830,7 @@ mod tests {
             space: None,
             platform: platform.into(),
             identity: None,
+            helper_version: None,
         };
         send(&mut data, &header).unwrap();
         for name in [r"a\b", "c:d"] {
@@ -1731,6 +1995,7 @@ mod tests {
                 watch_disconnect: false,
                 stream_stale: false,
                 force_refresh: false,
+                full_duplex: false,
             };
             let mut data = Vec::new();
             serve_session(session, &mut data).unwrap();
@@ -1770,6 +2035,7 @@ mod tests {
                 space: None,
                 platform: std::env::consts::OS.into(),
                 identity: None,
+                helper_version: None,
             },
         )
         .unwrap();

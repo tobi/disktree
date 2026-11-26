@@ -325,3 +325,65 @@ fn stdio_persists_to_remote_cache_db_and_revalidates_on_force_refresh() {
     let after = run(false);
     assert_eq!(after.tree.bytes, 350);
 }
+
+#[cfg(unix)]
+#[test]
+fn connected_full_duplex_accepts_prioritize_over_stdin_and_reports_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_home = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("focus");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("data.bin"), [0_u8; 128]).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_disktree-cli"))
+        .arg("--connected")
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let req = serde_json::json!({
+        "root": dir.path(),
+        "disk": false,
+        "options": ScanOptions {
+            apparent_size: true,
+            ..ScanOptions::default()
+        },
+        "watch_disconnect": true,
+        "full_duplex": true,
+        "stream_stale": true,
+    });
+    serde_json::to_writer(&mut input, &req).unwrap();
+    input
+        .write_all(
+            b"
+",
+        )
+        .unwrap();
+    // Send a full-duplex prioritize command on the same open stdin pipe.
+    let cmd = serde_json::json!({
+        "cmd": "prioritize",
+        "path": sub,
+    });
+    serde_json::to_writer(&mut input, &cmd).unwrap();
+    input
+        .write_all(
+            b"
+",
+        )
+        .unwrap();
+    input.flush().unwrap();
+
+    let snapshot =
+        read_snapshot(&mut BufReader::new(child.stdout.take().unwrap()))
+            .unwrap();
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert_eq!(snapshot.tree.bytes, 128);
+    assert_eq!(
+        snapshot.header.helper_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}

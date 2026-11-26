@@ -1872,9 +1872,11 @@ fn side_panel(
         .border_color(theme.divider())
         .bg(theme.surface)
         .child(handle)
-        .child(if app.is_indexing() {
+        .child(if app.tree().is_none() && app.is_indexing() {
             indexing_progress(app, theme, cx)
-        } else { selection_section(app, theme, cx) })
+        } else {
+            selection_section(app, theme, cx)
+        })
         .child(rule())
         // The lists scroll; the selection above and the disk below stay put,
         // so the two numbers that matter never leave the screen.
@@ -1891,120 +1893,13 @@ fn side_panel(
                 .child(rule())
                 .child(marked_section(app, theme, cx)),
         )
-        .children(activity_section(app, theme, cx))
+        .when(app.tree().is_some() && app.is_indexing(), |panel| {
+            panel.child(indexing_progress(app, theme, cx))
+        })
         .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
         .child(disk_section(app, theme, cx))
-}
-
-/// Calm, fixed-height sidebar banner explaining WHEN background scanning is
-/// running and WHY (stale cache refresh, explicit rescan, widening, or remote),
-/// with live monospace counters and current folder lane plus a Stop control.
-fn activity_section(
-    app: &Disktree,
-    theme: &Theme,
-    cx: &Context<'_, Disktree>,
-) -> Option<Div> {
-    let (heading, why) = app.scan_activity_summary()?;
-    let counts = if app.progress.files > 0 || app.progress.dirs > 0 {
-        format!(
-            "{} · {} files · {} dirs",
-            human_bytes(app.progress.bytes),
-            disktree_core::size::human_count(app.progress.files),
-            disktree_core::size::human_count(app.progress.dirs),
-        )
-    } else if app.remote.is_some() {
-        app.remote_progress.stage.label().to_owned()
-    } else {
-        "Checking cached folders…".to_owned()
-    };
-    let current_path = app
-        .remote
-        .as_ref()
-        .and(app.remote_progress.directory.as_deref())
-        .or(app.active_scan_path.as_deref())
-        .map(|p| app.display_path(p))
-        .unwrap_or_default();
-
-    Some(
-        div()
-            .debug_selector(|| "sidebar-activity".into())
-            .flex()
-            .flex_col()
-            .gap(space::XXS)
-            .px(space::LG)
-            .py(space::SM)
-            .bg(theme.inset)
-            .border_t_1()
-            .border_color(theme.divider())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(space::SM)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(space::XS)
-                            .child(
-                                gpui_omarchy::icon(
-                                    gpui_omarchy::IconName::RotateCw,
-                                )
-                                .size(icon::SM)
-                                .text_color(theme.accent),
-                            )
-                            .child(widgets::eyebrow(heading, cx)),
-                    )
-                    .child(
-                        button(
-                            "activity-stop",
-                            "Stop",
-                            ButtonVariant::Outline,
-                            cx,
-                        )
-                        .tab_stop(false)
-                        .px(space::XS)
-                        .py(space::XXS)
-                        .on_click(cx.listener(
-                            |this, _, window, cx| {
-                                this.cancel_scan(cx);
-                                window.focus(&this.focus, cx);
-                            },
-                        )),
-                    ),
-            )
-            .child(
-                div()
-                    .h(size::PROGRESS_ROW)
-                    .truncate()
-                    .text_size(text::CAPTION)
-                    .text_color(theme.foreground)
-                    .child(why),
-            )
-            .child(
-                div()
-                    .h(size::PROGRESS_ROW)
-                    .truncate()
-                    .font_family(theme.mono_font.clone())
-                    .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
-                    .child(counts),
-            )
-            .child(
-                div()
-                    .h(size::PROGRESS_ROW)
-                    .truncate()
-                    .font_family(theme.mono_font.clone())
-                    .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
-                    .child(current_path),
-            ),
-    )
 }
 
 /// What the keys act on: compact, static-height summary with Open, Mark and
@@ -3120,37 +3015,48 @@ fn indexing_compact(
 
 /// Progress has one owner. Stable rows and mono values prevent digit,
 // unit and path changes from pushing the rest of the screen around.
+/// Dense, unified scan status card used for both initial cold indexing and
+/// background cache refreshes. Every row uses fixed heights and equal flex
+/// columns so live counters and long paths never shift the sidebar layout.
 fn indexing_progress(
     app: &Disktree,
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
     let elapsed = app.scan_started.map_or(0, |at| at.elapsed().as_secs());
-    let row = |label: &'static str, value: String, id: &'static str| {
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .h(size::PROGRESS_ROW)
-            .child(div().text_color(theme.secondary).child(label))
-            .child(
-                div()
-                    .debug_selector(move || id.into())
-                    .w(size::PROGRESS_VALUE)
-                    .text_right()
-                    .font_family(theme.mono_font.clone())
-                    .child(value),
-            )
+    let (heading, why) = app.scan_activity_summary().unwrap_or_else(|| {
+        (
+            if app.is_refreshing() {
+                "Refreshing".into()
+            } else {
+                "Scanning".into()
+            },
+            if app.remote.is_some() {
+                app.remote_progress.stage.label().to_owned()
+            } else {
+                "Reading this computer".into()
+            },
+        )
+    });
+    let meta_badge = if app.progress.errors > 0 {
+        format!(
+            "{elapsed} s · {} err",
+            widgets::human_count(app.progress.errors)
+        )
+    } else {
+        format!("{elapsed} s")
     };
     let path = if app.remote.is_some() {
-        app.remote_progress.directory.as_ref()
+        app.remote_progress.directory.as_deref()
     } else {
-        app.scan_preview
-            .as_ref()
-            .and_then(|preview| preview.directory.as_ref())
+        app.active_scan_path.as_deref().or_else(|| {
+            app.scan_preview
+                .as_ref()
+                .and_then(|preview| preview.directory.as_deref())
+        })
     };
     let full_path = path.map_or_else(
-        || "Directory not reported yet".into(),
+        || "Waiting for first directory…".into(),
         |path| path.display().to_string(),
     );
     // Split by the scanned machine's rules: a Unix host's `a\b` is one name.
@@ -3161,29 +3067,104 @@ fn indexing_progress(
     } else {
         full_path.clone()
     };
+
+    let stat = |label: &'static str, value: String, id: &'static str| {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .child(
+                div()
+                    .debug_selector(move || id.into())
+                    .h(size::PROGRESS_ROW)
+                    .truncate()
+                    .font_family(theme.mono_font.clone())
+                    .text_size(text::BODY)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.bright)
+                    .child(value),
+            )
+            .child(
+                div()
+                    .h(size::PROGRESS_ROW)
+                    .truncate()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(label),
+            )
+    };
+
     div()
         .debug_selector(|| "indexing-progress".into())
         .flex()
         .flex_col()
         .min_w_0()
         .gap(space::XS)
-        .text_size(text::BODY)
-        .text_color(theme.foreground)
-        .child(widgets::eyebrow(
-            if app.is_refreshing() {
-                "Refreshing"
-            } else {
-                "Indexing"
-            },
-            cx,
-        ))
-        .child(div().h(size::PROGRESS_ROW).truncate().child(
-            if app.remote.is_some() {
-                app.remote_progress.stage.label()
-            } else {
-                "Reading this computer"
-            },
-        ))
+        .p(space::MD)
+        .bg(theme.inset)
+        .border_1()
+        .border_color(theme.divider())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(space::SM)
+                .h(size::PROGRESS_ROW)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(space::XS)
+                        .min_w_0()
+                        .flex_1()
+                        .child(
+                            gpui_omarchy::icon(
+                                gpui_omarchy::IconName::RotateCw,
+                            )
+                            .size(icon::SM)
+                            .text_color(theme.accent)
+                            .flex_shrink_0(),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(widgets::eyebrow(heading, cx)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme.mono_font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary)
+                                .child(format!("· {meta_badge}")),
+                        ),
+                )
+                .child(with_tooltip(
+                    button("cancel-scan", "Stop", ButtonVariant::Outline, cx)
+                        .tab_stop(false)
+                        .px(space::XS)
+                        .py(space::XXS)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_scan(cx);
+                            window.focus(&this.focus, cx);
+                        })),
+                    "Stop scan · Esc",
+                )),
+        )
+        .child(
+            div()
+                .h(size::PROGRESS_ROW)
+                .min_w_0()
+                .truncate()
+                .text_size(text::CAPTION)
+                .text_color(theme.foreground)
+                .child(why),
+        )
         .when_some(app.auth_url.clone(), |panel, url| {
             panel.child(
                 button(
@@ -3197,33 +3178,27 @@ fn indexing_progress(
                 }),
             )
         })
-        .child(row(
-            "Files",
-            widgets::human_count(app.progress.files),
-            "indexing-files",
-        ))
-        .child(row(
-            "Directories",
-            widgets::human_count(app.progress.dirs),
-            "indexing-dirs",
-        ))
-        .child(row(
-            "Measured",
-            human_bytes(app.progress.bytes),
-            "indexing-bytes",
-        ))
-        .child(row(
-            "Read errors",
-            widgets::human_count(app.progress.errors),
-            "indexing-errors",
-        ))
-        .child(row("Elapsed", format!("{elapsed} s"), "indexing-elapsed"))
         .child(
             div()
-                .h(size::PROGRESS_ROW)
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child("Recent directory"),
+                .flex()
+                .flex_row()
+                .gap(space::SM)
+                .pt(space::XXS)
+                .child(stat(
+                    "Measured",
+                    human_bytes(app.progress.bytes),
+                    "indexing-bytes",
+                ))
+                .child(stat(
+                    "Files",
+                    widgets::human_count(app.progress.files),
+                    "indexing-files",
+                ))
+                .child(stat(
+                    "Dirs",
+                    widgets::human_count(app.progress.dirs),
+                    "indexing-dirs",
+                )),
         )
         .child(with_tooltip(
             div()
@@ -3233,22 +3208,11 @@ fn indexing_progress(
                 .min_w_0()
                 .truncate()
                 .font_family(theme.mono_font.clone())
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
                 .child(short_path),
             full_path,
         ))
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child("Preview only · provisional totals"),
-        )
-        .child(
-            button("cancel-scan", "Stop indexing", ButtonVariant::Outline, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.cancel_scan(cx);
-                    window.focus(&this.focus, cx);
-                })),
-        )
 }
 
 fn find_field(app: &Disktree, theme: &Theme) -> Div {

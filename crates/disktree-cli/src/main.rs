@@ -26,7 +26,9 @@ fn main() -> Result<()> {
     // kernel resource limits before reading stdin.
     let raw_args: Vec<std::ffi::OsString> =
         std::env::args_os().skip(1).collect();
-    if raw_args.len() == 1 && raw_args[0] == "--stdio-v1" {
+    if raw_args.len() == 1
+        && (raw_args[0] == "--connected" || raw_args[0] == "--stdio-v1")
+    {
         return stdio::serve_stdio_v1().map_err(Into::into);
     }
 

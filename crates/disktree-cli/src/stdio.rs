@@ -10,24 +10,30 @@
 //! immediately if the SSH pipe closes so a blocked filesystem never outlives
 //! the connection.
 
-use std::io::{self, BufReader, BufWriter, Read as _, Write};
+use std::io::{self, BufRead as _, BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use disktree_core::remote::{
-    Operation, Request, SessionRequest, write_arena, write_header,
-    write_marker, write_progress,
+    ConnectedCommand, Operation, Request, SessionRequest, write_arena_pruned,
+    write_header, write_marker, write_progress,
 };
 use disktree_core::scan_preview;
 use disktree_scanner::{
     CachePolicy, DirTallyHook, Freshness, HostKey, ScanEvent, Scanner,
-    StorageMode,
+    StorageMode, TreeArena,
 };
 
 const STDOUT_BUFFER_BYTES: usize = 256 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(500);
+const PARTIAL_STREAM_INTERVAL: Duration = Duration::from_secs(3);
+const FINAL_WIRE_MAX_DEPTH: usize = 4;
+const FINAL_WIRE_MAX_CHILDREN: usize = 48;
+const PARTIAL_WIRE_MAX_DEPTH: usize = 4;
+const PARTIAL_WIRE_MAX_CHILDREN: usize = 32;
 
 pub fn serve_stdio_v1() -> io::Result<()> {
     limit_resources()?;
@@ -42,7 +48,43 @@ pub fn serve_stdio_v1() -> io::Result<()> {
         })?;
     let mut input = BufReader::new(io::stdin());
     let session = disktree_core::remote::read_request(&mut input)?;
-    if session.watch_disconnect {
+    let cmd_rx: Option<Receiver<ConnectedCommand>> = if session.full_duplex {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("scan-duplex-stdin".into())
+            .spawn(move || {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match input.read_line(&mut line) {
+                        Err(error)
+                            if error.kind() == io::ErrorKind::Interrupted => {}
+                        Ok(0) => {
+                            // Exit the process, not just a scan task: a
+                            // blocked filesystem must not outlive SSH.
+                            std::process::exit(0);
+                        }
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            if let Ok(cmd) =
+                                serde_json::from_str::<ConnectedCommand>(
+                                    trimmed,
+                                )
+                            {
+                                let _ = cmd_tx.send(cmd);
+                            }
+                        }
+                        Err(_) => {
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            })?;
+        Some(cmd_rx)
+    } else if session.watch_disconnect {
         std::thread::Builder::new()
             .name("scan-connection".into())
             .spawn(move || {
@@ -65,14 +107,18 @@ pub fn serve_stdio_v1() -> io::Result<()> {
                     }
                 }
             })?;
-    }
+        None
+    } else {
+        None
+    };
     let mut out =
         BufWriter::with_capacity(STDOUT_BUFFER_BYTES, io::stdout().lock());
-    serve_with_remote_db(session, &mut out)
+    serve_with_remote_db(session, cmd_rx.as_ref(), &mut out)
 }
 
 fn serve_with_remote_db(
     session: SessionRequest,
+    cmd_rx: Option<&Receiver<ConnectedCommand>>,
     out: &mut impl Write,
 ) -> io::Result<()> {
     let SessionRequest {
@@ -83,6 +129,7 @@ fn serve_with_remote_db(
         live_tree,
         stream_stale,
         force_refresh,
+        full_duplex,
     } = session;
     let request = match operation {
         Operation::Discover { .. } => {
@@ -95,6 +142,7 @@ fn serve_with_remote_db(
                     live_tree,
                     stream_stale,
                     force_refresh,
+                    full_duplex,
                 },
                 out,
             );
@@ -140,6 +188,7 @@ fn serve_with_remote_db(
                 live_tree,
                 stream_stale,
                 force_refresh,
+                full_duplex,
             },
             out,
         );
@@ -156,6 +205,7 @@ fn serve_with_remote_db(
             stream_stale,
             force_refresh,
         },
+        cmd_rx,
         out,
     )
 }
@@ -177,6 +227,7 @@ fn serve_scan_from_scanner<W: Write>(
     root: PathBuf,
     request: &Request,
     flags: StreamFlags,
+    cmd_rx: Option<&Receiver<ConnectedCommand>>,
     out: &mut W,
 ) -> io::Result<()> {
     let policy = CachePolicy {
@@ -206,6 +257,7 @@ fn serve_scan_from_scanner<W: Write>(
             });
         hook
     });
+    let session_root = root.clone();
     let session = scanner.open_with_tally(
         HostKey::Local,
         root,
@@ -216,8 +268,11 @@ fn serve_scan_from_scanner<W: Write>(
 
     let mut last_heartbeat = Instant::now();
     let mut last_preview: Option<Instant> = None;
+    let mut last_partial = Instant::now();
     let mut streamed_final = false;
     let mut streamed_stale = false;
+    let mut live_root: Option<TreeArena> = None;
+    let mut live_dirty = false;
 
     let emit_progress = |last: &mut Instant,
                          last_preview: &mut Option<Instant>,
@@ -266,61 +321,164 @@ fn serve_scan_from_scanner<W: Write>(
     };
 
     loop {
+        if let Some(rx) = cmd_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    ConnectedCommand::Prioritize { path } => {
+                        let _ = session.prioritize(&path);
+                    }
+                    ConnectedCommand::Focus { path, depth } => {
+                        let _ = session.prioritize(&path);
+                        let depth = depth.clamp(1, FINAL_WIRE_MAX_DEPTH);
+                        if flags.stream_stale
+                            && !streamed_final
+                            && let Some((cached, _)) = scanner.lookup_cached(
+                                &HostKey::Local,
+                                &path,
+                                &request.options.to_scanner(),
+                                &CachePolicy::default(),
+                            )
+                        {
+                            write_arena_pruned(
+                                &cached,
+                                &request.options,
+                                flags.client_dedup,
+                                depth,
+                                PARTIAL_WIRE_MAX_CHILDREN,
+                                out,
+                            )?;
+                            write_marker("partial", out)?;
+                        }
+                    }
+                    ConnectedCommand::Cancel => {
+                        session.cancel();
+                    }
+                }
+            }
+        }
+        if flags.stream_stale
+            && !streamed_final
+            && live_dirty
+            && last_partial.elapsed() >= PARTIAL_STREAM_INTERVAL
+            && let Some(arena) = live_root.as_mut()
+        {
+            arena.aggregate(
+                request.options.dedup_hardlinks,
+                request.options.include_hidden,
+            );
+            write_arena_pruned(
+                arena,
+                &request.options,
+                flags.client_dedup,
+                PARTIAL_WIRE_MAX_DEPTH,
+                PARTIAL_WIRE_MAX_CHILDREN,
+                out,
+            )?;
+            write_marker("partial", out)?;
+            live_dirty = false;
+            streamed_stale = true;
+            last_partial = Instant::now();
+            last_heartbeat = Instant::now();
+        }
+
         match session.recv_timeout(HEARTBEAT_INTERVAL) {
             Ok(ScanEvent::Snapshot(snap)) => match snap.freshness {
                 Freshness::Partial { .. } => {
-                    // If an earlier or interrupted scan already checkpointed
-                    // completed folders in the remote DB, stream that
-                    // approximate tree right away so the user can explore
-                    // while the remaining holes fill in.
                     if flags.stream_stale
                         && !streamed_stale
                         && snap.arena.node(snap.arena.root()).files > 0
                     {
-                        write_arena(
+                        write_arena_pruned(
                             &snap.arena,
                             &request.options,
                             flags.client_dedup,
+                            PARTIAL_WIRE_MAX_DEPTH,
+                            PARTIAL_WIRE_MAX_CHILDREN,
                             out,
                         )?;
                         write_marker("stale", out)?;
+                        live_root = Some((*snap.arena).clone());
                         streamed_stale = true;
+                        last_partial = Instant::now();
                         last_heartbeat = Instant::now();
                     }
                 }
                 Freshness::Fresh { .. } => {
-                    write_arena(
+                    write_arena_pruned(
                         &snap.arena,
                         &request.options,
                         flags.client_dedup,
+                        FINAL_WIRE_MAX_DEPTH,
+                        FINAL_WIRE_MAX_CHILDREN,
                         out,
                     )?;
                     streamed_final = true;
                 }
                 Freshness::Stale { .. } => {
                     if flags.stream_stale && !streamed_stale {
-                        write_arena(
+                        write_arena_pruned(
                             &snap.arena,
                             &request.options,
                             flags.client_dedup,
+                            PARTIAL_WIRE_MAX_DEPTH,
+                            PARTIAL_WIRE_MAX_CHILDREN,
                             out,
                         )?;
                         write_marker("stale", out)?;
+                        live_root = Some((*snap.arena).clone());
                         streamed_stale = true;
+                        last_partial = Instant::now();
                         last_heartbeat = Instant::now();
                     }
                 }
                 Freshness::Live { .. } => {
-                    write_arena(
+                    write_arena_pruned(
                         &snap.arena,
                         &request.options,
                         flags.client_dedup,
+                        FINAL_WIRE_MAX_DEPTH,
+                        FINAL_WIRE_MAX_CHILDREN,
                         out,
                     )?;
                     out.flush()?;
                     streamed_final = true;
                 }
             },
+            Ok(ScanEvent::SubtreeRefreshed { path, arena, .. }) => {
+                if flags.stream_stale && !streamed_final {
+                    let root_arena = live_root.get_or_insert_with(|| {
+                        let root_name = session_root.file_name().map_or_else(
+                            || "root".to_owned(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        TreeArena::new(session_root.clone(), &root_name)
+                    });
+                    if let Ok(rel) = path.strip_prefix(&session_root) {
+                        let parts: Vec<String> = rel
+                            .components()
+                            .map(|c| {
+                                c.as_os_str().to_string_lossy().into_owned()
+                            })
+                            .collect();
+                        if parts.len() == 1 {
+                            if let Some(existing) = root_arena
+                                .find_relative(parts.iter().map(String::as_str))
+                            {
+                                root_arena
+                                    .replace_node_contents(existing, &arena);
+                            } else {
+                                root_arena.graft_subtree(
+                                    root_arena.root(),
+                                    &arena,
+                                    Some(&parts[0]),
+                                );
+                            }
+                            live_dirty = true;
+                        }
+                    }
+                }
+                emit_progress(&mut last_heartbeat, &mut last_preview, out)?;
+            }
             Ok(ScanEvent::Finished) => {
                 // Waiting until `Finished` guarantees the remote host's cache
                 // DB commit completed before `"done"` lets the client close
@@ -338,7 +496,6 @@ fn serve_scan_from_scanner<W: Write>(
             }
             Ok(
                 ScanEvent::SubtreeUpdating { .. }
-                | ScanEvent::SubtreeRefreshed { .. }
                 | ScanEvent::Progress { .. }
                 | ScanEvent::StorageFallback { .. },
             )

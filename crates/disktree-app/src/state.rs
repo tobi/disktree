@@ -1139,6 +1139,7 @@ pub struct Disktree {
     pub remote: Option<String>,
     remote_disk: bool,
     pub remote_progress: disktree_core::remote_progress::Progress,
+    remote_stale_seq: u64,
     /// Tailscale SSH check URL opened in the browser while waiting for approval.
     pub auth_url: Option<String>,
     pub scan_preview: Option<Arc<disktree_core::scan_preview::Preview>>,
@@ -1351,6 +1352,7 @@ impl Disktree {
             preview_updated: None,
             remote_progress: disktree_core::remote_progress::Progress::default(
             ),
+            remote_stale_seq: 0,
             auth_url: None,
             remote_platform: String::new(),
             remote_identity: None,
@@ -2231,6 +2233,7 @@ impl Disktree {
         self.progress = ScanSnapshot::default();
         self.remote_progress =
             disktree_core::remote_progress::Progress::default();
+        self.remote_stale_seq = 0;
         self.scan_error = None;
         self.scan_preview = None;
         self.preview_updated = None;
@@ -2306,6 +2309,7 @@ impl Disktree {
         self.scan_error = None;
         self.remote_progress =
             disktree_core::remote_progress::Progress::default();
+        self.remote_stale_seq = 0;
         self.scan_preview = None;
         self.preview_updated = None;
         // A new scan starts at its root; where it was is one `<` away.
@@ -2478,10 +2482,16 @@ impl Disktree {
                 self.remote_progress = handle.progress();
                 let auth_url = self.remote_progress.auth_url.clone();
                 self.handle_auth_url(auth_url, cx);
-                if self.tree.is_none()
+                if self.remote_progress.stale_seq > self.remote_stale_seq
                     && let Some(stale) =
                         self.remote_progress.stale_snapshot.clone()
                 {
+                    self.remote_stale_seq = self.remote_progress.stale_seq;
+                    let had_tree = self.tree.is_some();
+                    let prev_dir = had_tree.then(|| self.current_path());
+                    let prev_sel = had_tree.then(|| {
+                        self.selected.as_deref().and_then(|c| self.path_at(c))
+                    });
                     let stale_dirs = stale.tree.dirs;
                     self.root_path.clone_from(&stale.header.root);
                     self.home.clone_from(&stale.header.home);
@@ -2489,8 +2499,13 @@ impl Disktree {
                     self.space = stale.header.space;
                     self.remote_platform.clone_from(&stale.header.platform);
                     self.update_remote_identity(stale.header.identity.clone());
+                    let ver = stale
+                        .header
+                        .helper_version
+                        .as_deref()
+                        .map_or_else(String::new, |v| format!(" · v{v}"));
                     self.device = self.remote.as_ref().map(|host| {
-                        format!("{host} · read-only · cached (refreshing…)")
+                        format!("{host}{ver} · read-only · live updating")
                     });
                     self.arena =
                         Some(Arc::new(disktree_core::scan::node_to_arena_at(
@@ -2503,7 +2518,17 @@ impl Disktree {
                         newest_at: 1,
                         stale_dirs,
                     });
-                    self.install_tree(stale.tree.clone(), None, cx);
+                    if let Some(directory) = prev_dir {
+                        self.install_refresh(
+                            stale.tree.clone(),
+                            self.options.metric,
+                            &directory,
+                            prev_sel.flatten(),
+                            cx,
+                        );
+                    } else {
+                        self.install_tree(stale.tree.clone(), None, cx);
+                    }
                 }
                 if self.remote_progress.preview.is_some()
                     && (self.scan_preview.is_none()
@@ -2539,8 +2564,13 @@ impl Disktree {
                         self.space = snapshot.header.space;
                         self.remote_platform = snapshot.header.platform;
                         self.update_remote_identity(snapshot.header.identity);
+                        let ver = snapshot
+                            .header
+                            .helper_version
+                            .as_deref()
+                            .map_or_else(String::new, |v| format!(" · v{v}"));
                         self.device = self.remote.as_ref().map(|host| {
-                            format!("{host} · read-only · space at scan")
+                            format!("{host}{ver} · read-only · space at scan")
                         });
                         let node = snapshot.tree;
                         let scanned_at = std::time::SystemTime::now()
@@ -3357,9 +3387,16 @@ impl Disktree {
         self.cache = None;
         // Entering a directory while a background SWR refresh is running
         // prioritizes that subtree first.
-        if let Some(ActiveScan::Local { handle, .. }) = &self.active_scan {
-            let target = self.current_path();
-            handle.prioritize(&target);
+        match &self.active_scan {
+            Some(ActiveScan::Local { handle, .. }) => {
+                let target = self.current_path();
+                handle.prioritize(&target);
+            }
+            Some(ActiveScan::Remote { handle, .. }) => {
+                let target = self.current_path();
+                handle.prioritize(&target);
+            }
+            None => {}
         }
         cx.notify();
     }
@@ -5253,48 +5290,68 @@ impl Disktree {
         self.tick_freshness_fades(window);
     }
 
-    /// Plain-language explanation of active background work for the sidebar
-    /// Activity card (`(heading, why)`), when a tree is already on screen.
+    /// Plain-language explanation of active scan work for the unified sidebar
+    /// status card (`(heading, why)`).
     #[must_use]
-    pub fn scan_activity_summary(&self) -> Option<(&'static str, String)> {
-        self.tree.as_ref()?;
+    pub fn scan_activity_summary(&self) -> Option<(String, String)> {
         let active = self.active_scan.as_ref()?;
+        let has_tree = self.tree.is_some();
         match active {
             ActiveScan::Remote { intent, .. } => {
                 let host = self.remote.as_deref().unwrap_or("remote");
-                Some(match intent {
+                let stage = self.remote_progress.stage;
+                let (heading, why) = match intent {
                     ScanIntent::Refresh { forced: true, .. } => (
-                        "Rescanning remote",
-                        format!("Rescanning {host} on request"),
+                        format!("Rescanning {host}"),
+                        "Rescanning on request — keep browsing".into(),
                     ),
                     ScanIntent::Refresh { forced: false, .. } => (
-                        "Refreshing cache",
-                        format!("Updating stale {host} cache in background"),
+                        format!("Refreshing {host}"),
+                        "Updating stale cache — keep browsing".into(),
                     ),
                     ScanIntent::Widening { .. } => (
-                        "Expanding scan",
-                        format!("Reading parent folder on {host}"),
+                        format!("Expanding {host}"),
+                        "Reading parent folder — keep browsing".into(),
                     ),
-                    ScanIntent::Initial => {
-                        ("Scanning remote", format!("Indexing {host} over SSH"))
-                    }
-                })
+                    ScanIntent::Initial if has_tree => (
+                        format!("Updating {host}"),
+                        "Filling remaining folders — keep browsing".into(),
+                    ),
+                    ScanIntent::Initial => (
+                        format!("Scanning {host}"),
+                        if stage
+                            == disktree_core::remote_progress::Stage::Indexing
+                        {
+                            "Building initial index — preview is provisional"
+                                .into()
+                        } else {
+                            stage.label().to_owned()
+                        },
+                    ),
+                };
+                Some((heading, why))
             }
             ActiveScan::Local { intent, .. } => Some(match intent {
-                ScanIntent::Refresh { forced: true, .. } => {
-                    ("Rescanning", "Rescanning this folder on request".into())
-                }
+                ScanIntent::Refresh { forced: true, .. } => (
+                    "Rescanning".into(),
+                    "Rescanning on request — keep browsing".into(),
+                ),
                 ScanIntent::Refresh { forced: false, .. } => (
-                    "Refreshing cache",
-                    "Updating folders older than 15 min — keep browsing".into(),
+                    "Refreshing cache".into(),
+                    "Updating folders >15m old — keep browsing".into(),
                 ),
                 ScanIntent::Widening { .. } => (
-                    "Expanding scan",
-                    "Reading parent folder around current view".into(),
+                    "Expanding scan".into(),
+                    "Reading parent folder — keep browsing".into(),
                 ),
-                ScanIntent::Initial => {
-                    ("Scanning", "Indexing this folder".into())
-                }
+                ScanIntent::Initial if has_tree => (
+                    "Updating".into(),
+                    "Filling remaining folders — keep browsing".into(),
+                ),
+                ScanIntent::Initial => (
+                    "Scanning".into(),
+                    "Building initial index — preview is provisional".into(),
+                ),
             }),
         }
     }
