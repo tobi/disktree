@@ -1373,14 +1373,13 @@ impl<T: Send + 'static> RemoteJob<T> {
     /// Send a full-duplex [`ConnectedCommand`] to the running remote helper
     /// over its open `stdin` pipe. Returns `false` if the pipe is closed.
     pub fn send_command(&self, cmd: &ConnectedCommand) -> bool {
-        let mut guard = self
-            .stdin
+        self.stdin
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(stdin) = guard.as_mut() else {
-            return false;
-        };
-        send(stdin, cmd).is_ok() && stdin.flush().is_ok()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .is_some_and(|stdin| {
+                send(stdin, cmd).is_ok() && stdin.flush().is_ok()
+            })
     }
 
     /// Preempt background walking on the remote host to refresh `path` first.
