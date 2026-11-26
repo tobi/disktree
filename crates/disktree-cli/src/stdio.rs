@@ -11,19 +11,23 @@
 //! the connection.
 
 use std::io::{self, BufReader, BufWriter, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use disktree_core::remote::{
     Operation, Request, SessionRequest, write_arena, write_header,
     write_marker, write_progress,
 };
+use disktree_core::scan_preview;
 use disktree_scanner::{
-    CachePolicy, Freshness, HostKey, ScanEvent, Scanner, StorageMode,
+    CachePolicy, DirTallyHook, Freshness, HostKey, ScanEvent, Scanner,
+    StorageMode,
 };
 
 const STDOUT_BUFFER_BYTES: usize = 256 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(500);
 
 pub fn serve_stdio_v1() -> io::Result<()> {
     limit_resources()?;
@@ -180,19 +184,45 @@ fn serve_scan_from_scanner<W: Write>(
         stale_while_revalidate: true,
         ..CachePolicy::default()
     };
-    let session = scanner.open_with(
+    let preview = Arc::new(Mutex::new(scan_preview::Builder::default()));
+    let apparent = request.options.apparent_size;
+    let on_dir_tally: Option<DirTallyHook> = flags.live_progress.then(|| {
+        let preview = Arc::clone(&preview);
+        let hook_root = root.clone();
+        let hook: DirTallyHook =
+            Arc::new(move |dir: &Path, alloc: u64, app: u64, files: u64| {
+                let Ok(below) = dir.strip_prefix(&hook_root) else {
+                    return;
+                };
+                let name = below
+                    .components()
+                    .next()
+                    .and_then(|c| c.as_os_str().to_str());
+                let bytes = if apparent { app } else { alloc };
+                if let Ok(mut guard) = preview.lock() {
+                    guard.add(name, bytes, files);
+                    guard.directory(dir);
+                }
+            });
+        hook
+    });
+    let session = scanner.open_with_tally(
         HostKey::Local,
         root,
         request.options.to_scanner(),
         policy,
+        on_dir_tally,
     )?;
 
     let mut last_heartbeat = Instant::now();
+    let mut last_preview: Option<Instant> = None;
     let mut streamed_final = false;
     let mut streamed_stale = false;
-    let apparent = request.options.apparent_size;
 
-    let emit_progress = |last: &mut Instant, out: &mut W| -> io::Result<()> {
+    let emit_progress = |last: &mut Instant,
+                         last_preview: &mut Option<Instant>,
+                         out: &mut W|
+     -> io::Result<()> {
         if !flags.live_progress || last.elapsed() < HEARTBEAT_INTERVAL {
             return Ok(());
         }
@@ -208,12 +238,27 @@ fn serve_scan_from_scanner<W: Write>(
         } else {
             stats.allocated_bytes
         };
+        let want_preview =
+            last_preview.is_none_or(|t| t.elapsed() >= PREVIEW_INTERVAL);
+        let preview_entries = want_preview.then(|| {
+            preview
+                .lock()
+                .map(|b| b.snapshot().entries)
+                .unwrap_or_default()
+        });
+        let preview_slice = preview_entries
+            .as_deref()
+            .filter(|entries| !entries.is_empty());
+        if preview_slice.is_some() {
+            *last_preview = Some(Instant::now());
+        }
         write_progress(
             dir.as_deref(),
             stats.files,
             stats.dirs,
             bytes,
             stats.errors,
+            preview_slice,
             out,
         )?;
         *last = Instant::now();
@@ -223,7 +268,26 @@ fn serve_scan_from_scanner<W: Write>(
     loop {
         match session.recv_timeout(HEARTBEAT_INTERVAL) {
             Ok(ScanEvent::Snapshot(snap)) => match snap.freshness {
-                Freshness::Partial { .. } => {}
+                Freshness::Partial { .. } => {
+                    // If an earlier or interrupted scan already checkpointed
+                    // completed folders in the remote DB, stream that
+                    // approximate tree right away so the user can explore
+                    // while the remaining holes fill in.
+                    if flags.stream_stale
+                        && !streamed_stale
+                        && snap.arena.node(snap.arena.root()).files > 0
+                    {
+                        write_arena(
+                            &snap.arena,
+                            &request.options,
+                            flags.client_dedup,
+                            out,
+                        )?;
+                        write_marker("stale", out)?;
+                        streamed_stale = true;
+                        last_heartbeat = Instant::now();
+                    }
+                }
                 Freshness::Fresh { .. } => {
                     write_arena(
                         &snap.arena,
@@ -279,7 +343,7 @@ fn serve_scan_from_scanner<W: Write>(
                 | ScanEvent::StorageFallback { .. },
             )
             | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                emit_progress(&mut last_heartbeat, out)?;
+                emit_progress(&mut last_heartbeat, &mut last_preview, out)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if streamed_final {

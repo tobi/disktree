@@ -36,6 +36,12 @@ pub type DirStartHook = Arc<dyn Fn(&Path) + Send + Sync>;
 /// `(dir_path, allocated_bytes, apparent_bytes, files)`.
 pub type DirTallyHook = Arc<dyn Fn(&Path, u64, u64, u64) + Send + Sync>;
 
+/// Callback invoked when a complete, uncancelled subtree finishes walking
+/// (used for cadence-based incremental DB checkpointing and live UI updates):
+/// `(dir_path, depth, materialized_arena)`.
+pub type DirCompleteHook =
+    Arc<dyn Fn(PathBuf, usize, Arc<TreeArena>) + Send + Sync>;
+
 /// Callback loading a cached shard by `dir_id` and path.
 pub type ShardLoader =
     Arc<dyn Fn(u64, &Path) -> Option<TreeArena> + Send + Sync>;
@@ -272,6 +278,10 @@ pub struct WalkConfig<'a> {
     /// Optional hook invoked after a directory's direct files are tallied (for
     /// live treemap previews during cold scans).
     pub on_dir_tally: Option<DirTallyHook>,
+    /// Optional hook invoked when a complete `depth == 1` (or large `depth == 2`)
+    /// subtree finishes walking, for incremental checkpointing and live UI
+    /// updates without blocking scan workers.
+    pub on_dir_complete: Option<DirCompleteHook>,
 }
 
 impl std::fmt::Debug for WalkConfig<'_> {
@@ -366,6 +376,7 @@ pub fn walk_parallel(
         skip_oracle: config.skip_oracle,
         on_dir_start: config.on_dir_start,
         on_dir_tally: config.on_dir_tally,
+        on_dir_complete: config.on_dir_complete,
         #[cfg(windows)]
         volume,
         deferred_stale: Mutex::new(Vec::new()),
@@ -590,7 +601,7 @@ fn run_deferred_stale(ctx: &Arc<WalkContext>, sub: &Arc<PendingDir>) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(BuiltChild::Grafted(Box::new(GraftedChild {
                     name: sub.name.clone(),
-                    arena: reused,
+                    arena: Arc::new(reused),
                     hidden: sub.hidden,
                     lossy_name: sub.lossy_name,
                 })));
@@ -615,6 +626,7 @@ struct WalkContext {
     skip_oracle: Option<Arc<dyn SkipOracle>>,
     on_dir_start: Option<DirStartHook>,
     on_dir_tally: Option<DirTallyHook>,
+    on_dir_complete: Option<DirCompleteHook>,
     #[cfg(windows)]
     volume: Option<u32>,
     /// Stale subdirectories (already have cached data) deferred until every
@@ -634,6 +646,9 @@ struct PendingDir {
     hidden: bool,
     lossy_name: bool,
     read_error: AtomicBool,
+    /// Set if this directory or any descendant was cut short by cancellation.
+    /// Incomplete subtrees are never incrementally checkpointed to the DB.
+    incomplete: AtomicBool,
     /// Starts at `1` (the `+1` sentinel for this directory's own scan).
     pending: AtomicUsize,
     children: Mutex<Vec<BuiltChild>>,
@@ -658,6 +673,7 @@ impl PendingDir {
             hidden,
             lossy_name,
             read_error: AtomicBool::new(false),
+            incomplete: AtomicBool::new(false),
             pending: AtomicUsize::new(1),
             children: Mutex::new(Vec::new()),
         }
@@ -672,7 +688,7 @@ pub(crate) enum BuiltChild {
 
 pub(crate) struct GraftedChild {
     pub name: String,
-    pub arena: TreeArena,
+    pub arena: Arc<TreeArena>,
     pub hidden: bool,
     pub lossy_name: bool,
 }
@@ -901,6 +917,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
     }
 
     if ctx.cancel.load(Ordering::Relaxed) {
+        dir.incomplete.store(true, Ordering::Relaxed);
         complete_one(ctx, dir);
         return;
     }
@@ -932,6 +949,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
 
     for entry_res in entries {
         if ctx.cancel.load(Ordering::Relaxed) {
+            dir.incomplete.store(true, Ordering::Relaxed);
             break;
         }
         let entry = match entry_res {
@@ -1089,7 +1107,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
                 local_children.push(BuiltChild::Grafted(Box::new(
                     GraftedChild {
                         name,
-                        arena: reused,
+                        arena: Arc::new(reused),
                         hidden,
                         lossy_name,
                     },
@@ -1225,6 +1243,7 @@ fn complete_one(ctx: &WalkContext, start: &Arc<PendingDir>) {
         if current.pending.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
+        let incomplete = current.incomplete.load(Ordering::Relaxed);
         let children = std::mem::take(
             &mut *current
                 .children
@@ -1240,11 +1259,37 @@ fn complete_one(ctx: &WalkContext, start: &Arc<PendingDir>) {
             children,
         };
         if let Some(parent) = current.parent.as_ref().map(Arc::clone) {
+            if incomplete {
+                parent.incomplete.store(true, Ordering::Relaxed);
+            }
+            let child = if !incomplete
+                && !ctx.cancel.load(Ordering::Relaxed)
+                && let Some(hook) = &ctx.on_dir_complete
+                && should_checkpoint_dir(current.depth, &built)
+            {
+                let scanned_at = unix_now();
+                let mut arena =
+                    materialize_arena(current.path.clone(), built, scanned_at);
+                arena.aggregate(
+                    ctx.options.dedup_hardlinks,
+                    ctx.options.include_hidden,
+                );
+                let arena = Arc::new(arena);
+                hook(current.path.clone(), current.depth, Arc::clone(&arena));
+                BuiltChild::Grafted(Box::new(GraftedChild {
+                    name: current.name.clone(),
+                    arena,
+                    hidden: current.hidden,
+                    lossy_name: current.lossy_name,
+                }))
+            } else {
+                BuiltChild::Dir(Box::new(built))
+            };
             parent
                 .children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(BuiltChild::Dir(Box::new(built)));
+                .push(child);
             current = parent;
         } else {
             *ctx.finished_root
@@ -1254,6 +1299,43 @@ fn complete_one(ctx: &WalkContext, start: &Arc<PendingDir>) {
             return;
         }
     }
+}
+
+/// Minimum node count before a `depth == 2` directory is checkpointed
+/// independently (every `depth == 1` directory is always eligible).
+const DEPTH2_CHECKPOINT_THRESHOLD: usize = 512;
+
+fn should_checkpoint_dir(depth: usize, built: &BuiltNode) -> bool {
+    match depth {
+        1 => true,
+        2 => subtree_has_at_least(built, DEPTH2_CHECKPOINT_THRESHOLD),
+        _ => false,
+    }
+}
+
+fn subtree_has_at_least(root: &BuiltNode, threshold: usize) -> bool {
+    let mut count = 0usize;
+    let mut stack: Vec<&BuiltNode> = vec![root];
+    while let Some(node) = stack.pop() {
+        for child in &node.children {
+            match child {
+                BuiltChild::Leaf(_) => {
+                    count += 1;
+                }
+                BuiltChild::Dir(dir) => {
+                    count += 1;
+                    stack.push(dir);
+                }
+                BuiltChild::Grafted(grafted) => {
+                    count = count.saturating_add(grafted.arena.len());
+                }
+            }
+            if count >= threshold {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Convert the completed parallel tree into a flat [`TreeArena`] in one
@@ -1592,6 +1674,7 @@ mod tests {
                 skip_oracle: Some(oracle),
                 on_dir_start: Some(on_dir_start),
                 on_dir_tally: None,
+                on_dir_complete: None,
             },
         )
         .expect("walk");

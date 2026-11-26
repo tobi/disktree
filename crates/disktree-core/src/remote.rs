@@ -230,6 +230,7 @@ struct Control {
     dirs: Option<u64>,
     bytes: Option<u64>,
     errors: Option<u64>,
+    preview: Option<Vec<crate::scan_preview::Entry>>,
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -340,13 +341,15 @@ pub fn write_header(
     out.flush()
 }
 
-/// Emit a live progress heartbeat line during a remote parallel scan.
+/// Emit a live progress heartbeat (with optional bounded top-level treemap
+/// preview buckets) during a remote parallel scan.
 pub fn write_progress(
     dir: Option<&Path>,
     files: u64,
     dirs: u64,
     bytes: u64,
     errors: u64,
+    preview: Option<&[crate::scan_preview::Entry]>,
     out: &mut impl Write,
 ) -> io::Result<()> {
     #[derive(Serialize)]
@@ -357,6 +360,8 @@ pub fn write_progress(
         dirs: u64,
         bytes: u64,
         errors: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<&'a [crate::scan_preview::Entry]>,
     }
     send(
         out,
@@ -366,6 +371,7 @@ pub fn write_progress(
             dirs,
             bytes,
             errors,
+            preview,
         },
     )?;
     out.flush()
@@ -673,6 +679,7 @@ fn read_snapshot_with_progress(
                 || control.files.is_some()
                 || control.dirs.is_some()
                 || control.bytes.is_some()
+                || control.preview.is_some()
             {
                 if let Some(directory) = control.directory {
                     progress.directory = Some(directory);
@@ -688,6 +695,15 @@ fn read_snapshot_with_progress(
                 }
                 if let Some(errors) = control.errors {
                     progress.errors = errors;
+                }
+                if let Some(entries) = control.preview
+                    && !entries.is_empty()
+                {
+                    progress.preview =
+                        Some(Arc::new(crate::scan_preview::Preview {
+                            entries,
+                            directory: progress.directory.clone(),
+                        }));
                 }
                 progress.updated = Some(Instant::now());
                 *shared.lock().expect("remote progress lock") =

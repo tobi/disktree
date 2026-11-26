@@ -1,15 +1,16 @@
 //! Bounded, non-actionable overview; never a replacement filesystem tree.
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 
 /// A measured contribution, not the total size of an unfinished directory.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Entry {
     pub name: String,
     pub bytes: u64,
     pub files: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Preview {
     pub entries: Vec<Entry>,
     pub directory: Option<std::path::PathBuf>,
@@ -18,14 +19,14 @@ pub struct Preview {
 /// Keep top-level arrival order, rather than re-ranking the view every tick.
 /// Extra names share one overflow bucket; no tree or per-file copy is kept.
 #[derive(Debug, Default)]
-pub(crate) struct Builder {
+pub struct Builder {
     index: FxHashMap<String, usize>,
     entries: Vec<Entry>,
     directory: Option<std::path::PathBuf>,
 }
 
 impl Builder {
-    pub(crate) fn add(&mut self, name: Option<&str>, bytes: u64, files: u64) {
+    pub fn add(&mut self, name: Option<&str>, bytes: u64, files: u64) {
         const LIMIT: usize = 128;
         let key = name.unwrap_or("");
         let index = if let Some(index) = self.index.get(key) {
@@ -52,11 +53,12 @@ impl Builder {
         entry.files = entry.files.saturating_add(files);
     }
 
-    pub(crate) fn directory(&mut self, path: &std::path::Path) {
+    pub fn directory(&mut self, path: &std::path::Path) {
         path.clone_into(self.directory.get_or_insert_default());
     }
 
-    pub(crate) fn snapshot(&self) -> Preview {
+    #[must_use]
+    pub fn snapshot(&self) -> Preview {
         Preview {
             entries: self.entries.clone(),
             directory: self.directory.clone(),

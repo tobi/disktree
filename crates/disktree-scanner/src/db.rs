@@ -247,12 +247,35 @@ impl CacheDb {
         options: &ScanOptions,
         scanned_at: u64,
     ) -> Result<(), FallbackReason> {
+        self.store_subtrees_batch(host, &[arena], options, scanned_at)
+    }
+
+    /// Persist a batch of completed subtrees inside a single `redb` write
+    /// transaction (used for cadence-based incremental checkpointing during
+    /// long walks so interrupted scans resume from already-finished folders).
+    #[cfg(feature = "cache-db")]
+    pub fn store_subtrees_batch(
+        &self,
+        host: &HostKey,
+        arenas: &[&TreeArena],
+        options: &ScanOptions,
+        scanned_at: u64,
+    ) -> Result<(), FallbackReason> {
+        if arenas.is_empty() {
+            return Ok(());
+        }
         check_cache_headroom(&self.path, self.min_free_headroom)?;
 
         let host_key = host.as_db_key();
-        let canonical_root = normalize_path(arena.root_path());
-        let counts = arena.subtree_counts();
-        let shard_nodes = choose_shard_roots(arena, &counts);
+        let planned: Vec<(String, Vec<NodeId>, &TreeArena)> = arenas
+            .iter()
+            .map(|&arena| {
+                let canonical_root = normalize_path(arena.root_path());
+                let counts = arena.subtree_counts();
+                let shard_nodes = choose_shard_roots(arena, &counts);
+                (canonical_root, shard_nodes, arena)
+            })
+            .collect();
 
         let txn = self
             .db
@@ -280,70 +303,12 @@ impl CacheDb {
 
             let mut next_id = read_next_id(&meta)?;
 
-            // Upsert host record.
+            // Upsert host record once per batch transaction.
             let host_record = make_host_record(host, &host_key, scanned_at);
             let host_bytes = encode_framed(&host_record);
             hosts
                 .insert(host_key.as_str(), host_bytes.as_slice())
                 .map_err(|e| classify_redb_error(&e.into()))?;
-
-            // Ensure ancestor chain exists from filesystem root down to
-            // `canonical_root`.
-            let root_dir_id = ensure_ancestor_chain(
-                &host_key,
-                &canonical_root,
-                &mut next_id,
-                &mut path_to_dir,
-                &mut dir_index,
-                &mut dir_children,
-            )?;
-
-            // Remove old descendants and old chunk(s) under `root_dir_id` so
-            // deleted directories never linger as ghost shards.
-            purge_descendants(
-                &host_key,
-                root_dir_id,
-                &mut path_to_dir,
-                &mut dir_index,
-                &mut dir_children,
-                &mut chunks,
-            )?;
-
-            // Allocate deterministic dir_ids and chunk_ids for every shard
-            // root in this arena.
-            let mut node_to_dir_id: FxHashMap<NodeId, u64> =
-                FxHashMap::default();
-            let mut node_to_chunk_id: FxHashMap<NodeId, u64> =
-                FxHashMap::default();
-            node_to_dir_id.insert(arena.root(), root_dir_id);
-            node_to_chunk_id.insert(arena.root(), alloc_id(&mut next_id));
-
-            for &shard_node in &shard_nodes {
-                if shard_node == arena.root() {
-                    continue;
-                }
-                let shard_path = normalize_path(&arena.path_of(shard_node));
-                let dir_id = if let Some(existing) = path_to_dir
-                    .get((host_key.as_str(), shard_path.as_str()))
-                    .map_err(|e| classify_redb_error(&e.into()))?
-                    .map(|v| v.value())
-                {
-                    existing
-                } else {
-                    alloc_id(&mut next_id)
-                };
-                node_to_dir_id.insert(shard_node, dir_id);
-                node_to_chunk_id.insert(shard_node, alloc_id(&mut next_id));
-            }
-
-            // Determine parent dir_id for each shard root (linking through
-            // nearest ancestor shard root, creating intermediate stubs if
-            // needed so whole-FS navigation works cleanly).
-            let root_parent_id = dir_index
-                .get((host_key.as_str(), root_dir_id))
-                .map_err(|e| classify_redb_error(&e.into()))?
-                .and_then(|v| decode_framed::<DirIndexEntry>(v.value()).ok())
-                .map_or(0, |entry| entry.parent_id);
 
             let coverage = if options.max_depth.is_some() {
                 Coverage::Shallow as u32
@@ -354,80 +319,148 @@ impl CacheDb {
                 .max_depth
                 .map_or(0, |d| d.min(u32::MAX as usize) as u32);
 
-            for &shard_node in &shard_nodes {
-                let dir_id = node_to_dir_id[&shard_node];
-                let chunk_id = node_to_chunk_id[&shard_node];
-                let shard_path = normalize_path(&arena.path_of(shard_node));
+            for (canonical_root, shard_nodes, arena) in planned {
+                // Ensure ancestor chain exists from filesystem root down to
+                // `canonical_root`.
+                let root_dir_id = ensure_ancestor_chain(
+                    &host_key,
+                    &canonical_root,
+                    &mut next_id,
+                    &mut path_to_dir,
+                    &mut dir_index,
+                    &mut dir_children,
+                )?;
 
-                let parent_dir_id = if shard_node == arena.root() {
-                    root_parent_id
-                } else {
-                    let parent_path = parent_normalized_path(&shard_path);
-                    match parent_path {
-                        Some(p) => ensure_ancestor_chain(
-                            &host_key,
-                            &p,
-                            &mut next_id,
-                            &mut path_to_dir,
-                            &mut dir_index,
-                            &mut dir_children,
-                        )?,
-                        None => 0,
+                // Remove old descendants and old chunk(s) under `root_dir_id`
+                // so deleted directories never linger as ghost shards.
+                purge_descendants(
+                    &host_key,
+                    root_dir_id,
+                    &mut path_to_dir,
+                    &mut dir_index,
+                    &mut dir_children,
+                    &mut chunks,
+                )?;
+
+                // Allocate deterministic dir_ids and chunk_ids for every shard
+                // root in this arena.
+                let mut node_to_dir_id: FxHashMap<NodeId, u64> =
+                    FxHashMap::default();
+                let mut node_to_chunk_id: FxHashMap<NodeId, u64> =
+                    FxHashMap::default();
+                node_to_dir_id.insert(arena.root(), root_dir_id);
+                node_to_chunk_id.insert(arena.root(), alloc_id(&mut next_id));
+
+                for &shard_node in &shard_nodes {
+                    if shard_node == arena.root() {
+                        continue;
                     }
-                };
+                    let shard_path = normalize_path(&arena.path_of(shard_node));
+                    let dir_id = if let Some(existing) = path_to_dir
+                        .get((host_key.as_str(), shard_path.as_str()))
+                        .map_err(|e| classify_redb_error(&e.into()))?
+                        .map(|v| v.value())
+                    {
+                        existing
+                    } else {
+                        alloc_id(&mut next_id)
+                    };
+                    node_to_dir_id.insert(shard_node, dir_id);
+                    node_to_chunk_id.insert(shard_node, alloc_id(&mut next_id));
+                }
 
-                // Encode chunk stopping at nested shard roots.
-                let chunk = encode_subtree_chunk(
-                    arena,
-                    shard_node,
-                    chunk_id,
-                    dir_id,
-                    scanned_at,
-                    &node_to_dir_id,
-                );
-                let chunk_bytes = encode_framed(&chunk);
-                chunks
-                    .insert(
-                        (host_key.as_str(), chunk_id),
-                        chunk_bytes.as_slice(),
-                    )
-                    .map_err(|e| classify_redb_error(&e.into()))?;
+                let root_parent_id = dir_index
+                    .get((host_key.as_str(), root_dir_id))
+                    .map_err(|e| classify_redb_error(&e.into()))?
+                    .and_then(|v| {
+                        decode_framed::<DirIndexEntry>(v.value()).ok()
+                    })
+                    .map_or(0, |entry| entry.parent_id);
 
-                let node = arena.node(shard_node);
-                let dir_ts = if node.scanned_at > 0 {
-                    node.scanned_at
-                } else {
-                    scanned_at
-                };
-                let entry = DirIndexEntry {
-                    dir_id,
-                    parent_id: parent_dir_id,
-                    name: leaf_name(&shard_path).to_owned(),
-                    scanned_at_unix: dir_ts,
-                    coverage,
-                    scanned_max_depth: max_depth_u32,
-                    options_mask: options.cache_topology_mask(),
-                    mount_dev: 0,
-                    dir_mtime: node.modified,
-                    chunk_id,
-                    allocated_bytes: node.allocated_bytes,
-                    apparent_bytes: node.apparent_bytes,
-                    files: node.files,
-                    dirs: node.dirs,
-                    newest_mtime: node.modified,
-                };
-                let entry_bytes = encode_framed(&entry);
+                for &shard_node in &shard_nodes {
+                    let dir_id = node_to_dir_id[&shard_node];
+                    let chunk_id = node_to_chunk_id[&shard_node];
+                    let shard_path = normalize_path(&arena.path_of(shard_node));
 
-                path_to_dir
-                    .insert((host_key.as_str(), shard_path.as_str()), dir_id)
-                    .map_err(|e| classify_redb_error(&e.into()))?;
-                dir_index
-                    .insert((host_key.as_str(), dir_id), entry_bytes.as_slice())
-                    .map_err(|e| classify_redb_error(&e.into()))?;
-                if parent_dir_id != 0 {
-                    dir_children
-                        .insert((host_key.as_str(), parent_dir_id, dir_id), ())
+                    let parent_dir_id = if shard_node == arena.root() {
+                        root_parent_id
+                    } else {
+                        let parent_path = parent_normalized_path(&shard_path);
+                        match parent_path {
+                            Some(p) => ensure_ancestor_chain(
+                                &host_key,
+                                &p,
+                                &mut next_id,
+                                &mut path_to_dir,
+                                &mut dir_index,
+                                &mut dir_children,
+                            )?,
+                            None => 0,
+                        }
+                    };
+
+                    // Encode chunk stopping at nested shard roots.
+                    let chunk = encode_subtree_chunk(
+                        arena,
+                        shard_node,
+                        chunk_id,
+                        dir_id,
+                        scanned_at,
+                        &node_to_dir_id,
+                    );
+                    let chunk_bytes = encode_framed(&chunk);
+                    chunks
+                        .insert(
+                            (host_key.as_str(), chunk_id),
+                            chunk_bytes.as_slice(),
+                        )
                         .map_err(|e| classify_redb_error(&e.into()))?;
+
+                    let node = arena.node(shard_node);
+                    let dir_ts = if node.scanned_at > 0 {
+                        node.scanned_at
+                    } else {
+                        scanned_at
+                    };
+                    let entry = DirIndexEntry {
+                        dir_id,
+                        parent_id: parent_dir_id,
+                        name: leaf_name(&shard_path).to_owned(),
+                        scanned_at_unix: dir_ts,
+                        coverage,
+                        scanned_max_depth: max_depth_u32,
+                        options_mask: options.cache_topology_mask(),
+                        mount_dev: 0,
+                        dir_mtime: node.modified,
+                        chunk_id,
+                        allocated_bytes: node.allocated_bytes,
+                        apparent_bytes: node.apparent_bytes,
+                        files: node.files,
+                        dirs: node.dirs,
+                        newest_mtime: node.modified,
+                    };
+                    let entry_bytes = encode_framed(&entry);
+
+                    path_to_dir
+                        .insert(
+                            (host_key.as_str(), shard_path.as_str()),
+                            dir_id,
+                        )
+                        .map_err(|e| classify_redb_error(&e.into()))?;
+                    dir_index
+                        .insert(
+                            (host_key.as_str(), dir_id),
+                            entry_bytes.as_slice(),
+                        )
+                        .map_err(|e| classify_redb_error(&e.into()))?;
+                    if parent_dir_id != 0 {
+                        dir_children
+                            .insert(
+                                (host_key.as_str(), parent_dir_id, dir_id),
+                                (),
+                            )
+                            .map_err(|e| classify_redb_error(&e.into()))?;
+                    }
                 }
             }
 
@@ -444,6 +477,19 @@ impl CacheDb {
         &self,
         _host: &HostKey,
         _arena: &TreeArena,
+        _options: &ScanOptions,
+        _scanned_at: u64,
+    ) -> Result<(), FallbackReason> {
+        Err(FallbackReason::DatabaseUnavailable {
+            detail: "compiled without cache-db feature".to_owned(),
+        })
+    }
+
+    #[cfg(not(feature = "cache-db"))]
+    pub fn store_subtrees_batch(
+        &self,
+        _host: &HostKey,
+        _arenas: &[&TreeArena],
         _options: &ScanOptions,
         _scanned_at: u64,
     ) -> Result<(), FallbackReason> {

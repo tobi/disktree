@@ -368,6 +368,7 @@ impl ScanHandle {
                         skip_oracle,
                         on_dir_start: None,
                         on_dir_tally: Some(on_dir_tally),
+                        on_dir_complete: None,
                     },
                 )
                 .map(|walk| walk.arena);
@@ -701,6 +702,7 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
             skip_oracle: None,
             on_dir_start: None,
             on_dir_tally: None,
+            on_dir_complete: None,
         },
     )?;
     Ok(arena_to_node(
@@ -1079,6 +1081,7 @@ mod tests {
                     skip_oracle: None,
                     on_dir_start: None,
                     on_dir_tally: None,
+                    on_dir_complete: None,
                 },
             )
             .expect("inner")

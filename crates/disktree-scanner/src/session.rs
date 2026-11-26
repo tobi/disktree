@@ -23,9 +23,15 @@ use crate::types::{
     HostKey, Priority, ScanOptions, ScanStats, StorageMode, unix_now,
 };
 use crate::walk::{
-    DirStartHook, DirTallyHook, MapSkipOracle, PauseGate, ShardLoader,
-    SkipOracle, WalkConfig, WalkProgress, walk_parallel,
+    DirCompleteHook, DirStartHook, DirTallyHook, MapSkipOracle, PauseGate,
+    ShardLoader, SkipOracle, WalkConfig, WalkProgress, walk_parallel,
 };
+
+/// How often completed subtrees are flushed to `scan-cache.redb` in one
+/// batched write transaction during a background walk.
+const CHECKPOINT_CADENCE: Duration = Duration::from_secs(4);
+/// Maximum queued completed subtrees before forcing an immediate batch flush.
+const CHECKPOINT_MAX_BATCH: usize = 32;
 
 /// A tree snapshot emitted by a [`ScanSession`].
 #[derive(Clone, Debug)]
@@ -1026,7 +1032,39 @@ fn run_background_walk(
         }
     });
 
-    let outcome = match walk_parallel(
+    // Spawn a dedicated non-blocking checkpoint writer thread so scan workers
+    // never stall on DB fsyncs while completed depth-1 and large depth-2
+    // subtrees are committed on a cadence (4 s / 32 subtrees). If the walk is
+    // cancelled or disconnected midway, everything already completed is safely
+    // in `scan-cache.redb` and skipped on the next resume.
+    let (cp_tx, cp_rx) = mpsc::channel::<(PathBuf, usize, Arc<TreeArena>)>();
+    let checkpoint_worker = {
+        let storage = Arc::clone(storage);
+        let host = host.clone();
+        let options = *options;
+        let event_tx = event_tx.clone();
+        thread::Builder::new()
+            .name("disktree-checkpoint".into())
+            .spawn(move || {
+                run_checkpoint_writer(
+                    &cp_rx, &storage, &host, &options, &event_tx,
+                );
+            })
+            .ok()
+    };
+    let on_dir_complete: Option<DirCompleteHook> =
+        checkpoint_worker.as_ref().map(|_| {
+            let tx = cp_tx.clone();
+            let hook: DirCompleteHook = Arc::new(
+                move |path: PathBuf, depth: usize, arena: Arc<TreeArena>| {
+                    let _ = tx.send((path, depth, arena));
+                },
+            );
+            hook
+        });
+    drop(cp_tx);
+
+    let outcome = walk_parallel(
         walk_root,
         WalkConfig {
             options,
@@ -1036,8 +1074,18 @@ fn run_background_walk(
             skip_oracle: Some(oracle),
             on_dir_start: Some(on_dir_start),
             on_dir_tally,
+            on_dir_complete,
         },
-    ) {
+    );
+
+    // Join the checkpoint writer BEFORE final root persistence (or exit on
+    // cancel) so any completed subtrees queued so far are durably flushed and
+    // there is no redb write-lock contention with the final root commit.
+    if let Some(handle) = checkpoint_worker {
+        let _ = handle.join();
+    }
+
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = event_tx.send(ScanEvent::Error {
@@ -1124,6 +1172,7 @@ fn run_priority_loop(
                             skip_oracle: None,
                             on_dir_start: None,
                             on_dir_tally: None,
+                            on_dir_complete: None,
                         },
                     );
 
@@ -1165,6 +1214,91 @@ fn run_priority_loop(
                         pause_gate.resume();
                     }
                 }
+            }
+        }
+    }
+}
+
+fn run_checkpoint_writer(
+    rx: &Receiver<(PathBuf, usize, Arc<TreeArena>)>,
+    storage: &Arc<Mutex<StorageState>>,
+    host: &HostKey,
+    options: &ScanOptions,
+    event_tx: &Sender<ScanEvent>,
+) {
+    let mut pending: Vec<(PathBuf, usize, Arc<TreeArena>)> = Vec::new();
+    let mut last_flush = Instant::now();
+
+    let flush = |pending: &mut Vec<(PathBuf, usize, Arc<TreeArena>)>| {
+        if pending.is_empty() {
+            return;
+        }
+        let now = unix_now();
+        let db_opt = {
+            let mut guard = storage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cache) = guard.mem_cache_mut() {
+                for (path, _, arena) in pending.iter() {
+                    cache.insert(
+                        (host.as_db_key(), path.clone()),
+                        (Arc::clone(arena), now, options.cache_topology_mask()),
+                    );
+                }
+            }
+            guard.db()
+        };
+        if let Some(db) = db_opt {
+            let refs: Vec<&TreeArena> =
+                pending.iter().map(|(_, _, a)| a.as_ref()).collect();
+            if let Err(reason) =
+                db.store_subtrees_batch(host, &refs, options, now)
+            {
+                let from = downgrade_storage(storage, reason.clone());
+                let _ = event_tx.send(ScanEvent::StorageFallback {
+                    from,
+                    to: ActiveStorageMode::InMemory,
+                    reason,
+                });
+            }
+        }
+        for (path, depth, arena) in pending.drain(..) {
+            if depth == 1 {
+                let _ = event_tx.send(ScanEvent::SubtreeRefreshed {
+                    path,
+                    arena,
+                    priority: Priority::Background,
+                    scanned_at: now,
+                });
+            }
+        }
+    };
+
+    loop {
+        let wait = if pending.is_empty() {
+            CHECKPOINT_CADENCE
+        } else {
+            CHECKPOINT_CADENCE.saturating_sub(last_flush.elapsed())
+        };
+        match rx.recv_timeout(wait) {
+            Ok(item) => {
+                pending.push(item);
+                if pending.len() >= CHECKPOINT_MAX_BATCH
+                    || last_flush.elapsed() >= CHECKPOINT_CADENCE
+                {
+                    flush(&mut pending);
+                    last_flush = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !pending.is_empty() {
+                    flush(&mut pending);
+                    last_flush = Instant::now();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                flush(&mut pending);
+                return;
             }
         }
     }
@@ -1575,5 +1709,76 @@ mod tests {
             .scan_blocking(&root, ScanOptions::default(), policy, false)
             .expect("second");
         assert_eq!(second.stats.apparent_bytes, 0);
+    }
+
+    #[test]
+    fn incremental_checkpoint_resumes_by_skipping_completed_subtrees() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("checkpoint.redb");
+        let root = temp.path().join("root");
+        let alpha = root.join("alpha");
+        let beta = root.join("beta");
+        fs::create_dir_all(&alpha).expect("mkdir alpha");
+        fs::create_dir_all(&beta).expect("mkdir beta");
+        fs::write(alpha.join("a.bin"), vec![1u8; 200]).expect("write a");
+        fs::write(beta.join("b.bin"), vec![2u8; 300]).expect("write b");
+
+        let policy = CachePolicy {
+            min_free_headroom: 0,
+            ..CachePolicy::default()
+        };
+        let scanner = Scanner::new(
+            StorageMode::Persistent {
+                path: db_path,
+                strict: true,
+            },
+            policy,
+        )
+        .expect("scanner");
+
+        // Checkpoint ONLY `alpha` (as happens when a long walk is interrupted
+        // after `alpha` finished and flushed to the DB, while `beta` is still
+        // an unscanned hole).
+        let _ = scanner
+            .scan_blocking(&alpha, ScanOptions::default(), policy, false)
+            .expect("checkpoint alpha");
+
+        // Opening the parent `root` should emit a Partial cached snapshot
+        // containing `alpha`, skip re-walking `alpha`, walk the unscanned hole
+        // `beta`, and emit the complete Live snapshot with both.
+        let session = scanner
+            .open_with(HostKey::Local, root, ScanOptions::default(), policy)
+            .expect("open root");
+
+        let mut saw_partial = false;
+        let mut live_snap = None;
+        while let Ok(ev) = session.recv_timeout(Duration::from_secs(5)) {
+            match ev {
+                ScanEvent::Snapshot(snap) => match snap.freshness {
+                    Freshness::Partial { .. } => {
+                        assert_eq!(
+                            snap.arena.node(snap.arena.root()).apparent_bytes,
+                            200
+                        );
+                        saw_partial = true;
+                    }
+                    Freshness::Live { .. } => {
+                        live_snap = Some(snap);
+                    }
+                    Freshness::Fresh { .. } | Freshness::Stale { .. } => {}
+                },
+                ScanEvent::Finished => break,
+                _ => {}
+            }
+        }
+        assert!(saw_partial, "partial checkpoint should surface immediately");
+        let live = live_snap.expect("live snapshot");
+        assert!(
+            live.stats.skipped_fresh_dirs >= 1,
+            "completed checkpoint `alpha` should be skipped on resume, stats: {:?}",
+            live.stats
+        );
+        assert_eq!(live.stats.apparent_bytes, 500);
+        assert_eq!(live.stats.files, 2);
     }
 }
