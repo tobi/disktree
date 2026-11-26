@@ -588,12 +588,12 @@ fn run_deferred_stale(ctx: &Arc<WalkContext>, sub: &Arc<PendingDir>) {
                 .children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(BuiltChild::Grafted {
+                .push(BuiltChild::Grafted(Box::new(GraftedChild {
                     name: sub.name.clone(),
                     arena: reused,
                     hidden: sub.hidden,
                     lossy_name: sub.lossy_name,
-                });
+                })));
             complete_one(ctx, parent);
         }
         return;
@@ -666,24 +666,26 @@ impl PendingDir {
 
 pub(crate) enum BuiltChild {
     Leaf(LeafRecord),
-    Dir(BuiltNode),
-    Grafted {
-        name: String,
-        arena: TreeArena,
-        hidden: bool,
-        lossy_name: bool,
-    },
+    Dir(Box<BuiltNode>),
+    Grafted(Box<GraftedChild>),
+}
+
+pub(crate) struct GraftedChild {
+    pub name: String,
+    pub arena: TreeArena,
+    pub hidden: bool,
+    pub lossy_name: bool,
 }
 
 pub(crate) struct LeafRecord {
-    pub name: String,
+    pub name: Box<str>,
     pub kind: NodeKind,
     pub allocated_bytes: u64,
     pub apparent_bytes: u64,
     pub modified: i64,
     pub hidden: bool,
     pub lossy_name: bool,
-    pub hardlink: Option<(u64, u64)>,
+    pub hardlink: Option<Box<(u64, u64)>>,
 }
 
 pub(crate) struct BuiltNode {
@@ -957,7 +959,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
                     local_alloc = local_alloc.saturating_add(alloc);
                     local_apparent = local_apparent.saturating_add(apparent);
                     local_children.push(BuiltChild::Leaf(LeafRecord {
-                        name,
+                        name: name.into_boxed_str(),
                         kind: NodeKind::Symlink,
                         allocated_bytes: alloc,
                         apparent_bytes: apparent,
@@ -1026,7 +1028,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
             local_alloc = local_alloc.saturating_add(alloc);
             local_apparent = local_apparent.saturating_add(apparent);
             local_children.push(BuiltChild::Leaf(LeafRecord {
-                name,
+                name: name.into_boxed_str(),
                 kind: if meta.is_file() {
                     NodeKind::File
                 } else {
@@ -1037,7 +1039,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
                 modified: modified_seconds(&meta),
                 hidden,
                 lossy_name,
-                hardlink: inode_of(&meta),
+                hardlink: inode_of(&meta).map(Box::new),
             }));
             continue;
         }
@@ -1084,12 +1086,14 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
                         reused_root.files,
                     );
                 }
-                local_children.push(BuiltChild::Grafted {
-                    name,
-                    arena: reused,
-                    hidden,
-                    lossy_name,
-                });
+                local_children.push(BuiltChild::Grafted(Box::new(
+                    GraftedChild {
+                        name,
+                        arena: reused,
+                        hidden,
+                        lossy_name,
+                    },
+                )));
                 continue;
             }
 
@@ -1151,7 +1155,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
         local_alloc = local_alloc.saturating_add(alloc);
         local_apparent = local_apparent.saturating_add(apparent);
         local_children.push(BuiltChild::Leaf(LeafRecord {
-            name,
+            name: name.into_boxed_str(),
             kind,
             allocated_bytes: alloc,
             apparent_bytes: apparent,
@@ -1160,7 +1164,8 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
             lossy_name,
             hardlink: (kind == NodeKind::File)
                 .then_some(facts.hardlink)
-                .flatten(),
+                .flatten()
+                .map(Box::new),
         }));
     }
 
@@ -1239,7 +1244,7 @@ fn complete_one(ctx: &WalkContext, start: &Arc<PendingDir>) {
                 .children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(BuiltChild::Dir(built));
+                .push(BuiltChild::Dir(Box::new(built)));
             current = parent;
         } else {
             *ctx.finished_root
@@ -1287,11 +1292,13 @@ fn materialize_arena(
                         leaf.modified,
                         flags,
                     );
-                    if let Some((dev, ino)) = leaf.hardlink {
+                    if let Some(link) = leaf.hardlink {
+                        let (dev, ino) = *link;
                         arena.record_hardlink(id, dev, ino);
                     }
                 }
                 BuiltChild::Dir(dir) => {
+                    let dir = *dir;
                     let mut flags = NodeFlags::new(NodeKind::Directory);
                     flags.set(NodeFlags::READ_ERROR, dir.read_error);
                     flags.set(NodeFlags::HIDDEN, dir.hidden);
@@ -1312,12 +1319,13 @@ fn materialize_arena(
                         stack.push((id, dir.children));
                     }
                 }
-                BuiltChild::Grafted {
-                    name,
-                    arena: sub_arena,
-                    hidden,
-                    lossy_name,
-                } => {
+                BuiltChild::Grafted(grafted) => {
+                    let GraftedChild {
+                        name,
+                        arena: sub_arena,
+                        hidden,
+                        lossy_name,
+                    } = *grafted;
                     let grafted_id =
                         arena.graft_subtree(parent_id, &sub_arena, Some(&name));
                     let node = arena.node_mut(grafted_id);
@@ -1611,5 +1619,14 @@ mod tests {
         );
         assert_eq!(outcome.stats.apparent_bytes, 16);
         assert_eq!(outcome.stats.files, 4);
+    }
+
+    #[test]
+    fn built_child_stays_compact() {
+        assert!(
+            std::mem::size_of::<BuiltChild>() <= 64,
+            "BuiltChild is paid per scanned file and grew to {} bytes",
+            std::mem::size_of::<BuiltChild>()
+        );
     }
 }

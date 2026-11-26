@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use disktree_core::remote::{
     Operation, Request, SessionRequest, write_arena, write_header,
-    write_heartbeat, write_marker,
+    write_marker, write_progress,
 };
 use disktree_scanner::{
     CachePolicy, Freshness, HostKey, ScanEvent, Scanner, StorageMode,
@@ -168,12 +168,12 @@ struct StreamFlags {
     force_refresh: bool,
 }
 
-fn serve_scan_from_scanner(
+fn serve_scan_from_scanner<W: Write>(
     scanner: &Scanner,
     root: PathBuf,
     request: &Request,
     flags: StreamFlags,
-    out: &mut impl Write,
+    out: &mut W,
 ) -> io::Result<()> {
     let policy = CachePolicy {
         force_refresh: flags.force_refresh,
@@ -190,6 +190,35 @@ fn serve_scan_from_scanner(
     let mut last_heartbeat = Instant::now();
     let mut streamed_final = false;
     let mut streamed_stale = false;
+    let apparent = request.options.apparent_size;
+
+    let emit_progress = |last: &mut Instant, out: &mut W| -> io::Result<()> {
+        if !flags.live_progress || last.elapsed() < HEARTBEAT_INTERVAL {
+            return Ok(());
+        }
+        let p = session.progress();
+        let stats = p.snapshot(0);
+        let dir = p
+            .active_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let bytes = if apparent {
+            stats.apparent_bytes
+        } else {
+            stats.allocated_bytes
+        };
+        write_progress(
+            dir.as_deref(),
+            stats.files,
+            stats.dirs,
+            bytes,
+            stats.errors,
+            out,
+        )?;
+        *last = Instant::now();
+        Ok(())
+    };
 
     loop {
         match session.recv_timeout(HEARTBEAT_INTERVAL) {
@@ -248,22 +277,9 @@ fn serve_scan_from_scanner(
                 | ScanEvent::SubtreeRefreshed { .. }
                 | ScanEvent::Progress { .. }
                 | ScanEvent::StorageFallback { .. },
-            ) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if flags.live_progress
-                    && last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL
-                {
-                    let dir = session
-                        .progress()
-                        .active_path
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    if let Some(dir) = dir {
-                        write_heartbeat(&dir, out)?;
-                    }
-                    last_heartbeat = Instant::now();
-                }
+            )
+            | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                emit_progress(&mut last_heartbeat, out)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if streamed_final {
@@ -279,14 +295,22 @@ fn serve_scan_from_scanner(
 }
 
 /// Kernel-enforced, not a sampled RSS check that can miss an allocation
-/// burst. Keep this in the helper: never constrain the desktop process.
+/// burst. Scales with host RAM (`total / 4`, clamped to 4..=32 GiB) so large
+/// multi-million-file dev boxes never abort at 1 GiB while runaway allocations
+/// still cannot exhaust the host.
 #[cfg(target_os = "linux")]
 fn limit_resources() -> io::Result<()> {
     use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
-    const MAX_ADDRESS_SPACE: u64 = 1 << 30;
+    const MIN_ADDRESS_SPACE: u64 = 4 << 30;
+    const DEFAULT_ADDRESS_SPACE: u64 = 8 << 30;
+    const MAX_ADDRESS_SPACE: u64 = 32 << 30;
+
+    let cap = linux_total_ram_bytes().map_or(DEFAULT_ADDRESS_SPACE, |total| {
+        (total / 4).clamp(MIN_ADDRESS_SPACE, MAX_ADDRESS_SPACE)
+    });
     let inherited = getrlimit(Resource::As);
-    let maximum = inherited.maximum.unwrap_or(u64::MAX).min(MAX_ADDRESS_SPACE);
+    let maximum = inherited.maximum.unwrap_or(u64::MAX).min(cap);
     let current = inherited.current.unwrap_or(u64::MAX).min(maximum);
     setrlimit(
         Resource::As,
@@ -304,6 +328,14 @@ fn limit_resources() -> io::Result<()> {
         },
     )?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_total_ram_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
 }
 
 #[cfg(not(target_os = "linux"))]

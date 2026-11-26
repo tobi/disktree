@@ -467,6 +467,104 @@ fn volumes_dialog(
                         })),
                 ),
         );
+        if !app.saved_ssh_hosts.is_empty() {
+            let mut pills = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(space::XS);
+            for (index, saved) in app.saved_ssh_hosts.iter().enumerate() {
+                let active = app.volumes_source.as_deref()
+                    == Some(saved.as_str())
+                    && app.discovery.is_ready();
+                let connect_host = saved.clone();
+                let remove_host = saved.clone();
+                pills = pills.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .bg(if active {
+                            theme.accent.opacity(0.14)
+                        } else {
+                            theme.inset
+                        })
+                        .border_1()
+                        .border_color(if active {
+                            theme.accent
+                        } else {
+                            theme.control_border()
+                        })
+                        .child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("saved-host-{index}").into(),
+                                ))
+                                .debug_selector(move || {
+                                    format!("saved-host-{index}")
+                                })
+                                .px(space::SM)
+                                .py(space::XXS)
+                                .cursor_pointer()
+                                .font_family(theme.mono_font.clone())
+                                .text_size(text::CAPTION)
+                                .text_color(if active {
+                                    theme.bright
+                                } else {
+                                    theme.foreground
+                                })
+                                .hover(|row| row.bg(theme.accent.opacity(0.1)))
+                                .child(saved.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.connect_saved_ssh_host(
+                                            &connect_host,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("saved-host-remove-{index}").into(),
+                                ))
+                                .px(space::XS)
+                                .py(space::XXS)
+                                .cursor_pointer()
+                                .text_color(theme.secondary)
+                                .hover(|row| {
+                                    row.text_color(theme.danger)
+                                        .bg(theme.danger.opacity(0.1))
+                                })
+                                .child(
+                                    gpui_omarchy::icon(
+                                        gpui_omarchy::IconName::Close,
+                                    )
+                                    .size(icon::SM),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.remove_saved_ssh_host(
+                                            &remove_host,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        ),
+                );
+            }
+            popup = popup.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::XS)
+                    .child(widgets::eyebrow("Recent hosts", cx))
+                    .child(pills),
+            );
+        }
     }
 
     if show_locations {

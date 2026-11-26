@@ -226,6 +226,10 @@ struct Control {
     enter: Option<String>,
     entry: Option<Record>,
     link: Option<(u64, u64)>,
+    files: Option<u64>,
+    dirs: Option<u64>,
+    bytes: Option<u64>,
+    errors: Option<u64>,
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -336,13 +340,34 @@ pub fn write_header(
     out.flush()
 }
 
-/// Emit a live directory heartbeat line during a remote scan.
-pub fn write_heartbeat(dir: &Path, out: &mut impl Write) -> io::Result<()> {
+/// Emit a live progress heartbeat line during a remote parallel scan.
+pub fn write_progress(
+    dir: Option<&Path>,
+    files: u64,
+    dirs: u64,
+    bytes: u64,
+    errors: u64,
+    out: &mut impl Write,
+) -> io::Result<()> {
     #[derive(Serialize)]
     struct Heartbeat<'a> {
-        directory: &'a Path,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        directory: Option<&'a Path>,
+        files: u64,
+        dirs: u64,
+        bytes: u64,
+        errors: u64,
     }
-    send(out, &Heartbeat { directory: dir })?;
+    send(
+        out,
+        &Heartbeat {
+            directory: dir,
+            files,
+            dirs,
+            bytes,
+            errors,
+        },
+    )?;
     out.flush()
 }
 
@@ -644,8 +669,26 @@ fn read_snapshot_with_progress(
                 ancestors.push(name);
                 continue;
             }
-            if let Some(directory) = control.directory {
-                progress.directory = Some(directory);
+            if control.directory.is_some()
+                || control.files.is_some()
+                || control.dirs.is_some()
+                || control.bytes.is_some()
+            {
+                if let Some(directory) = control.directory {
+                    progress.directory = Some(directory);
+                }
+                if let Some(files) = control.files {
+                    progress.files = files;
+                }
+                if let Some(dirs) = control.dirs {
+                    progress.dirs = dirs;
+                }
+                if let Some(bytes) = control.bytes {
+                    progress.bytes = bytes;
+                }
+                if let Some(errors) = control.errors {
+                    progress.errors = errors;
+                }
                 progress.updated = Some(Instant::now());
                 *shared.lock().expect("remote progress lock") =
                     progress.clone();

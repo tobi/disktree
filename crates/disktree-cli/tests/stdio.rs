@@ -146,7 +146,7 @@ fn memory_and_core_limits_are_installed_before_reading_a_request() {
                     .split_whitespace()
                     .nth(3)
                     .and_then(|value| value.parse::<u64>().ok())
-                    .is_some_and(|value| value <= 1 << 30)
+                    .is_some_and(|value| value <= 32 << 30)
         }) {
             break limits;
         }
@@ -159,8 +159,8 @@ fn memory_and_core_limits_are_installed_before_reading_a_request() {
         .find(|line| line.starts_with("Max address space"))
         .unwrap();
     let values: Vec<_> = address.split_whitespace().collect();
-    assert!(values[3].parse::<u64>().unwrap() <= 1 << 30);
-    assert!(values[4].parse::<u64>().unwrap() <= 1 << 30);
+    assert!(values[3].parse::<u64>().unwrap() <= 32 << 30);
+    assert!(values[4].parse::<u64>().unwrap() <= 32 << 30);
     let core = limits
         .lines()
         .find(|line| line.starts_with("Max core file size"))

@@ -158,6 +158,96 @@ fn remote_cache_host(host: &str) -> disktree_scanner::HostKey {
     })
 }
 
+/// Persistent list of successfully connected SSH hosts (MRU order, one host
+/// per line in `$XDG_CONFIG_HOME/disktree/ssh-hosts`).
+mod ssh_hosts {
+    use std::path::{Path, PathBuf};
+
+    const MAX_HOSTS: usize = 20;
+
+    pub fn default_path() -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            return std::env::home_dir().map(|home| {
+                home.join("Library/Application Support/disktree/ssh-hosts")
+            });
+        }
+        #[cfg(windows)]
+        {
+            return std::env::var_os("APPDATA")
+                .map(|dir| PathBuf::from(dir).join("disktree/ssh-hosts"));
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            if let Some(dir) =
+                std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
+            {
+                return Some(PathBuf::from(dir).join("disktree/ssh-hosts"));
+            }
+            std::env::home_dir()
+                .map(|home| home.join(".config/disktree/ssh-hosts"))
+        }
+    }
+
+    pub fn load_from(path: &Path) -> Vec<String> {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let mut hosts = Vec::new();
+        for line in content.lines() {
+            let host = line.trim();
+            if !host.is_empty()
+                && disktree_core::remote::validate_host(host).is_ok()
+                && !hosts.iter().any(|existing| existing == host)
+            {
+                hosts.push(host.to_owned());
+                if hosts.len() >= MAX_HOSTS {
+                    break;
+                }
+            }
+        }
+        hosts
+    }
+
+    pub fn save_to(path: &Path, hosts: &[String]) {
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+        let mut body = hosts.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
+    }
+
+    pub fn record(hosts: &mut Vec<String>, host: &str) -> bool {
+        let host = host.trim();
+        if host.is_empty()
+            || disktree_core::remote::validate_host(host).is_err()
+        {
+            return false;
+        }
+        if hosts.first().map(String::as_str) == Some(host) {
+            return false;
+        }
+        hosts.retain(|existing| existing != host);
+        hosts.insert(0, host.to_owned());
+        hosts.truncate(MAX_HOSTS);
+        true
+    }
+
+    pub fn remove(hosts: &mut Vec<String>, host: &str) -> bool {
+        let before = hosts.len();
+        hosts.retain(|existing| existing != host);
+        hosts.len() != before
+    }
+}
+
 /// Which screen the app is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Screen {
@@ -1110,6 +1200,9 @@ pub struct Disktree {
     pub awaiting_root: bool,
     pub picker_remote_tab: bool,
     pub volumes_source: Option<String>,
+    /// Successfully connected SSH hosts (most recently used first).
+    pub saved_ssh_hosts: Vec<String>,
+    ssh_hosts_path: Option<PathBuf>,
     pub picker_error: Option<String>,
     pub picker_host: Option<Entity<InputState>>,
     pub picker_path: Option<Entity<InputState>>,
@@ -1180,6 +1273,16 @@ impl Disktree {
                 Scanner::new(StorageMode::InMemory, CachePolicy::default())
                     .expect("in-memory fallback scanner")
             })
+        };
+        let (ssh_hosts_path, saved_ssh_hosts) = if cfg!(test) {
+            (None, Vec::new())
+        } else {
+            let path = ssh_hosts::default_path();
+            let hosts = path
+                .as_deref()
+                .map(ssh_hosts::load_from)
+                .unwrap_or_default();
+            (path, hosts)
         };
         let mut tree = Self {
             root_path,
@@ -1266,6 +1369,8 @@ impl Disktree {
             awaiting_root: !start,
             picker_remote_tab: false,
             volumes_source: None,
+            saved_ssh_hosts,
+            ssh_hosts_path,
             picker_error: None,
             picker_host: None,
             picker_path: None,
@@ -1640,6 +1745,9 @@ impl Disktree {
                     );
                 }
                 self.volumes = volumes;
+                if let Some(host) = self.volumes_source.clone() {
+                    self.record_saved_ssh_host(&host);
+                }
                 Ok(())
             }
             Err(error) => Err(error.to_string()),
@@ -1762,6 +1870,42 @@ impl Disktree {
             .map(|input| input.read(cx).value().trim().to_owned())
             .unwrap_or_default();
         self.load_volume_source(Some(host), cx);
+    }
+
+    pub fn connect_saved_ssh_host(
+        &mut self,
+        host: &str,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.picker_remote_tab = true;
+        if let Some(input) = self.picker_host.clone() {
+            input.update(cx, |state, cx| {
+                state.set_value(host.to_owned(), window, cx);
+            });
+        }
+        self.load_volume_source(Some(host.to_owned()), cx);
+    }
+
+    pub fn remove_saved_ssh_host(
+        &mut self,
+        host: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if ssh_hosts::remove(&mut self.saved_ssh_hosts, host) {
+            if let Some(path) = self.ssh_hosts_path.as_deref() {
+                ssh_hosts::save_to(path, &self.saved_ssh_hosts);
+            }
+            cx.notify();
+        }
+    }
+
+    fn record_saved_ssh_host(&mut self, host: &str) {
+        if ssh_hosts::record(&mut self.saved_ssh_hosts, host)
+            && let Some(path) = self.ssh_hosts_path.as_deref()
+        {
+            ssh_hosts::save_to(path, &self.saved_ssh_hosts);
+        }
     }
 
     pub fn accept_picker(&mut self, cx: &mut Context<'_, Self>) {
@@ -2334,9 +2478,10 @@ impl Disktree {
                                 &node,
                                 scanned_at,
                             ));
-                        if let Some(host) = self.remote.as_deref() {
+                        if let Some(host) = self.remote.clone() {
+                            self.record_saved_ssh_host(&host);
                             self.scanner.store_snapshot(
-                                &remote_cache_host(host),
+                                &remote_cache_host(&host),
                                 &arena,
                                 &self.options.to_scanner(),
                                 scanned_at,
@@ -5549,5 +5694,25 @@ mod tests {
         let done = fade.value(start + Duration::from_millis(200));
         assert!(done.abs() < 1e-5);
         assert!(!fade.is_running(start + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn ssh_hosts_record_deduplicates_mru_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disktree/ssh-hosts");
+        let mut hosts = Vec::new();
+        assert!(ssh_hosts::record(&mut hosts, "dev"));
+        assert!(ssh_hosts::record(&mut hosts, "user@prod"));
+        assert!(ssh_hosts::record(&mut hosts, "dev"));
+        assert!(!ssh_hosts::record(&mut hosts, "dev"));
+        assert!(!ssh_hosts::record(&mut hosts, "-oProxyCommand=bad"));
+        assert_eq!(hosts, vec!["dev", "user@prod"]);
+
+        ssh_hosts::save_to(&path, &hosts);
+        assert_eq!(ssh_hosts::load_from(&path), vec!["dev", "user@prod"]);
+
+        assert!(ssh_hosts::remove(&mut hosts, "user@prod"));
+        ssh_hosts::save_to(&path, &hosts);
+        assert_eq!(ssh_hosts::load_from(&path), vec!["dev"]);
     }
 }

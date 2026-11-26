@@ -2604,10 +2604,11 @@ fn tiles_distinguish_fresh_stale_scheduled_and_updating_states(
 
     // 2. Start an SWR background refresh: stale `junk` becomes Scheduled while
     //    fresh `keep` stays Fresh; active `updating_paths` flips to Updating.
+    let dummy_scan = tempfile::tempdir().expect("dummy scan dir");
     update(&view, cx, |app, _| {
         app.active_scan = Some(ActiveScan::Local {
             handle: disktree_core::scan::ScanHandle::spawn(
-                temp.path().into(),
+                dummy_scan.path().into(),
                 options(),
             ),
             intent: ScanIntent::Refresh {
