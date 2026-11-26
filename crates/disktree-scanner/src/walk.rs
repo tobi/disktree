@@ -616,7 +616,7 @@ struct WalkContext {
     on_dir_start: Option<DirStartHook>,
     on_dir_tally: Option<DirTallyHook>,
     #[cfg(windows)]
-    volume: Option<u32>,
+    volume: Option<u64>,
     /// Stale subdirectories (already have cached data) deferred until every
     /// Unscanned (no-data) subdirectory finishes.
     deferred_stale: Mutex<Vec<(u64, Arc<PendingDir>)>>,
@@ -945,7 +945,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
         let hidden = entry.is_hidden(&name);
         let path = entry.entry_path(&dir.path);
 
-        let Ok(kind) = entry.kind() else {
+        let Ok(kind) = Listed::kind(&entry) else {
             ctx.progress.errors.fetch_add(1, Ordering::Relaxed);
             continue;
         };
