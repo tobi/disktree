@@ -1,0 +1,31 @@
+# disktree — studied production errors log
+# Runtime errors from the desktop app are also automatically appended to:
+#   ~/.local/state/disktree/errors.log
+
+[2026-11-25] ssh:dev | os error 2 (No such file or directory)
+Cause: Running `make install` replaced `~/.local/bin/disktree` under a running
+  process; Linux resolved `std::env::current_exe()` to `... (deleted)`, so
+  `payload::Archive::current()` failed with ENOENT.
+Fix: Open `/proc/self/exe` directly on Linux (8df1c08).
+---
+[2026-11-25] ssh:dev | Remote scan exceeded five minutes
+Cause: Remote helper ran single-threaded `stream_walk_with_config` on 25M+
+  files with a hardcoded 5-minute wall deadline and no remote cache DB.
+Fix: Backed `--connected`/`--stdio-v1` with `disktree-scanner`'s parallel
+  walker + remote host `scan-cache.redb` + 30-minute deadline (b1edd42, 26b8a6d).
+---
+[2026-11-26] ssh:dev | memory allocation of 24 bytes failed (aborted)
+Cause: `limit_resources()` capped `RLIMIT_AS` at 1 GiB while `BuiltChild` had
+  ~248 B/file inline `TreeArena` enum padding on a 25M-file / 192 GiB dev box.
+Fix: Scaled `RLIMIT_AS` to `MemTotal / 4` (4..=32 GiB), boxed `BuiltChild`,
+  moved to zero-alloc Linux `openat`+`getdents64`+`statx`/`io_uring` direct
+  subtree walker (3cbbec6, 2203025, 18aef47).
+---
+[2026-11-26] ssh:dev | memory allocation of 8566006208 bytes failed (8.56 GiB)
+Cause: In `stdio.rs`, `live_root` cloned the full 28M-node `snap.arena` and
+  called `replace_node_contents` on every `SubtreeRefreshed`, appending
+  millions of orphaned nodes/strings until `Vec` doubled to 8.56 GiB.
+Fix: Replaced `live_root` with `live_summaries: FxHashMap<String, TreeArena>`
+  holding depth-3 pruned summaries (< 50 KiB each, < 3 MiB total) + depth-4
+  wire pruning and full-duplex on-demand `Focus` subtree expansion.
+---

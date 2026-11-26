@@ -78,25 +78,30 @@ pub fn agent_prompt_for(
         let _ = writeln!(
             prompt,
             "\nMANDATORY HOST CHECK before any destructive action:\n\
-             Run hostname on the target and require the exact value {}.\n\
-             An SSH alias is not proof of machine identity.",
+             - Expected hostname: {}\n\
+             Run `hostname` on the target machine and double-check that it \
+             matches exactly (an SSH alias is not proof of machine identity).",
             shell_quote(&identity.hostname),
         );
         if let Some(id) = &identity.machine_id {
             let _ = writeln!(
                 prompt,
-                "Read /etc/machine-id on the target and require {}.",
-                shell_quote(id)
+                "- Expected /etc/machine-id: {}\n\
+                 Read `/etc/machine-id` on the target machine and \
+                 double-check that it matches exactly.",
+                shell_quote(id),
             );
         }
         prompt.push_str(
-            "If either check fails, cannot be performed, or differs, STOP \
-             and ask me. Do not delete anything or bypass these checks.\n",
+            "If there is any mismatch or either check cannot be verified, \
+             STOP and ask me what to do. Do not delete anything or bypass \
+             these checks.\n",
         );
     } else {
         prompt.push_str(
-            "\nHOST IDENTITY WAS NOT CAPTURED. Before deleting anything, STOP \
-             and ask me to confirm the actual target hostname and machine ID.\n",
+            "\nMANDATORY HOST CHECK: Host identity was not captured. Before \
+             deleting anything, double-check the target machine's `hostname` \
+             and `/etc/machine-id`, and STOP to ask me what to do.\n",
         );
     }
     if let Some(space) = space {

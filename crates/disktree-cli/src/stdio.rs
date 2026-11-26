@@ -17,14 +17,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use disktree_core::remote::{
-    ConnectedCommand, Operation, Request, SessionRequest, write_arena_pruned,
-    write_header, write_marker, write_progress,
+    ConnectedCommand, FULL_WIRE_NODE_LIMIT, Operation, Request, SessionRequest,
+    write_arena_pruned, write_arena_subtree_pruned, write_header, write_marker,
+    write_progress, write_subtree_header,
 };
 use disktree_core::scan_preview;
 use disktree_scanner::{
-    CachePolicy, DirTallyHook, Freshness, HostKey, ScanEvent, Scanner,
-    StorageMode, TreeArena,
+    CachePolicy, DirTallyHook, Freshness, HostKey, NodeFlags, NodeId, NodeKind,
+    ScanEvent, Scanner, StorageMode, TreeArena,
 };
+use rustc_hash::FxHashMap;
 
 const STDOUT_BUFFER_BYTES: usize = 256 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
@@ -34,6 +36,7 @@ const FINAL_WIRE_MAX_DEPTH: usize = 4;
 const FINAL_WIRE_MAX_CHILDREN: usize = 48;
 const PARTIAL_WIRE_MAX_DEPTH: usize = 4;
 const PARTIAL_WIRE_MAX_CHILDREN: usize = 32;
+const DEPTH5_PREFETCH_DIRS: usize = 16;
 
 pub fn serve_stdio_v1() -> io::Result<()> {
     limit_resources()?;
@@ -271,7 +274,10 @@ fn serve_scan_from_scanner<W: Write>(
     let mut last_partial = Instant::now();
     let mut streamed_final = false;
     let mut streamed_stale = false;
-    let mut live_root: Option<TreeArena> = None;
+    // Bounded depth-3 pruned summary per top-level child (< 50 KiB each,
+    // < 3 MiB total) instead of cloning/appending full 28M-node arenas.
+    let mut live_summaries: FxHashMap<String, TreeArena> = FxHashMap::default();
+    let mut final_arena: Option<Arc<TreeArena>> = None;
     let mut live_dirty = false;
 
     let emit_progress = |last: &mut Instant,
@@ -360,14 +366,15 @@ fn serve_scan_from_scanner<W: Write>(
             && !streamed_final
             && live_dirty
             && last_partial.elapsed() >= PARTIAL_STREAM_INTERVAL
-            && let Some(arena) = live_root.as_mut()
+            && !live_summaries.is_empty()
         {
-            arena.aggregate(
-                request.options.dedup_hardlinks,
-                request.options.include_hidden,
+            let combined = build_summary_root(
+                &session_root,
+                &live_summaries,
+                &request.options,
             );
             write_arena_pruned(
-                arena,
+                &combined,
                 &request.options,
                 flags.client_dedup,
                 PARTIAL_WIRE_MAX_DEPTH,
@@ -397,13 +404,18 @@ fn serve_scan_from_scanner<W: Write>(
                             out,
                         )?;
                         write_marker("stale", out)?;
-                        live_root = Some((*snap.arena).clone());
+                        seed_live_summaries(
+                            &snap.arena,
+                            &request.options,
+                            &mut live_summaries,
+                        );
                         streamed_stale = true;
                         last_partial = Instant::now();
                         last_heartbeat = Instant::now();
                     }
                 }
                 Freshness::Fresh { .. } => {
+                    live_summaries.clear();
                     write_arena_pruned(
                         &snap.arena,
                         &request.options,
@@ -412,6 +424,7 @@ fn serve_scan_from_scanner<W: Write>(
                         FINAL_WIRE_MAX_CHILDREN,
                         out,
                     )?;
+                    final_arena = Some(snap.arena);
                     streamed_final = true;
                 }
                 Freshness::Stale { .. } => {
@@ -425,13 +438,18 @@ fn serve_scan_from_scanner<W: Write>(
                             out,
                         )?;
                         write_marker("stale", out)?;
-                        live_root = Some((*snap.arena).clone());
+                        seed_live_summaries(
+                            &snap.arena,
+                            &request.options,
+                            &mut live_summaries,
+                        );
                         streamed_stale = true;
                         last_partial = Instant::now();
                         last_heartbeat = Instant::now();
                     }
                 }
                 Freshness::Live { .. } => {
+                    live_summaries.clear();
                     write_arena_pruned(
                         &snap.arena,
                         &request.options,
@@ -441,40 +459,28 @@ fn serve_scan_from_scanner<W: Write>(
                         out,
                     )?;
                     out.flush()?;
+                    final_arena = Some(snap.arena);
                     streamed_final = true;
                 }
             },
             Ok(ScanEvent::SubtreeRefreshed { path, arena, .. }) => {
-                if flags.stream_stale && !streamed_final {
-                    let root_arena = live_root.get_or_insert_with(|| {
-                        let root_name = session_root.file_name().map_or_else(
-                            || "root".to_owned(),
-                            |n| n.to_string_lossy().into_owned(),
+                if flags.stream_stale
+                    && !streamed_final
+                    && let Ok(rel) = path.strip_prefix(&session_root)
+                {
+                    let mut comps = rel.components();
+                    if let (Some(first), None) = (comps.next(), comps.next()) {
+                        let name =
+                            first.as_os_str().to_string_lossy().into_owned();
+                        let pruned = prune_subtree_arena(
+                            &arena,
+                            arena.root(),
+                            &request.options,
+                            PARTIAL_WIRE_MAX_DEPTH.saturating_sub(1),
+                            PARTIAL_WIRE_MAX_CHILDREN,
                         );
-                        TreeArena::new(session_root.clone(), &root_name)
-                    });
-                    if let Ok(rel) = path.strip_prefix(&session_root) {
-                        let parts: Vec<String> = rel
-                            .components()
-                            .map(|c| {
-                                c.as_os_str().to_string_lossy().into_owned()
-                            })
-                            .collect();
-                        if parts.len() == 1 {
-                            if let Some(existing) = root_arena
-                                .find_relative(parts.iter().map(String::as_str))
-                            {
-                                root_arena
-                                    .replace_node_contents(existing, &arena);
-                            } else {
-                                root_arena.graft_subtree(
-                                    root_arena.root(),
-                                    &arena,
-                                    Some(&parts[0]),
-                                );
-                            }
-                            live_dirty = true;
-                        }
+                        live_summaries.insert(name, pruned);
+                        live_dirty = true;
                     }
                 }
                 emit_progress(&mut last_heartbeat, &mut last_preview, out)?;
@@ -489,6 +495,16 @@ fn serve_scan_from_scanner<W: Write>(
                     ));
                 }
                 write_marker("done", out)?;
+                if let (Some(rx), Some(arena)) = (cmd_rx, final_arena) {
+                    serve_duplex_followups(
+                        scanner,
+                        &session_root,
+                        &arena,
+                        request,
+                        rx,
+                        out,
+                    )?;
+                }
                 return Ok(());
             }
             Ok(ScanEvent::Error { message }) => {
@@ -513,6 +529,302 @@ fn serve_scan_from_scanner<W: Write>(
             }
         }
     }
+}
+
+/// After the initial depth-4 snapshot is delivered (`"done"`), keep a
+/// full-duplex `--connected` session alive to:
+/// 1. Proactively prefetch depth 5 for the largest pruned depth-4 directories
+///    (yielding immediately to any incoming `Focus` command from the UX).
+/// 2. Serve on-demand `Focus { path, depth }` requests straight from the
+///    in-memory `TreeArena` (or remote cache DB) in milliseconds until `stdin`
+///    closes.
+fn serve_duplex_followups<W: Write>(
+    scanner: &Scanner,
+    session_root: &Path,
+    arena: &TreeArena,
+    request: &Request,
+    cmd_rx: &Receiver<ConnectedCommand>,
+    out: &mut W,
+) -> io::Result<()> {
+    let send_focus =
+        |path: &Path, depth: usize, out: &mut W| -> io::Result<()> {
+            let depth = depth.clamp(1, 6);
+            if let Some(node_id) = find_node_in_arena(arena, session_root, path)
+            {
+                write_subtree_header(path, out)?;
+                write_arena_subtree_pruned(
+                    arena,
+                    node_id,
+                    &request.options,
+                    depth,
+                    FINAL_WIRE_MAX_CHILDREN,
+                    out,
+                )?;
+                write_marker("subtree_done", out)?;
+                return Ok(());
+            }
+            if let Some((cached, _)) = scanner.lookup_cached(
+                &HostKey::Local,
+                path,
+                &request.options.to_scanner(),
+                &CachePolicy::default(),
+            ) {
+                write_subtree_header(path, out)?;
+                write_arena_subtree_pruned(
+                    &cached,
+                    cached.root(),
+                    &request.options,
+                    depth,
+                    FINAL_WIRE_MAX_CHILDREN,
+                    out,
+                )?;
+                write_marker("subtree_done", out)?;
+            }
+            Ok(())
+        };
+
+    // 1. Proactive depth-5 prefetch for the largest pruned depth-4 dirs,
+    //    checking `cmd_rx` before every item so interactive focus always wins.
+    if arena.len() > FULL_WIRE_NODE_LIMIT {
+        let mut depth4_dirs: Vec<(u64, NodeId)> = Vec::new();
+        let mut stack: Vec<(NodeId, usize)> = vec![(arena.root(), 0)];
+        while let Some((id, d)) = stack.pop() {
+            if d == FINAL_WIRE_MAX_DEPTH {
+                let n = arena.node(id);
+                if n.is_dir() && n.first_child.is_some() {
+                    let bytes = if request.options.apparent_size {
+                        n.apparent_bytes
+                    } else {
+                        n.allocated_bytes
+                    };
+                    depth4_dirs.push((bytes, id));
+                }
+                continue;
+            }
+            for child in arena.children(id) {
+                if arena.node(child).is_dir() {
+                    stack.push((child, d + 1));
+                }
+            }
+        }
+        depth4_dirs.sort_unstable_by_key(|&(b, _)| std::cmp::Reverse(b));
+        depth4_dirs.truncate(DEPTH5_PREFETCH_DIRS);
+
+        for (_, node_id) in depth4_dirs {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    ConnectedCommand::Focus { path, depth } => {
+                        send_focus(&path, depth, out)?;
+                    }
+                    ConnectedCommand::Prioritize { path } => {
+                        send_focus(&path, FINAL_WIRE_MAX_DEPTH, out)?;
+                    }
+                    ConnectedCommand::Cancel => return Ok(()),
+                }
+            }
+            let path = arena.path_of(node_id);
+            write_subtree_header(&path, out)?;
+            write_arena_subtree_pruned(
+                arena,
+                node_id,
+                &request.options,
+                1,
+                PARTIAL_WIRE_MAX_CHILDREN,
+                out,
+            )?;
+            write_marker("subtree_done", out)?;
+        }
+    }
+
+    // 2. Idle on-demand command loop (0% CPU until the UX focuses a folder or
+    //    closes stdin).
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            ConnectedCommand::Focus { path, depth } => {
+                send_focus(&path, depth, out)?;
+            }
+            ConnectedCommand::Prioritize { path } => {
+                send_focus(&path, FINAL_WIRE_MAX_DEPTH, out)?;
+            }
+            ConnectedCommand::Cancel => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+fn seed_live_summaries(
+    arena: &TreeArena,
+    options: &disktree_core::scan::ScanOptions,
+    out: &mut FxHashMap<String, TreeArena>,
+) {
+    out.clear();
+    for child in arena.children(arena.root()) {
+        let name = arena.name(child).to_owned();
+        if arena.node(child).is_dir() {
+            let pruned = prune_subtree_arena(
+                arena,
+                child,
+                options,
+                PARTIAL_WIRE_MAX_DEPTH.saturating_sub(1),
+                PARTIAL_WIRE_MAX_CHILDREN,
+            );
+            out.insert(name, pruned);
+        }
+    }
+}
+
+fn build_summary_root(
+    root_path: &Path,
+    summaries: &FxHashMap<String, TreeArena>,
+    options: &disktree_core::scan::ScanOptions,
+) -> TreeArena {
+    let root_name = root_path.file_name().map_or_else(
+        || "root".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let mut combined = TreeArena::new(root_path.to_path_buf(), &root_name);
+    for (name, sub) in summaries {
+        combined.graft_subtree(combined.root(), sub, Some(name));
+    }
+    combined.aggregate(options.dedup_hardlinks, options.include_hidden);
+    combined
+}
+
+/// Compactly prune `src` starting at `start` down to `max_depth` and top
+/// `max_children` per directory, rolling deeper/tail bytes into summary leaves
+/// so `live_summaries` stays under a few MiB even on 30M-file volumes.
+fn prune_subtree_arena(
+    src: &TreeArena,
+    start: NodeId,
+    options: &disktree_core::scan::ScanOptions,
+    max_depth: usize,
+    max_children: usize,
+) -> TreeArena {
+    let start_node = src.node(start);
+    let mut out = TreeArena::new(src.path_of(start), src.name(start));
+    {
+        let r = out.node_mut(out.root());
+        r.modified = start_node.modified;
+        r.flags = start_node.flags;
+        r.scanned_at = start_node.scanned_at;
+    }
+
+    let node_bytes = |id: NodeId| -> u64 {
+        let n = src.node(id);
+        if options.apparent_size {
+            if n.is_dir() {
+                n.apparent_bytes
+            } else {
+                n.effective_apparent_bytes()
+            }
+        } else if n.is_dir() {
+            n.allocated_bytes
+        } else {
+            n.effective_allocated_bytes()
+        }
+    };
+
+    let mut stack: Vec<(NodeId, NodeId, usize)> = vec![(start, out.root(), 0)];
+    while let Some((src_id, dst_id, depth)) = stack.pop() {
+        let mut kids: Vec<NodeId> = src.children(src_id).collect();
+        kids.sort_unstable_by_key(|&id| std::cmp::Reverse(node_bytes(id)));
+        let mut tail_alloc = 0u64;
+        let mut tail_app = 0u64;
+        let mut tail_files = 0u64;
+        let mut tail_mod = 0i64;
+        if kids.len() > max_children {
+            for &cid in &kids[max_children..] {
+                let cn = src.node(cid);
+                tail_alloc = tail_alloc.saturating_add(if cn.is_dir() {
+                    cn.allocated_bytes
+                } else {
+                    cn.effective_allocated_bytes()
+                });
+                tail_app = tail_app.saturating_add(if cn.is_dir() {
+                    cn.apparent_bytes
+                } else {
+                    cn.effective_apparent_bytes()
+                });
+                tail_files = tail_files.saturating_add(cn.files);
+                tail_mod = tail_mod.max(cn.modified);
+            }
+            kids.truncate(max_children);
+        }
+        for cid in kids {
+            let cn = src.node(cid);
+            if cn.is_dir() {
+                let d_id = out.add_child_raw(
+                    dst_id,
+                    src.name(cid),
+                    NodeKind::Directory,
+                    0,
+                    0,
+                    cn.modified,
+                    cn.flags,
+                );
+                out.node_mut(d_id).scanned_at = cn.scanned_at;
+                if depth + 1 >= max_depth {
+                    if cn.allocated_bytes > 0
+                        || cn.apparent_bytes > 0
+                        || cn.files > 0
+                    {
+                        let leaf = out.add_child_raw(
+                            d_id,
+                            "(deeper files)",
+                            NodeKind::File,
+                            cn.allocated_bytes,
+                            cn.apparent_bytes,
+                            cn.modified,
+                            NodeFlags::new(NodeKind::File),
+                        );
+                        out.node_mut(leaf).files = cn.files;
+                    }
+                } else {
+                    stack.push((cid, d_id, depth + 1));
+                }
+            } else {
+                out.add_child_raw(
+                    dst_id,
+                    src.name(cid),
+                    cn.kind(),
+                    cn.effective_allocated_bytes(),
+                    cn.effective_apparent_bytes(),
+                    cn.modified,
+                    cn.flags,
+                );
+            }
+        }
+        if tail_alloc > 0 || tail_app > 0 || tail_files > 0 {
+            let leaf = out.add_child_raw(
+                dst_id,
+                "(smaller entries)",
+                NodeKind::File,
+                tail_alloc,
+                tail_app,
+                tail_mod,
+                NodeFlags::new(NodeKind::File),
+            );
+            out.node_mut(leaf).files = tail_files;
+        }
+    }
+    out.aggregate(false, options.include_hidden);
+    out
+}
+
+fn find_node_in_arena(
+    arena: &TreeArena,
+    root: &Path,
+    path: &Path,
+) -> Option<NodeId> {
+    if path == root {
+        return Some(arena.root());
+    }
+    let rel = path.strip_prefix(root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    arena.find_relative(parts.iter().map(String::as_str))
 }
 
 /// Kernel-enforced, not a sampled RSS check that can miss an allocation

@@ -1140,6 +1140,11 @@ pub struct Disktree {
     remote_disk: bool,
     pub remote_progress: disktree_core::remote_progress::Progress,
     remote_stale_seq: u64,
+    /// Persistent full-duplex SSH handle retained after an initial remote scan
+    /// completes so depth-5 prefetches and on-demand `Focus` expansions stream
+    /// over the same SSH pipe in milliseconds.
+    remote_session: Option<disktree_core::remote::RemoteSession>,
+    remote_session_epoch: u64,
     /// Tailscale SSH check URL opened in the browser while waiting for approval.
     pub auth_url: Option<String>,
     pub scan_preview: Option<Arc<disktree_core::scan_preview::Preview>>,
@@ -1353,6 +1358,8 @@ impl Disktree {
             remote_progress: disktree_core::remote_progress::Progress::default(
             ),
             remote_stale_seq: 0,
+            remote_session: None,
+            remote_session_epoch: 0,
             auth_url: None,
             remote_platform: String::new(),
             remote_identity: None,
@@ -1815,7 +1822,14 @@ impl Disktree {
                 }
                 Ok(())
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                let target = self.volumes_source.as_deref().unwrap_or("local");
+                disktree_core::error_log::record(
+                    &format!("discover:{target}"),
+                    &error.to_string(),
+                );
+                Err(error.to_string())
+            }
         };
         self.step_discovery(
             discovery_machine::Event::Completed { epoch, outcome },
@@ -2324,6 +2338,8 @@ impl Disktree {
         self.active_scan_path = None;
         self.pending_arena_flush = false;
         self.last_arena_flush = None;
+        self.remote_session = None;
+        self.remote_session_epoch += 1;
         self.tile_fades.clear();
         self.tile_rects.clear();
         self.crumbs.clear();
@@ -2547,8 +2563,10 @@ impl Disktree {
                     cx.notify();
                     return true;
                 };
+                let mut promote_session = false;
                 match outcome {
                     Ok(snapshot) => {
+                        promote_session = true;
                         let refresh_paths = refresh_metric.map(|metric| {
                             (
                                 metric,
@@ -2614,6 +2632,11 @@ impl Disktree {
                             self.scan_started.map(|t| t.elapsed());
                     }
                     Err(error) => {
+                        let host = self.remote.as_deref().unwrap_or("remote");
+                        disktree_core::error_log::record(
+                            &format!("ssh:{host}:{}", self.root_path.display()),
+                            &error.to_string(),
+                        );
                         if self.tree.is_some() {
                             self.notice = Some((
                                 format!("Refresh failed: {error}"),
@@ -2624,7 +2647,16 @@ impl Disktree {
                         }
                     }
                 }
-                self.active_scan = None;
+                let finished = self.active_scan.take();
+                if promote_session
+                    && let Some(ActiveScan::Remote { handle, .. }) = finished
+                    && let Some(session) = handle.into_session()
+                {
+                    self.remote_session_epoch += 1;
+                    let session_epoch = self.remote_session_epoch;
+                    self.remote_session = Some(session);
+                    Self::poll_remote_patches(session_epoch, cx);
+                }
                 self.auth_url = None;
                 self.scan_preview = None;
                 self.progress.finished = true;
@@ -2733,6 +2765,10 @@ impl Disktree {
                             break;
                         }
                         ScanUpdate::Error(error) => {
+                            disktree_core::error_log::record(
+                                &format!("local:{}", self.root_path.display()),
+                                &error.to_string(),
+                            );
                             self.scan_error = Some(error.to_string());
                             keep_polling = false;
                             break;
@@ -3395,10 +3431,85 @@ impl Disktree {
             Some(ActiveScan::Remote { handle, .. }) => {
                 let target = self.current_path();
                 handle.prioritize(&target);
+                handle.focus(&target, 4);
             }
-            None => {}
+            None => {
+                if let Some(session) = &self.remote_session {
+                    let target = self.current_path();
+                    session.focus(&target, 4);
+                }
+            }
         }
         cx.notify();
+    }
+
+    fn poll_remote_patches(epoch: u64, cx: &Context<'_, Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(160))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        this.poll_remote_patches_once(epoch, cx)
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn poll_remote_patches_once(
+        &mut self,
+        epoch: u64,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if epoch != self.remote_session_epoch || self.remote_session.is_none() {
+            return false;
+        }
+        let mut patches = Vec::new();
+        if let Some(session) = &self.remote_session {
+            while let Some(patch) = session.poll_patch() {
+                patches.push(patch);
+            }
+        }
+        if patches.is_empty() {
+            return true;
+        }
+        let Some(root_tree) = self.tree.as_ref() else {
+            return true;
+        };
+        let mut updated = (**root_tree).clone();
+        let mut applied = false;
+        for patch in patches {
+            if let Ok(rel) = patch.path.strip_prefix(&self.root_path) {
+                let parts: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                if splice_node_by_names(&mut updated, &parts, patch.tree) {
+                    applied = true;
+                }
+            }
+        }
+        if applied {
+            disktree_core::tree::aggregate(&mut updated, self.options.metric);
+            disktree_core::classify::classify(&mut updated);
+            let directory = self.current_path();
+            let selected =
+                self.selected.as_deref().and_then(|c| self.path_at(c));
+            self.install_refresh(
+                updated,
+                self.options.metric,
+                &directory,
+                selected,
+                cx,
+            );
+        }
+        true
     }
 
     /// Note the directory on screen as one to come back to, before leaving
@@ -4803,13 +4914,23 @@ impl Disktree {
             cx.notify();
             return;
         }
-        let mut prompt = if self.remote.is_some() {
+        let mut prompt = if let Some(host) = &self.remote {
+            let fallback_identity;
+            let identity = if let Some(id) = self.remote_identity.as_ref() {
+                Some(id)
+            } else {
+                fallback_identity = disktree_core::identity::HostIdentity {
+                    hostname: host.clone(),
+                    machine_id: None,
+                };
+                Some(&fallback_identity)
+            };
             disktree_core::export::agent_prompt_for(
                 &plan.targets,
                 &self.root_path,
                 self.space,
                 &self.remote_platform,
-                self.remote_identity.as_ref(),
+                identity,
             )
         } else {
             disktree_core::export::agent_prompt(
@@ -5367,6 +5488,35 @@ impl Disktree {
             window.request_animation_frame();
         }
     }
+}
+
+/// Splice a remote `SubtreePatch` rooted at `parts` (relative path
+/// components beneath the scanned root) directly into `root`, keeping its
+/// original node name intact.
+fn splice_node_by_names(
+    root: &mut Node,
+    parts: &[String],
+    mut replacement: Node,
+) -> bool {
+    if parts.is_empty() {
+        replacement.name = root.name.clone();
+        *root = replacement;
+        return true;
+    }
+    let mut cur = root;
+    for part in parts {
+        let Some(next) = cur
+            .children
+            .iter_mut()
+            .find(|child| child.name.as_ref() == part.as_str())
+        else {
+            return false;
+        };
+        cur = next;
+    }
+    replacement.name = cur.name.clone();
+    *cur = replacement;
+    true
 }
 
 fn sample_tile_rect(

@@ -387,3 +387,77 @@ fn connected_full_duplex_accepts_prioritize_over_stdin_and_reports_version() {
         Some(env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn connected_full_duplex_expands_focused_deep_subtree_on_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_home = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("d1/d2/d3/d4/d5/d6");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("payload.bin"), [0_u8; 512]).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_disktree-cli"))
+        .arg("--connected")
+        .env("XDG_CACHE_HOME", cache_home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+
+    let req = serde_json::json!({
+        "root": dir.path(),
+        "disk": false,
+        "options": ScanOptions {
+            apparent_size: true,
+            ..ScanOptions::default()
+        },
+        "watch_disconnect": true,
+        "full_duplex": true,
+        "stream_stale": true,
+    });
+    serde_json::to_writer(&mut input, &req).unwrap();
+    input
+        .write_all(
+            b"
+",
+        )
+        .unwrap();
+    input.flush().unwrap();
+
+    let initial = read_snapshot(&mut output).unwrap();
+    assert_eq!(initial.tree.bytes, 512);
+
+    // Send a Focus command over the SAME open stdin pipe and read the patch.
+    let focus_target = dir.path().canonicalize().unwrap().join("d1/d2/d3");
+    let cmd = serde_json::json!({
+        "cmd": "focus",
+        "path": focus_target,
+        "depth": 4,
+    });
+    serde_json::to_writer(&mut input, &cmd).unwrap();
+    input
+        .write_all(
+            b"
+",
+        )
+        .unwrap();
+    input.flush().unwrap();
+
+    let patch = disktree_core::remote::read_subtree_patch(
+        &mut output,
+        disktree_core::tree::Metric::Bytes,
+    )
+    .unwrap()
+    .expect("focused subtree patch");
+    assert_eq!(patch.path, focus_target);
+    assert_eq!(patch.tree.bytes, 512);
+    assert!(patch.tree.child_named("d4").is_some());
+
+    // Closing stdin cleanly stops the persistent full-duplex helper.
+    drop(input);
+    wait_bounded(&mut child);
+}

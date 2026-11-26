@@ -228,6 +228,15 @@ pub struct Snapshot {
     pub tree: Node,
 }
 
+/// Depth-bounded subtree expansion streamed back over a full-duplex
+/// `--connected` session (either proactive depth-5 prefetch or an on-demand
+/// `Focus` expansion when the user drills into a directory).
+#[derive(Debug)]
+pub struct SubtreePatch {
+    pub path: PathBuf,
+    pub tree: Node,
+}
+
 // Children are already on the receiver's stack; counts preserve empty dirs
 // and deduplicated leaves without transmitting derived subtree totals.
 #[derive(Debug, Serialize, Deserialize)]
@@ -252,6 +261,7 @@ struct Control {
     bytes: Option<u64>,
     errors: Option<u64>,
     preview: Option<Vec<crate::scan_preview::Entry>>,
+    subtree: Option<PathBuf>,
 }
 
 fn json_error(error: serde_json::Error) -> io::Error {
@@ -399,10 +409,23 @@ pub fn write_progress(
     out.flush()
 }
 
-/// Emit a stream terminator marker (`"stale"` or `"done"`).
+/// Emit a stream terminator marker (`"stale"`, `"partial"`, `"done"`, or
+/// `"subtree_done"`).
 pub fn write_marker(marker: &str, out: &mut impl Write) -> io::Result<()> {
     send(out, &marker)?;
     out.flush()
+}
+
+/// Emit the header control line for a focused/prefetched subtree patch.
+pub fn write_subtree_header(
+    path: &Path,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct SubtreeHeader<'a> {
+        subtree: &'a Path,
+    }
+    send(out, &SubtreeHeader { subtree: path })
 }
 
 /// Node threshold above which `--connected` uses depth-pruned wire streaming.
@@ -428,11 +451,39 @@ pub fn write_arena_pruned(
     if arena.len() <= FULL_WIRE_NODE_LIMIT {
         return write_arena(arena, options, client_dedup, out);
     }
-    write_arena_summary(arena, options, max_depth, max_children, out)
+    write_arena_summary(
+        arena,
+        arena.root(),
+        options,
+        max_depth,
+        max_children,
+        out,
+    )
+}
+
+/// Serialize a depth-bounded subtree rooted at `start_node` inside `arena`
+/// (used for on-demand `Focus` expansions and proactive depth-5 prefetches).
+pub fn write_arena_subtree_pruned(
+    arena: &disktree_scanner::TreeArena,
+    start_node: disktree_scanner::NodeId,
+    options: &ScanOptions,
+    max_depth: usize,
+    max_children: usize,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    write_arena_summary(
+        arena,
+        start_node,
+        options,
+        max_depth,
+        max_children,
+        out,
+    )
 }
 
 fn write_arena_summary(
     arena: &disktree_scanner::TreeArena,
+    start_node: disktree_scanner::NodeId,
     options: &ScanOptions,
     max_depth: usize,
     max_children: usize,
@@ -510,7 +561,7 @@ fn write_arena_summary(
         }
     };
 
-    let mut frames = vec![make_frame(arena.root(), 0)];
+    let mut frames = vec![make_frame(start_node, 0)];
     while let Some(top) = frames.last_mut() {
         if top.next_idx < top.children.len() {
             let child_id = top.children[top.next_idx];
@@ -1076,6 +1127,101 @@ fn read_snapshot_with_progress(
     Ok(Snapshot { header, tree })
 }
 
+/// Read one postorder [`SubtreePatch`] (`{"subtree": path}` + records +
+/// `"subtree_done"`) from a full-duplex `--connected` stream. Returns `Ok(None)`
+/// on clean EOF.
+pub fn read_subtree_patch(
+    input: &mut impl BufRead,
+    metric: crate::tree::Metric,
+) -> io::Result<Option<SubtreePatch>> {
+    let mut line = String::new();
+    let target_path = loop {
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if text.starts_with('{') {
+            let control: Control =
+                serde_json::from_str(text).map_err(json_error)?;
+            if let Some(path) = control.subtree {
+                break path;
+            }
+        }
+    };
+
+    let mut stack = Vec::<Node>::new();
+    let seen = crate::tree::Seen::new();
+    loop {
+        receive_line(input, &mut line)?;
+        let text = line.trim_start();
+        let record: Record = if text.starts_with('[') {
+            serde_json::from_str(text).map_err(json_error)?
+        } else if text.starts_with('{') {
+            let control: Control =
+                serde_json::from_str(text).map_err(json_error)?;
+            let mut entry = control.entry.ok_or_else(|| {
+                io::Error::other("invalid remote subtree control record")
+            })?;
+            let identity = control.link.ok_or_else(|| {
+                io::Error::other("missing remote hardlink identity")
+            })?;
+            if entry.2 > 0 && !seen.insert(identity) {
+                entry.2 = 0;
+            }
+            entry
+        } else {
+            let marker: String =
+                serde_json::from_str(text).map_err(json_error)?;
+            if marker == "subtree_done" {
+                break;
+            }
+            return Err(io::Error::other("invalid remote subtree marker"));
+        };
+        let Record(name, kind, bytes, files, modified, read_error, count) =
+            record;
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\0'])
+            || count > stack.len()
+        {
+            return Err(io::Error::other("invalid remote subtree record"));
+        }
+        let kind = match kind {
+            0 => NodeKind::Directory,
+            1 => NodeKind::File,
+            2 => NodeKind::Symlink,
+            3 => NodeKind::Other,
+            _ => return Err(io::Error::other("invalid remote node kind")),
+        };
+        let children = if count == stack.len() {
+            std::mem::take(&mut stack)
+        } else {
+            stack.split_off(stack.len() - count)
+        };
+        let mut node = Node::entry(name, kind, bytes);
+        node.files = files;
+        node.modified = modified;
+        node.read_error = read_error;
+        node.children = children;
+        stack.push(node);
+    }
+    if stack.len() != 1 {
+        return Err(io::Error::other("incomplete remote subtree patch"));
+    }
+    let mut tree = stack.pop().expect("one root checked above");
+    aggregate(&mut tree, metric);
+    crate::classify::classify(&mut tree);
+    Ok(Some(SubtreePatch {
+        path: target_path,
+        tree,
+    }))
+}
+
 pub fn validate_host(host: &str) -> io::Result<()> {
     if host.is_empty()
         || host.starts_with('-')
@@ -1157,10 +1303,69 @@ fn ssh_error(host: &str, details: &str, fallback: &io::Error) -> io::Error {
 /// keep the request pipe open until the entire snapshot has arrived.
 #[derive(Debug)]
 pub struct RemoteJob<T> {
-    child: Arc<Mutex<Child>>,
+    child: Option<Arc<Mutex<Child>>>,
     stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
     result: mpsc::Receiver<io::Result<T>>,
+    patches: mpsc::Receiver<SubtreePatch>,
     progress: Shared,
+}
+
+/// Persistent full-duplex SSH handle retained after an initial remote scan
+/// finishes so drilling deeper or focusing folders fetches depth-4 expansions
+/// over the already-open pipe in milliseconds.
+#[derive(Debug)]
+pub struct RemoteSession {
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    patches: mpsc::Receiver<SubtreePatch>,
+}
+
+impl RemoteSession {
+    /// Send a full-duplex [`ConnectedCommand`] over the open `stdin` pipe.
+    pub fn send_command(&self, cmd: &ConnectedCommand) -> bool {
+        self.stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .is_some_and(|stdin| {
+                send(stdin, cmd).is_ok() && stdin.flush().is_ok()
+            })
+    }
+
+    /// Ask the remote helper to immediately stream `depth` levels (<= 4) below
+    /// `path` from its live in-memory `TreeArena` / cache DB.
+    pub fn focus(&self, path: &Path, depth: usize) -> bool {
+        self.send_command(&ConnectedCommand::Focus {
+            path: path.to_path_buf(),
+            depth,
+        })
+    }
+
+    /// Preempt background walking on the remote host to refresh `path` first.
+    pub fn prioritize(&self, path: &Path) -> bool {
+        self.send_command(&ConnectedCommand::Prioritize {
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Drain the next ready [`SubtreePatch`], if any.
+    pub fn poll_patch(&self) -> Option<SubtreePatch> {
+        self.patches.try_recv().ok()
+    }
+}
+
+impl Drop for RemoteSession {
+    fn drop(&mut self) {
+        // Closing stdin first lets `--connected` observe EOF and exit 0 cleanly.
+        let _ = self
+            .stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub type RemoteScan = RemoteJob<Snapshot>;
@@ -1231,6 +1436,8 @@ impl RemoteScan {
             Operation::Scan(request.clone()),
             archive,
             force_refresh,
+            true,
+            Some(metric),
             move |input, progress| {
                 let mut snapshot =
                     read_snapshot_with_progress(input, progress)?;
@@ -1254,18 +1461,26 @@ impl RemoteRoots {
             },
             archive,
             false,
+            false,
+            None,
             |input, _| read_roots(input),
         )
     }
 }
 
 impl<T: Send + 'static> RemoteJob<T> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal remote job spawn helper"
+    )]
     fn start(
         mut command: Command,
         host: &str,
         operation: Operation,
         archive: Option<crate::payload::Archive>,
         force_refresh: bool,
+        full_duplex: bool,
+        patch_metric: Option<crate::tree::Metric>,
         decode: impl FnOnce(
             &mut BufReader<std::process::ChildStdout>,
             &Shared,
@@ -1295,6 +1510,7 @@ impl<T: Send + 'static> RemoteJob<T> {
         let worker = child.clone();
         let host = host.to_owned();
         let (tx, result) = mpsc::channel();
+        let (patch_tx, patches) = mpsc::channel();
         let live = progress.clone();
         std::thread::spawn(move || {
             let mut input = BufReader::new(stdout);
@@ -1318,7 +1534,7 @@ impl<T: Send + 'static> RemoteJob<T> {
                         live_tree: true,
                         stream_stale: true,
                         force_refresh,
-                        full_duplex: true,
+                        full_duplex,
                     },
                 )?;
                 stdin.flush()?;
@@ -1328,44 +1544,80 @@ impl<T: Send + 'static> RemoteJob<T> {
                     Some(stdin);
                 decode(&mut input, &live)
             })();
+            if let Ok(value) = response {
+                if full_duplex && let Some(metric) = patch_metric {
+                    // Deliver the completed depth-4 snapshot immediately, then
+                    // keep reading proactive depth-5 / on-demand `Focus`
+                    // subtree patches until the client closes stdin.
+                    let _ = tx.send(Ok(value));
+                    while let Ok(Some(patch)) =
+                        read_subtree_patch(&mut input, metric)
+                    {
+                        if patch_tx.send(patch).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = stdin_worker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let _ = diagnostics.join();
+                    return;
+                }
+                let _ = stdin_worker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let status = loop {
+                    let status =
+                        worker.lock().expect("SSH process lock").try_wait();
+                    match status {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) => {}
+                        Err(error) => break Err(error),
+                    }
+                    std::thread::park_timeout(
+                        std::time::Duration::from_millis(10),
+                    );
+                };
+                let details = diagnostics.join().unwrap_or_default();
+                let outcome = match status {
+                    Ok(status) if status.success() => Ok(value),
+                    Err(error) => Err(ssh_error(&host, &details, &error)),
+                    Ok(status) => Err(ssh_error(
+                        &host,
+                        &details,
+                        &io::Error::other(format!("SSH exited with {status}")),
+                    )),
+                };
+                let _ = tx.send(outcome);
+                return;
+            }
+            let error = response.err().expect("checked error branch");
             // Drop stdin cleanly so the remote helper observes EOF and exits.
             let _ = stdin_worker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            if response.is_err() {
-                let _ = worker.lock().expect("SSH process lock").kill();
-            }
-            // Never hold the process lock across wait(): cancellation must
-            // be able to acquire it even after a response was read.
-            let status = loop {
+            let _ = worker.lock().expect("SSH process lock").kill();
+            let _ = loop {
                 let status =
                     worker.lock().expect("SSH process lock").try_wait();
                 match status {
                     Ok(Some(status)) => break Ok(status),
                     Ok(None) => {}
-                    Err(error) => break Err(error),
+                    Err(err) => break Err(err),
                 }
                 std::thread::park_timeout(std::time::Duration::from_millis(10));
             };
             let details = diagnostics.join().unwrap_or_default();
-            let outcome = match (response, status) {
-                (Ok(response), Ok(status)) if status.success() => Ok(response),
-                (Err(error), _) | (_, Err(error)) => {
-                    Err(ssh_error(&host, &details, &error))
-                }
-                (_, Ok(status)) => Err(ssh_error(
-                    &host,
-                    &details,
-                    &io::Error::other(format!("SSH exited with {status}")),
-                )),
-            };
-            let _ = tx.send(outcome);
+            let _ = tx.send(Err(ssh_error(&host, &details, &error)));
         });
         Ok(Self {
-            child,
+            child: Some(child),
             stdin: stdin_shared,
             result,
+            patches,
             progress,
         })
     }
@@ -1389,6 +1641,34 @@ impl<T: Send + 'static> RemoteJob<T> {
         });
     }
 
+    /// Request a depth-bounded subtree expansion rooted at `path`.
+    pub fn focus(&self, path: &Path, depth: usize) {
+        let _ = self.send_command(&ConnectedCommand::Focus {
+            path: path.to_path_buf(),
+            depth,
+        });
+    }
+
+    /// Drain the next ready [`SubtreePatch`], if any.
+    pub fn poll_patch(&self) -> Option<SubtreePatch> {
+        self.patches.try_recv().ok()
+    }
+
+    /// Hand off the live full-duplex SSH pipe into a persistent
+    /// [`RemoteSession`] so the desktop can keep requesting deep subtrees
+    /// without opening a new SSH connection.
+    pub fn into_session(mut self) -> Option<RemoteSession> {
+        let child = self.child.take()?;
+        let stdin = Arc::clone(&self.stdin);
+        let (_, empty_rx) = mpsc::channel();
+        let patches = std::mem::replace(&mut self.patches, empty_rx);
+        Some(RemoteSession {
+            child,
+            stdin,
+            patches,
+        })
+    }
+
     pub fn progress(&self) -> Progress {
         self.progress.lock().expect("remote progress lock").clone()
     }
@@ -1400,8 +1680,15 @@ impl<T: Send + 'static> RemoteJob<T> {
 
 impl<T> Drop for RemoteJob<T> {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
+        if let Some(child) = self.child.take() {
+            let _ = self
+                .stdin
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
         }
     }
 }
@@ -1772,6 +2059,8 @@ mod tests {
             },
             Some(archive),
             false,
+            false,
+            None,
             |input, _| read_roots(input),
         )
         .unwrap();
