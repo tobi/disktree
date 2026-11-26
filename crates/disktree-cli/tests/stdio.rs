@@ -262,3 +262,66 @@ fn executable_discovers_roots_without_scanning_a_path() {
     assert!(helper.0.wait().unwrap().success());
     drop(input);
 }
+
+#[cfg(unix)]
+#[test]
+fn stdio_persists_to_remote_cache_db_and_revalidates_on_force_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_home = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("first.bin"), [0_u8; 100]).unwrap();
+
+    let run = |force_refresh: bool| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_disktree-cli"))
+            .arg("--stdio-v1")
+            .env("XDG_CACHE_HOME", cache_home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let req = serde_json::json!({
+            "root": dir.path(),
+            "disk": false,
+            "options": ScanOptions {
+                apparent_size: true,
+                ..ScanOptions::default()
+            },
+            "watch_disconnect": true,
+            "stream_stale": true,
+            "force_refresh": force_refresh,
+        });
+        serde_json::to_writer(&mut input, &req).unwrap();
+        input.write_all(b"\n").unwrap();
+        let snapshot =
+            read_snapshot(&mut BufReader::new(child.stdout.take().unwrap()))
+                .unwrap();
+        drop(input);
+        assert!(child.wait().unwrap().success());
+        snapshot
+    };
+
+    // 1. Cold scan populates the remote host's cache DB.
+    let first = run(false);
+    assert_eq!(first.tree.bytes, 100);
+    assert!(
+        cache_home.path().join("disktree/scan-cache.redb").exists(),
+        "remote helper should persist its redb cache DB"
+    );
+
+    // 2. Add a file; a warm request within TTL hits the remote DB directly.
+    std::fs::write(dir.path().join("second.bin"), [0_u8; 250]).unwrap();
+    let warm = run(false);
+    assert_eq!(
+        warm.tree.bytes, 100,
+        "warm scan should come straight from the remote cache DB"
+    );
+
+    // 3. Explicit force_refresh bypasses TTL, revalidates, and updates the DB.
+    let refreshed = run(true);
+    assert_eq!(refreshed.tree.bytes, 350);
+
+    // 4. Subsequent warm scan sees the newly persisted remote DB state.
+    let after = run(false);
+    assert_eq!(after.tree.bytes, 350);
+}

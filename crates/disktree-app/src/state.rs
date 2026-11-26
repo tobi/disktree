@@ -2035,7 +2035,9 @@ impl Disktree {
                 disk: self.remote_disk,
                 options: self.options,
             };
-            match disktree_core::remote::RemoteScan::spawn(host, &request) {
+            match disktree_core::remote::RemoteScan::spawn_with_refresh(
+                host, &request, true,
+            ) {
                 Ok(handle) => {
                     self.active_scan =
                         Some(ActiveScan::Remote { handle, intent });
@@ -2162,7 +2164,11 @@ impl Disktree {
                 disk: self.remote_disk,
                 options: self.options,
             };
-            match disktree_core::remote::RemoteScan::spawn(&host, &request) {
+            match disktree_core::remote::RemoteScan::spawn_with_refresh(
+                &host,
+                &request,
+                policy.force_refresh,
+            ) {
                 Ok(handle) => {
                     self.active_scan =
                         Some(ActiveScan::Remote { handle, intent });
@@ -2262,6 +2268,33 @@ impl Disktree {
                 self.remote_progress = handle.progress();
                 let auth_url = self.remote_progress.auth_url.clone();
                 self.handle_auth_url(auth_url, cx);
+                if self.tree.is_none()
+                    && let Some(stale) =
+                        self.remote_progress.stale_snapshot.clone()
+                {
+                    let stale_dirs = stale.tree.dirs;
+                    self.root_path.clone_from(&stale.header.root);
+                    self.home.clone_from(&stale.header.home);
+                    self.disk_root.clone_from(&stale.header.disk_root);
+                    self.space = stale.header.space;
+                    self.remote_platform.clone_from(&stale.header.platform);
+                    self.update_remote_identity(stale.header.identity.clone());
+                    self.device = self.remote.as_ref().map(|host| {
+                        format!("{host} · read-only · cached (refreshing…)")
+                    });
+                    self.arena =
+                        Some(Arc::new(disktree_core::scan::node_to_arena_at(
+                            self.root_path.clone(),
+                            &stale.tree,
+                            1,
+                        )));
+                    self.freshness = Some(Freshness::Stale {
+                        oldest_at: 1,
+                        newest_at: 1,
+                        stale_dirs,
+                    });
+                    self.install_tree(stale.tree.clone(), None, cx);
+                }
                 self.scan_preview.clone_from(&self.remote_progress.preview);
                 self.progress.files = self.remote_progress.files;
                 self.progress.dirs = self.remote_progress.dirs;

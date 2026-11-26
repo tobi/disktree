@@ -40,6 +40,9 @@ pub struct Progress {
     pub auth_url: Option<String>,
     pub updated: Option<Instant>,
     pub preview: Option<Arc<crate::scan_preview::Preview>>,
+    /// Stale cached snapshot streamed from the remote host's own cache DB
+    /// while parallel revalidation runs on the remote host.
+    pub stale_snapshot: Option<Arc<crate::remote::Snapshot>>,
 }
 
 /// Extract a Tailscale SSH check/login URL from SSH stderr diagnostics.

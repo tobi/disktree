@@ -152,6 +152,13 @@ pub struct SessionRequest {
     pub client_dedup: bool,
     #[serde(default)]
     pub live_tree: bool,
+    /// Opt-in: allow the remote host to stream a stale cached snapshot first
+    /// (terminated by `"stale"`) before revalidating and streaming `"done"`.
+    #[serde(default)]
+    pub stream_stale: bool,
+    /// Ask the remote host to bypass its own 15m cache TTL and revalidate.
+    #[serde(default)]
+    pub force_refresh: bool,
 }
 
 /// The target's root candidates, without walking or probing any of them.
@@ -182,7 +189,7 @@ pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
     Ok(roots)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Header {
     version: u32,
     pub root: PathBuf,
@@ -307,6 +314,195 @@ pub fn serve_session(
     }
 }
 
+/// Write the scan header line for `root` (shared by both the streaming and
+/// cache-backed `--stdio-v1` server).
+pub fn write_header(
+    root: &Path,
+    home: Option<PathBuf>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    send(
+        out,
+        &Header {
+            version: VERSION,
+            disk_root: volume_root_for(root),
+            space: space_info(root).ok(),
+            root: root.to_path_buf(),
+            home,
+            platform: std::env::consts::OS.into(),
+            identity: crate::identity::HostIdentity::current(),
+        },
+    )?;
+    out.flush()
+}
+
+/// Emit a live directory heartbeat line during a remote scan.
+pub fn write_heartbeat(dir: &Path, out: &mut impl Write) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct Heartbeat<'a> {
+        directory: &'a Path,
+    }
+    send(out, &Heartbeat { directory: dir })?;
+    out.flush()
+}
+
+/// Emit a stream terminator marker (`"stale"` or `"done"`).
+pub fn write_marker(marker: &str, out: &mut impl Write) -> io::Result<()> {
+    send(out, &marker)?;
+    out.flush()
+}
+
+/// Serialize a `disktree_scanner::TreeArena` in the postorder `Record` wire
+/// format expected by `read_snapshot` / `RemoteScan`.
+pub fn write_arena(
+    arena: &disktree_scanner::TreeArena,
+    options: &ScanOptions,
+    client_dedup: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    use disktree_scanner::{NodeFlags, NodeId, NodeKind as ScannerKind};
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    #[derive(Serialize)]
+    struct LinkRecord<'a> {
+        entry: &'a Record,
+        link: (u64, u64),
+    }
+
+    // Iterative postorder traversal so arbitrarily deep trees never blow the
+    // helper thread stack.
+    struct Frame {
+        id: NodeId,
+        depth: usize,
+        emitted_children: usize,
+        next_child: Option<NodeId>,
+    }
+
+    let mut hardlinks: FxHashMap<NodeId, (u64, u64)> = FxHashMap::default();
+    if !arena.hardlinks().is_empty() {
+        hardlinks.reserve(arena.hardlinks().len());
+        for entry in arena.hardlinks() {
+            hardlinks.insert(entry.node, (entry.dev, entry.ino));
+        }
+    }
+    let mut seen_links: FxHashSet<(u64, u64)> = FxHashSet::default();
+
+    let root_id = arena.root();
+    let mut frames = vec![Frame {
+        id: root_id,
+        depth: 0,
+        emitted_children: 0,
+        next_child: arena.node(root_id).first_child,
+    }];
+
+    while let Some(top) = frames.last_mut() {
+        let Some(child_id) = top.next_child else {
+            let done = frames.pop().expect("checked non-empty");
+            let an = arena.node(done.id);
+            let wire_name = if done.depth == 0 {
+                "root".to_owned()
+            } else {
+                arena.name(done.id).to_owned()
+            };
+            let record = Record(
+                wire_name,
+                0,
+                0,
+                0,
+                an.modified,
+                an.read_error(),
+                done.emitted_children,
+            );
+            send(out, &record)?;
+            continue;
+        };
+
+        let child = arena.node(child_id);
+        top.next_child = child.next_sibling;
+
+        if !options.include_hidden && child.flags.has(NodeFlags::HIDDEN) {
+            continue;
+        }
+        let name = arena.name(child_id);
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\0'])
+        {
+            continue;
+        }
+
+        let child_depth = top.depth + 1;
+        if child.kind() == ScannerKind::Directory {
+            if options.max_depth.is_some_and(|limit| child_depth > limit) {
+                continue;
+            }
+            top.emitted_children += 1;
+            frames.push(Frame {
+                id: child_id,
+                depth: child_depth,
+                emitted_children: 0,
+                next_child: child.first_child,
+            });
+            continue;
+        }
+
+        top.emitted_children += 1;
+        let kind_code = match child.kind() {
+            ScannerKind::Directory => 0,
+            ScannerKind::File => 1,
+            ScannerKind::Symlink => 2,
+            ScannerKind::Other => 3,
+        };
+        let mut bytes = if options.apparent_size {
+            child.apparent_bytes
+        } else {
+            child.allocated_bytes
+        };
+        let link = hardlinks.get(&child_id).copied();
+        if let Some(id) = link
+            && options.dedup_hardlinks
+            && kind_code == 1
+        {
+            if client_dedup {
+                let record = Record(
+                    name.to_owned(),
+                    kind_code,
+                    bytes,
+                    1,
+                    child.modified,
+                    child.read_error(),
+                    0,
+                );
+                send(
+                    out,
+                    &LinkRecord {
+                        entry: &record,
+                        link: id,
+                    },
+                )?;
+                continue;
+            }
+            if bytes > 0 && !seen_links.insert(id) {
+                bytes = 0;
+            }
+        }
+        let files = u64::from(kind_code == 1);
+        let record = Record(
+            name.to_owned(),
+            kind_code,
+            bytes,
+            files,
+            child.modified,
+            child.read_error(),
+            0,
+        );
+        send(out, &record)?;
+    }
+
+    Ok(())
+}
+
 /// Scan a decoded request. The standalone helper supervises its lifetime.
 pub fn serve_request(request: Request, out: &mut impl Write) -> io::Result<()> {
     serve_request_with_progress(request, out, false, false, false)
@@ -422,7 +618,7 @@ fn read_snapshot_with_progress(
     let mut published = Instant::now();
     let mut stack = Vec::<Node>::new();
     let mut line = String::new();
-    let seen = crate::tree::Seen::new();
+    let mut seen = crate::tree::Seen::new();
     let mut preview = crate::scan_preview::Builder::default();
     let mut ancestors = Vec::<String>::new();
     let mut preview_published = Instant::now();
@@ -469,11 +665,38 @@ fn read_snapshot_with_progress(
                 entry.2 = 0;
             }
             entry
-        } else if serde_json::from_str::<String>(text).map_err(json_error)?
-            == "done"
-        {
-            break;
         } else {
+            let marker: String =
+                serde_json::from_str(text).map_err(json_error)?;
+            if marker == "done" {
+                break;
+            }
+            if marker == "stale" {
+                if stack.len() != 1 {
+                    return Err(io::Error::other(
+                        "incomplete remote stale tree",
+                    ));
+                }
+                let mut stale_tree = stack.pop().expect("one root checked");
+                aggregate(&mut stale_tree, crate::tree::Metric::Bytes);
+                crate::classify::classify(&mut stale_tree);
+                progress.stale_snapshot = Some(Arc::new(Snapshot {
+                    header: header.clone(),
+                    tree: stale_tree,
+                }));
+                progress.files = 0;
+                progress.dirs = 0;
+                progress.bytes = 0;
+                progress.errors = 0;
+                progress.updated = Some(Instant::now());
+                *shared.lock().expect("remote progress lock") =
+                    progress.clone();
+                seen = crate::tree::Seen::new();
+                preview = crate::scan_preview::Builder::default();
+                ancestors.clear();
+                published = Instant::now();
+                continue;
+            }
             return Err(io::Error::other("invalid remote stream marker"));
         };
         let Record(name, kind, bytes, files, modified, read_error, count) =
@@ -685,8 +908,16 @@ fn ssh_command(
 
 impl RemoteScan {
     pub fn spawn(host: &str, request: &Request) -> io::Result<Self> {
+        Self::spawn_with_refresh(host, request, false)
+    }
+
+    pub fn spawn_with_refresh(
+        host: &str,
+        request: &Request,
+        force_refresh: bool,
+    ) -> io::Result<Self> {
         let (command, archive) = ssh_command(host)?;
-        Self::spawn_with_archive(command, host, request, archive)
+        Self::spawn_with_archive(command, host, request, archive, force_refresh)
     }
 
     // Only the Unix tests run a fake ssh, so Windows has no caller.
@@ -696,7 +927,7 @@ impl RemoteScan {
         host: &str,
         request: &Request,
     ) -> io::Result<Self> {
-        Self::spawn_with_archive(command, host, request, None)
+        Self::spawn_with_archive(command, host, request, None, false)
     }
 
     fn spawn_with_archive(
@@ -704,6 +935,7 @@ impl RemoteScan {
         host: &str,
         request: &Request,
         archive: Option<crate::payload::Archive>,
+        force_refresh: bool,
     ) -> io::Result<Self> {
         let metric = request.options.metric;
         Self::start(
@@ -711,6 +943,7 @@ impl RemoteScan {
             host,
             Operation::Scan(request.clone()),
             archive,
+            force_refresh,
             move |input, progress| {
                 let mut snapshot =
                     read_snapshot_with_progress(input, progress)?;
@@ -733,6 +966,7 @@ impl RemoteRoots {
                 discover_version: VERSION,
             },
             archive,
+            false,
             |input, _| read_roots(input),
         )
     }
@@ -744,6 +978,7 @@ impl<T: Send + 'static> RemoteJob<T> {
         host: &str,
         operation: Operation,
         archive: Option<crate::payload::Archive>,
+        force_refresh: bool,
         decode: impl FnOnce(
             &mut BufReader<std::process::ChildStdout>,
             &Shared,
@@ -791,6 +1026,8 @@ impl<T: Send + 'static> RemoteJob<T> {
                         live_progress: true,
                         client_dedup: true,
                         live_tree: true,
+                        stream_stale: true,
+                        force_refresh,
                     },
                 )?;
                 decode(&mut input, &live)
@@ -987,6 +1224,8 @@ mod tests {
             live_progress: true,
             client_dedup: true,
             live_tree: true,
+            stream_stale: false,
+            force_refresh: false,
         };
         let bytes = serde_json::to_vec(&session).unwrap();
         assert!(serde_json::from_slice::<Request>(&bytes).is_err());
@@ -1164,6 +1403,7 @@ mod tests {
                 "fixture",
                 &request,
                 Some(archive.clone()),
+                false,
             )
             .unwrap();
             let snapshot = wait(&handle).unwrap();
@@ -1210,6 +1450,7 @@ mod tests {
                 discover_version: VERSION,
             },
             Some(archive),
+            false,
             |input, _| read_roots(input),
         )
         .unwrap();
@@ -1429,6 +1670,8 @@ mod tests {
                 client_dedup: true,
                 live_tree: true,
                 watch_disconnect: false,
+                stream_stale: false,
+                force_refresh: false,
             };
             let mut data = Vec::new();
             serve_session(session, &mut data).unwrap();
