@@ -33,7 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::types::{NodeKind, ScanOptions};
-use crate::walk::{BuiltChild, BuiltNode, LeafRecord, WalkProgress};
+use crate::walk::{BuiltChild, BuiltNode, LeafRecord, LeafSlab, WalkProgress};
 use crate::windows::{Aligned, drive_letter};
 
 /// Most bytes read per call: large enough that the disk streams, small
@@ -1153,6 +1153,7 @@ impl Table<'_> {
             read_error: false,
             hidden,
             lossy_name: false,
+            leaves: LeafSlab::default(),
             children,
         })
     }
@@ -1185,7 +1186,7 @@ impl Table<'_> {
             }
             return self
                 .directory(entry.child, name.to_owned(), hidden, depth + 1)
-                .map(|dir| Some(BuiltChild::Dir(dir)));
+                .map(|dir| Some(BuiltChild::Dir(Box::new(dir))));
         }
         let kind = if link {
             NodeKind::Symlink
@@ -1193,14 +1194,15 @@ impl Table<'_> {
             NodeKind::File
         };
         Ok(Some(BuiltChild::Leaf(LeafRecord {
-            name: name.to_owned(),
+            name: name.into(),
             kind,
             allocated_bytes: info.allocated,
             apparent_bytes: info.apparent,
             modified: info.modified,
             hidden,
             lossy_name: false,
-            hardlink: (info.names > 1).then(|| (0, u64::from(entry.child))),
+            hardlink: (info.names > 1)
+                .then(|| Box::new((0, u64::from(entry.child)))),
         })))
     }
 }
@@ -1645,7 +1647,7 @@ mod tests {
                     }
                     out.push((format!("{prefix}{}", leaf.name), leaf.kind));
                 }
-                BuiltChild::Grafted { .. } => {}
+                BuiltChild::Grafted(_) => {}
             }
         }
     }
@@ -1763,8 +1765,8 @@ mod tests {
             // Only a file with a second name needs its identity kept.
             let inode = |name: &str| {
                 root.children.iter().find_map(|child| match child {
-                    BuiltChild::Leaf(leaf) if leaf.name == name => {
-                        leaf.hardlink
+                    BuiltChild::Leaf(leaf) if leaf.name.as_ref() == name => {
+                        leaf.hardlink.as_deref().copied()
                     }
                     _ => None,
                 })

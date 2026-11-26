@@ -4,6 +4,8 @@
 //! fallback to in-memory or streaming modes.
 
 pub mod db;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(windows)]

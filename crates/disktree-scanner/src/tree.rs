@@ -214,7 +214,7 @@ impl TreeArena {
     /// Create a new arena with a single directory root node.
     pub fn new(root_path: PathBuf, root_name: &str) -> Self {
         let mut strings = StringPool::new();
-        let name = strings.intern(root_name);
+        let name = strings.push_raw(root_name);
         let root = ArenaNode {
             name,
             parent: None,
@@ -232,6 +232,51 @@ impl TreeArena {
             root_path,
             nodes: vec![root],
             last_child: vec![None],
+            strings,
+            hardlinks: Vec::new(),
+        }
+    }
+
+    /// Drop build-time string deduplication tables to minimize resident memory
+    /// once all nodes have been inserted into the arena.
+    pub fn finish_building(&mut self) {
+        self.strings.finish_building();
+    }
+
+    /// Create an arena with pre-allocated node and raw string capacity
+    /// (zero build-time hash table, single backing allocation when exact).
+    pub fn with_exact_capacity(
+        root_path: PathBuf,
+        root_name: &str,
+        expected_nodes: usize,
+        expected_string_bytes: usize,
+    ) -> Self {
+        let mut strings = StringPool::with_capacity(
+            expected_nodes.max(1),
+            expected_string_bytes.max(root_name.len()),
+        );
+        let name = strings.push_raw(root_name);
+        let cap = expected_nodes.max(1);
+        let mut nodes = Vec::with_capacity(cap);
+        let mut last_child = Vec::with_capacity(cap);
+        nodes.push(ArenaNode {
+            name,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+            allocated_bytes: 0,
+            apparent_bytes: 0,
+            files: 0,
+            dirs: 1,
+            flags: NodeFlags::new(NodeKind::Directory),
+            modified: 0,
+            scanned_at: 0,
+        });
+        last_child.push(None);
+        Self {
+            root_path,
+            nodes,
+            last_child,
             strings,
             hardlinks: Vec::new(),
         }
@@ -337,6 +382,59 @@ impl TreeArena {
         flags: NodeFlags,
     ) -> NodeId {
         let name_id = self.strings.intern(name);
+        self.add_child_with_name_id(
+            parent,
+            name_id,
+            kind,
+            allocated_bytes,
+            apparent_bytes,
+            modified,
+            flags,
+        )
+    }
+
+    /// Hot-path child insertion that appends `name` straight into the flat
+    /// string buffer without building or probing a hash table.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors ArenaNode fields without extra wrapper structs"
+    )]
+    pub fn add_child_raw(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        kind: NodeKind,
+        allocated_bytes: u64,
+        apparent_bytes: u64,
+        modified: i64,
+        flags: NodeFlags,
+    ) -> NodeId {
+        let name_id = self.strings.push_raw(name);
+        self.add_child_with_name_id(
+            parent,
+            name_id,
+            kind,
+            allocated_bytes,
+            apparent_bytes,
+            modified,
+            flags,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "shared flat ArenaNode insertion helper"
+    )]
+    fn add_child_with_name_id(
+        &mut self,
+        parent: NodeId,
+        name_id: NameId,
+        kind: NodeKind,
+        allocated_bytes: u64,
+        apparent_bytes: u64,
+        modified: i64,
+        flags: NodeFlags,
+    ) -> NodeId {
         let id = NodeId::from_index(self.nodes.len())
             .expect("arena node count fits in u32");
         let is_file = kind == NodeKind::File;
@@ -386,54 +484,62 @@ impl TreeArena {
 
     /// Graft an entire `child` arena under `parent`, renaming the grafted
     /// root to `child_name` (if `Some`). Preserves hardlinks, flags, and
-    /// per-directory freshness timestamps.
+    /// per-directory freshness timestamps via a single linear index-shift pass
+    /// with zero DFS stack, zero `id_map`, and zero hash-table probing.
     pub fn graft_subtree(
         &mut self,
         parent: NodeId,
         child: &Self,
         child_name: Option<&str>,
     ) -> NodeId {
-        let mut id_map = vec![NodeId::ROOT; child.nodes.len()];
-        let mut stack = vec![(child.root(), parent, true)];
-        let mut kids = Vec::new();
+        let base_node = self.nodes.len();
+        let base_name = self.strings.append_raw(&child.strings);
+        let root_override = child_name.map(|name| self.strings.push_raw(name));
+        let shift = |id: NodeId| {
+            NodeId::from_index(id.index() + base_node)
+                .expect("arena node count fits in u32")
+        };
 
-        while let Some((src_id, dst_parent, is_graft_root)) = stack.pop() {
-            let src = child.node(src_id);
-            let name_str = if is_graft_root {
-                child_name.unwrap_or_else(|| child.name(src_id))
-            } else {
-                child.name(src_id)
-            };
-            let name_id = self.strings.intern(name_str);
-            let dst_id = NodeId::from_index(self.nodes.len())
-                .expect("arena node count fits in u32");
+        self.nodes.reserve(child.nodes.len());
+        self.last_child.reserve(child.last_child.len());
+        for (i, src) in child.nodes.iter().enumerate() {
             let mut copy = *src;
-            copy.name = name_id;
-            copy.parent = Some(dst_parent);
-            copy.first_child = None;
-            copy.next_sibling = None;
+            copy.name = if i == 0
+                && let Some(override_id) = root_override
+            {
+                override_id
+            } else {
+                NameId(src.name.0 + base_name)
+            };
+            copy.parent = if i == 0 {
+                Some(parent)
+            } else {
+                src.parent.map(shift)
+            };
+            copy.first_child = src.first_child.map(shift);
+            copy.next_sibling = if i == 0 {
+                None
+            } else {
+                src.next_sibling.map(shift)
+            };
             self.nodes.push(copy);
-            self.last_child.push(None);
-            self.link_child(dst_parent, dst_id);
-            id_map[src_id.index()] = dst_id;
-
-            kids.clear();
-            kids.extend(child.children(src_id));
-            for &kid in kids.iter().rev() {
-                stack.push((kid, dst_id, false));
-            }
+            self.last_child.push(child.last_child[i].map(shift));
         }
 
+        let grafted_root = NodeId::from_index(base_node)
+            .expect("arena node count fits in u32");
+        self.link_child(parent, grafted_root);
+
+        self.hardlinks.reserve(child.hardlinks.len());
         for link in &child.hardlinks {
-            let mapped = id_map[link.node.index()];
             self.hardlinks.push(HardlinkEntry {
-                node: mapped,
+                node: shift(link.node),
                 dev: link.dev,
                 ino: link.ino,
             });
         }
 
-        id_map[child.root().index()]
+        grafted_root
     }
 
     /// Replace the children and metadata of an existing node `target` with
@@ -612,7 +718,13 @@ impl TreeArena {
             }
         }
 
-        let mut duplicate_nodes = FxHashSet::default();
+        // Mark hardlink duplicates directly in each node's flag bits instead
+        // of allocating a second HashSet and probing it for every leaf.
+        for link in &self.hardlinks {
+            self.nodes[link.node.index()]
+                .flags
+                .set(NodeFlags::DEDUPED_LINK, false);
+        }
         if dedup_hardlinks && !self.hardlinks.is_empty() {
             let mut seen = FxHashSet::with_capacity_and_hasher(
                 self.hardlinks.len(),
@@ -626,17 +738,15 @@ impl TreeArena {
                     continue;
                 }
                 if !seen.insert((link.dev, link.ino)) {
-                    duplicate_nodes.insert(link.node);
+                    self.nodes[link.node.index()]
+                        .flags
+                        .set(NodeFlags::DEDUPED_LINK, true);
                 }
             }
         }
 
         for &id in order.iter().rev() {
             if !self.nodes[id.index()].is_dir() {
-                let is_dup = duplicate_nodes.contains(&id);
-                self.nodes[id.index()]
-                    .flags
-                    .set(NodeFlags::DEDUPED_LINK, is_dup);
                 continue;
             }
 

@@ -23,9 +23,9 @@ use rayon::Scope;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::mounts::{mount_boundaries_for, never_scanned};
-use crate::stream::{
-    device_of, inode_of, measure_both, modified_seconds, nlink_of,
-};
+use crate::stream::{device_of, inode_of, modified_seconds};
+#[cfg(not(target_os = "linux"))]
+use crate::stream::{measure_both, nlink_of};
 use crate::tree::{NodeFlags, NodeId, TreeArena};
 use crate::types::{NodeKind, ScanOptions, ScanStats, SubtreeStatus, unix_now};
 
@@ -210,6 +210,12 @@ pub trait SkipOracle: Send + Sync {
     /// [`TreeArena`] to graft directly into the walk.
     fn try_reuse(&self, path: &Path) -> Option<TreeArena>;
 
+    /// Whether this oracle has any fresh subtrees available to reuse. Returning
+    /// `false` lets hot loops skip per-directory path construction on cold scans.
+    fn has_fresh(&self) -> bool {
+        true
+    }
+
     /// Classify `path` for priority ordering: unscanned (no data) walks before
     /// stale (has cached data).
     fn freshness(&self, _path: &Path) -> DirFreshness {
@@ -306,8 +312,8 @@ pub struct WalkOutcome {
 /// Choose a balanced worker count from the host's logical CPU count when the
 /// caller does not pass an explicit `--scan-threads` override.
 ///
-/// Metadata walks scale strongly up to ~6–8 workers; past 8, VFS lock
-/// contention adds CPU heat and fan noise without meaningful wall-time gains.
+/// Stays quiet on laptops (4–8 workers on 4–16 logical CPUs) while letting
+/// multi-socket / many-core servers scale up to 32 workers.
 #[must_use]
 pub const fn default_worker_threads(cpus: usize) -> usize {
     if cpus <= 1 {
@@ -318,7 +324,7 @@ pub const fn default_worker_threads(cpus: usize) -> usize {
         4
     } else {
         let half = cpus / 2;
-        if half > 8 { 8 } else { half }
+        if half > 32 { 32 } else { half }
     }
 }
 
@@ -346,6 +352,19 @@ pub fn walk_parallel(
     } else {
         None
     };
+    let mut mount_parents: FxHashSet<PathBuf> = FxHashSet::default();
+    for path in &never {
+        if let Some(parent) = path.parent() {
+            mount_parents.insert(parent.to_path_buf());
+        }
+    }
+    if let Some(mounts) = &foreign_mounts {
+        for path in mounts {
+            if let Some(parent) = path.parent() {
+                mount_parents.insert(parent.to_path_buf());
+            }
+        }
+    }
 
     let mut visited_dirs = FxHashSet::default();
     if let Some(id) = inode_of(&root_meta) {
@@ -369,6 +388,7 @@ pub fn walk_parallel(
         root_dev,
         foreign_mounts,
         never_scanned: never,
+        mount_parents,
         visited_dirs: Mutex::new(visited_dirs),
         cancel: config.cancel,
         progress: config.progress,
@@ -619,6 +639,9 @@ struct WalkContext {
     root_dev: u64,
     foreign_mounts: Option<FxHashSet<PathBuf>>,
     never_scanned: FxHashSet<PathBuf>,
+    /// Parent directories of every path in `never_scanned` / `foreign_mounts`.
+    /// Directories absent from this set skip all per-entry mount hash checks.
+    mount_parents: FxHashSet<PathBuf>,
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     cancel: Arc<AtomicBool>,
     progress: Arc<WalkProgress>,
@@ -651,6 +674,7 @@ struct PendingDir {
     incomplete: AtomicBool,
     /// Starts at `1` (the `+1` sentinel for this directory's own scan).
     pending: AtomicUsize,
+    leaves: Mutex<LeafSlab>,
     children: Mutex<Vec<BuiltChild>>,
 }
 
@@ -675,12 +699,97 @@ impl PendingDir {
             read_error: AtomicBool::new(false),
             incomplete: AtomicBool::new(false),
             pending: AtomicUsize::new(1),
+            leaves: Mutex::new(LeafSlab::new()),
             children: Mutex::new(Vec::new()),
         }
     }
 }
 
+/// Struct-of-Arrays (`SoA`) bump slab for a directory's direct leaf entries.
+///
+/// Zero per-file heap allocations: all UTF-8 names sit back-to-back in `names`,
+/// numeric fields live in contiguous parallel arrays, and hardlinks are stored
+/// sparsely (only files with `nlink > 1`).
+#[derive(Default)]
+pub(crate) struct LeafSlab {
+    names: Vec<u8>,
+    name_ends: Vec<u32>,
+    allocated: Vec<u64>,
+    apparent: Vec<u64>,
+    modified: Vec<i64>,
+    /// Packed `kind: 2 bits | hidden: bit 2 | lossy: bit 3`.
+    meta: Vec<u8>,
+    /// Sparse `(leaf_index, dev, ino)` for multi-link files.
+    hardlinks: Vec<(u32, u64, u64)>,
+}
+
+impl LeafSlab {
+    const fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            name_ends: Vec::new(),
+            allocated: Vec::new(),
+            apparent: Vec::new(),
+            modified: Vec::new(),
+            meta: Vec::new(),
+            hardlinks: Vec::new(),
+        }
+    }
+
+    const fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "flat SoA push avoids intermediate struct copies"
+    )]
+    fn push(
+        &mut self,
+        name: &str,
+        kind: NodeKind,
+        allocated_bytes: u64,
+        apparent_bytes: u64,
+        modified: i64,
+        hidden: bool,
+        lossy_name: bool,
+        hardlink: Option<(u64, u64)>,
+    ) {
+        let index = self.meta.len() as u32;
+        self.names.extend_from_slice(name.as_bytes());
+        self.name_ends.push(self.names.len() as u32);
+        self.allocated.push(allocated_bytes);
+        self.apparent.push(apparent_bytes);
+        self.modified.push(modified);
+        let kind_bits = match kind {
+            NodeKind::Directory => 0u8,
+            NodeKind::File => 1u8,
+            NodeKind::Symlink => 2u8,
+            NodeKind::Other => 3u8,
+        };
+        let packed =
+            kind_bits | (u8::from(hidden) << 2) | (u8::from(lossy_name) << 3);
+        self.meta.push(packed);
+        if let Some((dev, ino)) = hardlink {
+            self.hardlinks.push((index, dev, ino));
+        }
+    }
+
+    const fn unpack_meta(packed: u8) -> (NodeKind, bool, bool) {
+        let kind = match packed & 0b11 {
+            0 => NodeKind::Directory,
+            1 => NodeKind::File,
+            2 => NodeKind::Symlink,
+            _ => NodeKind::Other,
+        };
+        let hidden = (packed & (1 << 2)) != 0;
+        let lossy = (packed & (1 << 3)) != 0;
+        (kind, hidden, lossy)
+    }
+}
+
 pub(crate) enum BuiltChild {
+    #[cfg_attr(not(windows), allow(dead_code, reason = "used by Windows MFT"))]
     Leaf(LeafRecord),
     Dir(Box<BuiltNode>),
     Grafted(Box<GraftedChild>),
@@ -693,6 +802,7 @@ pub(crate) struct GraftedChild {
     pub lossy_name: bool,
 }
 
+#[cfg_attr(not(windows), allow(dead_code, reason = "used by Windows MFT"))]
 pub(crate) struct LeafRecord {
     pub name: Box<str>,
     pub kind: NodeKind,
@@ -710,6 +820,7 @@ pub(crate) struct BuiltNode {
     pub read_error: bool,
     pub hidden: bool,
     pub lossy_name: bool,
+    pub leaves: LeafSlab,
     pub children: Vec<BuiltChild>,
 }
 
@@ -725,11 +836,13 @@ impl BuiltNode {
             read_error: false,
             hidden: false,
             lossy_name: false,
+            leaves: LeafSlab::new(),
             children: Vec::new(),
         }
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 struct DirFacts {
     device: u64,
     modified: i64,
@@ -737,6 +850,7 @@ struct DirFacts {
     inode: Option<(u64, u64)>,
 }
 
+#[cfg(not(target_os = "linux"))]
 struct LeafFacts {
     allocated_bytes: u64,
     apparent_bytes: u64,
@@ -744,6 +858,7 @@ struct LeafFacts {
     hardlink: Option<(u64, u64)>,
 }
 
+#[cfg(not(target_os = "linux"))]
 trait Listed {
     fn file_name_parts(&self) -> (String, bool);
     fn entry_path(&self, dir: &Path) -> PathBuf;
@@ -755,7 +870,7 @@ trait Listed {
     fn leaf_facts(&self, follow_links: bool) -> io::Result<LeafFacts>;
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl Listed for fs::DirEntry {
     fn file_name_parts(&self) -> (String, bool) {
         let raw = self.file_name();
@@ -903,7 +1018,7 @@ fn read_dir_entries(
     crate::windows::read_dir(path, ctx.volume)
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn read_dir_entries(
     path: &Path,
     _ctx: &WalkContext,
@@ -911,6 +1026,946 @@ fn read_dir_entries(
     fs::read_dir(path)
 }
 
+/// Depth at which Linux workers switch from Rayon fan-out to a zero-allocation
+/// iterative subtree walker (`walk_subtree_direct`), keeping all cores
+/// saturated across shallow branches (e.g. `.cargo/registry/src/<idx>/<crate>`
+/// and `.bun/install/cache/<pkg>`) while eliminating per-directory `Arc`/
+/// `Mutex`/`PathBuf` allocations across the 95%+ deeper directories.
+#[cfg(target_os = "linux")]
+const DIRECT_SUBTREE_DEPTH: usize = 4;
+
+#[cfg(target_os = "linux")]
+fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
+    if dir.depth >= DIRECT_SUBTREE_DEPTH {
+        scan_dir_linux_direct(ctx, dir);
+    } else {
+        scan_dir_linux(scope, ctx, dir);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "zero-alloc iterative Linux subtree walker kept inline"
+)]
+fn scan_dir_linux_direct(ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    use rustix::fs::FileType;
+
+    // Single reusable PathBuf + flat LIFO byte buffer for child dir names:
+    // zero PathBuf / String / Arc / Mutex / PendingDir allocations for the
+    // entire subtree beneath `dir`.
+    struct Frame {
+        node_id: NodeId,
+        depth: usize,
+        path_len: usize,
+        name_start: usize,
+        name_end: usize,
+    }
+
+    if let Some(gate) = &ctx.pause_gate {
+        gate.wait_if_paused(&ctx.cancel);
+    }
+    if ctx.cancel.load(Ordering::Relaxed) {
+        dir.incomplete.store(true, Ordering::Relaxed);
+        complete_one(ctx, dir);
+        return;
+    }
+
+    let scanned_at = unix_now();
+    let mut arena = TreeArena::new(dir.path.clone(), &dir.name);
+    let sub_root_id = arena.root();
+    {
+        let r = arena.node_mut(sub_root_id);
+        r.modified = dir.modified;
+        r.flags.set(NodeFlags::HIDDEN, dir.hidden);
+        r.flags.set(NodeFlags::LOSSY_NAME, dir.lossy_name);
+        r.set_status(SubtreeStatus::Fresh { scanned_at });
+    }
+
+    let mut cur_path = dir.path.clone().into_os_string();
+    let mut name_buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut stack: Vec<Frame> = Vec::with_capacity(64);
+    stack.push(Frame {
+        node_id: sub_root_id,
+        depth: dir.depth,
+        path_len: cur_path.len(),
+        name_start: 0,
+        name_end: 0,
+    });
+
+    let mut incomplete = false;
+    let mut batch_dirs = 0u64;
+    let mut batch_files = 0u64;
+    let mut batch_alloc = 0u64;
+    let mut batch_apparent = 0u64;
+    let mut batch_errors = 0u64;
+
+    let flush_batch = |batch_dirs: &mut u64,
+                       batch_files: &mut u64,
+                       batch_alloc: &mut u64,
+                       batch_apparent: &mut u64,
+                       batch_errors: &mut u64| {
+        if *batch_dirs > 0 {
+            ctx.progress
+                .walked_dirs
+                .fetch_add(*batch_dirs, Ordering::Relaxed);
+            ctx.progress.dirs.fetch_add(*batch_dirs, Ordering::Relaxed);
+            *batch_dirs = 0;
+        }
+        if *batch_files > 0 {
+            ctx.progress
+                .files
+                .fetch_add(*batch_files, Ordering::Relaxed);
+            *batch_files = 0;
+        }
+        if *batch_alloc > 0 {
+            ctx.progress
+                .allocated_bytes
+                .fetch_add(*batch_alloc, Ordering::Relaxed);
+            *batch_alloc = 0;
+        }
+        if *batch_apparent > 0 {
+            ctx.progress
+                .apparent_bytes
+                .fetch_add(*batch_apparent, Ordering::Relaxed);
+            *batch_apparent = 0;
+        }
+        if *batch_errors > 0 {
+            ctx.progress
+                .errors
+                .fetch_add(*batch_errors, Ordering::Relaxed);
+            *batch_errors = 0;
+        }
+    };
+
+    while let Some(frame) = stack.pop() {
+        if let Some(gate) = &ctx.pause_gate {
+            gate.wait_if_paused(&ctx.cancel);
+        }
+        if ctx.cancel.load(Ordering::Relaxed) {
+            incomplete = true;
+            break;
+        }
+
+        // Reconstruct `cur_path` in-place with zero heap allocation.
+        if frame.name_end > frame.name_start {
+            let mut bytes = cur_path.into_vec();
+            bytes.truncate(frame.path_len);
+            if !bytes.ends_with(b"/") {
+                bytes.push(b'/');
+            }
+            bytes
+                .extend_from_slice(&name_buf[frame.name_start..frame.name_end]);
+            name_buf.truncate(frame.name_start);
+            cur_path = std::ffi::OsString::from_vec(bytes);
+        }
+
+        batch_dirs += 1;
+        if batch_dirs >= 64 {
+            flush_batch(
+                &mut batch_dirs,
+                &mut batch_files,
+                &mut batch_alloc,
+                &mut batch_apparent,
+                &mut batch_errors,
+            );
+            if let Ok(mut active) = ctx.progress.active_path.try_lock() {
+                *active = Some(PathBuf::from(&cur_path));
+            }
+        }
+
+        let dir_path_ref = Path::new(&cur_path);
+        let check_mounts = !ctx.mount_parents.is_empty()
+            && ctx.mount_parents.contains(dir_path_ref);
+        let parent_path_len = cur_path.len();
+        let mut dir_files = 0u64;
+        let mut dir_alloc = 0u64;
+        let mut dir_apparent = 0u64;
+
+        let read_res = crate::linux::scan_dir_entries(
+            dir_path_ref,
+            |dirfd, c_name, file_type| {
+                if ctx.cancel.load(Ordering::Relaxed) {
+                    incomplete = true;
+                    return Ok(false);
+                }
+
+                let raw_bytes = c_name.to_bytes();
+                let hidden = raw_bytes.first() == Some(&b'.');
+                let utf8 = std::str::from_utf8(raw_bytes);
+                let lossy_name = utf8.is_err();
+                let lossy_owned;
+                let name_str: &str = if let Ok(s) = utf8 {
+                    s
+                } else {
+                    lossy_owned = String::from_utf8_lossy(raw_bytes);
+                    lossy_owned.as_ref()
+                };
+
+                if matches!(
+                    file_type,
+                    FileType::RegularFile
+                        | FileType::Fifo
+                        | FileType::Socket
+                        | FileType::CharacterDevice
+                        | FileType::BlockDevice
+                ) {
+                    if check_mounts {
+                        let path =
+                            dir_path_ref.join(OsStr::from_bytes(raw_bytes));
+                        if ctx.never_scanned.contains(&path)
+                            || (ctx.options.one_filesystem
+                                && ctx
+                                    .foreign_mounts
+                                    .as_ref()
+                                    .is_some_and(|m| m.contains(&path)))
+                        {
+                            return Ok(true);
+                        }
+                    }
+                    let Ok(st) = crate::linux::stat_at(dirfd, c_name, false)
+                    else {
+                        batch_errors += 1;
+                        return Ok(true);
+                    };
+                    let (alloc, apparent) = if st.kind == NodeKind::Other {
+                        (0, 0)
+                    } else {
+                        (st.allocated_bytes, st.apparent_bytes)
+                    };
+                    if st.kind == NodeKind::File {
+                        dir_files += 1;
+                    }
+                    dir_alloc = dir_alloc.saturating_add(alloc);
+                    dir_apparent = dir_apparent.saturating_add(apparent);
+                    let mut flags = NodeFlags::new(st.kind);
+                    flags.set(NodeFlags::HIDDEN, hidden);
+                    flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                    let id = arena.add_child_raw(
+                        frame.node_id,
+                        name_str,
+                        st.kind,
+                        alloc,
+                        apparent,
+                        st.modified,
+                        flags,
+                    );
+                    if st.kind == NodeKind::File
+                        && let Some((dev, ino)) = st.hardlink
+                    {
+                        arena.record_hardlink(id, dev, ino);
+                    }
+                    return Ok(true);
+                }
+
+                if file_type == FileType::Symlink {
+                    if !ctx.options.follow_links {
+                        let Ok(st) =
+                            crate::linux::stat_at(dirfd, c_name, false)
+                        else {
+                            batch_errors += 1;
+                            return Ok(true);
+                        };
+                        dir_alloc =
+                            dir_alloc.saturating_add(st.allocated_bytes);
+                        dir_apparent =
+                            dir_apparent.saturating_add(st.apparent_bytes);
+                        let mut flags = NodeFlags::new(NodeKind::Symlink);
+                        flags.set(NodeFlags::HIDDEN, hidden);
+                        flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                        arena.add_child_raw(
+                            frame.node_id,
+                            name_str,
+                            NodeKind::Symlink,
+                            st.allocated_bytes,
+                            st.apparent_bytes,
+                            st.modified,
+                            flags,
+                        );
+                        return Ok(true);
+                    }
+
+                    let Ok(st) = crate::linux::stat_at(dirfd, c_name, true)
+                    else {
+                        return Ok(true);
+                    };
+                    if st.kind == NodeKind::Directory {
+                        let path =
+                            dir_path_ref.join(OsStr::from_bytes(raw_bytes));
+                        if ctx.never_scanned.contains(&path)
+                            || (ctx.options.one_filesystem
+                                && ctx
+                                    .foreign_mounts
+                                    .as_ref()
+                                    .is_some_and(|m| m.contains(&path)))
+                            || (ctx.options.one_filesystem
+                                && ctx.foreign_mounts.is_none()
+                                && st.device != ctx.root_dev)
+                        {
+                            return Ok(true);
+                        }
+                        if let Some(id) = st.inode
+                            && !ctx
+                                .visited_dirs
+                                .lock()
+                                .unwrap_or_else(
+                                    std::sync::PoisonError::into_inner,
+                                )
+                                .insert(id)
+                        {
+                            return Ok(true);
+                        }
+                        if ctx
+                            .options
+                            .max_depth
+                            .is_some_and(|limit| frame.depth + 1 > limit)
+                        {
+                            return Ok(true);
+                        }
+                        let mut flags = NodeFlags::new(NodeKind::Directory);
+                        flags.set(NodeFlags::HIDDEN, hidden);
+                        flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                        let cid = arena.add_child_raw(
+                            frame.node_id,
+                            name_str,
+                            NodeKind::Directory,
+                            0,
+                            0,
+                            st.modified,
+                            flags,
+                        );
+                        arena
+                            .node_mut(cid)
+                            .set_status(SubtreeStatus::Fresh { scanned_at });
+                        let name_start = name_buf.len();
+                        name_buf.extend_from_slice(raw_bytes);
+                        let name_end = name_buf.len();
+                        stack.push(Frame {
+                            node_id: cid,
+                            depth: frame.depth + 1,
+                            path_len: parent_path_len,
+                            name_start,
+                            name_end,
+                        });
+                        return Ok(true);
+                    }
+
+                    if st.kind == NodeKind::File {
+                        dir_files += 1;
+                    }
+                    dir_alloc = dir_alloc.saturating_add(st.allocated_bytes);
+                    dir_apparent =
+                        dir_apparent.saturating_add(st.apparent_bytes);
+                    let mut flags = NodeFlags::new(st.kind);
+                    flags.set(NodeFlags::HIDDEN, hidden);
+                    flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                    let id = arena.add_child_raw(
+                        frame.node_id,
+                        name_str,
+                        st.kind,
+                        st.allocated_bytes,
+                        st.apparent_bytes,
+                        st.modified,
+                        flags,
+                    );
+                    if let Some((dev, ino)) = st.hardlink {
+                        arena.record_hardlink(id, dev, ino);
+                    }
+                    return Ok(true);
+                }
+
+                // Directory or DT_UNKNOWN.
+                if file_type != FileType::Directory {
+                    let Ok(st) = crate::linux::stat_at(dirfd, c_name, false)
+                    else {
+                        batch_errors += 1;
+                        return Ok(true);
+                    };
+                    if st.kind != NodeKind::Directory {
+                        let (alloc, apparent) = if st.kind == NodeKind::Other {
+                            (0, 0)
+                        } else {
+                            (st.allocated_bytes, st.apparent_bytes)
+                        };
+                        if st.kind == NodeKind::File {
+                            dir_files += 1;
+                        }
+                        dir_alloc = dir_alloc.saturating_add(alloc);
+                        dir_apparent = dir_apparent.saturating_add(apparent);
+                        let mut flags = NodeFlags::new(st.kind);
+                        flags.set(NodeFlags::HIDDEN, hidden);
+                        flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                        let id = arena.add_child_raw(
+                            frame.node_id,
+                            name_str,
+                            st.kind,
+                            alloc,
+                            apparent,
+                            st.modified,
+                            flags,
+                        );
+                        if st.kind == NodeKind::File
+                            && let Some((dev, ino)) = st.hardlink
+                        {
+                            arena.record_hardlink(id, dev, ino);
+                        }
+                        return Ok(true);
+                    }
+                }
+
+                if check_mounts {
+                    let path = dir_path_ref.join(OsStr::from_bytes(raw_bytes));
+                    if ctx.never_scanned.contains(&path)
+                        || (ctx.options.one_filesystem
+                            && ctx
+                                .foreign_mounts
+                                .as_ref()
+                                .is_some_and(|m| m.contains(&path)))
+                    {
+                        return Ok(true);
+                    }
+                }
+
+                if let Some(oracle) = &ctx.skip_oracle
+                    && oracle.has_fresh()
+                {
+                    let path = dir_path_ref.join(OsStr::from_bytes(raw_bytes));
+                    if let Some(reused) = oracle.try_reuse(&path) {
+                        let reused_root = reused.node(reused.root());
+                        ctx.progress.skipped_fresh_dirs.fetch_add(
+                            u64::from(reused_root.dirs),
+                            Ordering::Relaxed,
+                        );
+                        batch_dirs += u64::from(reused_root.dirs);
+                        batch_files += reused_root.files;
+                        batch_alloc = batch_alloc
+                            .saturating_add(reused_root.allocated_bytes);
+                        batch_apparent = batch_apparent
+                            .saturating_add(reused_root.apparent_bytes);
+                        if let Some(hook) = &ctx.on_dir_tally {
+                            hook(
+                                &path,
+                                reused_root.allocated_bytes,
+                                reused_root.apparent_bytes,
+                                reused_root.files,
+                            );
+                        }
+                        let gid = arena.graft_subtree(
+                            frame.node_id,
+                            &reused,
+                            Some(name_str),
+                        );
+                        let gn = arena.node_mut(gid);
+                        gn.flags.set(NodeFlags::HIDDEN, hidden);
+                        gn.flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                        return Ok(true);
+                    }
+                }
+
+                let Ok(st) = crate::linux::stat_at(dirfd, c_name, false) else {
+                    batch_errors += 1;
+                    return Ok(true);
+                };
+                if ctx.options.one_filesystem
+                    && ctx.foreign_mounts.is_none()
+                    && st.device != ctx.root_dev
+                {
+                    return Ok(true);
+                }
+                if ctx.options.follow_links
+                    && let Some(id) = st.inode
+                    && !ctx
+                        .visited_dirs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(id)
+                {
+                    return Ok(true);
+                }
+                if ctx
+                    .options
+                    .max_depth
+                    .is_some_and(|limit| frame.depth + 1 > limit)
+                {
+                    return Ok(true);
+                }
+
+                let mut flags = NodeFlags::new(NodeKind::Directory);
+                flags.set(NodeFlags::HIDDEN, hidden);
+                flags.set(NodeFlags::LOSSY_NAME, lossy_name);
+                let cid = arena.add_child_raw(
+                    frame.node_id,
+                    name_str,
+                    NodeKind::Directory,
+                    0,
+                    0,
+                    st.modified,
+                    flags,
+                );
+                arena
+                    .node_mut(cid)
+                    .set_status(SubtreeStatus::Fresh { scanned_at });
+                let name_start = name_buf.len();
+                name_buf.extend_from_slice(raw_bytes);
+                let name_end = name_buf.len();
+                stack.push(Frame {
+                    node_id: cid,
+                    depth: frame.depth + 1,
+                    path_len: parent_path_len,
+                    name_start,
+                    name_end,
+                });
+                Ok(true)
+            },
+        );
+
+        if let Err(error) = read_res {
+            arena
+                .node_mut(frame.node_id)
+                .flags
+                .set(NodeFlags::READ_ERROR, true);
+            ctx.progress.record_error(dir_path_ref, &error);
+        }
+
+        if dir_files > 0 || dir_alloc > 0 || dir_apparent > 0 {
+            batch_files += dir_files;
+            batch_alloc = batch_alloc.saturating_add(dir_alloc);
+            batch_apparent = batch_apparent.saturating_add(dir_apparent);
+            if let Some(hook) = &ctx.on_dir_tally {
+                hook(dir_path_ref, dir_alloc, dir_apparent, dir_files);
+            }
+        }
+    }
+
+    flush_batch(
+        &mut batch_dirs,
+        &mut batch_files,
+        &mut batch_alloc,
+        &mut batch_apparent,
+        &mut batch_errors,
+    );
+
+    if incomplete {
+        dir.incomplete.store(true, Ordering::Relaxed);
+    }
+
+    // Attach the directly built `TreeArena` onto `dir.parent` and release `dir`
+    // cleanly (no `BuiltNode`, no `LeafSlab`, no `materialize_arena` copy!).
+    if let Some(parent) = dir.parent.as_ref() {
+        if incomplete {
+            parent.incomplete.store(true, Ordering::Relaxed);
+        }
+        parent
+            .children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(BuiltChild::Grafted(Box::new(GraftedChild {
+                name: dir.name.clone(),
+                arena: Arc::new(arena),
+                hidden: dir.hidden,
+                lossy_name: dir.lossy_name,
+            })));
+        complete_one(ctx, parent);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "hot Linux openat+getdents64+statx loop kept inline"
+)]
+fn scan_dir_linux(
+    scope: &Scope<'_>,
+    ctx: &Arc<WalkContext>,
+    dir: &Arc<PendingDir>,
+) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    use rustix::fs::FileType;
+
+    if let Some(gate) = &ctx.pause_gate {
+        gate.wait_if_paused(&ctx.cancel);
+    }
+
+    if ctx.cancel.load(Ordering::Relaxed) {
+        dir.incomplete.store(true, Ordering::Relaxed);
+        complete_one(ctx, dir);
+        return;
+    }
+
+    ctx.progress.walked_dirs.fetch_add(1, Ordering::Relaxed);
+    ctx.progress.dirs.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut active) = ctx.progress.active_path.try_lock() {
+        *active = Some(dir.path.clone());
+    }
+    if let Some(hook) = &ctx.on_dir_start {
+        hook(&dir.path);
+    }
+
+    let check_mounts = ctx.mount_parents.contains(&dir.path);
+    let mut local_leaves = LeafSlab::new();
+    let mut local_children: Vec<BuiltChild> = Vec::new();
+    let mut subdirs: Vec<Arc<PendingDir>> = Vec::new();
+    let mut local_files = 0u64;
+    let mut local_alloc = 0u64;
+    let mut local_apparent = 0u64;
+
+    let read_res = crate::linux::scan_dir_entries(
+        &dir.path,
+        |dirfd, c_name, file_type| {
+            if ctx.cancel.load(Ordering::Relaxed) {
+                dir.incomplete.store(true, Ordering::Relaxed);
+                return Ok(false);
+            }
+
+            let raw_bytes = c_name.to_bytes();
+            let hidden = raw_bytes.first() == Some(&b'.');
+            let utf8 = std::str::from_utf8(raw_bytes);
+            let lossy_name = utf8.is_err();
+            let lossy_owned;
+            let name_str: &str = if let Ok(s) = utf8 {
+                s
+            } else {
+                lossy_owned = String::from_utf8_lossy(raw_bytes);
+                lossy_owned.as_ref()
+            };
+
+            // Fast path: regular files, FIFOs, sockets, devices never need a
+            // `PathBuf` unless this directory actually holds a mount point.
+            if matches!(
+                file_type,
+                FileType::RegularFile
+                    | FileType::Fifo
+                    | FileType::Socket
+                    | FileType::CharacterDevice
+                    | FileType::BlockDevice
+            ) {
+                if check_mounts {
+                    let path = dir.path.join(OsStr::from_bytes(raw_bytes));
+                    if ctx.never_scanned.contains(&path)
+                        || (ctx.options.one_filesystem
+                            && ctx
+                                .foreign_mounts
+                                .as_ref()
+                                .is_some_and(|m| m.contains(&path)))
+                    {
+                        return Ok(true);
+                    }
+                }
+                let Ok(st) = crate::linux::stat_at(dirfd, c_name, false) else {
+                    ctx.progress.errors.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true);
+                };
+                let (alloc, apparent) = if st.kind == NodeKind::Other {
+                    (0, 0)
+                } else {
+                    (st.allocated_bytes, st.apparent_bytes)
+                };
+                if st.kind == NodeKind::File {
+                    local_files += 1;
+                }
+                local_alloc = local_alloc.saturating_add(alloc);
+                local_apparent = local_apparent.saturating_add(apparent);
+                local_leaves.push(
+                    name_str,
+                    st.kind,
+                    alloc,
+                    apparent,
+                    st.modified,
+                    hidden,
+                    lossy_name,
+                    (st.kind == NodeKind::File)
+                        .then_some(st.hardlink)
+                        .flatten(),
+                );
+                return Ok(true);
+            }
+
+            // Symlinks (no PathBuf allocated unless follow_links && target dir).
+            if file_type == FileType::Symlink {
+                if !ctx.options.follow_links {
+                    let Ok(st) = crate::linux::stat_at(dirfd, c_name, false)
+                    else {
+                        ctx.progress.errors.fetch_add(1, Ordering::Relaxed);
+                        return Ok(true);
+                    };
+                    local_alloc =
+                        local_alloc.saturating_add(st.allocated_bytes);
+                    local_apparent =
+                        local_apparent.saturating_add(st.apparent_bytes);
+                    local_leaves.push(
+                        name_str,
+                        NodeKind::Symlink,
+                        st.allocated_bytes,
+                        st.apparent_bytes,
+                        st.modified,
+                        hidden,
+                        lossy_name,
+                        None,
+                    );
+                    return Ok(true);
+                }
+
+                let Ok(st) = crate::linux::stat_at(dirfd, c_name, true) else {
+                    return Ok(true);
+                };
+                if st.kind == NodeKind::Directory {
+                    let path = dir.path.join(OsStr::from_bytes(raw_bytes));
+                    if ctx.never_scanned.contains(&path) {
+                        return Ok(true);
+                    }
+                    if ctx.options.one_filesystem
+                        && ctx
+                            .foreign_mounts
+                            .as_ref()
+                            .is_some_and(|m| m.contains(&path))
+                    {
+                        return Ok(true);
+                    }
+                    if ctx.options.one_filesystem
+                        && ctx.foreign_mounts.is_none()
+                        && st.device != ctx.root_dev
+                    {
+                        return Ok(true);
+                    }
+                    if let Some(id) = st.inode
+                        && !ctx
+                            .visited_dirs
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(id)
+                    {
+                        return Ok(true);
+                    }
+                    if ctx
+                        .options
+                        .max_depth
+                        .is_some_and(|limit| dir.depth + 1 > limit)
+                    {
+                        return Ok(true);
+                    }
+                    subdirs.push(Arc::new(PendingDir::new(
+                        name_str.to_owned(),
+                        path,
+                        Some(Arc::clone(dir)),
+                        dir.depth + 1,
+                        st.modified,
+                        hidden,
+                        lossy_name,
+                    )));
+                    return Ok(true);
+                }
+
+                if st.kind == NodeKind::File {
+                    local_files += 1;
+                }
+                local_alloc = local_alloc.saturating_add(st.allocated_bytes);
+                local_apparent =
+                    local_apparent.saturating_add(st.apparent_bytes);
+                local_leaves.push(
+                    name_str,
+                    st.kind,
+                    st.allocated_bytes,
+                    st.apparent_bytes,
+                    st.modified,
+                    hidden,
+                    lossy_name,
+                    st.hardlink,
+                );
+                return Ok(true);
+            }
+
+            // Directory or DT_UNKNOWN: resolve kind via relative statx first.
+            if file_type != FileType::Directory {
+                let Ok(st) = crate::linux::stat_at(dirfd, c_name, false) else {
+                    ctx.progress.errors.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true);
+                };
+                if st.kind != NodeKind::Directory {
+                    let (alloc, apparent) = if st.kind == NodeKind::Other {
+                        (0, 0)
+                    } else {
+                        (st.allocated_bytes, st.apparent_bytes)
+                    };
+                    if st.kind == NodeKind::File {
+                        local_files += 1;
+                    }
+                    local_alloc = local_alloc.saturating_add(alloc);
+                    local_apparent = local_apparent.saturating_add(apparent);
+                    local_leaves.push(
+                        name_str,
+                        st.kind,
+                        alloc,
+                        apparent,
+                        st.modified,
+                        hidden,
+                        lossy_name,
+                        (st.kind == NodeKind::File)
+                            .then_some(st.hardlink)
+                            .flatten(),
+                    );
+                    return Ok(true);
+                }
+            }
+
+            let path = dir.path.join(OsStr::from_bytes(raw_bytes));
+            if check_mounts {
+                if ctx.never_scanned.contains(&path) {
+                    return Ok(true);
+                }
+                if ctx.options.one_filesystem
+                    && ctx
+                        .foreign_mounts
+                        .as_ref()
+                        .is_some_and(|m| m.contains(&path))
+                {
+                    return Ok(true);
+                }
+            }
+
+            // Fresh-subtree cache skip BEFORE statting or descending.
+            if let Some(oracle) = &ctx.skip_oracle
+                && let Some(reused) = oracle.try_reuse(&path)
+            {
+                let reused_root = reused.node(reused.root());
+                ctx.progress
+                    .skipped_fresh_dirs
+                    .fetch_add(u64::from(reused_root.dirs), Ordering::Relaxed);
+                ctx.progress
+                    .dirs
+                    .fetch_add(u64::from(reused_root.dirs), Ordering::Relaxed);
+                ctx.progress
+                    .files
+                    .fetch_add(reused_root.files, Ordering::Relaxed);
+                ctx.progress
+                    .allocated_bytes
+                    .fetch_add(reused_root.allocated_bytes, Ordering::Relaxed);
+                ctx.progress
+                    .apparent_bytes
+                    .fetch_add(reused_root.apparent_bytes, Ordering::Relaxed);
+                if let Some(hook) = &ctx.on_dir_tally {
+                    hook(
+                        &path,
+                        reused_root.allocated_bytes,
+                        reused_root.apparent_bytes,
+                        reused_root.files,
+                    );
+                }
+                local_children.push(BuiltChild::Grafted(Box::new(
+                    GraftedChild {
+                        name: name_str.to_owned(),
+                        arena: Arc::new(reused),
+                        hidden,
+                        lossy_name,
+                    },
+                )));
+                return Ok(true);
+            }
+
+            let Ok(st) = crate::linux::stat_at(dirfd, c_name, false) else {
+                ctx.progress.errors.fetch_add(1, Ordering::Relaxed);
+                return Ok(true);
+            };
+            if ctx.options.one_filesystem
+                && ctx.foreign_mounts.is_none()
+                && st.device != ctx.root_dev
+            {
+                return Ok(true);
+            }
+            if ctx.options.follow_links
+                && let Some(id) = st.inode
+                && !ctx
+                    .visited_dirs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id)
+            {
+                return Ok(true);
+            }
+            if ctx
+                .options
+                .max_depth
+                .is_some_and(|limit| dir.depth + 1 > limit)
+            {
+                return Ok(true);
+            }
+            subdirs.push(Arc::new(PendingDir::new(
+                name_str.to_owned(),
+                path,
+                Some(Arc::clone(dir)),
+                dir.depth + 1,
+                st.modified,
+                hidden,
+                lossy_name,
+            )));
+            Ok(true)
+        },
+    );
+
+    if let Err(error) = read_res {
+        dir.read_error.store(true, Ordering::Relaxed);
+        ctx.progress.record_error(&dir.path, &error);
+        complete_one(ctx, dir);
+        return;
+    }
+
+    if local_files > 0 || local_alloc > 0 || local_apparent > 0 {
+        ctx.progress.files.fetch_add(local_files, Ordering::Relaxed);
+        ctx.progress
+            .allocated_bytes
+            .fetch_add(local_alloc, Ordering::Relaxed);
+        ctx.progress
+            .apparent_bytes
+            .fetch_add(local_apparent, Ordering::Relaxed);
+        if let Some(hook) = &ctx.on_dir_tally {
+            hook(&dir.path, local_alloc, local_apparent, local_files);
+        }
+    }
+
+    if local_leaves.len() > 0 {
+        *dir.leaves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = local_leaves;
+    }
+    if !local_children.is_empty() {
+        dir.children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(local_children);
+    }
+
+    if !subdirs.is_empty() {
+        dir.pending.fetch_add(subdirs.len(), Ordering::AcqRel);
+        let mut stale_deferred: Vec<(u64, Arc<PendingDir>)> = Vec::new();
+        for sub in subdirs {
+            if let Some(oracle) = &ctx.skip_oracle
+                && let DirFreshness::Stale { scanned_at } =
+                    oracle.freshness(&sub.path)
+            {
+                stale_deferred.push((scanned_at, sub));
+                continue;
+            }
+            let ctx = Arc::clone(ctx);
+            scope.spawn(move |s| {
+                scan_dir(s, &ctx, &sub);
+            });
+        }
+        if !stale_deferred.is_empty() {
+            ctx.deferred_stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(stale_deferred);
+        }
+    }
+
+    complete_one(ctx, dir);
+}
+
+#[cfg(not(target_os = "linux"))]
 fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
     if let Some(gate) = &ctx.pause_gate {
         gate.wait_if_paused(&ctx.cancel);
@@ -1244,6 +2299,12 @@ fn complete_one(ctx: &WalkContext, start: &Arc<PendingDir>) {
             return;
         }
         let incomplete = current.incomplete.load(Ordering::Relaxed);
+        let leaves = std::mem::take(
+            &mut *current
+                .leaves
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let children = std::mem::take(
             &mut *current
                 .children
@@ -1256,6 +2317,7 @@ fn complete_one(ctx: &WalkContext, start: &Arc<PendingDir>) {
             read_error: current.read_error.load(Ordering::Relaxed),
             hidden: current.hidden,
             lossy_name: current.lossy_name,
+            leaves,
             children,
         };
         if let Some(parent) = current.parent.as_ref().map(Arc::clone) {
@@ -1317,6 +2379,10 @@ fn subtree_has_at_least(root: &BuiltNode, threshold: usize) -> bool {
     let mut count = 0usize;
     let mut stack: Vec<&BuiltNode> = vec![root];
     while let Some(node) = stack.pop() {
+        count = count.saturating_add(node.leaves.len());
+        if count >= threshold {
+            return true;
+        }
         for child in &node.children {
             match child {
                 BuiltChild::Leaf(_) => {
@@ -1338,25 +2404,100 @@ fn subtree_has_at_least(root: &BuiltNode, threshold: usize) -> bool {
     false
 }
 
+fn append_leaves_to_arena(
+    arena: &mut TreeArena,
+    parent_id: NodeId,
+    leaves: &LeafSlab,
+) {
+    let count = leaves.len();
+    if count == 0 {
+        return;
+    }
+    let first_child_node_idx = arena.len();
+    let mut start = 0usize;
+    for i in 0..count {
+        let end = leaves.name_ends[i] as usize;
+        let name =
+            std::str::from_utf8(&leaves.names[start..end]).unwrap_or_default();
+        start = end;
+        let (kind, hidden, lossy) = LeafSlab::unpack_meta(leaves.meta[i]);
+        let mut flags = NodeFlags::new(kind);
+        flags.set(NodeFlags::HIDDEN, hidden);
+        flags.set(NodeFlags::LOSSY_NAME, lossy);
+        arena.add_child_raw(
+            parent_id,
+            name,
+            kind,
+            leaves.allocated[i],
+            leaves.apparent[i],
+            leaves.modified[i],
+            flags,
+        );
+    }
+    for &(leaf_idx, dev, ino) in &leaves.hardlinks {
+        if let Some(id) =
+            NodeId::from_index(first_child_node_idx + leaf_idx as usize)
+        {
+            arena.record_hardlink(id, dev, ino);
+        }
+    }
+}
+
+fn estimate_built_capacity(root: &BuiltNode) -> (usize, usize) {
+    let mut nodes = 1usize;
+    let mut bytes = root.name.len();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        nodes += dir.leaves.len();
+        bytes += dir.leaves.names.len();
+        for child in &dir.children {
+            match child {
+                BuiltChild::Leaf(leaf) => {
+                    nodes += 1;
+                    bytes += leaf.name.len();
+                }
+                BuiltChild::Dir(sub) => {
+                    nodes += 1;
+                    bytes += sub.name.len();
+                    stack.push(sub);
+                }
+                BuiltChild::Grafted(g) => {
+                    nodes += g.arena.len();
+                    bytes += g.arena.strings().byte_len() + g.name.len();
+                }
+            }
+        }
+    }
+    (nodes, bytes)
+}
+
 /// Convert the completed parallel tree into a flat [`TreeArena`] in one
-/// iterative pass.
+/// iterative pass with exact pre-sized backing arrays and zero hash-table build.
 fn materialize_arena(
     root_path: PathBuf,
     root: BuiltNode,
     scanned_at: u64,
 ) -> TreeArena {
-    let mut arena = TreeArena::new(root_path, &root.name);
+    let (expected_nodes, expected_bytes) = estimate_built_capacity(&root);
+    let mut arena = TreeArena::with_exact_capacity(
+        root_path,
+        &root.name,
+        expected_nodes,
+        expected_bytes,
+    );
+    let root_id = arena.root();
     {
-        let r = arena.node_mut(arena.root());
+        let r = arena.node_mut(root_id);
         r.modified = root.modified;
         r.flags.set(NodeFlags::READ_ERROR, root.read_error);
         r.flags.set(NodeFlags::HIDDEN, root.hidden);
         r.flags.set(NodeFlags::LOSSY_NAME, root.lossy_name);
         r.set_status(SubtreeStatus::Fresh { scanned_at });
     }
+    append_leaves_to_arena(&mut arena, root_id, &root.leaves);
 
     let mut stack: Vec<(NodeId, Vec<BuiltChild>)> =
-        vec![(arena.root(), root.children)];
+        vec![(root_id, root.children)];
 
     while let Some((parent_id, children)) = stack.pop() {
         for child in children {
@@ -1385,7 +2526,7 @@ fn materialize_arena(
                     flags.set(NodeFlags::READ_ERROR, dir.read_error);
                     flags.set(NodeFlags::HIDDEN, dir.hidden);
                     flags.set(NodeFlags::LOSSY_NAME, dir.lossy_name);
-                    let id = arena.add_child(
+                    let id = arena.add_child_raw(
                         parent_id,
                         &dir.name,
                         NodeKind::Directory,
@@ -1397,6 +2538,7 @@ fn materialize_arena(
                     arena
                         .node_mut(id)
                         .set_status(SubtreeStatus::Fresh { scanned_at });
+                    append_leaves_to_arena(&mut arena, id, &dir.leaves);
                     if !dir.children.is_empty() {
                         stack.push((id, dir.children));
                     }
@@ -1418,6 +2560,7 @@ fn materialize_arena(
         }
     }
 
+    arena.finish_building();
     arena
 }
 
@@ -1448,6 +2591,15 @@ impl std::fmt::Debug for MapSkipOracle {
 }
 
 impl SkipOracle for MapSkipOracle {
+    fn has_fresh(&self) -> bool {
+        !self.db_fresh.is_empty()
+            || !self
+                .in_memory
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
+
     fn try_reuse(&self, path: &Path) -> Option<TreeArena> {
         if let Some(arena) = self
             .in_memory
@@ -1514,8 +2666,9 @@ mod tests {
         assert_eq!(default_worker_threads(4), 4);
         assert_eq!(default_worker_threads(8), 4);
         assert_eq!(default_worker_threads(12), 6);
-        assert_eq!(default_worker_threads(18), 8);
-        assert_eq!(default_worker_threads(64), 8);
+        assert_eq!(default_worker_threads(18), 9);
+        assert_eq!(default_worker_threads(64), 32);
+        assert_eq!(default_worker_threads(128), 32);
     }
 
     #[test]

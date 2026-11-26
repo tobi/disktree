@@ -25,14 +25,16 @@ impl NameId {
 /// Contiguous, deduplicated string pool with zero per-string heap allocations.
 ///
 /// Strings live back-to-back in `data`; `offsets` has length `len() + 1`, so
-/// entry `i` is `&data[offsets[i]..offsets[i + 1]]`. Lookup uses 64-bit `FxHash`
-/// buckets without storing a second copy of any string.
+/// entry `i` is `&data[offsets[i]..offsets[i + 1]]`. The lookup hash table is
+/// kept only while building (`intern`), and dropped via [`Self::finish_building`]
+/// (or skipped entirely during [`Self::decode_front_coded`]) so finished arenas
+/// carry zero hash-table memory overhead.
 #[derive(Clone, Debug)]
 pub struct StringPool {
     data: String,
     offsets: Vec<u32>,
-    /// Primary hash -> first `NameId` with that hash.
-    index: FxHashMap<u64, NameId>,
+    /// Primary hash -> first `NameId` with that hash (dropped once finalized).
+    index: Option<FxHashMap<u64, NameId>>,
     /// Rare hash-collision overflow list.
     collisions: Vec<(u64, NameId)>,
 }
@@ -48,7 +50,7 @@ impl StringPool {
         Self {
             data: String::new(),
             offsets: vec![0],
-            index: FxHashMap::default(),
+            index: None,
             collisions: Vec::new(),
         }
     }
@@ -59,9 +61,40 @@ impl StringPool {
         Self {
             data: String::with_capacity(bytes),
             offsets,
-            index: FxHashMap::with_capacity_and_hasher(strings, FxBuildHasher),
+            index: None,
             collisions: Vec::new(),
         }
+    }
+
+    /// Release the build-time deduplication hash table while keeping O(1)
+    /// flat-array reads via [`Self::get`].
+    pub fn finish_building(&mut self) {
+        self.index = None;
+        self.collisions.clear();
+        self.collisions.shrink_to_fit();
+    }
+
+    fn ensure_index(&mut self) -> &mut FxHashMap<u64, NameId> {
+        if self.index.is_none() {
+            let count = self.len();
+            let mut map =
+                FxHashMap::with_capacity_and_hasher(count, FxBuildHasher);
+            self.collisions.clear();
+            for i in 0..count {
+                let id = NameId(i as u32);
+                let s = self.get(id);
+                let hash = Self::hash_str(s);
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    map.entry(hash)
+                {
+                    e.insert(id);
+                } else {
+                    self.collisions.push((hash, id));
+                }
+            }
+            self.index = Some(map);
+        }
+        self.index.as_mut().expect("initialized above")
     }
 
     /// Number of unique interned strings.
@@ -81,7 +114,8 @@ impl StringPool {
     /// Intern `value`, returning its existing [`NameId`] or inserting it once.
     pub fn intern(&mut self, value: &str) -> NameId {
         let hash = Self::hash_str(value);
-        if let Some(&existing) = self.index.get(&hash) {
+        let existing = self.ensure_index().get(&hash).copied();
+        if let Some(existing) = existing {
             if self.get(existing) == value {
                 return existing;
             }
@@ -90,17 +124,51 @@ impl StringPool {
                     return id;
                 }
             }
-            let id = self.push_raw(value);
+            let id = self.push_raw_indexed(value);
             self.collisions.push((hash, id));
             return id;
         }
-        let id = self.push_raw(value);
-        self.index.insert(hash, id);
+        let id = self.push_raw_indexed(value);
+        self.index
+            .as_mut()
+            .expect("index initialized above")
+            .insert(hash, id);
         id
     }
 
     /// Append a string known to be unique.
-    fn push_raw(&mut self, value: &str) -> NameId {
+    /// Append `value` directly without build-time hash deduplication (used by
+    /// the hot zero-alloc walker; on-disk shards still front-code and deduplicate).
+    pub fn push_raw(&mut self, value: &str) -> NameId {
+        // Invalidates any previously built lookup table so a later `intern()`
+        // stays consistent.
+        self.index = None;
+        self.collisions.clear();
+        let id = NameId(self.len() as u32);
+        self.data.push_str(value);
+        self.offsets.push(self.data.len() as u32);
+        id
+    }
+
+    /// Bulk-append every string in `other` in one contiguous copy, returning
+    /// the base [`NameId`] offset to add to `other`'s `NameId`s.
+    pub fn append_raw(&mut self, other: &Self) -> u32 {
+        self.index = None;
+        self.collisions.clear();
+        let base_id = self.len() as u32;
+        if other.is_empty() {
+            return base_id;
+        }
+        let base_byte = self.data.len() as u32;
+        self.data.push_str(&other.data);
+        self.offsets.reserve(other.len());
+        for &off in &other.offsets[1..] {
+            self.offsets.push(base_byte + off);
+        }
+        base_id
+    }
+
+    fn push_raw_indexed(&mut self, value: &str) -> NameId {
         let id = NameId(self.len() as u32);
         self.data.push_str(value);
         self.offsets.push(self.data.len() as u32);
@@ -226,16 +294,7 @@ impl StringPool {
             pool.data.push_str(suffix_str);
 
             let new_len = pool.data.len() - new_start;
-            let id = NameId(pool.len() as u32);
             pool.offsets.push(pool.data.len() as u32);
-            let hash = Self::hash_str(&pool.data[new_start..]);
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                pool.index.entry(hash)
-            {
-                e.insert(id);
-            } else {
-                pool.collisions.push((hash, id));
-            }
 
             prev_start = new_start;
             prev_len = new_len;

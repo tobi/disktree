@@ -1038,7 +1038,9 @@ fn run_background_walk(
     // cancelled or disconnected midway, everything already completed is safely
     // in `scan-cache.redb` and skipped on the next resume.
     let (cp_tx, cp_rx) = mpsc::channel::<(PathBuf, usize, Arc<TreeArena>)>();
-    let checkpoint_worker = {
+    // Only checkpoint completed subtrees during the walk when a cache DB is
+    // active (in-memory/one-shot runs avoid double-materializing depth-1 dirs).
+    let checkpoint_worker = if db_opt.is_some() {
         let storage = Arc::clone(storage);
         let host = host.clone();
         let options = *options;
@@ -1051,6 +1053,9 @@ fn run_background_walk(
                 );
             })
             .ok()
+    } else {
+        drop(cp_rx);
+        None
     };
     let on_dir_complete: Option<DirCompleteHook> =
         checkpoint_worker.as_ref().map(|_| {
