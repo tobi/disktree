@@ -114,6 +114,60 @@ const INSIGHT_LIMIT: usize = 6;
 
 /// Duration of the tile freshness colour fade when a square becomes fresh.
 const FRESHNESS_FADE_MS: f32 = 200.0;
+/// Duration of smooth per-tile rectangle gliding when sizes update during a
+/// live scan or background refresh.
+const TILE_RECT_GLIDE_MS: f32 = 200.0;
+/// Minimum interval between incremental subtree re-layouts during a background
+/// scan so the treemap stays calm instead of thrashing on every checkpoint.
+const LIVE_REPROJECT_BUFFER: Duration = Duration::from_millis(1200);
+
+#[derive(Clone, Copy, Debug)]
+struct TileRectAnim {
+    from: Rect,
+    target: Rect,
+    started: Instant,
+}
+
+impl TileRectAnim {
+    fn settled(rect: Rect, now: Instant) -> Self {
+        let elapsed = Duration::from_millis(250);
+        Self {
+            from: rect,
+            target: rect,
+            started: now.checked_sub(elapsed).unwrap_or(now),
+        }
+    }
+
+    fn rects_close(a: Rect, b: Rect) -> bool {
+        (a.x - b.x).abs() < 0.5
+            && (a.y - b.y).abs() < 0.5
+            && (a.w - b.w).abs() < 0.5
+            && (a.h - b.h).abs() < 0.5
+    }
+
+    fn value(&self, now: Instant) -> Rect {
+        if Self::rects_close(self.from, self.target) {
+            return self.target;
+        }
+        let elapsed_ms =
+            now.saturating_duration_since(self.started).as_secs_f32() * 1000.0;
+        let t = (elapsed_ms / TILE_RECT_GLIDE_MS).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        Rect::new(
+            (self.target.x - self.from.x).mul_add(eased, self.from.x),
+            (self.target.y - self.from.y).mul_add(eased, self.from.y),
+            (self.target.w - self.from.w).mul_add(eased, self.from.w),
+            (self.target.h - self.from.h).mul_add(eased, self.from.h),
+        )
+    }
+
+    fn is_running(&self, now: Instant) -> bool {
+        !Self::rects_close(self.from, self.target)
+            && now.saturating_duration_since(self.started).as_secs_f32()
+                * 1000.0
+                < TILE_RECT_GLIDE_MS
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TileFade {
@@ -1101,6 +1155,8 @@ pub struct Disktree {
     pub updating_paths: FxHashSet<PathBuf>,
     pub refreshed_paths: FxHashSet<PathBuf>,
     pub active_scan_path: Option<PathBuf>,
+    pending_arena_flush: bool,
+    last_arena_flush: Option<Instant>,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
     pub scan_error: Option<String>,
@@ -1123,6 +1179,9 @@ pub struct Disktree {
     pub transition: Option<LayoutTransition>,
     /// Per-tile smooth colour fade when freshness changes (200 ms ease-out).
     tile_fades: FxHashMap<PathBuf, TileFade>,
+    /// Per-tile smooth rectangle glide when live updates shift sizes (200 ms).
+    tile_rects: FxHashMap<PathBuf, TileRectAnim>,
+    last_treemap_size: Size<Pixels>,
     pub layout_options: LayoutOptions,
     cache: Option<LayoutCache>,
     marked: Option<MarkedCrumbs>,
@@ -1305,6 +1364,8 @@ impl Disktree {
             updating_paths: FxHashSet::default(),
             refreshed_paths: FxHashSet::default(),
             active_scan_path: None,
+            pending_arena_flush: false,
+            last_arena_flush: None,
             scan_epoch: 0,
             progress: ScanSnapshot::default(),
             scan_error: None,
@@ -1318,6 +1379,8 @@ impl Disktree {
             view: View::default(),
             transition: None,
             tile_fades: FxHashMap::default(),
+            tile_rects: FxHashMap::default(),
+            last_treemap_size: Size::default(),
             layout_options: LayoutOptions {
                 max_depth: depth.clamp(1, 6),
                 ..LayoutOptions::default()
@@ -2255,7 +2318,10 @@ impl Disktree {
         self.updating_paths.clear();
         self.refreshed_paths.clear();
         self.active_scan_path = None;
+        self.pending_arena_flush = false;
+        self.last_arena_flush = None;
         self.tile_fades.clear();
+        self.tile_rects.clear();
         self.crumbs.clear();
         self.selected = None;
         self.hovered = None;
@@ -2439,7 +2505,15 @@ impl Disktree {
                     });
                     self.install_tree(stale.tree.clone(), None, cx);
                 }
-                self.scan_preview.clone_from(&self.remote_progress.preview);
+                if self.remote_progress.preview.is_some()
+                    && (self.scan_preview.is_none()
+                        || self
+                            .preview_updated
+                            .is_none_or(|at| at.elapsed().as_secs() >= 1))
+                {
+                    self.scan_preview.clone_from(&self.remote_progress.preview);
+                    self.preview_updated = Some(Instant::now());
+                }
                 self.progress.files = self.remote_progress.files;
                 self.progress.dirs = self.remote_progress.dirs;
                 self.progress.bytes = self.remote_progress.bytes;
@@ -2541,120 +2615,158 @@ impl Disktree {
                         self.preview_updated = Some(Instant::now());
                     }
                 }
-                let Some(update) = handle.poll_update() else {
+                let mut drained = Vec::new();
+                while drained.len() < 64
+                    && let Some(update) = handle.poll_update()
+                {
+                    let stop = matches!(
+                        update,
+                        ScanUpdate::Live { .. }
+                            | ScanUpdate::Error(_)
+                            | ScanUpdate::Finished
+                    );
+                    drained.push(update);
+                    if stop {
+                        break;
+                    }
+                }
+                let mut keep_polling = true;
+                let mut spliced_arenas: Vec<(PathBuf, Arc<TreeArena>)> =
+                    Vec::new();
+                for update in drained {
+                    match update {
+                        ScanUpdate::Cached {
+                            arena,
+                            node,
+                            freshness,
+                        } => {
+                            let is_fresh =
+                                matches!(freshness, Freshness::Fresh { .. });
+                            self.arena = Some(arena);
+                            self.freshness = Some(freshness);
+                            self.install_tree(node, None, cx);
+                            if is_fresh {
+                                keep_polling = false;
+                                break;
+                            }
+                            // Stale SWR hit: paint immediately and transition
+                            // the active scan's intent to Refresh so the live
+                            // landing preserves navigation by path.
+                            if let Some(active) = &mut self.active_scan {
+                                active.set_intent(ScanIntent::Refresh {
+                                    metric: self.options.metric,
+                                    forced: false,
+                                });
+                            }
+                        }
+                        ScanUpdate::SubtreeUpdating { path } => {
+                            self.updating_paths.insert(path);
+                        }
+                        ScanUpdate::SubtreeRefreshed { path, arena: sub } => {
+                            self.updating_paths.remove(&path);
+                            self.refreshed_paths.insert(path.clone());
+                            spliced_arenas.push((path, sub));
+                        }
+                        ScanUpdate::Live { arena, node } => {
+                            spliced_arenas.clear();
+                            self.pending_arena_flush = false;
+                            self.arena = Some(arena);
+                            self.freshness = Some(Freshness::Live {
+                                scanned_at: disktree_scanner::unix_now(),
+                            });
+                            match &intent {
+                                ScanIntent::Refresh { metric, .. } => {
+                                    let directory = self.current_path();
+                                    let selected = self
+                                        .selected
+                                        .as_deref()
+                                        .and_then(|c| self.path_at(c));
+                                    self.install_refresh(
+                                        node, *metric, &directory, selected, cx,
+                                    );
+                                    self.scan_elapsed = self
+                                        .scan_started
+                                        .map(|started| started.elapsed());
+                                }
+                                ScanIntent::Widening { target } => {
+                                    self.install_tree(
+                                        node,
+                                        Some(target.clone()),
+                                        cx,
+                                    );
+                                }
+                                ScanIntent::Initial => {
+                                    self.install_tree(node, None, cx);
+                                }
+                            }
+                            keep_polling = false;
+                            break;
+                        }
+                        ScanUpdate::Error(error) => {
+                            self.scan_error = Some(error.to_string());
+                            keep_polling = false;
+                            break;
+                        }
+                        ScanUpdate::Finished => {
+                            keep_polling = false;
+                            break;
+                        }
+                    }
+                }
+
+                // Coalesce all SubtreeRefreshed checkpoints received on this
+                // tick into one arena splice, and buffer full tree re-layout to
+                // at most once per LIVE_REPROJECT_BUFFER so the treemap stays
+                // calm instead of jumping around on every folder.
+                if !spliced_arenas.is_empty()
+                    && let Some(current_arena) = self.arena.as_ref()
+                {
+                    let root = current_arena.root_path().to_path_buf();
+                    let mut next = (**current_arena).clone();
+                    let mut changed = false;
+                    for (path, sub) in spliced_arenas {
+                        if path == root {
+                            next = (*sub).clone();
+                            changed = true;
+                        } else if let Ok(rel) = path.strip_prefix(&root) {
+                            let parts: Vec<String> = rel
+                                .components()
+                                .map(|c| {
+                                    c.as_os_str().to_string_lossy().into_owned()
+                                })
+                                .collect();
+                            if let Some(target_id) = next
+                                .find_relative(parts.iter().map(String::as_str))
+                            {
+                                next.replace_node_contents(target_id, &sub);
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        next.aggregate(
+                            self.options.dedup_hardlinks,
+                            self.options.include_hidden,
+                        );
+                        self.arena = Some(Arc::new(next));
+                        self.pending_arena_flush = true;
+                    }
+                }
+
+                if self.pending_arena_flush
+                    && self
+                        .last_arena_flush
+                        .is_none_or(|t| t.elapsed() >= LIVE_REPROJECT_BUFFER)
+                    && let Some(arena) = self.arena.clone()
+                {
+                    self.pending_arena_flush = false;
+                    self.last_arena_flush = Some(Instant::now());
+                    self.reproject_arena(&arena, cx);
+                }
+
+                if keep_polling {
                     cx.notify();
                     return true;
-                };
-                match update {
-                    ScanUpdate::Cached {
-                        arena,
-                        node,
-                        freshness,
-                    } => {
-                        let is_fresh =
-                            matches!(freshness, Freshness::Fresh { .. });
-                        self.arena = Some(arena);
-                        self.freshness = Some(freshness);
-                        self.install_tree(node, None, cx);
-                        if is_fresh {
-                            self.active_scan = None;
-                            self.updating_paths.clear();
-                            self.refreshed_paths.clear();
-                            self.active_scan_path = None;
-                            self.scan_preview = None;
-                            self.progress.finished = true;
-                            cx.notify();
-                            return false;
-                        }
-                        // Stale SWR hit: paint immediately and transition the
-                        // active scan's intent to Refresh so the live landing
-                        // preserves navigation by path.
-                        if let Some(active) = &mut self.active_scan {
-                            active.set_intent(ScanIntent::Refresh {
-                                metric: self.options.metric,
-                                forced: false,
-                            });
-                        }
-                        cx.notify();
-                        return true;
-                    }
-                    ScanUpdate::SubtreeUpdating { path } => {
-                        self.updating_paths.insert(path);
-                        cx.notify();
-                        return true;
-                    }
-                    ScanUpdate::SubtreeRefreshed { path, arena: sub } => {
-                        self.updating_paths.remove(&path);
-                        self.refreshed_paths.insert(path.clone());
-                        if let Some(current_arena) = self.arena.as_mut() {
-                            let root = current_arena.root_path().to_path_buf();
-                            let updated = if path == root {
-                                Some((*sub).clone())
-                            } else if let Ok(rel) = path.strip_prefix(&root) {
-                                let parts: Vec<String> = rel
-                                    .components()
-                                    .map(|c| {
-                                        c.as_os_str()
-                                            .to_string_lossy()
-                                            .into_owned()
-                                    })
-                                    .collect();
-                                let mut next = (**current_arena).clone();
-                                if let Some(target_id) = next.find_relative(
-                                    parts.iter().map(String::as_str),
-                                ) {
-                                    next.replace_node_contents(target_id, &sub);
-                                    next.aggregate(
-                                        self.options.dedup_hardlinks,
-                                        self.options.include_hidden,
-                                    );
-                                    Some(next)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some(next) = updated {
-                                let next = Arc::new(next);
-                                self.arena = Some(Arc::clone(&next));
-                                self.reproject_arena(&next, cx);
-                            }
-                        }
-                        cx.notify();
-                        return true;
-                    }
-                    ScanUpdate::Live { arena, node } => {
-                        self.arena = Some(arena);
-                        self.freshness = Some(Freshness::Live {
-                            scanned_at: disktree_scanner::unix_now(),
-                        });
-                        match intent {
-                            ScanIntent::Refresh { metric, .. } => {
-                                let directory = self.current_path();
-                                let selected = self
-                                    .selected
-                                    .as_deref()
-                                    .and_then(|c| self.path_at(c));
-                                self.install_refresh(
-                                    node, metric, &directory, selected, cx,
-                                );
-                                self.scan_elapsed = self
-                                    .scan_started
-                                    .map(|started| started.elapsed());
-                            }
-                            ScanIntent::Widening { target } => {
-                                self.install_tree(node, Some(target), cx);
-                            }
-                            ScanIntent::Initial => {
-                                self.install_tree(node, None, cx);
-                            }
-                        }
-                    }
-                    ScanUpdate::Error(error) => {
-                        self.scan_error = Some(error.to_string());
-                    }
-                    ScanUpdate::Finished => {}
                 }
             }
         }
@@ -3803,7 +3915,14 @@ impl Disktree {
         let mut decorations = Vec::with_capacity(tiles.len());
         let mut slots: Vec<LabelSlot<'_>> = Vec::new();
         let now_instant = Instant::now();
+        let current_area = self.treemap_size.get();
+        let viewport_resized = current_area != self.last_treemap_size;
+        self.last_treemap_size = current_area;
+        if viewport_resized || self.transition.is_some() {
+            self.tile_rects.clear();
+        }
         let mut tile_fades = std::mem::take(&mut self.tile_fades);
+        let mut tile_rects = std::mem::take(&mut self.tile_rects);
         let mut visible_fade_keys = FxHashSet::default();
         for tile in tiles {
             let crumbs = tile.crumbs();
@@ -3826,21 +3945,20 @@ impl Disktree {
             let freshness =
                 self.tile_freshness_at(crumbs, now_unix, refresh_mode);
             let target_fade = freshness.fade_amount();
-            let freshness_fade = match &tile.kind {
-                TileKind::Node { crumbs } => {
-                    if let Some(path) = self.path_at(crumbs) {
-                        visible_fade_keys.insert(path.clone());
-                        sample_tile_fade(
-                            &mut tile_fades,
-                            path,
-                            target_fade,
-                            now_instant,
-                        )
-                    } else {
-                        target_fade
-                    }
-                }
-                TileKind::Others { .. } => target_fade,
+            let node_path = match &tile.kind {
+                TileKind::Node { crumbs } => self.path_at(crumbs),
+                TileKind::Others { .. } => None,
+            };
+            let freshness_fade = if let Some(path) = &node_path {
+                visible_fade_keys.insert(path.clone());
+                sample_tile_fade(
+                    &mut tile_fades,
+                    path.clone(),
+                    target_fade,
+                    now_instant,
+                )
+            } else {
+                target_fade
             };
             let is_marked = marked.contains(crumbs);
             // Everything inside a marked directory goes with it, so it is
@@ -3848,7 +3966,13 @@ impl Disktree {
             let is_covered = !marked.is_empty()
                 && (1..crumbs.len())
                     .any(|length| marked.contains(&crumbs[..length]));
-            let rect = self.animated_rect(tile.rect);
+            let rect = if self.transition.is_some() {
+                self.animated_rect(tile.rect)
+            } else if let Some(path) = node_path {
+                sample_tile_rect(&mut tile_rects, path, tile.rect, now_instant)
+            } else {
+                tile.rect
+            };
             decorations.push(TileDeco {
                 rect,
                 depth: tile.depth,
@@ -3867,7 +3991,18 @@ impl Disktree {
 
             // Labels are chosen in screen space: zooming in makes room for more
             // of them, which is the point of zooming in.
-            let header = tile.header.map(|header| self.animated_rect(header));
+            let header = tile.header.map(|header| {
+                if self.transition.is_some() {
+                    self.animated_rect(header)
+                } else {
+                    Rect::new(
+                        rect.x + (header.x - tile.rect.x),
+                        rect.y + (header.y - tile.rect.y),
+                        rect.w.min(header.w),
+                        rect.h.min(header.h),
+                    )
+                }
+            });
             let screen = view.project(header.unwrap_or(rect));
             if screen.w < LABEL_MIN_W_REMS * self.rem
                 || screen.h < LABEL_MIN_H_REMS * self.rem
@@ -3900,6 +4035,9 @@ impl Disktree {
         tile_fades.retain(|path, fade| {
             visible_fade_keys.contains(path) || fade.is_running(now_instant)
         });
+        tile_rects.retain(|path, anim| {
+            visible_fade_keys.contains(path) || anim.is_running(now_instant)
+        });
         drop(visible_fade_keys);
 
         slots.sort_by(|left, right| {
@@ -3930,6 +4068,7 @@ impl Disktree {
             .collect();
         self.cache = Some(cache);
         self.tile_fades = tile_fades;
+        self.tile_rects = tile_rects;
 
         Mosaic {
             tiles: decorations,
@@ -5114,13 +5253,82 @@ impl Disktree {
         self.tick_freshness_fades(window);
     }
 
-    /// Keep animation frames flowing while any tile is mid-fade after a
-    /// freshness change (200 ms ease-out), then stop cleanly at 0% idle CPU.
+    /// Plain-language explanation of active background work for the sidebar
+    /// Activity card (`(heading, why)`), when a tree is already on screen.
+    #[must_use]
+    pub fn scan_activity_summary(&self) -> Option<(&'static str, String)> {
+        self.tree.as_ref()?;
+        let active = self.active_scan.as_ref()?;
+        match active {
+            ActiveScan::Remote { intent, .. } => {
+                let host = self.remote.as_deref().unwrap_or("remote");
+                Some(match intent {
+                    ScanIntent::Refresh { forced: true, .. } => (
+                        "Rescanning remote",
+                        format!("Rescanning {host} on request"),
+                    ),
+                    ScanIntent::Refresh { forced: false, .. } => (
+                        "Refreshing cache",
+                        format!("Updating stale {host} cache in background"),
+                    ),
+                    ScanIntent::Widening { .. } => (
+                        "Expanding scan",
+                        format!("Reading parent folder on {host}"),
+                    ),
+                    ScanIntent::Initial => {
+                        ("Scanning remote", format!("Indexing {host} over SSH"))
+                    }
+                })
+            }
+            ActiveScan::Local { intent, .. } => Some(match intent {
+                ScanIntent::Refresh { forced: true, .. } => {
+                    ("Rescanning", "Rescanning this folder on request".into())
+                }
+                ScanIntent::Refresh { forced: false, .. } => (
+                    "Refreshing cache",
+                    "Updating folders older than 15 min — keep browsing".into(),
+                ),
+                ScanIntent::Widening { .. } => (
+                    "Expanding scan",
+                    "Reading parent folder around current view".into(),
+                ),
+                ScanIntent::Initial => {
+                    ("Scanning", "Indexing this folder".into())
+                }
+            }),
+        }
+    }
+
+    /// Keep animation frames flowing while any tile is mid-fade or mid-glide
+    /// after a freshness/layout change (200 ms ease-out), then stop cleanly at
+    /// 0% idle CPU.
     pub fn tick_freshness_fades(&self, window: &Window) {
         let now = Instant::now();
-        if self.tile_fades.values().any(|fade| fade.is_running(now)) {
+        if self.tile_fades.values().any(|fade| fade.is_running(now))
+            || self.tile_rects.values().any(|anim| anim.is_running(now))
+        {
             window.request_animation_frame();
         }
+    }
+}
+
+fn sample_tile_rect(
+    tile_rects: &mut FxHashMap<PathBuf, TileRectAnim>,
+    path: PathBuf,
+    target: Rect,
+    now: Instant,
+) -> Rect {
+    if let Some(anim) = tile_rects.get_mut(&path) {
+        if !TileRectAnim::rects_close(anim.target, target) {
+            let current = anim.value(now);
+            anim.from = current;
+            anim.target = target;
+            anim.started = now;
+        }
+        anim.value(now)
+    } else {
+        tile_rects.insert(path, TileRectAnim::settled(target, now));
+        target
     }
 }
 
@@ -5694,6 +5902,24 @@ mod tests {
         let done = fade.value(start + Duration::from_millis(200));
         assert!(done.abs() < 1e-5);
         assert!(!fade.is_running(start + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn tile_rect_glides_smoothly_over_200ms() {
+        let start = Instant::now();
+        let anim = TileRectAnim {
+            from: Rect::new(0.0, 0.0, 100.0, 100.0),
+            target: Rect::new(50.0, 20.0, 200.0, 140.0),
+            started: start,
+        };
+        assert!(anim.is_running(start));
+        let mid = anim.value(start + Duration::from_millis(100));
+        assert!(mid.x > 0.0 && mid.x < 50.0);
+        assert!(mid.w > 100.0 && mid.w < 200.0);
+        let done = anim.value(start + Duration::from_millis(200));
+        assert!((done.x - 50.0).abs() < 1e-3);
+        assert!((done.w - 200.0).abs() < 1e-3);
+        assert!(!anim.is_running(start + Duration::from_millis(200)));
     }
 
     #[test]

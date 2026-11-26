@@ -75,6 +75,7 @@ impl ScanOptions {
             max_depth: self.max_depth,
             dedup_hardlinks: self.dedup_hardlinks,
             threads: self.threads,
+            backend: disktree_scanner::ScanBackend::Auto,
         }
     }
 }

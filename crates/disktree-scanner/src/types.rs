@@ -262,6 +262,9 @@ pub struct ScanOptions {
     pub dedup_hardlinks: bool,
     /// Optional explicit worker count; `None` uses available parallelism.
     pub threads: Option<usize>,
+    /// Directory-enumeration / metadata strategy (`Auto` by default).
+    #[serde(default)]
+    pub backend: crate::backend::ScanBackend,
 }
 
 impl Default for ScanOptions {
@@ -274,6 +277,7 @@ impl Default for ScanOptions {
             max_depth: None,
             dedup_hardlinks: true,
             threads: None,
+            backend: crate::backend::ScanBackend::Auto,
         }
     }
 }

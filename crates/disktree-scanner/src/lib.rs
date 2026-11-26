@@ -3,6 +3,7 @@
 //! DB, priority-interruptible stale-while-revalidate (SWR), and automatic
 //! fallback to in-memory or streaming modes.
 
+pub mod backend;
 pub mod db;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -21,6 +22,7 @@ pub mod walk;
 #[cfg(windows)]
 pub mod windows;
 
+pub use backend::{DirEntryMeta, ScanBackend};
 pub use db::{CacheDb, CachedSubtree, InvalidateReport, SubtreeCatalog};
 pub use mounts::{default_cache_db_path, space_info};
 pub use session::{ScanEvent, ScanSession, ScanSnapshot, Scanner};

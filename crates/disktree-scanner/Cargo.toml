@@ -10,8 +10,9 @@ description = "High-efficiency disk space scanner with Protobuf cache DB, prefix
 workspace = true
 
 [features]
-default = ["cache-db"]
+default = ["cache-db", "io-uring"]
 cache-db = ["dep:redb"]
+io-uring = ["dep:io-uring"]
 
 [dependencies]
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
@@ -23,6 +24,9 @@ serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(not(windows))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "0.1.11"

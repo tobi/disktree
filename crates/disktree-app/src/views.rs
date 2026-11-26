@@ -1891,10 +1891,120 @@ fn side_panel(
                 .child(rule())
                 .child(marked_section(app, theme, cx)),
         )
+        .children(activity_section(app, theme, cx))
         .children(notice_line(app, theme, cx))
         .children(privacy_line(app, theme, cx))
         .children(administrator_line(app, theme, cx))
         .child(disk_section(app, theme, cx))
+}
+
+/// Calm, fixed-height sidebar banner explaining WHEN background scanning is
+/// running and WHY (stale cache refresh, explicit rescan, widening, or remote),
+/// with live monospace counters and current folder lane plus a Stop control.
+fn activity_section(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    let (heading, why) = app.scan_activity_summary()?;
+    let counts = if app.progress.files > 0 || app.progress.dirs > 0 {
+        format!(
+            "{} · {} files · {} dirs",
+            human_bytes(app.progress.bytes),
+            disktree_core::size::human_count(app.progress.files),
+            disktree_core::size::human_count(app.progress.dirs),
+        )
+    } else if app.remote.is_some() {
+        app.remote_progress.stage.label().to_owned()
+    } else {
+        "Checking cached folders…".to_owned()
+    };
+    let current_path = app
+        .remote
+        .as_ref()
+        .and(app.remote_progress.directory.as_deref())
+        .or(app.active_scan_path.as_deref())
+        .map(|p| app.display_path(p))
+        .unwrap_or_default();
+
+    Some(
+        div()
+            .debug_selector(|| "sidebar-activity".into())
+            .flex()
+            .flex_col()
+            .gap(space::XXS)
+            .px(space::LG)
+            .py(space::SM)
+            .bg(theme.inset)
+            .border_t_1()
+            .border_color(theme.divider())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(space::SM)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(space::XS)
+                            .child(
+                                gpui_omarchy::icon(
+                                    gpui_omarchy::IconName::RotateCw,
+                                )
+                                .size(icon::SM)
+                                .text_color(theme.accent),
+                            )
+                            .child(widgets::eyebrow(heading, cx)),
+                    )
+                    .child(
+                        button(
+                            "activity-stop",
+                            "Stop",
+                            ButtonVariant::Outline,
+                            cx,
+                        )
+                        .tab_stop(false)
+                        .px(space::XS)
+                        .py(space::XXS)
+                        .on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.cancel_scan(cx);
+                                window.focus(&this.focus, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .h(size::PROGRESS_ROW)
+                    .truncate()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.foreground)
+                    .child(why),
+            )
+            .child(
+                div()
+                    .h(size::PROGRESS_ROW)
+                    .truncate()
+                    .font_family(theme.mono_font.clone())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(counts),
+            )
+            .child(
+                div()
+                    .h(size::PROGRESS_ROW)
+                    .truncate()
+                    .font_family(theme.mono_font.clone())
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(current_path),
+            ),
+    )
 }
 
 /// What the keys act on: compact, static-height summary with Open, Mark and

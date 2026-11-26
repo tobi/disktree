@@ -1657,6 +1657,7 @@ dependencies = [
 name = "disktree-scanner"
 version = "1.0.0"
 dependencies = [
+ "io-uring",
  "lz4_flex",
  "prost",
  "rayon",
@@ -3686,6 +3687,17 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "leaky-cow",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "878c26bc5e45fe089ce2ca25689260c152a87ce1d7de2ca86101efeea6973932"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]

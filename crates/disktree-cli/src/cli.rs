@@ -90,6 +90,18 @@ pub struct Cli {
     /// Fixed worker threads for scanning (defaults to CPU count).
     #[arg(long)]
     pub scan_threads: Option<usize>,
+
+    /// Directory enumeration / metadata strategy (auto, statx, uring, portable).
+    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+    pub backend: BackendArg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BackendArg {
+    Auto,
+    Statx,
+    Uring,
+    Portable,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -177,6 +189,18 @@ impl Cli {
             max_depth: None,
             dedup_hardlinks: true,
             threads: self.scan_threads,
+            backend: match self.backend {
+                BackendArg::Auto => disktree_scanner::ScanBackend::Auto,
+                BackendArg::Portable => disktree_scanner::ScanBackend::Portable,
+                BackendArg::Statx => {
+                    disktree_scanner::ScanBackend::parse("statx")
+                        .unwrap_or(disktree_scanner::ScanBackend::Auto)
+                }
+                BackendArg::Uring => {
+                    disktree_scanner::ScanBackend::parse("uring")
+                        .unwrap_or(disktree_scanner::ScanBackend::Auto)
+                }
+            },
         }
     }
 
