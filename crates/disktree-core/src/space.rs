@@ -1135,6 +1135,7 @@ portal /run/user/1000/doc fuse.portal rw 0 0
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn local_btrfs_scan_keeps_distinct_subvolumes_but_not_aliases_or_network() {
         let mounts = parse_mounts(
             "/dev/root / btrfs rw,subvol=/@ 0 0\n\
