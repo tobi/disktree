@@ -185,7 +185,7 @@ fn resolved_face() -> Option<SharedString> {
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-fn resolved_face() -> Option<SharedString> {
+const fn resolved_face() -> Option<SharedString> {
     None
 }
 
