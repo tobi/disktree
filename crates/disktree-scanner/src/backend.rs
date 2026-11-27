@@ -6,7 +6,9 @@
 //! them. Adding a new OS or filesystem strategy only requires implementing one
 //! backend behind [`visit_dir_entries`].
 
+#[cfg(target_os = "linux")]
 use std::io;
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};

@@ -23,9 +23,11 @@ use rayon::Scope;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::mounts::{mount_boundaries_for, never_scanned};
-use crate::stream::{device_of, inode_of, modified_seconds};
 #[cfg(not(target_os = "linux"))]
-use crate::stream::{measure_both, nlink_of};
+use crate::stream::measure_both;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+use crate::stream::nlink_of;
+use crate::stream::{device_of, inode_of, modified_seconds};
 use crate::tree::{NodeFlags, NodeId, TreeArena};
 use crate::types::{NodeKind, ScanOptions, ScanStats, SubtreeStatus, unix_now};
 
@@ -655,7 +657,7 @@ struct WalkContext {
     on_dir_tally: Option<DirTallyHook>,
     on_dir_complete: Option<DirCompleteHook>,
     #[cfg(windows)]
-    volume: Option<u32>,
+    volume: Option<u64>,
     /// Stale subdirectories (already have cached data) deferred until every
     /// Unscanned (no-data) subdirectory finishes.
     deferred_stale: Mutex<Vec<(u64, Arc<PendingDir>)>>,
@@ -1737,7 +1739,7 @@ fn scan_dir(scope: &Scope<'_>, ctx: &Arc<WalkContext>, dir: &Arc<PendingDir>) {
         let hidden = entry.is_hidden(&name);
         let path = entry.entry_path(&dir.path);
 
-        let Ok(kind) = entry.kind() else {
+        let Ok(kind) = Listed::kind(&entry) else {
             ctx.progress.errors.fetch_add(1, Ordering::Relaxed);
             continue;
         };

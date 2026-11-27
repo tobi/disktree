@@ -284,30 +284,30 @@ impl MountView {
 /// `one_filesystem = false`: virtual kernel filesystems on Linux, and macOS's
 /// duplicate Data volume mount + `/Network` automount.
 pub fn never_scanned(root: &Path) -> FxHashSet<PathBuf> {
-    let mut set = FxHashSet::default();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        let mut set = FxHashSet::default();
+        #[cfg(target_os = "linux")]
         for virtual_fs in ["/proc", "/sys", "/dev"] {
             let path = PathBuf::from(virtual_fs);
             if path != root && path.starts_with(root) {
                 set.insert(path);
             }
         }
-    }
-    #[cfg(target_os = "macos")]
-    {
+        #[cfg(target_os = "macos")]
         for skip in ["/System/Volumes/Data", "/Network"] {
             let path = PathBuf::from(skip);
             if path != root && path.starts_with(root) {
                 set.insert(path);
             }
         }
+        set
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = root;
+        FxHashSet::default()
     }
-    set
 }
 
 fn unescape_octal(raw: &str) -> String {
