@@ -305,8 +305,14 @@ fn temp_db_mode_works_and_cleans_up_on_drop() {
         assert!(db_path.as_ref().is_some_and(|p| p.exists()));
     }
 
-    // Temp DB file should be removed once Scanner is dropped.
+    // Temp DB file should be removed once Scanner and its background worker
+    // release the last Arc<CacheDb>.
     if let Some(path) = db_path {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!path.exists(), "temp db should be cleaned up on drop");
     }
 }

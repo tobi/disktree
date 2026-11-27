@@ -448,10 +448,10 @@ fn file_id(id: u128) -> Option<u64> {
     u64::try_from(id).ok().filter(|&low| low != 0)
 }
 
-/// `(volume serial, file index)` of what `path` names, following links: how
-/// a walk that follows links notices it has been somewhere before. `None`
-/// where there is no usable index; zero and all ones mean exactly that
-/// ([MS-FSCC] 2.1.9).
+/// `(volume serial, file index)` of what `path` names, following links.
+///
+/// Used to detect symlink loops; returns `None` where there is no usable index
+/// (zero and all ones per [MS-FSCC] 2.1.9).
 ///
 /// [MS-FSCC]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/2d3333fe-fc98-4a6f-98a2-4bb805aff407
 pub fn identity(path: &Path) -> Option<(u64, u64)> {
@@ -461,11 +461,11 @@ pub fn identity(path: &Path) -> Option<(u64, u64)> {
         .then(|| (info.volume_serial_number(), index))
 }
 
-/// Serial number of the volume every directory under `canonical` is on,
-/// for a walk that does not follow links. Only a local drive has one:
-/// mounted folders there are reparse points the walk takes for links,
-/// while a share's DFS links are not, and lead to other servers' volumes.
-/// `None` for a share, or when the serial cannot be read.
+/// Serial number of the volume every directory under `canonical` is on.
+///
+/// Only local drives have one (mounted folders are reparse points, whereas a
+/// share's DFS links lead to other servers' volumes). Returns `None` for a
+/// share or when the serial cannot be read.
 pub fn walk_volume(canonical: &Path) -> Option<u64> {
     let Some(Component::Prefix(prefix)) = canonical.components().next() else {
         return None;
@@ -610,9 +610,10 @@ pub fn elevated() -> bool {
     unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
 }
 
-/// Whether `root` is a whole drive an administrator would read from its
-/// file table: a drive letter's root, formatted NTFS. Anything else, from
-/// a folder or a mounted folder to another file system, is walked either way.
+/// Whether `root` is a whole NTFS drive readable from its file table.
+///
+/// Anything else — a subdirectory, mounted folder, or non-NTFS volume — falls
+/// back to the regular directory walk.
 pub fn file_table_readable(root: &Path) -> bool {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let Some(letter) = drive_letter(&canonical) else {
@@ -673,10 +674,9 @@ pub fn run_elevated(program: &Path, args: &[OsString]) -> io::Result<()> {
     }
 }
 
-/// Write out what the file system holds only in memory for the volume
-/// holding `path`, its file table included. Flushing a volume takes write
-/// access, so an administrator. Only a volume mounted as a drive letter:
-/// for one mounted in a folder, `\\.\X:` would name the drive around it.
+/// Flush in-memory NTFS metadata (including the MFT) for `path`'s volume.
+///
+/// Requires administrator write access and a drive-letter mount.
 pub fn flush_volume(path: &Path) -> io::Result<()> {
     let root = volume_root(path).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "no volume holds the path")

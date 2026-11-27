@@ -68,16 +68,14 @@ pub fn default_cache_db_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var_os("HOME")?;
-        return Some(
+        Some(
             PathBuf::from(home).join("Library/Caches/disktree/scan-cache.redb"),
-        );
+        )
     }
     #[cfg(windows)]
     {
         let base = std::env::var_os("LOCALAPPDATA")?;
-        return Some(
-            PathBuf::from(base).join("disktree/cache/scan-cache.redb"),
-        );
+        Some(PathBuf::from(base).join("disktree/cache/scan-cache.redb"))
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -259,6 +257,7 @@ pub struct MountView {
 }
 
 impl MountView {
+    #[cfg(any(target_os = "linux", test))]
     fn parse(line: &str) -> Option<Self> {
         let (left, right) = line.split_once(" - ")?;
         let mut left = left.split_whitespace().skip(3);

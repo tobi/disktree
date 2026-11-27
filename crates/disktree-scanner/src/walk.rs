@@ -354,19 +354,23 @@ pub fn walk_parallel(
     } else {
         None
     };
-    let mut mount_parents: FxHashSet<PathBuf> = FxHashSet::default();
-    for path in &never {
-        if let Some(parent) = path.parent() {
-            mount_parents.insert(parent.to_path_buf());
-        }
-    }
-    if let Some(mounts) = &foreign_mounts {
-        for path in mounts {
+    #[cfg(target_os = "linux")]
+    let mount_parents = {
+        let mut parents: FxHashSet<PathBuf> = FxHashSet::default();
+        for path in &never {
             if let Some(parent) = path.parent() {
-                mount_parents.insert(parent.to_path_buf());
+                parents.insert(parent.to_path_buf());
             }
         }
-    }
+        if let Some(mounts) = &foreign_mounts {
+            for path in mounts {
+                if let Some(parent) = path.parent() {
+                    parents.insert(parent.to_path_buf());
+                }
+            }
+        }
+        parents
+    };
 
     let mut visited_dirs = FxHashSet::default();
     if let Some(id) = inode_of(&root_meta) {
@@ -379,10 +383,10 @@ pub fn walk_parallel(
     );
 
     #[cfg(windows)]
-    let volume = if !config.options.follow_links {
-        crate::windows::walk_volume(&canonical_root)
-    } else {
+    let volume = if config.options.follow_links {
         None
+    } else {
+        crate::windows::walk_volume(&canonical_root)
     };
 
     let ctx = Arc::new(WalkContext {
@@ -392,6 +396,7 @@ pub fn walk_parallel(
         root_dev,
         foreign_mounts,
         never_scanned: never,
+        #[cfg(target_os = "linux")]
         mount_parents,
         visited_dirs: Mutex::new(visited_dirs),
         cancel: config.cancel,
@@ -419,21 +424,21 @@ pub fn walk_parallel(
 
     let run_walk = || -> io::Result<()> {
         #[cfg(windows)]
-        if ctx.skip_oracle.is_none() {
-            if let Some(result) = crate::mft::scan(
+        if ctx.skip_oracle.is_none()
+            && let Some(result) = crate::mft::scan(
                 root,
                 &canonical_root,
                 &ctx.options,
                 &ctx.cancel,
                 &ctx.progress,
-            ) {
-                let built = result?;
-                *ctx.finished_root
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(built);
-                return Ok(());
-            }
+            )
+        {
+            let built = result?;
+            *ctx.finished_root
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(built);
+            return Ok(());
         }
         let (mut phase, mut effects) = walk_machine::step(
             walk_machine::State::Idle,
@@ -647,6 +652,7 @@ struct WalkContext {
     never_scanned: FxHashSet<PathBuf>,
     /// Parent directories of every path in `never_scanned` / `foreign_mounts`.
     /// Directories absent from this set skip all per-entry mount hash checks.
+    #[cfg(target_os = "linux")]
     mount_parents: FxHashSet<PathBuf>,
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     cancel: Arc<AtomicBool>,
@@ -746,6 +752,7 @@ impl LeafSlab {
         self.meta.len()
     }
 
+    #[cfg(target_os = "linux")]
     #[allow(
         clippy::too_many_arguments,
         reason = "flat SoA push avoids intermediate struct copies"

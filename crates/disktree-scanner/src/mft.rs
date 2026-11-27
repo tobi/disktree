@@ -1,7 +1,8 @@
-//! Measuring an NTFS volume from its master file table, the way `WizTree`
-//! does: one read of every file record instead of a listing per directory.
-//! On a disk of four million files the walk opens six hundred thousand
-//! directories; this reads five gigabytes in a few large requests.
+//! Measuring an NTFS volume from its master file table.
+//!
+//! Reads every file record in bulk instead of listing every directory: on a
+//! disk of four million files the walk opens six hundred thousand directories,
+//! whereas this reads five gigabytes in a few large requests.
 //!
 //! Only for a whole drive, `C:\`. The table costs the same to read whatever
 //! part of it is wanted, so for a small directory the walk is faster.
@@ -1131,8 +1132,8 @@ impl Table<'_> {
             }
             self.child(entry, depth, descend).transpose()
         };
-        let entries = self.entries(number);
         const PARALLEL_LEVELS: usize = 3;
+        let entries = self.entries(number);
         let children = if depth < PARALLEL_LEVELS {
             entries
                 .par_iter()
