@@ -17,13 +17,12 @@ const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 pub fn default_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        return std::env::home_dir()
-            .map(|h| h.join("Library/Logs/disktree/errors.log"));
+        std::env::home_dir().map(|h| h.join("Library/Logs/disktree/errors.log"))
     }
     #[cfg(windows)]
     {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(|d| PathBuf::from(d).join("disktree/errors.log"));
+        std::env::var_os("LOCALAPPDATA")
+            .map(|d| PathBuf::from(d).join("disktree/errors.log"))
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

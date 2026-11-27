@@ -140,14 +140,19 @@ fn memory_and_core_limits_are_installed_before_reading_a_request() {
         let limits =
             std::fs::read_to_string(format!("/proc/{}/limits", helper.0.id()))
                 .unwrap();
-        if limits.lines().any(|line| {
+        let as_ready = limits.lines().any(|line| {
             line.starts_with("Max address space")
                 && line
                     .split_whitespace()
                     .nth(3)
                     .and_then(|value| value.parse::<u64>().ok())
                     .is_some_and(|value| value <= 32 << 30)
-        }) {
+        });
+        let core_ready = limits.lines().any(|line| {
+            line.starts_with("Max core file size")
+                && line.split_whitespace().nth(4) == Some("0")
+        });
+        if as_ready && core_ready {
             break limits;
         }
         assert!(std::time::Instant::now() < deadline);

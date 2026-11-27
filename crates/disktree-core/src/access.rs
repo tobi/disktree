@@ -73,7 +73,9 @@ pub const fn file_table_readable(root: &Path) -> bool {
 /// UAC prompt. An error if the prompt is declined, or off Windows.
 pub fn restart_as_administrator(args: &[OsString]) -> io::Result<()> {
     #[cfg(windows)]
-    return crate::windows::run_elevated(&std::env::current_exe()?, args);
+    {
+        crate::windows::run_elevated(&std::env::current_exe()?, args)
+    }
     #[cfg(not(windows))]
     {
         let _ = args;

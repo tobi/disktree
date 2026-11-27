@@ -222,14 +222,14 @@ mod ssh_hosts {
     pub fn default_path() -> Option<PathBuf> {
         #[cfg(target_os = "macos")]
         {
-            return std::env::home_dir().map(|home| {
+            std::env::home_dir().map(|home| {
                 home.join("Library/Application Support/disktree/ssh-hosts")
-            });
+            })
         }
         #[cfg(windows)]
         {
-            return std::env::var_os("APPDATA")
-                .map(|dir| PathBuf::from(dir).join("disktree/ssh-hosts"));
+            std::env::var_os("APPDATA")
+                .map(|dir| PathBuf::from(dir).join("disktree/ssh-hosts"))
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {

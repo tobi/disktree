@@ -1132,9 +1132,8 @@ impl Table<'_> {
             }
             self.child(entry, depth, descend).transpose()
         };
-        const PARALLEL_LEVELS: usize = 3;
         let entries = self.entries(number);
-        let children = if depth < PARALLEL_LEVELS {
+        let children = if depth < 3 {
             entries
                 .par_iter()
                 .filter_map(child)
