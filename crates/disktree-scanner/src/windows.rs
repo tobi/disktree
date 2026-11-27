@@ -896,7 +896,7 @@ impl Aligned {
 
 /// Make a directory junction for a test: unlike a symbolic link, one needs
 /// no privilege to create. `false` when there is no `cmd` to make it with.
-#[cfg(test)]
+#[doc(hidden)]
 pub fn make_junction(link: &Path, target: &Path) -> bool {
     // Rebuilt from components, because `mklink` takes no `/` in a path, and
     // a test's `root.join("sub/loop")` has one.

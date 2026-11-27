@@ -2,6 +2,24 @@
 
 All notable changes to disktree are documented here.
 
+## [1.5.0] - 2026-11-27
+
+### Highlights
+- **6–9× faster Linux scanning & 2.2–2.7× lower peak RAM:** strategy-invariant `ScanBackend` abstraction with Linux `openat` + 64 KiB `getdents64` + relative `statx`, optional batched `io_uring` (`IORING_OP_STATX`, `--backend auto|statx|uring|portable`), zero-allocation iterative direct subtree walker, Struct-of-Arrays (`SoA`) `LeafSlab`, bulk O(N) `TreeArena::graft_subtree` / `replace_node_contents`, and removal of build-time `StringPool` / hardlink hash tables (up to **8.9× faster** and **2.7× less RAM** on 63-core Linux benchmarks).
+- **Full-duplex `disktree-cli --connected` remote engine:** runs `disktree-scanner` directly against the remote host's own `scan-cache.redb` with cadence-based incremental checkpointing (every 4 s), streams depth-4 pruned trees (~1,300× less SSH traffic on 25M+ file volumes), proactively prefetches depth 5 for top folders, and answers on-demand `Focus` / `Prioritize` commands over the same open SSH pipe in milliseconds.
+- **Tailscale SSH auto-auth & saved SSH hosts:** detects Tailscale SSH check URLs live from stderr, opens the browser login page automatically while keeping SSH waiting, and persists successfully connected SSH hosts as one-click **Recent hosts** pills in **Open location → SSH remote**.
+- **Calm, animated desktop UX:** buffered incremental subtree updates (1.2 s cadence), 200 ms cubic ease-out per-tile rectangle gliding and colour freshness fades, subtle neutral fade-only freshness shading, unified dense sidebar scan status card (keeping **Selection** interactive during background refreshes), and cleaner top-bar / selection controls.
+
+### Added
+- **Incremental resume & checkpointing:** completed depth-1 and large depth-2 subtrees flush to `scan-cache.redb` every 4 seconds in one batched `redb` write transaction so interrupted cold scans resume by skipping finished folders and prioritizing unscanned holes first.
+- **Remote version visibility & error logging:** `Header.helper_version` reports the remote `disktree-cli` version in the UI, and runtime discovery/scan/SSH failures append timestamped entries to `~/.local/state/disktree/errors.log` (auto-rotated at 2 MiB).
+- **Stronger "Copy as prompt" host checks:** always includes expected `hostname` (with SSH host fallback) and `/etc/machine-id` when available, instructing the agent to double-check both and stop to ask what to do on any mismatch.
+
+### Fixed
+- Open `/proc/self/exe` directly on Linux in `payload::Archive::current()` so in-place `make install` upgrades under a running window never fail SSH with `ENOENT`.
+- Scale Linux helper `RLIMIT_AS` to `MemTotal / 4` (4–32 GiB), raise remote wall deadline to 30 min, and store bounded depth-3 summaries in `--connected` to eliminate OOM crashes on 25M+ file servers.
+- Stop `gpui-omarchy`'s background `notify-rs` watcher in headless tests and fix cross-platform macOS/Windows lints and test races.
+
 ## [1.0.0] - 2026-11-25
 
 ### Highlights
